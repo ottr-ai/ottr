@@ -48,20 +48,32 @@ A card that passes all three is a **suspect**.
 
 ## Diagnosis (read-only)
 
-One probe call returns, in addition to the tree and session age:
+**Session identity.** The run's own session id is known mid-run: the
+runner parses it from the run's event stream and `dispatchSessionEntry`
+writes it onto the task row (`task.sessionId`) while the run is live.
+The probe selects that session file and no other — `sessionFile(dir,
+sessionId)` on the server for a local run, the same name pattern under
+the run's data dir on the worker. A card whose session id is not yet
+known reports `sessionAt: null` (never a suspect on a guessed file).
 
-- `lastTool`: the last `tool_execution_start` in the newest session
-  `.jsonl` (bounded tail read, at most 64 KiB): `{tool, command, timeout}`
+- `lastTool`: the last `tool_execution_start` in **the run's own session
+  file** (bounded tail read, at most 64 KiB): `{tool, command, timeout}`
   with `timeout` the raw number from the tool arguments (`0` = unbounded).
-- `locks`: for every lock-candidate path the command text names
-  (`extractLockPaths`: path-like tokens ending in `.lock`, at most 5,
-  each at most 300 chars), the host that owns the run reads the file and
-  reports `{path, exists, pid, alive}` — `pid` parsed strictly from JSON
-  `{"pid":<positive integer>}` (`parseLockPid`), `alive` from
-  `kill(pid, 0)` on that host (`true`, `false`, or `null` when
-  unreadable). The host reads **only** paths that pass
-  `lockPathAllowed(path, worktree, cardNum)` (below); everything else is
-  reported as `exists: false` without a read.
+- `locks`: for every lock-candidate path (`.lock`) the command text
+  names…
+- `pidFiles`: for every pid-file path (`.pid`) the command names, the
+  same fact shape — content parsed as `{"pid":N}` or a bare integer.
+- `pids`: for every inline pid reference in the command (`--pid N`,
+  `kill -0 N`, `kill N`), `{pid, alive}` on that host.
+- `ports`: for every port reference (`--port N`, `nc -z host N`,
+  `localhost:N`, `127.0.0.1:N`, `0.0.0.0:N`, `PORT=N`), `{port,
+  listeners}` where listeners counts `LISTEN` entries for that port in
+  the host's `/proc/net/tcp` and `/proc/net/tcp6`.
+
+Candidate reads are bounded (at most 5 per kind, 1 KiB per file,
+`O_NOFOLLOW`, regular files only) but **not** confined: the facts feed
+the diagnosis and the ask, and the confinement decides only what a fix
+may touch. A deletion or a signal is still confined at act time.
 
 Session text and command text are untrusted data: they select which facts
 to read, never what to execute.
@@ -93,17 +105,44 @@ fix changes nothing and the card goes to the ask path.
    `{"pid":N}` with `N > 1`; pid `N` does not exist on that host. Then:
    steer, `unlink` the lock file, log
    `supervisor: removed stale lock <path> (pid <N> gone), steered`.
-2. **Hung child** — preconditions at act time: the pid is a descendant of
+2. **Hung child** — the child is only ever killed with proof that its
+   dependency can never clear. The diagnosis grants the kill only when
+   the idle timeout-0 child waits on a **dead dependency inside the
+   card's own trust domain**: a lock or pid file that passes
+   `lockPathAllowed` and still names a pid dead on that host, an inline
+   pid reference whose pid is dead on that host, or a port with zero
+   listeners. An idle timeout-0 child without such proof — a plain
+   sleep, a quiet network request — and any dead dependency outside the
+   card's own dirs (another card's lock) never auto-kills: they file the
+   ask, and the kill happens only on the owner's Apply-the-fix answer
+   through the same re-validated path. Act-time preconditions, all
+   re-checked immediately before the signal: the pid is a descendant of
    the run's omp pid in a fresh `/proc` ppid walk; it is not the omp pid
-   and not the daemon pid; it is the shell of the last tool call (its
-   normalized argv contains the normalized command text, both capped at
-   300 chars); the last tool call had `timeout 0` (unbounded); the child
-   gained `< BUSY_MIN_TICKS` ticks across the window. Then: steer,
-   `SIGTERM` that child only, log
+   and not the daemon pid; the session's last tool call is still the
+   diagnosed call (`timeout 0`, same normalized command) — the agent has
+   not moved on; the child's current argv still matches that command;
+   the child gained `< BUSY_MIN_TICKS` ticks since the probe (it has not
+   resumed); and the diagnosed dependency is still dead (the file still
+   names the same dead pid, the inline pid is still dead, the port still
+   has no listener). Then: steer, `SIGTERM` that child only, log
    `supervisor: stopped hung child <pid> (<command>), steered`.
+
+The stale-lock fix re-checks one more fact at act time: the session's
+last tool call still names the lock path (the turn still waits on it).
 
 A refused fix logs `supervisor: stale fix refused (<reason>)` and files
 the ask.
+
+### Steer delivery
+
+`pendingPrompt` is delivered with the card's next dispatched turn
+(`settleSteered`): a steer queued mid-run reaches the agent after the
+current run ends, and the queue holds a premature settle from landing —
+a partial ready report is never accepted while the steer waits. The
+current run's remaining steps may still act on the stuck call's partial
+output; the steer text says so honestly (it arrives with the next turn).
+A channel that injects into a live run would be new extension prompt
+text — a hard stop that needs owner approval before it is built.
 
 ### Steer wording (draft; agent-facing prompt text)
 
@@ -111,7 +150,9 @@ The steer is queued as supervisor text on the running card
 (`pendingPrompt`, `pendingBy: "supervisor"`):
 
 ```
-Supervisor: your last tool call was waiting on state that could not change.
+Supervisor: your last tool call was waiting on state that could not
+change, and the supervisor applied a fix. This note rides your next
+turn.
 <facts>
 Do not trust partial results from that call. Re-run the step in the
 foreground with a bounded timeout, and do not start watcher loops with
@@ -158,18 +199,25 @@ The reply route intercepts replies on a card whose reason carries the
 
 - `Apply the fix`: queue the generic approval steer (`STALE_FIX_PENDING_STEER`
   in `src/staleTurn.ts` — the responder holds no probe, so it cannot build
-  the specific text), return the row to `state: "running"`, clear the ask;
-  the supervisor's stale pass performs the allowlisted fix on its next
-  tick (it treats a queued supervisor steer as fix-pending), appends the
-  specific `staleSteerText(fix)` with the concrete facts when it applies
-  the fix, and logs the action. If the fix is refused, the ask is filed
-  again with the refusal reason.
+  the specific text), return the row to `state: "running"`, clear the ask,
+  and log `supervisor: stale fix approved by owner, applying`. The
+  supervisor's stale pass processes this approval **before the idle-log
+  gate** (the approval's own log line resets the log age): it matches the
+  exact `STALE_FIX_PENDING_STEER` text on a running card, re-diagnoses at
+  once, performs the allowlisted fix, appends the specific
+  `staleSteerText(fix)` with the concrete facts, and logs the action. If
+  the fix is refused, the ask is filed again with the refusal reason.
 - `Stop the turn and restart`: stop the turn through the loop's stop
   path, then queue the resume (`"."` supervisor reply) so a fresh turn
   continues on the same session.
 - `Wait`: clear the ask and the reason and return the row to
-  `state: "running"`. The detection cooldown keeps the pass quiet for
-  `STALE_REASK_MS`.
+  `state: "running"`. The pass's log gate resets the tick baseline but
+  keeps a pending ask cooldown; when a suspect re-qualifies and the row
+  shows the ask cleared (running, no `asked`, no `needsReason`, no
+  queued prompt) beside a live cooldown entry, that is the Wait answer:
+  the pass refreshes the cooldown from now (`STALE_REASK_MS`) and stays
+  quiet. The ask re-files at most once per `STALE_REASK_MS` (4 h,
+  memory) per card while the situation persists.
 - Any other reply while the process is alive is refused (409) with the
   three options; no row change. When the process is no longer live, the
   ask is cleared and the reply takes the normal path (a plain resume).

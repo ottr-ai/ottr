@@ -15,10 +15,13 @@ import { mergeHold, pickRunnable } from "./scheduler.ts";
 import {
 	diagnoseStale,
 	isStaleAskReason,
+	type KillExpect,
 	type LastTool,
 	type LockFact,
+	normalizeCmd,
 	type ProcSample,
 	STALE_ASK_MARKER,
+	STALE_FIX_PENDING_STEER,
 	type StaleProbe,
 	staleAskQuestion,
 	staleAskReason,
@@ -121,8 +124,18 @@ interface FakeOps extends SupervisorOps {
 	staleFixCalls: {
 		run: { url?: string; runId?: string; pid: number | null };
 		fix:
-			| { kind: "stale-lock"; path: string; pid: number }
-			| { kind: "hung-child"; pid: number; command: string };
+			| {
+					kind: "stale-lock";
+					path: string;
+					pid: number;
+					expect: { sessionCommand: string };
+			  }
+			| {
+					kind: "hung-child";
+					pid: number;
+					command: string;
+					expect: KillExpect;
+			  };
 	}[];
 }
 
@@ -6765,6 +6778,9 @@ const OMP_PID = 329; // the run's omp process in every stale fixture
 const GATE_LOCK = "/var/tmp/gate-1191/tmp/ott-stryker.lock";
 const IDLE_MIN = 40; // every stale fixture idles past the 30 min gates
 
+/** The OTTR-1191 watcher loop the default fixture's session ends on. */
+const GATE_CMD = `while [ ! -f ${GATE_LOCK} ]; do sleep 600; done`;
+
 /** The worker run entry the stale ops act on for one card. */
 const staleRun = () => ({
 	pid: OMP_PID,
@@ -6773,25 +6789,30 @@ const staleRun = () => ({
 });
 
 /** The run's process tree: omp plus a bash child parked at `child` ticks. */
-const staleProcs = (child = 0): ProcSample[] => [
+const staleProcs = (child = 0, childCommand?: string): ProcSample[] => [
 	{ pid: OMP_PID, ppid: 1, ticks: 42, command: "omp --project proj" },
 	{
 		pid: 401,
 		ppid: OMP_PID,
 		ticks: child,
-		command: "bash -c while [ ! -f /x.lock ]; do sleep 600; done",
+		command:
+			childCommand ?? "bash -c while [ ! -f /x.lock ]; do sleep 600; done",
 	},
 ];
 
 /** The OTTR-1191 probe: omp alive, the session file IDLE_MIN minutes old, the last tool
- * call asleep on GATE_LOCK; `locks` and the child's ticks vary per test. */
+ * call asleep on GATE_LOCK; `locks`, the child and the other dependency facts vary per
+ * test (OTTR-1261: pidFiles/pids/ports are new probe facts, empty unless a test sets
+ * them). */
 function staleProbe(
 	t0: number,
 	locks: LockFact[],
 	opts: {
 		child?: number;
+		childCommand?: string;
 		lastTool?: LastTool | null;
 		omitChild?: boolean;
+		pidFiles?: LockFact[];
 	} = {},
 ): StaleProbe {
 	return {
@@ -6799,17 +6820,20 @@ function staleProbe(
 		alive: true,
 		procs: opts.omitChild
 			? [{ pid: OMP_PID, ppid: 1, ticks: 42, command: "omp --project proj" }]
-			: staleProcs(opts.child ?? 0),
+			: staleProcs(opts.child ?? 0, opts.childCommand),
 		sessionAt: t0 - IDLE_MIN * 60_000,
 		lastTool:
 			opts.lastTool === undefined
 				? {
 						tool: "bash",
-						command: `while [ ! -f ${GATE_LOCK} ]; do sleep 600; done`,
+						command: GATE_CMD,
 						timeout: 0,
 					}
 				: opts.lastTool,
 		locks,
+		pidFiles: opts.pidFiles ?? [],
+		pids: [],
+		ports: [],
 	};
 }
 
@@ -6830,17 +6854,26 @@ function staleAskRow() {
 	};
 }
 
-/** The concrete stale-lock verdict the fixture diagnoses. */
+/** The concrete stale-lock verdict the fixture diagnoses; expect carries the act-time
+ * session command the fix re-checks (OTTR-1261). */
 const expectedFix = {
 	kind: "stale-lock",
 	path: GATE_LOCK,
 	pid: 5229,
+	expect: { sessionCommand: normalizeCmd(GATE_CMD) },
 } as const;
 
 /** Sets the card log's mtime IDLE_MIN minutes before `t0` (the fake ops.now()). */
 function backdateLog(logPath: string, t0: number) {
 	const back = new Date(t0 - IDLE_MIN * 60_000);
 	utimesSync(logPath, back, back);
+}
+
+/** The reply responder's log line: the card log's mtime moves to `at` (the fake
+ * ops.now()), the way every appendLog write freshens it (OTTR-1261). */
+function touchLog(logPath: string, at: number) {
+	const now = new Date(at);
+	utimesSync(logPath, now, now);
 }
 
 /** A running card in a fresh store: backdated card log, a worktree whose basename
@@ -6953,14 +6986,18 @@ describe("stale-turn pass", () => {
 	test("a lock outside the card's dirs is unsure: ask without a fix", async () => {
 		const t0 = Date.now();
 		const { store, t, wt, logPath } = await staleCard("stale-foreign", t0);
-		const probe = staleProbe(t0, [
+		const foreign = "/var/tmp/other-999/tmp/ott-stryker.lock";
+		const cmd = `while [ ! -f ${foreign} ]; do sleep 600; done`;
+		const probe = staleProbe(
+			t0,
+			[{ path: foreign, exists: true, pid: 9999, alive: false }],
 			{
-				path: "/var/tmp/other-999/tmp/ott-stryker.lock",
-				exists: true,
-				pid: 9999,
-				alive: false,
+				// an idle child matching the call, so only the dead dependency outside
+				// the card's own dirs blocks the fix (OTTR-1261)
+				childCommand: `bash -c ${cmd}`,
+				lastTool: { tool: "bash", command: cmd, timeout: 0 },
 			},
-		]);
+		);
 		const ops = staleOps(t0, t, probe);
 		await tickProj(store, ops); // baseline
 		await tickProj(store, ops); // suspect: confinement fails, park the ask
@@ -7133,23 +7170,171 @@ describe("stale-turn pass", () => {
 		await store.close();
 	});
 
-	test("a generic supervisor approval gets the specific steer appended", async () => {
+	test("the owner's approval applies before the idle-log gate", async () => {
 		const t0 = Date.now();
-		const { store, t } = await staleCard("stale-approval", t0);
-		const approval = "Supervisor: the card owner approved the stale-turn fix.";
-		await store.updateTask(t.id, {
-			pendingPrompt: approval, // the reply responder's generic approval line
-			pendingBy: "supervisor",
-		});
-		const ops = staleOps(t0, t, staleProbe(t0, deadLock()));
+		const { store, t, logPath } = await staleCard("stale-approve-idle", t0);
+		const probe = staleProbe(t0, deadLock());
+		const ops = staleOps(t0, t, probe);
 		await tickProj(store, ops); // baseline
-		await tickProj(store, ops); // fix runs, the specific facts ride along
+		// The reply responder's exact "Apply the fix" patch, plus its own log line:
+		// the approval freshens the card log, so the pass must act now — waiting for
+		// the idle gate would stall the approved fix for another full window (OTTR-1261).
+		await store.updateTask(t.id, {
+			pendingPrompt: STALE_FIX_PENDING_STEER,
+			pendingBy: "supervisor",
+			pendingFeedback: false,
+			state: "running",
+			asked: null,
+			needsReason: null,
+		});
+		touchLog(logPath, ops.time);
+		await tickProj(store, ops); // the approval, processed with a fresh log
 		expect(ops.staleFixCalls.length).toBe(1);
+		expect(ops.staleFixCalls[0]!.fix).toEqual(expectedFix);
+		expect(ops.staleFixCalls[0]!.run).toEqual(staleRun());
 		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		// the generic approval marker gains the fix's specific facts
 		expect(after.pendingPrompt).toBe(
-			`${approval}\n\n${staleSteerText(expectedFix)}`,
+			`${STALE_FIX_PENDING_STEER}\n\n${staleSteerText(expectedFix)}`,
 		);
 		expect(after.pendingBy).toBe("supervisor");
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain(
+			`supervisor: removed stale lock ${GATE_LOCK} (pid 5229 gone), steered`,
+		);
+		await store.close();
+	});
+
+	test("an approval whose fresh diagnosis is unsure parks the ask without a fix", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-approve-unsure", t0);
+		const probe = staleProbe(t0, [
+			{ path: GATE_LOCK, exists: true, pid: 5229, alive: true },
+		]);
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await store.updateTask(t.id, {
+			pendingPrompt: STALE_FIX_PENDING_STEER,
+			pendingBy: "supervisor",
+			state: "running",
+			asked: null,
+			needsReason: null,
+		});
+		touchLog(logPath, ops.time);
+		await tickProj(store, ops); // the lock names a live pid: no rule matches
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason?.startsWith(STALE_ASK_MARKER)).toBe(true);
+		expect(after.asked).toEqual([staleAskRow()]);
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain("ask filed");
+		await store.close();
+	});
+
+	test("a Wait answer keeps the cooldown quiet; the ask re-files only after 4 h", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-wait", t0);
+		const probe = staleProbe(t0, [
+			{ path: GATE_LOCK, exists: true, pid: 5229, alive: true },
+		]);
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // suspect: ask filed
+		expect((await store.getTask(t.id))!.state).toBe("needs_you");
+		// The responder's exact "Wait" patch, plus its own log line: the ask clears
+		// while the fresh log would delete a memory-stored cooldown (OTTR-1261).
+		await store.updateTask(t.id, {
+			state: "running",
+			asked: null,
+			needsReason: null,
+		});
+		touchLog(logPath, ops.time);
+		ops.time += 30 * 60_000;
+		await tickProj(store, ops); // suspect again beside the cleared row: Wait answer
+		expect(ops.staleFixCalls).toEqual([]);
+		let after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.asked).toBeNull();
+		expect(after.needsReason).toBeNull();
+		ops.time += 30 * 60_000;
+		await tickProj(store, ops); // 30 min into the refreshed 4 h cooldown: quiet
+		after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.asked).toBeNull();
+		expect((await Bun.file(logPath).text()).match(/ask filed/g)?.length).toBe(
+			1,
+		);
+		ops.time += 5 * 60 * 60_000; // past STALE_REASK_MS: the situation persists
+		await tickProj(store, ops); // the ask re-files
+		after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.asked).toEqual([staleAskRow()]);
+		expect((await Bun.file(logPath).text()).match(/ask filed/g)?.length).toBe(
+			2,
+		);
+		await store.close();
+	});
+
+	test("an idle timeout-0 child with no dependency proof asks and never kills", async () => {
+		const t0 = Date.now();
+		const { store, t } = await staleCard("stale-nodep", t0);
+		const cmd = "while true; do sleep 600; done";
+		// locks, pidFiles, pids and ports all empty: the child is idle and matches
+		// the last tool call, but nothing proves its dependency can never clear.
+		const probe = staleProbe(t0, [], {
+			lastTool: { tool: "bash", command: cmd, timeout: 0 },
+			childCommand: `bash -c ${cmd}`,
+		});
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // suspect: no proof, park the ask
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.needsReason?.startsWith(STALE_ASK_MARKER)).toBe(true);
+		expect(after.asked).toEqual([staleAskRow()]);
+		await store.close();
+	});
+
+	test("a dead pid file inside the worktree proves the kill: hung child with expectations", async () => {
+		const t0 = Date.now();
+		const { store, t, wt, logPath } = await staleCard("stale-pidfile", t0);
+		const pidPath = join(wt, "agent.pid");
+		const cmd = `while kill -0 $(cat ${pidPath}) 2>/dev/null; do sleep 5; done`;
+		const childCommand = `bash -c ${cmd}`;
+		const probe = staleProbe(t0, [], {
+			lastTool: { tool: "bash", command: cmd, timeout: 0 },
+			childCommand,
+			child: 50, // idle: the same ticks across the probes
+			pidFiles: [{ path: pidPath, exists: true, pid: 5229, alive: false }],
+		});
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // suspect: the dep is dead inside the card's dirs
+		expect(ops.staleFixCalls.length).toBe(1);
+		// the fix carries the act-time expectations ops.staleFix re-checks (OTTR-1261)
+		expect(ops.staleFixCalls[0]!.fix).toEqual({
+			kind: "hung-child",
+			pid: 401,
+			command: childCommand,
+			expect: {
+				sessionCommand: normalizeCmd(cmd),
+				ticks: 50,
+				dep: { kind: "pidfile", path: pidPath, pid: 5229 },
+			},
+		});
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.pendingPrompt).toBe(
+			staleSteerText({ kind: "hung-child", pid: 401, command: childCommand }),
+		);
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain(
+			`supervisor: stopped hung child 401 (${childCommand}), steered`,
+		);
 		await store.close();
 	});
 });

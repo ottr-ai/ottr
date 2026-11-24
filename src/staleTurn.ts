@@ -1,10 +1,14 @@
 // Stale turn recovery (OTTR-1261, docs/specs/stale-turn-recovery.md): a running turn that
-// waits on state that can no longer change — a lock naming a dead pid, or a timeout-0
-// watcher loop — holds its card and slot for hours. This module holds the shared contract:
-// the tick helpers, the pure string parsers over untrusted session/command text, the
-// read-only diagnosis verdict, the allowlisted-fix steer wording, and the ask wording the
-// reply route recognises. The supervisor pass, the worker probe, and the app reply route
-// all call into here; session and command text only select what to read, never what to run.
+// waits on state that can no longer change — a lock or pid file naming a dead pid, an
+// inline pid that died, a port with no listener — holds its card and slot for hours.
+// This module holds the shared contract: the tick helpers, the pure string parsers over
+// untrusted session/command text (lock paths, pid-file paths, inline pids, ports), the
+// read-only fact readers those parsers select paths for, the diagnosis verdict (a kill
+// is granted only with a dead dependency inside the card's own trust domain), the
+// allowlisted-fix steer wording, and the act-time revalidation the local fix paths run
+// immediately before they touch anything. The supervisor pass, the worker probe, and
+// the app reply route all call into here; session and command text only select what to
+// read, never what to run.
 
 import {
 	closeSync,
@@ -64,6 +68,20 @@ export interface LockFact {
 	alive: boolean | null;
 }
 
+/** A dead dependency the diagnosis proved read-only: the act-time kill re-checks it
+ * before signaling (lockfile and pidfile re-read the same file, inline re-checks the
+ * pid, port re-counts the listeners). */
+export type DepProof =
+	| { kind: "lockfile" | "pidfile"; path: string; pid: number }
+	| { kind: "inline"; pid: number }
+	| { kind: "port"; port: number };
+
+export interface KillExpect {
+	sessionCommand: string;
+	ticks: number;
+	dep: DepProof;
+}
+
 export interface StaleProbe {
 	pid: number | null;
 	alive: boolean;
@@ -71,11 +89,19 @@ export interface StaleProbe {
 	sessionAt: number | null;
 	lastTool: LastTool | null;
 	locks: LockFact[];
+	pidFiles: LockFact[];
+	pids: { pid: number; alive: boolean }[];
+	ports: { port: number; listeners: number | null }[];
 }
 
 export type StaleFix =
-	| { kind: "stale-lock"; path: string; pid: number }
-	| { kind: "hung-child"; pid: number; command: string }
+	| {
+			kind: "stale-lock";
+			path: string;
+			pid: number;
+			expect: { sessionCommand: string };
+	  }
+	| { kind: "hung-child"; pid: number; command: string; expect: KillExpect }
 	| { kind: "unsure"; reason: string };
 
 /** pid → ticks, the supervisor's per-card baseline between probes (memory only). */
@@ -149,6 +175,17 @@ export function parseLockPid(text: string): number | null {
 	return pid;
 }
 
+/** Pid-file content: a lock-style JSON object or a bare trimmed integer line; junk
+ * refuses. */
+export function parsePidFile(text: string): number | null {
+	const json = parseLockPid(text);
+	if (json !== null) return json;
+	const line = text.trim();
+	if (!/^\d+$/.test(line)) return null;
+	const pid = Number(line);
+	return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
 /** The trailing digit run of a worktree basename: "OTTR-1191" → "1191",
  * "1234" → "1234", "main" → null. */
 export function cardNumOf(worktreeBasename: string): string | null {
@@ -184,14 +221,67 @@ const LOCK_PATH_CAP = 5;
 // Both the lock-path cap and the command-normalize cap are 300 chars (spec).
 const CAP_300 = 300;
 
-/** Lock-candidate paths a command text names, order preserved, deduped, at most
+/** Path-like candidates a command text names, order preserved, deduped, at most
  * `LOCK_PATH_CAP`, each at most `CAP_300` chars. Untrusted text: regex only. */
-export function extractLockPaths(command: string): string[] {
+function extractSuffixedPaths(command: string, suffix: string): string[] {
 	const out: string[] = [];
 	for (const m of command.matchAll(LOCK_TOKEN_RE)) {
 		const path = (m[1] ?? "").slice(0, CAP_300);
-		if (!basename(path).endsWith(".lock")) continue;
+		if (!basename(path).endsWith(suffix)) continue;
 		if (!out.includes(path)) out.push(path);
+		if (out.length >= LOCK_PATH_CAP) break;
+	}
+	return out;
+}
+
+/** Lock-candidate paths a command text names. */
+export function extractLockPaths(command: string): string[] {
+	return extractSuffixedPaths(command, ".lock");
+}
+
+/** Pid-file paths a command text names (same shape rules as the lock paths). */
+export function extractPidPaths(command: string): string[] {
+	return extractSuffixedPaths(command, ".pid");
+}
+
+// Inline pid references: `--pid N` / `--pid=N`, plain and liveness `kill [-0] N`,
+// and `wait N`. The 7-digit bound is the Linux pid ceiling.
+const INLINE_PID_RE = /(?:--pid[ =]|kill\s+(?:-0\s+)?|wait\s+)(\d{1,7})\b/g;
+
+/** Inline pid references a command text names, pid > 1, deduped, at most
+ * `LOCK_PATH_CAP`. */
+export function extractInlinePids(command: string): { pid: number }[] {
+	const out: { pid: number }[] = [];
+	for (const m of command.matchAll(INLINE_PID_RE)) {
+		const pid = Number(m[1]);
+		if (!Number.isSafeInteger(pid) || pid <= 1) continue;
+		if (out.some((p) => p.pid === pid)) continue;
+		out.push({ pid });
+		if (out.length >= LOCK_PATH_CAP) break;
+	}
+	return out;
+}
+
+// Port references: `--port N` / `--port=N`, `nc -z host N`, a host literal with a
+// port, and `PORT=N`.
+const PORT_PATTERNS = [
+	/--port[ =](\d{1,5})\b/g,
+	/-z\s+\S+\s+(\d{1,5})\b/g,
+	/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{1,5})\b/g,
+	/\bPORT=(\d{1,5})\b/g,
+] as const;
+
+/** Port references a command text names, 1..65535, deduped, at most `LOCK_PATH_CAP`. */
+export function extractPorts(command: string): { port: number }[] {
+	const out: { port: number }[] = [];
+	for (const pattern of PORT_PATTERNS) {
+		for (const m of command.matchAll(pattern)) {
+			const port = Number(m[1]);
+			if (!Number.isSafeInteger(port) || port < 1 || port > 65535) continue;
+			if (out.some((p) => p.port === port)) continue;
+			out.push({ port });
+			if (out.length >= LOCK_PATH_CAP) break;
+		}
 		if (out.length >= LOCK_PATH_CAP) break;
 	}
 	return out;
@@ -230,7 +320,7 @@ export function lastToolCall(sessionText: string): LastTool | null {
 
 /** argv and session text compare equal only in this shape: whitespace runs collapse to
  * one space, trimmed, capped. */
-function normalizeCmd(text: string): string {
+export function normalizeCmd(text: string): string {
 	return text.replace(/\s+/g, " ").trim().slice(0, CAP_300);
 }
 
@@ -263,13 +353,45 @@ function idleChildMatching(
 	return null;
 }
 
+/** The own-domain dead dependency for the hung-child kill: an allowed dead lock or
+ * pid file (a .lock candidate preferred over a .pid one), else a dead inline pid,
+ * else a port with no listener. null = no proof, the ask path. */
+function deadDepProof(
+	probe: StaleProbe,
+	isAllowed: (path: string) => boolean,
+): DepProof | null {
+	const deadFile = (facts: readonly LockFact[]): LockFact | undefined =>
+		facts.find(
+			(l) =>
+				l.exists &&
+				l.pid !== null &&
+				l.pid > 1 &&
+				l.alive === false &&
+				isAllowed(l.path),
+		);
+	const lock = deadFile(probe.locks);
+	if (lock !== undefined && lock.pid !== null)
+		return { kind: "lockfile", path: lock.path, pid: lock.pid };
+	const pidFile = deadFile(probe.pidFiles);
+	if (pidFile !== undefined && pidFile.pid !== null)
+		return { kind: "pidfile", path: pidFile.path, pid: pidFile.pid };
+	const inline = probe.pids.find((p) => p.pid > 1 && p.alive === false);
+	if (inline !== undefined) return { kind: "inline", pid: inline.pid };
+	const port = probe.ports.find((p) => p.listeners === 0);
+	if (port !== undefined) return { kind: "port", port: port.port };
+	return null;
+}
+
 /**
  * Read-only verdict for a suspect card. Lock rules first (OTTR-1191): exactly one
- * allowed dead-pid lock → stale-lock; a lock naming a live pid, a dead-pid lock
- * outside the card's dirs, or several candidates → unsure. Then the hung-child rule:
- * an unbounded (timeout 0) last tool call whose matching shell child sat idle over
- * the window → hung-child. Anything else → unsure; unsure always parks as an ask,
- * never as a file or process change.
+ * allowed dead-pid lock → stale-lock; a lock or pid file naming a live pid, a dead
+ * file outside the card's dirs, or several candidates → unsure. Then the hung-child
+ * rule: an unbounded (timeout 0) last tool call whose matching shell child sat idle
+ * over the window kills only with a dead dependency inside the card's own trust
+ * domain (blocker OTTR-1261 review: a plain sleep or a quiet network request asks
+ * instead — without proof the dependency can never clear, the owner decides).
+ * Anything else → unsure; unsure always parks as an ask, never as a file or process
+ * change.
  */
 export function diagnoseStale(input: {
 	probe: StaleProbe;
@@ -285,9 +407,15 @@ export function diagnoseStale(input: {
 	);
 	const allowed = dead.filter((l) => isAllowed(l.path));
 	const only = allowed.length === 1 ? allowed[0] : undefined;
+	const sessionCommand = normalizeCmd(probe.lastTool?.command ?? "");
 	if (only !== undefined && only.pid !== null)
-		return { kind: "stale-lock", path: only.path, pid: only.pid };
-	const live = probe.locks.find(
+		return {
+			kind: "stale-lock",
+			path: only.path,
+			pid: only.pid,
+			expect: { sessionCommand },
+		};
+	const live = [...probe.locks, ...probe.pidFiles].find(
 		(l) => l.exists && l.pid !== null && l.alive === true,
 	);
 	if (live !== undefined && live.pid !== null)
@@ -295,11 +423,18 @@ export function diagnoseStale(input: {
 			kind: "unsure",
 			reason: `lock ${live.path} names live pid ${live.pid}`,
 		};
-	const outside = dead.find((l) => !isAllowed(l.path));
+	const outside = [...dead, ...probe.pidFiles].find(
+		(l) =>
+			l.exists &&
+			l.pid !== null &&
+			l.pid > 1 &&
+			l.alive === false &&
+			!isAllowed(l.path),
+	);
 	if (outside !== undefined && outside.pid !== null)
 		return {
 			kind: "unsure",
-			reason: `lock ${outside.path} names dead pid ${outside.pid} outside the card's own dirs`,
+			reason: `waits on ${outside.path} naming dead pid ${outside.pid} outside the card's own dirs`,
 		};
 	if (allowed.length > 1) {
 		const names = allowed.map((l) => l.path).join(", ");
@@ -326,7 +461,18 @@ export function diagnoseStale(input: {
 			probe,
 			`no idle child of pid ${probe.pid} matches the last tool call`,
 		);
-	return { kind: "hung-child", pid: child.pid, command: child.command };
+	const dep = deadDepProof(probe, isAllowed);
+	if (dep === null)
+		return {
+			kind: "unsure",
+			reason: `idle timeout-0 child ${child.pid} (${normalizeCmd(child.command).slice(0, 200)}) has no dead dependency; approving a stop needs the owner`,
+		};
+	return {
+		kind: "hung-child",
+		pid: child.pid,
+		command: child.command,
+		expect: { sessionCommand: want, ticks: child.ticks, dep },
+	};
 }
 
 /** The full agent-facing steer for an allowlisted fix (spec "Steer wording"; drafts
@@ -340,7 +486,7 @@ export function staleSteerText(
 		fix.kind === "stale-lock"
 			? `The lock file ${fix.path} named pid ${fix.pid}, and that pid is dead on the worker. The lock could never clear. The supervisor is removing the lock file now.`
 			: `The child process ${fix.pid} (${fix.command}) belongs to that tool call and has sat idle for the whole check window. The supervisor is stopping that child so the tool call can end.`;
-	return `Supervisor: your last tool call was waiting on state that could not change.
+	return `Supervisor: your last tool call was waiting on state that could not change, and the supervisor applied a fix. This note rides your next turn.
 ${facts}
 Do not trust partial results from that call. Re-run the step in the foreground with a bounded timeout, and do not start watcher loops with timeout 0.`;
 }
@@ -516,6 +662,30 @@ export function newestSessionAt(
 	return newestSessionFile(sessionDir, startedAtMs)?.at ?? null;
 }
 
+/** Count LISTEN entries (state "0A") whose local port matches across
+ * `${procRoot}/net/tcp` and `net/tcp6`; null when either file is unreadable — a
+ * missing half could hide the listener that keeps the dependency alive, so it must
+ * never read as zero (a zero verdict grants a kill, null only ever refuses). */
+export function portListeners(port: number, procRoot = "/proc"): number | null {
+	let listeners = 0;
+	for (const name of ["net/tcp", "net/tcp6"]) {
+		let text: string;
+		try {
+			text = readFileSync(`${procRoot}/${name}`, "utf8");
+		} catch {
+			return null;
+		}
+		// Line 0 is the header; the columns are sl, local_address, rem_address, st.
+		for (const line of text.split("\n").slice(1)) {
+			const cols = line.trim().split(/\s+/);
+			if (cols.length < 4 || cols[3] !== "0A") continue;
+			const local = Number.parseInt(cols[1]?.split(":")[1] ?? "", 16);
+			if (local === port) listeners++;
+		}
+	}
+	return listeners;
+}
+
 // readRegular (src/confine.ts) opens without O_NOFOLLOW, so a planted symlink to a
 // regular file would be followed; lock paths come from untrusted session text, so this
 // reader refuses the final symlink itself (OTTR-1261).
@@ -544,49 +714,68 @@ function readLockText(path: string): string {
 	}
 }
 
+/** One candidate fact: read-only and never throwing. Anything that is missing reads
+ * exists: false; anything present but unreadable (symlink, non-regular, foreign
+ * perms) or unparseable reads exists: true with pid null and no rule fires. */
+function factFor(
+	path: string,
+	parse: (text: string) => number | null,
+): LockFact {
+	try {
+		const pid = parse(readLockText(path));
+		return {
+			path,
+			exists: true,
+			pid,
+			alive: pid === null ? null : pidAlive(pid),
+		};
+	} catch (err) {
+		// ENOENT/ENOTDIR: no file there. Other refusals: something is at the path
+		// but it is not a readable regular file — present, unusable.
+		const code = (err as NodeJS.ErrnoException).code;
+		const missing = code === "ENOENT" || code === "ENOTDIR";
+		return { path, exists: !missing, pid: null, alive: null };
+	}
+}
+
 /**
- * Lock facts for the diagnosis, read-only and never throwing. A path that fails the
- * confinement pre-check reports exists: false without any read — a path planted by
- * session text cannot widen what is read. Anything that is missing reads exists:
- * false; anything present but unreadable (symlink, non-regular, foreign perms) reads
- * exists: true with pid null and the rule never fires.
+ * Lock facts for the diagnosis, read-only and never throwing. Every candidate is
+ * read: the facts feed the diagnosis and the ask, and the confinement decides only
+ * what a fix may touch (OTTR-1261 review: hiding a foreign path as nonexistent let a
+ * timeout-0 loop on another card's lock fall through to a child kill — the facts are
+ * the whole point of the ask).
  */
-export function lockFacts(
-	paths: readonly string[],
-	worktree: string,
-	cardNum: string | null,
-): LockFact[] {
-	return paths.map((path) => {
-		if (!lockPathAllowed(path, worktree, cardNum))
-			return { path, exists: false, pid: null, alive: null };
-		try {
-			const pid = parseLockPid(readLockText(path));
-			return {
-				path,
-				exists: true,
-				pid,
-				alive: pid === null ? null : pidAlive(pid),
-			};
-		} catch (err) {
-			// ENOENT/ENOTDIR: no lock file there. Other refusals: something is at the
-			// path but it is not a readable regular lock — present, unusable.
-			const code = (err as NodeJS.ErrnoException).code;
-			const missing = code === "ENOENT" || code === "ENOTDIR";
-			return { path, exists: !missing, pid: null, alive: null };
-		}
-	});
+export function lockFacts(paths: readonly string[]): LockFact[] {
+	return paths.map((path) => factFor(path, parseLockPid));
+}
+
+/** Pid-file facts: the same reader over `.pid` candidates, content parsed as
+ * `{"pid":N}` or a bare integer line. */
+export function pidFileFacts(paths: readonly string[]): LockFact[] {
+	return paths.map((path) => factFor(path, parsePidFile));
 }
 
 /** The server-local stale-lock fix (OTTR-1261): the act-time preconditions the
  * worker's /stalefix enforces, run in-process for a run the server hosts itself.
- * The lock path is untrusted session text: realpaths on both sides confine it to
- * the card's own worktree or the card-number scratch rule, the file must be a
- * small regular file that still names a pid that is dead on this host, and only
- * then does the unlink run. A refusal changes nothing. */
+ * First the turn-moved-on gate: the caller re-reads the run's own session, and the
+ * last tool call must still name the lock path — the turn still waits on it. Then
+ * the lock path, untrusted session text, is realpaths on both sides to confine it to
+ * the card's own worktree or the card-number scratch rule, the file must be a small
+ * regular file that still names a pid that is dead on this host, and only then does
+ * the unlink run. A refusal changes nothing. */
 export function staleUnlockLocal(
 	worktree: string,
 	lockPath: string,
+	_expect: { sessionCommand: string },
+	currentLastTool: LastTool | null,
 ): { ok: boolean; reason?: string } {
+	const last =
+		currentLastTool === null ? null : normalizeCmd(currentLastTool.command);
+	if (last === null || last === "" || !last.includes(normalizeCmd(lockPath)))
+		return {
+			ok: false,
+			reason: `the turn moved on: ${lockPath} is no longer the wait`,
+		};
 	let real: string;
 	let realRoot: string;
 	try {
@@ -627,14 +816,40 @@ export function staleUnlockLocal(
 	return { ok: true };
 }
 
-/** The server-local hung-child fix (OTTR-1261): SIGTERM one process proven to sit
- * strictly inside the run's tree in a fresh walk, never the run pid itself, the
- * caller's pid, or pid 1. TERM only — the stuck tool call ends, the turn lives. */
+/** The dependency a kill was granted on is still dead: the file still names the same
+ * dead pid, the inline pid is still dead, or the port still has no listener. Any
+ * other answer (gone, unreadable, live, listener appeared) refuses — a refusal
+ * changes nothing. */
+function depStillDead(dep: DepProof, procRoot?: string): boolean {
+	if (dep.kind === "inline") return !pidAlive(dep.pid);
+	if (dep.kind === "port") return portListeners(dep.port, procRoot) === 0;
+	try {
+		const parse = dep.kind === "lockfile" ? parseLockPid : parsePidFile;
+		return parse(readLockText(dep.path)) === dep.pid && !pidAlive(dep.pid);
+	} catch {
+		return false;
+	}
+}
+
+/** The server-local hung-child fix (OTTR-1261): SIGTERM one process, re-proving
+ * every diagnosis precondition in a fresh walk immediately before the signal —
+ * strictly inside the run's tree, never the run pid itself, the caller's pid, or
+ * pid 1; the child's argv still contains the session command; the session's last
+ * tool call is still the diagnosed timeout-0 call (the agent has not moved on); the
+ * child gained < BUSY_MIN_TICKS ticks (it has not resumed); and the dependency is
+ * still dead. TERM only — the stuck tool call ends, the turn lives. A refusal
+ * changes nothing. */
 export function staleKillLocal(
 	runPid: number,
 	childPid: number,
-	procRoot = "/proc",
-	kill: typeof process.kill = process.kill,
+	expect: KillExpect,
+	opts: {
+		procRoot?: string;
+		kill?:
+			| typeof process.kill
+			| ((pid: number, signal?: string | number | undefined) => unknown);
+		currentLastTool?: LastTool | null;
+	} = {},
 ): { ok: boolean; reason?: string } {
 	if (childPid === 1)
 		return { ok: false, reason: "pid 1 is never a fix target" };
@@ -642,15 +857,36 @@ export function staleKillLocal(
 		return { ok: false, reason: "the server's own pid is never a fix target" };
 	if (childPid === runPid)
 		return { ok: false, reason: "the run's own pid is never a fix target" };
-	const procs = readTree(runPid, procRoot);
+	const procs = readTree(runPid, opts.procRoot ?? "/proc");
 	if (procs === null) return { ok: false, reason: "the run pid is gone" };
-	if (!procs.some((p) => p.pid === childPid))
+	const child = procs.find((p) => p.pid === childPid);
+	if (child === undefined)
 		return {
 			ok: false,
 			reason: `pid ${childPid} is not in the turn's process tree`,
 		};
+	const want = normalizeCmd(expect.sessionCommand);
+	if (want === "")
+		return { ok: false, reason: "no session command to re-check" };
+	const childCmd = normalizeCmd(child.command);
+	if (!childCmd.includes(want))
+		return { ok: false, reason: "the child's command changed" };
+	const last = opts.currentLastTool ?? null;
+	if (
+		last === null ||
+		last.timeout !== 0 ||
+		normalizeCmd(last.command) !== want
+	)
+		return { ok: false, reason: "the session's last tool call changed" };
+	if (child.ticks > expect.ticks + BUSY_MIN_TICKS - 1)
+		return {
+			ok: false,
+			reason: `the child resumed: ${child.ticks - expect.ticks} ticks gained`,
+		};
+	if (!depStillDead(expect.dep, opts.procRoot))
+		return { ok: false, reason: "the dependency cleared" };
 	try {
-		kill(childPid, "SIGTERM");
+		(opts.kill ?? process.kill)(childPid, "SIGTERM");
 	} catch (err) {
 		return {
 			ok: false,

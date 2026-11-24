@@ -24,6 +24,7 @@ import {
 	busyDescendant,
 	diagnoseStale,
 	type LastTool,
+	STALE_FIX_PENDING_STEER,
 	STALE_IDLE_MS,
 	STALE_REASK_MS,
 	type StaleFix,
@@ -47,6 +48,7 @@ import type {
 	OutcomeStatus,
 	ProjectSettings,
 	RunResult,
+	Task,
 	Turn,
 } from "./types.ts";
 import type { SweptProcess, WorkerTarget } from "./workers.ts";
@@ -117,8 +119,13 @@ export interface SupervisorOps {
 		id: string,
 	): { pid: number | null; url?: string; runId?: string } | null;
 	/** OTTR-1261 stale-turn pass: one read-only probe of the run on the host that owns it
-	 * (process tree, session age, last tool call, lock facts); null when unreachable. */
-	probeStale?(run: StaleTurnRun): Promise<StaleProbe | null>;
+	 * (process tree, session age, last tool call, lock facts); null when unreachable.
+	 * `sessionId` is the run's own session (`task.sessionId`, written mid-run by
+	 * dispatchSessionEntry); the probe selects that session file and no other. */
+	probeStale?(
+		run: StaleTurnRun,
+		sessionId: string | null,
+	): Promise<StaleProbe | null>;
 	/** OTTR-1261 stale-turn pass: applies one allowlisted fix on that host after it
 	 * re-checked every precondition; a refusal changes nothing and the card goes to the ask. */
 	staleFix?(
@@ -1320,7 +1327,8 @@ export function createSupervisor(
 		{ at: number; ticks: Map<number, number> }
 	>();
 	// cardKey -> last action; keeps the pass quiet while the situation persists. Memory
-	// only — the card log keeps the durable record, and fresh log activity clears both.
+	// only — the card log keeps the durable record; a fresh card log clears a fixed
+	// mark, an ask cooldown survives it (OTTR-1261: the Wait reply freshens the log too).
 	const staleActed = new Map<
 		string,
 		{ kind: "fixed" } | { kind: "ask"; at: number }
@@ -1380,27 +1388,27 @@ export function createSupervisor(
 		);
 	}
 
-	/** A suspect card: apply the allowlisted fix, steering first. `fixPending` when the
-	 * steer is already queued on the card (this pass queued it earlier, or the reply
-	 * responder answered "Apply the fix"): diagnose and fix without a second steer. Before
-	 * the fix acts on the world, re-read the card: state, cancel flag and the queued
-	 * prompt must still be what this pass saw, or the fix skips (it retries next tick). */
-	async function staleSuspect(
+	/** Diagnose a suspect probe and apply the allowlisted fix, steering first (OTTR-1261).
+	 * `pending` is non-null when a supervisor prompt is already queued on the card (this
+	 * pass queued it on an earlier tick, or the reply responder answered "Apply the fix"):
+	 * diagnose and fix without a second steer, and `approved` marks the responder's generic
+	 * marker, whose refusal the ask must name. The fix object carries its act-time
+	 * expectations (session command, probe ticks, dependency proof) built from this
+	 * diagnosis; ops.staleFix re-checks them. Before the fix acts on the world, re-read
+	 * the card: state, cancel flag and the queued prompt must still be what this pass saw,
+	 * or the fix skips (it retries next tick). A refused fix logs the refusal and parks
+	 * the ask with it; the unsure verdict never reaches ops.staleFix. */
+	async function staleApply(
 		e: SupervisorEntry,
 		t: ListedTask,
 		run: StaleTurnRun,
 		probe: StaleProbe,
 		key: string,
-		prevTicks: Map<number, number>,
+		prevTicks: ReadonlyMap<number, number> | null,
 		wt: string,
+		pending: { prompt: string | null; approved: boolean } | null,
 		staleFixOp: StaleFixOp,
 	): Promise<void> {
-		const acted = staleActed.get(key);
-		if (acted !== undefined) {
-			if (acted.kind === "fixed") return;
-			if (ops.now() - acted.at < STALE_REASK_MS) return;
-		}
-		const fixPending = t.pendingPrompt !== null && t.pendingBy === "supervisor";
 		const d = diagnoseStale({ probe, worktree: wt, prevTicks });
 		const idleMin = Math.floor(
 			(ops.now() - (probe.sessionAt ?? ops.now())) / 60_000,
@@ -1411,7 +1419,7 @@ export function createSupervisor(
 			return;
 		}
 		const steer = staleSteerText(d);
-		if (!fixPending) {
+		if (pending === null) {
 			const queued = await applyTask(e, t, {
 				pendingPrompt: queuedReply(t.pendingPrompt, steer),
 				pendingBy: "supervisor",
@@ -1419,9 +1427,8 @@ export function createSupervisor(
 			});
 			if (!queued) return; // user steering landed meanwhile: skip, no fix
 		}
-		const expected = fixPending
-			? t.pendingPrompt
-			: queuedReply(t.pendingPrompt, steer);
+		const expected =
+			pending !== null ? pending.prompt : queuedReply(t.pendingPrompt, steer);
 		const fresh = await e.store.getTask(t.id);
 		if (
 			fresh === null ||
@@ -1437,15 +1444,15 @@ export function createSupervisor(
 			// fix's specific facts ride along unless the queue already carries one.
 			const hasFact =
 				d.kind === "stale-lock"
-					? (t.pendingPrompt?.includes(d.path) ?? false)
-					: (t.pendingPrompt?.includes(d.command.slice(0, 80)) ?? false);
-			if (fixPending && !hasFact) {
+					? (fresh.pendingPrompt?.includes(d.path) ?? false)
+					: (fresh.pendingPrompt?.includes(d.command.slice(0, 80)) ?? false);
+			if (pending !== null && !hasFact) {
 				// Same reason staleAsk writes through updateTaskIfCurrent: the queued
 				// steer itself would make applyTask skip.
 				await e.store.updateTaskIfCurrent(
 					fresh.id,
 					{
-						pendingPrompt: queuedReply(t.pendingPrompt, steer),
+						pendingPrompt: queuedReply(fresh.pendingPrompt, steer),
 						pendingBy: "supervisor",
 					},
 					fresh.revision,
@@ -1477,13 +1484,66 @@ export function createSupervisor(
 			d.kind === "stale-lock"
 				? `the lock at ${d.path} still names dead pid ${d.pid}`
 				: `the child ${d.pid} (${d.command}) sat idle through the window`,
-			`the proposed fix was refused: ${refusal}`,
+			pending?.approved === true
+				? `the owner approved this fix, and it was refused: ${refusal}`
+				: `the proposed fix was refused: ${refusal}`,
 		);
 	}
 
-	/** One card's stale-turn check: four gates (live ops, idle card log, live process,
-	 * idle session with no busy descendant), then diagnose. Every non-suspect exit keeps
-	 * the tick baseline current; a fresh card log clears the card's memory marks. */
+	/** A re-qualified suspect: the ask cooldown and the owner's Wait answer first
+	 * (OTTR-1261), then diagnose and apply. The Wait reply's patch clears the row while
+	 * its own log line freshens the card log, so the cooldown entry must survive the
+	 * log gate; a suspect beside that cleared row inside STALE_REASK_MS is the Wait
+	 * answer — refresh the cooldown from now and stay quiet. Past the cooldown the ask
+	 * re-files (the situation persists). */
+	async function staleSuspect(
+		e: SupervisorEntry,
+		t: ListedTask,
+		fresh: Task,
+		run: StaleTurnRun,
+		probe: StaleProbe,
+		key: string,
+		prevTicks: Map<number, number>,
+		wt: string,
+		staleFixOp: StaleFixOp,
+	): Promise<void> {
+		const acted = staleActed.get(key);
+		if (acted !== undefined) {
+			if (acted.kind === "fixed") return;
+			if (ops.now() - acted.at < STALE_REASK_MS) {
+				// The row the Wait reply left (running, ask and reason cleared, nothing
+				// queued) beside this live cooldown is the owner's answer.
+				if (
+					fresh.state === "running" &&
+					fresh.asked === null &&
+					fresh.needsReason === null &&
+					fresh.pendingPrompt === null
+				)
+					staleActed.set(key, { kind: "ask", at: ops.now() });
+				return;
+			}
+		}
+		const fixPending = t.pendingPrompt !== null && t.pendingBy === "supervisor";
+		await staleApply(
+			e,
+			t,
+			run,
+			probe,
+			key,
+			prevTicks,
+			wt,
+			fixPending ? { prompt: t.pendingPrompt, approved: false } : null,
+			staleFixOp,
+		);
+	}
+
+	/** One card's stale-turn check. The owner-approval path runs BEFORE the idle-log
+	 * gate (OTTR-1261: the approval's own log line resets the log age, so letting the
+	 * gate see it first would clear the card's memory and stall the approved fix for
+	 * another full window). Then four gates (live ops, idle card log, live process,
+	 * idle session with no busy descendant), then diagnose. Every non-suspect exit
+	 * keeps the tick baseline current; a fresh card log clears the tick memory and any
+	 * applied-fix mark, but keeps an ask cooldown (the Wait reply freshens the log too). */
 	async function staleTurnPass(
 		e: SupervisorEntry,
 		t: ListedTask,
@@ -1501,6 +1561,49 @@ export function createSupervisor(
 		const run = ops.liveRun(e.name, t.id);
 		if (run === null) return;
 		const key = `${e.name}/${t.id}`;
+		// The row as it is now, not the tick's start snapshot: the reply responder's
+		// approval marker lands on the row mid-tick, and the probe must select the run's
+		// own session (task.sessionId, written mid-run), never a guessed file.
+		const fresh = await e.store.getTask(t.id);
+		if (fresh === null) return;
+		if (
+			fresh.pendingPrompt === STALE_FIX_PENDING_STEER &&
+			fresh.pendingBy === "supervisor"
+		) {
+			// Owner approval: re-diagnose now. The log gate below is skipped entirely.
+			const probe = await ops.probeStale(run, fresh.sessionId);
+			if (probe === null || !probe.alive) return;
+			const prev = staleTicks.get(key);
+			const d = diagnoseStale({
+				probe,
+				worktree: wt,
+				prevTicks: prev?.ticks ?? null,
+			});
+			staleTicks.set(key, { at: ops.now(), ticks: tickMap(probe.procs) });
+			if (d.kind === "unsure") {
+				// The owner approved, but the fresh diagnosis matches no rule with all
+				// preconditions true: park the ask with that reason, fix nothing.
+				const idleMin = Math.floor(
+					(ops.now() - (probe.sessionAt ?? ops.now())) / 60_000,
+				);
+				await staleAsk(e, t, key, probe, idleMin, d.reason);
+				return;
+			}
+			// The steer (the marker itself) is already approved; the fix's specific
+			// facts ride along, then the fix applies.
+			await staleApply(
+				e,
+				t,
+				run,
+				probe,
+				key,
+				prev?.ticks ?? null,
+				wt,
+				{ prompt: fresh.pendingPrompt, approved: true },
+				staleFixOp,
+			);
+			return;
+		}
 		// Gate 1: the card log is idle. A missing log reads as age 0, never a suspect.
 		const logAge =
 			ops.now() -
@@ -1508,11 +1611,15 @@ export function createSupervisor(
 				?.mtimeMs ?? ops.now());
 		if (logAge < STALE_IDLE_MS) {
 			staleTicks.delete(key);
-			staleActed.delete(key);
+			// Only an applied-fix mark clears with the fresh log (OTTR-1261): an ask
+			// cooldown survives it, or the Wait reply's own log line would delete the
+			// four-hour cooldown and re-ask the same turn after one idle window.
+			const acted = staleActed.get(key);
+			if (acted?.kind === "fixed") staleActed.delete(key);
 			return;
 		}
 		// Gate 2: the run's process is alive. No process at all is OTTR-1216's domain.
-		const probe = await ops.probeStale(run);
+		const probe = await ops.probeStale(run, fresh.sessionId);
 		if (probe === null || !probe.alive) {
 			staleTicks.delete(key); // the tick tree died with the pid; never compare across runs
 			return;
@@ -1537,7 +1644,17 @@ export function createSupervisor(
 			updateBaseline(); // first probe: baseline only, decide on the next tick
 			return;
 		}
-		await staleSuspect(e, t, run, probe, key, prev.ticks, wt, staleFixOp);
+		await staleSuspect(
+			e,
+			t,
+			fresh,
+			run,
+			probe,
+			key,
+			prev.ticks,
+			wt,
+			staleFixOp,
+		);
 	}
 
 	// ---- auto-tend bookkeeping: supervisor-lifetime only; turn rows keep the durable count ----

@@ -19,6 +19,7 @@ import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
 import { SWEEP_CLOCK_SKEW_MS, sweepTmpDirs } from "./tmpsweep.ts";
+import type { KillExpect } from "./staleTurn.ts";
 import { projectTurnUid } from "./turnUid.ts";
 import {
 	detachedRuns,
@@ -3501,6 +3502,127 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 				})
 			).status,
 		).toBe(400);
+		// The session id selects the run's own transcript: absent is fine, anything
+		// but a short non-empty string is a bad body (OTTR-1261).
+		expect(
+			(await postJson(url, "/runprobe", "t", { run: "x", sessionId: "" }))
+				.status,
+		).toBe(400);
+		expect(
+			(await postJson(url, "/runprobe", "t", { run: "x", sessionId: 42 }))
+				.status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/runprobe", "t", {
+					run: "x",
+					sessionId: "s".repeat(201),
+				})
+			).status,
+		).toBe(400);
+		// At the cap the shape is valid: the unknown run id answers 404.
+		expect(
+			(
+				await postJson(url, "/runprobe", "t", {
+					run: "ghost",
+					sessionId: "s".repeat(200),
+				})
+			).status,
+		).toBe(404);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "unlock",
+					path: "/tmp/gate-7/x.lock",
+					expect: { sessionCommand: "sleep 600" },
+					sessionId: "",
+				})
+			).status,
+		).toBe(400);
+		// OTTR-1261: both fixes carry the diagnosis (expect) — a kill without it,
+		// or with an off-shape one, 400s before any run lookup; so does an unlock
+		// without the expect.
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 5,
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "unlock",
+					path: "/tmp/gate-7/x.lock",
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 5,
+					expect: "no",
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 5,
+					expect: { sessionCommand: "sleep 600" },
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 5,
+					expect: {
+						sessionCommand: "sleep 600",
+						ticks: -1,
+						dep: { kind: "inline", pid: 2 },
+					},
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 5,
+					expect: {
+						sessionCommand: "sleep 600",
+						ticks: 0,
+						dep: { kind: "alien" },
+					},
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 5,
+					expect: {
+						sessionCommand: "sleep 600",
+						ticks: 0,
+						dep: { kind: "inline", pid: 0 },
+					},
+				})
+			).status,
+		).toBe(400);
 	});
 
 	test("unknown run id errors on both endpoints and clients", async () => {
@@ -3509,12 +3631,28 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		const miss = await postJson(url, "/runprobe", "t", { run: "ghost" });
 		expect(miss.status).toBe(404);
 		expect(await miss.text()).toBe("not found");
+		// A well-shaped fix body on an unknown run: 404 (the shape validated first).
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "ghost",
+					action: "unlock",
+					path: "/tmp/gate-ghost/x.lock",
+					expect: { sessionCommand: "sleep 600" },
+				})
+			).status,
+		).toBe(404);
 		expect(
 			(
 				await postJson(url, "/stalefix", "t", {
 					run: "ghost",
 					action: "kill",
 					pid: 5000,
+					expect: {
+						sessionCommand: "sleep 600",
+						ticks: 3,
+						dep: { kind: "inline", pid: 5001 },
+					},
 				})
 			).status,
 		).toBe(404);
@@ -3522,7 +3660,16 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			WorkerConnectError,
 		);
 		await expect(
-			staleFix(target, url, { run: "ghost", action: "kill", pid: 5000 }),
+			staleFix(target, url, {
+				run: "ghost",
+				action: "kill",
+				pid: 5000,
+				expect: {
+					sessionCommand: "sleep 600",
+					ticks: 3,
+					dep: { kind: "inline", pid: 5001 },
+				},
+			}),
 		).rejects.toBeInstanceOf(WorkerConnectError);
 	});
 
@@ -3556,8 +3703,9 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		servers.push(cap as Bun.Server<never>);
 		const capUrl = `http://127.0.0.1:${cap.port}`;
 		const target: WorkerTarget = { urls: [capUrl], token: "t" };
-		// The documented wire shapes: POST { run } on /runprobe, the fix request
-		// verbatim on /stalefix.
+		// The documented wire shapes: POST { run } on /runprobe — with the session id
+		// only when the caller knows it (OTTR-1261) — and the fix request verbatim
+		// on /stalefix.
 		const probeBody = {
 			pid: 77,
 			alive: false,
@@ -3567,6 +3715,11 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			locks: [
 				{ path: "/tmp/gate-7/x.lock", exists: true, pid: 5, alive: false },
 			],
+			pidFiles: [
+				{ path: "/tmp/gate-7/t.pid", exists: false, pid: null, alive: null },
+			],
+			pids: [{ pid: 5100, alive: false }],
+			ports: [{ port: 3000, listeners: null }],
 		};
 		answer = () => Response.json(probeBody);
 		expect(await probeRun(target, capUrl, "r-7")).toEqual(probeBody);
@@ -3576,19 +3729,29 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			token: "t",
 			body: { run: "r-7" },
 		});
+		await probeRun(target, capUrl, "r-7", "sess-9");
+		expect(seen.at(-1)?.body).toEqual({ run: "r-7", sessionId: "sess-9" });
+		await probeRun(target, capUrl, "r-7", null);
+		expect(seen.at(-1)?.body).toEqual({ run: "r-7" });
 		answer = () => Response.json({ ok: true });
+		const killExpect: KillExpect = {
+			sessionCommand: "sleep 600",
+			ticks: 3,
+			dep: { kind: "inline", pid: 77 },
+		};
 		expect(
 			await staleFix(target, capUrl, {
 				run: "r-7",
 				action: "kill",
 				pid: 5102,
+				expect: killExpect,
 			}),
 		).toEqual({ ok: true });
 		expect(seen.at(-1)).toEqual({
 			method: "POST",
 			path: "/stalefix",
 			token: "t",
-			body: { run: "r-7", action: "kill", pid: 5102 },
+			body: { run: "r-7", action: "kill", pid: 5102, expect: killExpect },
 		});
 		answer = () =>
 			Response.json({ ok: false, reason: "lock pid 5 still alive" });
@@ -3597,12 +3760,20 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 				run: "r-7",
 				action: "unlock",
 				path: "/tmp/gate-7/x.lock",
+				expect: {
+					sessionCommand: "while [ -f /tmp/gate-7/x.lock ]; do sleep 600; done",
+				},
+				sessionId: "sess-9",
 			}),
 		).toEqual({ ok: false, reason: "lock pid 5 still alive" });
 		expect(seen.at(-1)?.body).toEqual({
 			run: "r-7",
 			action: "unlock",
 			path: "/tmp/gate-7/x.lock",
+			expect: {
+				sessionCommand: "while [ -f /tmp/gate-7/x.lock ]; do sleep 600; done",
+			},
+			sessionId: "sess-9",
 		});
 		// A 200 body off the shape is null, not an error: the caller reads it as
 		// "no usable answer".
@@ -3610,7 +3781,12 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		expect(await probeRun(target, capUrl, "r-7")).toBeNull();
 		answer = () => Response.json({ ok: "yes" });
 		expect(
-			await staleFix(target, capUrl, { run: "r", action: "kill", pid: 1 }),
+			await staleFix(target, capUrl, {
+				run: "r",
+				action: "kill",
+				pid: 1,
+				expect: killExpect,
+			}),
 		).toBeNull();
 		// Non-200 stays a WorkerConnectError.
 		answer = () => new Response("boom", { status: 500 });
@@ -3618,7 +3794,12 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			WorkerConnectError,
 		);
 		await expect(
-			staleFix(target, capUrl, { run: "r", action: "kill", pid: 1 }),
+			staleFix(target, capUrl, {
+				run: "r",
+				action: "kill",
+				pid: 1,
+				expect: killExpect,
+			}),
 		).rejects.toBeInstanceOf(WorkerConnectError);
 		// No token on the target: the header stays off the request.
 		answer = () => Response.json({ ok: true });
@@ -3626,6 +3807,7 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			run: "r",
 			action: "kill",
 			pid: 2,
+			expect: killExpect,
 		});
 		expect(seen.at(-1)?.token).toBeNull();
 	});
@@ -3677,6 +3859,8 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			// trusting Date.now() to have advanced (AGENTS.md).
 			const fresh = new Date(Date.now() + 2000);
 			utimesSync(sessionPath, fresh, fresh);
+			// No session id: the newest-since-start fallback still works, and a loop
+			// command names no pid files, inline pids, or ports.
 			const probe = await probeRun(target, url, "probe1");
 			expect(probe).not.toBeNull();
 			expect(probe?.pid).toBe(pid);
@@ -3699,6 +3883,36 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			expect(probe?.locks).toEqual([
 				{ path: lockPath, exists: true, pid: deadPid, alive: false },
 			]);
+			expect(probe?.pidFiles).toEqual([]);
+			expect(probe?.pids).toEqual([]);
+			expect(probe?.ports).toEqual([]);
+			// The run's own session id picks the same file by name (OTTR-1261).
+			const mine = await probeRun(target, url, "probe1", "probe");
+			expect(mine?.sessionAt).not.toBeNull();
+			expect(Math.abs((mine?.sessionAt ?? 0) - fresh.getTime())).toBeLessThan(
+				5,
+			);
+			expect(mine?.lastTool).toEqual(probe?.lastTool);
+			expect(mine?.locks).toEqual(probe?.locks);
+			// A session id is resolved strictly by name: "old" is a real file, so its
+			// own facts come back — a different command, no lock candidates.
+			const old = await probeRun(target, url, "probe1", "old");
+			expect(old?.sessionAt).not.toBeNull();
+			expect(old?.lastTool).toEqual({
+				tool: "bash",
+				command: "echo from-the-old-session",
+				timeout: 30,
+			});
+			expect(old?.locks).toEqual([]);
+			// A known-missing sid reads no foreign transcript: every session fact
+			// degrades to null/empty (OTTR-1261).
+			const ghost = await probeRun(target, url, "probe1", "ghost");
+			expect(ghost?.sessionAt).toBeNull();
+			expect(ghost?.lastTool).toBeNull();
+			expect(ghost?.locks).toEqual([]);
+			expect(ghost?.pidFiles).toEqual([]);
+			expect(ghost?.pids).toEqual([]);
+			expect(ghost?.ports).toEqual([]);
 			// After a detach the entry moves to the detached map, keeps dataDir on
 			// the wire, and the probe still answers from it.
 			expect(
@@ -3771,7 +3985,166 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			expect(probe?.sessionAt).toBeNull();
 			expect(probe?.lastTool).toBeNull();
 			expect(probe?.locks).toEqual([]);
+			expect(probe?.pidFiles).toEqual([]);
+			expect(probe?.pids).toEqual([]);
+			expect(probe?.ports).toEqual([]);
 			await stopStaleRun(url, "t", "seam1", pidFile);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("/runprobe picks the run's own session by id over a newer foreign one", async () => {
+		// OTTR-1261 review: the fallback reads the newest transcript under the data
+		// dir, so a concurrent card's newer session could suppress detection or feed
+		// a foreign diagnosis. A known session id must pick the run's own file alone.
+		const root = mkdtempSync(join(tmpdir(), "ottr-stale-own-"));
+		const wt = join(root, "proj", ".worktrees", "OTTR-1191");
+		mkdirSync(wt, { recursive: true });
+		const dataDir = join(root, "data");
+		const sessions = join(dataDir, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const deadPid = spawnDeadPid();
+		const lockPath = join(wt, "ott-stryker.lock");
+		writeFileSync(lockPath, JSON.stringify({ pid: deadPid }));
+		// This run's own session: the timeout-0 loop on its card's lock. Its mtime
+		// stays behind the run's start — a by-name pick must ignore that.
+		const ownPath = join(sessions, "1700000000000_probe.jsonl");
+		const ownCommand = `while [ -f ${lockPath} ]; do sleep 600; done`;
+		writeFileSync(
+			ownPath,
+			`${JSON.stringify({
+				type: "tool_execution_start",
+				toolCallId: "call_1",
+				toolName: "bash",
+				args: { command: ownCommand, timeout: 0 },
+			})}\n`,
+		);
+		const past = new Date(Date.now() - 60_000);
+		utimesSync(ownPath, past, past);
+		// A concurrent card's session: NEWER than the run start, so the fallback
+		// picks it — its tool call names only the other card's scratch lock.
+		const foreignPath = join(sessions, "1700000009999_other.jsonl");
+		const foreignLock = "/var/tmp/gate-1244/tmp/other.lock";
+		writeFileSync(
+			foreignPath,
+			`${JSON.stringify({
+				type: "tool_execution_start",
+				toolCallId: "call_9",
+				toolName: "bash",
+				args: { command: `tail -f ${foreignLock}`, timeout: 0 },
+			})}\n`,
+		);
+		const url = start({ token: "t", ompPath: process.execPath });
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		try {
+			const { pid, pidFile } = await startStaleRun(url, "t", "own1", wt, {
+				OTTR_DATA_DIR: dataDir,
+			});
+			// Push the foreign file's mtime past the run's startedAt stamp instead of
+			// trusting Date.now() to have advanced (AGENTS.md).
+			const fresh = new Date(Date.now() + 2000);
+			utimesSync(foreignPath, fresh, fresh);
+			// The session id wins over recency: the run's own file, older mtime and all.
+			const mine = await probeRun(target, url, "own1", "probe");
+			expect(mine?.pid).toBe(pid);
+			expect(mine?.alive).toBe(true);
+			expect(mine?.sessionAt).not.toBeNull();
+			expect(Math.abs((mine?.sessionAt ?? 0) - past.getTime())).toBeLessThan(5);
+			expect(mine?.lastTool).toEqual({
+				tool: "bash",
+				command: ownCommand,
+				timeout: 0,
+			});
+			expect(mine?.locks).toEqual([
+				{ path: lockPath, exists: true, pid: deadPid, alive: false },
+			]);
+			// The foreign card's lock never enters the own-session facts.
+			expect(mine?.locks.every((l) => l.path !== foreignLock)).toBe(true);
+			// Without an id the fallback still reports (a signal only): it names the
+			// newest file, the foreign one — never an auto-fix on that guess.
+			const fallback = await probeRun(target, url, "own1");
+			expect(fallback?.sessionAt).not.toBeNull();
+			expect(fallback?.lastTool?.command).toBe(`tail -f ${foreignLock}`);
+			// A known-missing sid reads nothing: no foreign file, all facts degraded.
+			const ghost = await probeRun(target, url, "own1", "ghost");
+			expect(ghost?.sessionAt).toBeNull();
+			expect(ghost?.lastTool).toBeNull();
+			expect(ghost?.locks).toEqual([]);
+			expect(ghost?.pidFiles).toEqual([]);
+			expect(ghost?.pids).toEqual([]);
+			expect(ghost?.ports).toEqual([]);
+			await stopStaleRun(url, "t", "own1", pidFile);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("/runprobe reads pid file, inline pid, and port facts from the session command", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-stale-facts-"));
+		const wt = join(root, "proj", ".worktrees", "OTTR-1261");
+		mkdirSync(wt, { recursive: true });
+		const procRoot = freshProcRoot();
+		const sessions = join(root, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const deadPid = spawnDeadPid();
+		// The bare-integer pid file the command names, holding a dead pid.
+		const pidPath = join(root, "gate-1261", "tracker.pid");
+		mkdirSync(dirname(pidPath), { recursive: true });
+		writeFileSync(pidPath, String(deadPid));
+		// The seam's /proc/net/tcp{,6}: one LISTEN entry (state 0A) for port 9090
+		// (hex 2382), so 9090 counts one listener and the absent 9091 counts zero.
+		// Both halves must be readable, else portListeners answers null.
+		mkdirSync(join(procRoot, "net"), { recursive: true });
+		const listenHeader =
+			"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+		const listenRow =
+			"   0: 00000000:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 1 1 0000000000000 0 100 0 0 0 0\n";
+		writeFileSync(join(procRoot, "net", "tcp"), `${listenHeader}${listenRow}`);
+		writeFileSync(join(procRoot, "net", "tcp6"), listenHeader);
+		// The session command names a live inline pid (this test runner), two ports,
+		// and the pid file above.
+		const command = `watch --pid ${process.pid} --port 9090 --port 9091 tail ${pidPath}`;
+		writeFileSync(
+			join(sessions, "1700000000000_probe.jsonl"),
+			`${JSON.stringify({
+				type: "tool_execution_start",
+				toolCallId: "call_1",
+				toolName: "bash",
+				args: { command, timeout: 0 },
+			})}\n`,
+		);
+		const url = start({
+			token: "t",
+			ompPath: process.execPath,
+			staleProcRoot: procRoot,
+			staleSessionsDir: sessions,
+		});
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		try {
+			const { pidFile } = await startStaleRun(url, "t", "facts1", wt, {});
+			const fresh = new Date(Date.now() + 2000);
+			utimesSync(join(sessions, "1700000000000_probe.jsonl"), fresh, fresh);
+			const probe = await probeRun(target, url, "facts1", "probe");
+			expect(probe?.pidFiles).toEqual([
+				{ path: pidPath, exists: true, pid: deadPid, alive: false },
+			]);
+			// The live inline pid: signal-0 only, true for the test runner's own pid.
+			expect(probe?.pids).toEqual([{ pid: process.pid, alive: true }]);
+			expect(probe?.ports).toEqual([
+				{ port: 9090, listeners: 1 },
+				{ port: 9091, listeners: 0 },
+			]);
+			expect(probe?.locks).toEqual([]);
+			expect(probe?.lastTool).toEqual({
+				tool: "bash",
+				command,
+				timeout: 0,
+			});
+			expect(Math.abs((probe?.sessionAt ?? 0) - fresh.getTime())).toBeLessThan(
+				5,
+			);
+			await stopStaleRun(url, "t", "facts1", pidFile);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -3804,55 +4177,90 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		writeFileSync(garbageLock, "scree");
 		const initLock = join(wt, "init.lock");
 		writeFileSync(initLock, JSON.stringify({ pid: 1 }));
+		// The act-time session recheck (OTTR-1261): the unlock refuses unless the
+		// session's last tool call still names the path. Each sub-case points the
+		// run's own session at the one path it exercises — one loop-command builder
+		// keeps every command under the normalize cap.
+		const dataDir = join(root, "data");
+		const sessions = join(dataDir, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const sessionPath = join(sessions, "1700000000000_probe.jsonl");
+		const loop = (p: string): string => `while [ -f ${p} ]; do sleep 600; done`;
+		const setSession = (command: string, timeout = 0): void => {
+			writeFileSync(
+				sessionPath,
+				`${JSON.stringify({
+					type: "tool_execution_start",
+					toolCallId: "call_1",
+					toolName: "bash",
+					args: { command, timeout },
+				})}\n`,
+			);
+		};
 		const url = start({ token: "t", ompPath: process.execPath });
 		const target: WorkerTarget = { urls: [url], token: "t" };
+		const unlock = (path: string, sessionCommand: string) =>
+			staleFix(target, url, {
+				run: "fix1",
+				action: "unlock",
+				path,
+				expect: { sessionCommand },
+				sessionId: "probe",
+			});
 		try {
-			const { pidFile } = await startStaleRun(url, "t", "fix1", wt, {});
-			// Success: the worktree lock names a dead pid.
-			expect(
-				await staleFix(target, url, {
-					run: "fix1",
-					action: "unlock",
-					path: lockPath,
-				}),
-			).toEqual({ ok: true });
+			const { pidFile } = await startStaleRun(url, "t", "fix1", wt, {
+				OTTR_DATA_DIR: dataDir,
+			});
+			// Success: the session still names the worktree lock, the pid is dead.
+			setSession(loop(lockPath));
+			expect(await unlock(lockPath, loop(lockPath))).toEqual({ ok: true });
 			expect(existsSync(lockPath)).toBe(false);
 			// The OTTR-1191 scratch shape: under a temp root, one segment carries
 			// the card number, pid dead.
-			expect(
-				await staleFix(target, url, {
-					run: "fix1",
-					action: "unlock",
-					path: scratchLock,
-				}),
-			).toEqual({ ok: true });
+			setSession(loop(scratchLock));
+			expect(await unlock(scratchLock, loop(scratchLock))).toEqual({
+				ok: true,
+			});
+			expect(existsSync(scratchLock)).toBe(false);
+			// The turn moved on: the session's last tool call no longer names the
+			// lock. Refused, the lock file intact (OTTR-1261).
+			writeFileSync(scratchLock, JSON.stringify({ pid: deadPid }));
+			writeFileSync(
+				sessionPath,
+				`${JSON.stringify({
+					type: "tool_execution_start",
+					toolCallId: "call_2",
+					toolName: "bash",
+					args: { command: "echo moved on to other work", timeout: 30 },
+				})}\n`,
+			);
+			const moved = await unlock(scratchLock, loop(scratchLock));
+			expect(moved?.ok).toBe(false);
+			expect(moved?.reason).toContain("no longer the wait");
+			expect(existsSync(scratchLock)).toBe(true);
+			// The session names the lock again: the same fix now goes through.
+			setSession(loop(scratchLock));
+			expect(await unlock(scratchLock, loop(scratchLock))).toEqual({
+				ok: true,
+			});
 			expect(existsSync(scratchLock)).toBe(false);
 			// A live pid in the lock refuses and changes nothing.
-			const live = await staleFix(target, url, {
-				run: "fix1",
-				action: "unlock",
-				path: liveLock,
-			});
+			setSession(loop(liveLock));
+			const live = await unlock(liveLock, loop(liveLock));
 			expect(live?.ok).toBe(false);
 			expect(live?.reason).toContain("still alive");
 			expect(readFileSync(liveLock, "utf8")).toBe(
 				JSON.stringify({ pid: process.pid }),
 			);
 			// Outside the worktree and outside the card-number scratch rule.
-			const outside = await staleFix(target, url, {
-				run: "fix1",
-				action: "unlock",
-				path: outsideLock,
-			});
+			setSession(loop(outsideLock));
+			const outside = await unlock(outsideLock, loop(outsideLock));
 			expect(outside?.ok).toBe(false);
 			expect(outside?.reason).toContain("outside the card's own dirs");
 			expect(existsSync(outsideLock)).toBe(true);
 			// A symlinked lock resolves outside: refused, link and target intact.
-			const escaped = await staleFix(target, url, {
-				run: "fix1",
-				action: "unlock",
-				path: link,
-			});
+			setSession(loop(link));
+			const escaped = await unlock(link, loop(link));
 			expect(escaped?.ok).toBe(false);
 			expect(escaped?.reason).toContain("outside the card's own dirs");
 			expect(existsSync(link)).toBe(true);
@@ -3861,38 +4269,50 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 			);
 			// Not a regular file, not a pid, pid 1, and a path that does not
 			// resolve: every precondition refuses by name.
+			setSession(loop(dirLock));
 			const notFile = (await (
 				await postJson(url, "/stalefix", "t", {
 					run: "fix1",
 					action: "unlock",
 					path: dirLock,
+					expect: { sessionCommand: loop(dirLock) },
+					sessionId: "probe",
 				})
 			).json()) as { ok: boolean; reason: string };
 			expect(notFile.ok).toBe(false);
 			expect(notFile.reason).toContain("not a regular file");
+			setSession(loop(garbageLock));
 			const garbage = (await (
 				await postJson(url, "/stalefix", "t", {
 					run: "fix1",
 					action: "unlock",
 					path: garbageLock,
+					expect: { sessionCommand: loop(garbageLock) },
+					sessionId: "probe",
 				})
 			).json()) as { ok: boolean; reason: string };
 			expect(garbage.ok).toBe(false);
 			expect(garbage.reason).toContain("does not name a pid");
+			setSession(loop(initLock));
 			const init = (await (
 				await postJson(url, "/stalefix", "t", {
 					run: "fix1",
 					action: "unlock",
 					path: initLock,
+					expect: { sessionCommand: loop(initLock) },
+					sessionId: "probe",
 				})
 			).json()) as { ok: boolean; reason: string };
 			expect(init.ok).toBe(false);
 			expect(init.reason).toContain("does not name a pid");
+			setSession(loop(join(wt, "absent.lock")));
 			const missing = (await (
 				await postJson(url, "/stalefix", "t", {
 					run: "fix1",
 					action: "unlock",
 					path: join(wt, "absent.lock"),
+					expect: { sessionCommand: loop(join(wt, "absent.lock")) },
+					sessionId: "probe",
 				})
 			).json()) as { ok: boolean; reason: string };
 			expect(missing.ok).toBe(false);
@@ -3903,19 +4323,49 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		}
 	}, 30_000);
 
-	test("/stalefix kill TERMs one strict descendant via the seam", async () => {
+	test("/stalefix kill TERMs one strict descendant after full revalidation", async () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-stale-kill-"));
 		const wt = join(root, "proj", ".worktrees", "OTTR-1261");
 		mkdirSync(wt, { recursive: true });
 		const procRoot = freshProcRoot();
+		const deadPid = spawnDeadPid();
+		const lockPath = join(wt, "ott-stryker.lock");
+		writeFileSync(lockPath, JSON.stringify({ pid: deadPid }));
+		// The diagnosed hung child: a strict descendant whose argv is the whole
+		// timeout-0 loop command (OTTR-1261).
+		const loop = `while [ -f ${lockPath} ]; do sleep 600; done`;
 		staleProcFixture(procRoot, {
 			pid: 5102,
 			ppid: 5101,
-			cmd: ["sleep", "600"],
+			ticks: [12, 0, 0, 0],
+			cmd: ["bash", "-c", loop],
 		});
 		// A sibling of the run: its parent chain never reaches the run pid.
 		staleProcFixture(procRoot, { pid: 5099, ppid: 1 });
 		const { calls, kill } = recordingKill();
+		// The run's own session: still the diagnosed timeout-0 call. The act-time
+		// recheck re-reads this tail through the entry's data dir.
+		const dataDir = join(root, "data");
+		const sessions = join(dataDir, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const sessionPath = join(sessions, "1700000000000_probe.jsonl");
+		const setSession = (command: string, timeout = 0): void => {
+			writeFileSync(
+				sessionPath,
+				`${JSON.stringify({
+					type: "tool_execution_start",
+					toolCallId: "call_1",
+					toolName: "bash",
+					args: { command, timeout },
+				})}\n`,
+			);
+		};
+		setSession(loop);
+		const expectLock: KillExpect = {
+			sessionCommand: loop,
+			ticks: 12,
+			dep: { kind: "lockfile", path: lockPath, pid: deadPid },
+		};
 		const url = start({
 			token: "t",
 			ompPath: process.execPath,
@@ -3924,27 +4374,31 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		});
 		const target: WorkerTarget = { urls: [url], token: "t" };
 		try {
-			const { pid, pidFile } = await startStaleRun(url, "t", "kill1", wt, {});
+			const { pid, pidFile } = await startStaleRun(url, "t", "kill1", wt, {
+				OTTR_DATA_DIR: dataDir,
+			});
 			staleProcFixture(procRoot, { pid, ppid: 1, cmd: ["omp"] });
 			staleProcFixture(procRoot, {
 				pid: 5101,
 				ppid: pid,
-				cmd: ["bash", "-c", "sleep 600"],
+				cmd: ["bash", "-c", "exec wrapper"],
 			});
-			// Success: the grandchild is a strict descendant, TERM only.
+			// Success: every recheck passes, exactly one TERM through the seam.
 			expect(
 				await staleFix(target, url, {
 					run: "kill1",
 					action: "kill",
 					pid: 5102,
+					expect: expectLock,
+					sessionId: "probe",
 				}),
 			).toEqual({ ok: true });
 			expect(calls).toEqual([{ pid: 5102, signal: "SIGTERM" }]);
-			// Refusals, each leaving the kill log untouched: a sibling, an unknown
-			// pid, the run's own pid, the daemon's own pid, and pid 1.
+			// Ancestry refusals, each leaving the kill log untouched: a sibling, an
+			// unknown pid, the run's own pid, the daemon's own pid, and pid 1.
 			const refusals: [number, string][] = [
-				[5099, "not a descendant"],
-				[999999, "not a descendant"],
+				[5099, "not in the turn's process tree"],
+				[999999, "not in the turn's process tree"],
 				[pid, "the run's own pid"],
 				[process.pid, "the daemon's own pid"],
 				[1, "pid 1 is never a fix target"],
@@ -3954,11 +4408,141 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 					run: "kill1",
 					action: "kill",
 					pid: badPid,
+					expect: expectLock,
+					sessionId: "probe",
 				});
 				expect(res?.ok).toBe(false);
 				expect(res?.reason).toContain(reason);
 				expect(calls).toEqual([{ pid: 5102, signal: "SIGTERM" }]);
 			}
+			// The session's last tool call changed: the agent moved on, no signal.
+			setSession("echo moved on to other work", 30);
+			const moved = await staleFix(target, url, {
+				run: "kill1",
+				action: "kill",
+				pid: 5102,
+				expect: expectLock,
+				sessionId: "probe",
+			});
+			expect(moved?.ok).toBe(false);
+			expect(moved?.reason).toBe("the session's last tool call changed");
+			setSession(loop);
+			// The child's argv no longer matches the diagnosis (fixture cmdline
+			// edited in the seam between probe and fix): refused.
+			writeFileSync(
+				join(procRoot, "5102", "cmdline"),
+				["sleep", "600"].map((seg) => `${seg}\0`).join(""),
+			);
+			const argvChanged = await staleFix(target, url, {
+				run: "kill1",
+				action: "kill",
+				pid: 5102,
+				expect: expectLock,
+				sessionId: "probe",
+			});
+			expect(argvChanged?.ok).toBe(false);
+			expect(argvChanged?.reason).toBe("the child's command changed");
+			staleProcFixture(procRoot, {
+				pid: 5102,
+				ppid: 5101,
+				ticks: [12, 0, 0, 0],
+				cmd: ["bash", "-c", loop],
+			});
+			// The child resumed: at the BUSY_MIN_TICKS window boundary the kill is
+			// still allowed, one tick past it refused.
+			staleProcFixture(procRoot, {
+				pid: 5102,
+				ppid: 5101,
+				ticks: [16, 0, 0, 0],
+				cmd: ["bash", "-c", loop],
+			});
+			expect(
+				await staleFix(target, url, {
+					run: "kill1",
+					action: "kill",
+					pid: 5102,
+					expect: expectLock,
+					sessionId: "probe",
+				}),
+			).toEqual({ ok: true });
+			expect(calls).toEqual([
+				{ pid: 5102, signal: "SIGTERM" },
+				{ pid: 5102, signal: "SIGTERM" },
+			]);
+			staleProcFixture(procRoot, {
+				pid: 5102,
+				ppid: 5101,
+				ticks: [17, 0, 0, 0],
+				cmd: ["bash", "-c", loop],
+			});
+			const resumed = await staleFix(target, url, {
+				run: "kill1",
+				action: "kill",
+				pid: 5102,
+				expect: expectLock,
+				sessionId: "probe",
+			});
+			expect(resumed?.ok).toBe(false);
+			expect(resumed?.reason).toContain("the child resumed");
+			staleProcFixture(procRoot, {
+				pid: 5102,
+				ppid: 5101,
+				ticks: [12, 0, 0, 0],
+				cmd: ["bash", "-c", loop],
+			});
+			// The dependency cleared: the lock now names a live pid.
+			writeFileSync(lockPath, JSON.stringify({ pid: process.pid }));
+			const cleared = await staleFix(target, url, {
+				run: "kill1",
+				action: "kill",
+				pid: 5102,
+				expect: expectLock,
+				sessionId: "probe",
+			});
+			expect(cleared?.ok).toBe(false);
+			expect(cleared?.reason).toBe("the dependency cleared");
+			writeFileSync(lockPath, JSON.stringify({ pid: deadPid }));
+			// Port dependency: no listener on the seam's net tables — the kill is
+			// proven; one LISTEN row for the port appears and it refuses.
+			mkdirSync(join(procRoot, "net"), { recursive: true });
+			const listenHeader =
+				"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+			writeFileSync(join(procRoot, "net", "tcp"), listenHeader);
+			writeFileSync(join(procRoot, "net", "tcp6"), listenHeader);
+			const expectPort: KillExpect = {
+				sessionCommand: loop,
+				ticks: 12,
+				dep: { kind: "port", port: 9090 },
+			};
+			expect(
+				await staleFix(target, url, {
+					run: "kill1",
+					action: "kill",
+					pid: 5102,
+					expect: expectPort,
+					sessionId: "probe",
+				}),
+			).toEqual({ ok: true });
+			expect(calls).toEqual([
+				{ pid: 5102, signal: "SIGTERM" },
+				{ pid: 5102, signal: "SIGTERM" },
+				{ pid: 5102, signal: "SIGTERM" },
+			]);
+			const listenRow =
+				"   1: 00000000:2382 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 2 1 0000000000000 0 100 0 0 0 0\n";
+			writeFileSync(
+				join(procRoot, "net", "tcp"),
+				`${listenHeader}${listenRow}`,
+			);
+			const ported = await staleFix(target, url, {
+				run: "kill1",
+				action: "kill",
+				pid: 5102,
+				expect: expectPort,
+				sessionId: "probe",
+			});
+			expect(ported?.ok).toBe(false);
+			expect(ported?.reason).toBe("the dependency cleared");
 			await stopStaleRun(url, "t", "kill1", pidFile);
 		} finally {
 			rmSync(root, { recursive: true, force: true });

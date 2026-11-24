@@ -83,14 +83,16 @@ import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
 import { RunTokens } from "./runTokens.ts";
 import { archReviewView, blockingReview, lastFullReview } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
+import { sessionFile } from "./session.ts";
 import {
-	cardNumOf,
+	extractInlinePids,
 	extractLockPaths,
-	type LastTool,
+	extractPidPaths,
+	extractPorts,
 	lastToolCall,
 	lockFacts,
-	newestSessionAt,
-	newestSessionFile,
+	pidFileFacts,
+	portListeners,
 	readTree,
 	type StaleFix,
 	type StaleProbe,
@@ -1079,11 +1081,12 @@ async function probeStaleRun(
 	projects: ReadonlyMap<string, Entry>,
 	workers: WorkerTarget | null,
 	run: StaleRunRef,
+	sessionId: string | null,
 ): Promise<StaleProbe | null> {
 	if (run.url !== undefined && run.runId !== undefined) {
 		if (workers === null) return null;
 		try {
-			return await probeRunRequest(workers, run.url, run.runId);
+			return await probeRunRequest(workers, run.url, run.runId, sessionId);
 		} catch {
 			// An unreachable worker is not a suspect: no action, no ask.
 			return null;
@@ -1097,30 +1100,65 @@ async function probeStaleRun(
 	// A dead or unreadable run pid is not a suspect (OTTR-1216 owns the
 	// no-process case).
 	if (procs === null) return null;
-	const task = await e.store.getTask(run.id);
-	// The loop entry exposes no start time, so the session scan takes the newest
-	// file overall (cutoff 0): local runs are the dev case, workers are the fleet
-	// case, and the worker probe stats the run's own data dir instead.
-	const sessionAt = newestSessionAt(e.store.sessionsDir, 0);
-	const sessionPath = newestSessionFile(e.store.sessionsDir, 0)?.path ?? null;
-	const tail = sessionPath === null ? null : staleTail(sessionPath);
-	const lastTool: LastTool | null = tail === null ? null : lastToolCall(tail);
-	// The confinement root: the card's own worktree, else the main checkout.
-	const root = task === null ? null : (task.worktree ?? e.path);
+	// OTTR-1261: select the run's own session file, never the project store's
+	// newest one — another active card's session must not block this card's
+	// detection or feed it a foreign diagnosis. The task row's live sessionId
+	// (dispatchSessionEntry writes the run's own id mid-run) picks the file.
+	const file = sessionFile(e.store.sessionsDir, sessionId);
+	// No known session yet: never a suspect on a guessed file.
+	if (file === null)
+		return {
+			pid: run.pid,
+			alive: true,
+			procs,
+			sessionAt: null,
+			lastTool: null,
+			locks: [],
+			pidFiles: [],
+			pids: [],
+			ports: [],
+		};
+	let sessionAt: number | null;
+	try {
+		sessionAt = statSync(file).mtimeMs;
+	} catch {
+		// An unreadable session file fails the session signal: no suspect.
+		sessionAt = null;
+	}
+	const tail = staleTail(file);
+	const lastTool = tail === null ? null : lastToolCall(tail);
+	if (lastTool === null)
+		return {
+			pid: run.pid,
+			alive: true,
+			procs,
+			sessionAt,
+			lastTool: null,
+			locks: [],
+			pidFiles: [],
+			pids: [],
+			ports: [],
+		};
+	// The last tool command is untrusted text: it selects which facts to read,
+	// never what to act on. Confinement is a fix-time decision, so the probe
+	// reads facts anywhere on this host.
+	const { command } = lastTool;
 	return {
 		pid: run.pid,
 		alive: true,
 		procs,
 		sessionAt,
 		lastTool,
-		locks:
-			lastTool === null || root === null
-				? []
-				: lockFacts(
-						extractLockPaths(lastTool.command),
-						root,
-						cardNumOf(basename(task?.worktree ?? run.id)),
-					),
+		locks: lockFacts(extractLockPaths(command)),
+		pidFiles: pidFileFacts(extractPidPaths(command)),
+		pids: extractInlinePids(command).map(({ pid }) => ({
+			pid,
+			alive: pidAlive(pid),
+		})),
+		ports: extractPorts(command).map(({ port }) => ({
+			port,
+			listeners: portListeners(port),
+		})),
 	};
 }
 
@@ -1137,11 +1175,23 @@ async function applyStaleFix(
 	if (run.url !== undefined && run.runId !== undefined) {
 		if (workers === null)
 			return { ok: false, reason: "no worker fleet is configured" };
+		// OTTR-1261: the expect payload rides to the worker so the act-time
+		// recheck compares against the diagnosed facts, not a fresh guess.
 		const req =
 			fix.kind === "stale-lock"
-				? { run: run.runId, action: "unlock" as const, path: fix.path }
+				? {
+						run: run.runId,
+						action: "unlock" as const,
+						path: fix.path,
+						expect: fix.expect,
+					}
 				: fix.kind === "hung-child"
-					? { run: run.runId, action: "kill" as const, pid: fix.pid }
+					? {
+							run: run.runId,
+							action: "kill" as const,
+							pid: fix.pid,
+							expect: fix.expect,
+						}
 					: null;
 		if (req === null)
 			return {
@@ -1166,15 +1216,27 @@ async function applyStaleFix(
 	if (e === undefined)
 		return { ok: false, reason: "the run is no longer live" };
 	if (fix.kind === "unsure") return { ok: false, reason: fix.reason };
-	if (fix.kind === "stale-lock") {
-		const task = await e.store.getTask(run.id);
-		if (task === null) return { ok: false, reason: "the card row is gone" };
-		return staleUnlockLocal(task.worktree ?? e.path, fix.path);
-	}
-	// Hung child: staleKillLocal proves the pid sits strictly inside the turn's
-	// tree in a fresh walk before a signal flies; the run's own pid is never a
+	const task = await e.store.getTask(run.id);
+	if (task === null) return { ok: false, reason: "the card row is gone" };
+	// The act-time recheck reads the run's own session, the same session
+	// identity the probe used: the task row's live sessionId (OTTR-1261).
+	const file = sessionFile(e.store.sessionsDir, task.sessionId);
+	const tail = file === null ? null : staleTail(file);
+	const currentLastTool = tail === null ? null : lastToolCall(tail);
+	if (fix.kind === "stale-lock")
+		// staleUnlockLocal owns the whole precondition set at act time:
+		// realpath confinement, file content, dead pid, and the "turn still
+		// waits on this lock" recheck against currentLastTool.
+		return staleUnlockLocal(
+			task.worktree ?? e.path,
+			fix.path,
+			fix.expect,
+			currentLastTool,
+		);
+	// Hung child: staleKillLocal revalidates descendant/cmdline/ticks/dependency
+	// on a fresh /proc walk before a signal flies; the run's own pid is never a
 	// target.
-	return staleKillLocal(run.pid, fix.pid);
+	return staleKillLocal(run.pid, fix.pid, fix.expect, { currentLastTool });
 }
 
 // Supervisor: retries locked-worktree removal after done/cancel and watches CI for merge pushes.
@@ -1220,7 +1282,10 @@ const supervisor = createSupervisor(
 			};
 			return run;
 		},
-		probeStale: (run) => probeStaleRun(projects, workerTarget, run),
+		// The probe fixes the session by run identity — the task row's live
+		// sessionId — before the pass reads idle facts from it (OTTR-1261).
+		probeStale: (run, sessionId) =>
+			probeStaleRun(projects, workerTarget, run, sessionId),
 		staleFix: (run, fix) => applyStaleFix(projects, workerTarget, run, fix),
 	},
 	workerTarget,

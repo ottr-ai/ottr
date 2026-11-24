@@ -15,15 +15,24 @@ import {
 	busyDescendant,
 	cardNumOf,
 	diagnoseStale,
+	extractInlinePids,
 	extractLockPaths,
+	extractPidPaths,
+	extractPorts,
 	isStaleAskReason,
+	type KillExpect,
+	type LastTool,
 	type LockFact,
 	lastToolCall,
 	lockFacts,
 	lockPathAllowed,
 	newestSessionAt,
+	normalizeCmd,
 	type ProcSample,
 	parseLockPid,
+	parsePidFile,
+	pidFileFacts,
+	portListeners,
 	readTree,
 	STALE_ASK_MARKER,
 	STALE_FIX_PENDING_STEER,
@@ -128,7 +137,6 @@ mkdirSync(join(procDir, "acpi"), { recursive: true }); // non-pid dir name
 
 // OTTR-1191 shape: omp 329 alive, shell 5300 looping on a lock that names dead 5229.
 const wt = "/srv/board/OTTR-1191";
-const cardNum = "1191";
 const lockPath = "/var/tmp/gate-1191/tmp/ott-stryker.lock";
 const loopCmd =
 	"while [ ! -f /var/tmp/gate-1191/tmp/ott-stryker.lock ]; do sleep 600; done";
@@ -145,9 +153,33 @@ const prev1191 = new Map([
 	[329, 100],
 	[5300, 3],
 ]);
+
+// The same fake tree also carries /proc/net tables in the kernel's hex layout:
+// 0x1F90 = 8080, 0x0016 = 22. tcp holds one LISTEN 8080, one ESTABLISHED (state 01)
+// 8080, and one LISTEN 22; tcp6 holds one LISTEN 8080 — so the kill path can re-check
+// a port dependency against the same procRoot it walks for the process tree.
+mkdirSync(join(procDir, "net"), { recursive: true });
+const NET_HEADER =
+	"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+const TCP_TABLE = [
+	NET_HEADER,
+	"   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 ffff8800abc 100 0 0 10 0",
+	"   1: 0100007F:1F90 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 12346 2 ffff8800abc 100 0 0 10 0",
+	"   2: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12347 1 ffff8800abc 100 0 0 10 0",
+	"",
+].join("\n");
+const TCP6_TABLE = [
+	NET_HEADER,
+	"   0: 00000000000000000000000000000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12348 1 ffff8800abc 100 0 0 10 0",
+	"",
+].join("\n");
+writeFileSync(join(procDir, "net", "tcp"), TCP_TABLE);
+writeFileSync(join(procDir, "net", "tcp6"), TCP6_TABLE);
+
 const probe1191 = (
 	locks: LockFact[],
 	lastTool: StaleProbe["lastTool"],
+	more: Partial<StaleProbe> = {},
 ): StaleProbe => ({
 	pid: 329,
 	alive: true,
@@ -155,6 +187,10 @@ const probe1191 = (
 	sessionAt: 1000,
 	lastTool,
 	locks,
+	pidFiles: [],
+	pids: [],
+	ports: [],
+	...more,
 });
 
 // ---- constants ----------------------------------------------------------------
@@ -314,6 +350,127 @@ describe("extractLockPaths", () => {
 	});
 });
 
+// ---- parsePidFile ----------------------------------------------------------------
+
+describe("parsePidFile", () => {
+	test("accepts the JSON lock form and a bare trimmed integer line", () => {
+		expect(parsePidFile('{"pid":5229}')).toBe(5229);
+		expect(parsePidFile("5229")).toBe(5229);
+		expect(parsePidFile("5229\n")).toBe(5229);
+		expect(parsePidFile("  8080  ")).toBe(8080);
+	});
+
+	test("refuses junk and non-pid integers", () => {
+		expect(parsePidFile("pid: 5229")).toBeNull();
+		expect(parsePidFile("")).toBeNull();
+		expect(parsePidFile("0")).toBeNull();
+		expect(parsePidFile("-5")).toBeNull();
+		expect(parsePidFile("12.5")).toBeNull();
+		expect(parsePidFile("abc")).toBeNull();
+	});
+});
+
+// ---- extractPidPaths ----------------------------------------------------------------
+
+describe("extractPidPaths", () => {
+	test("path-like .pid tokens in order, deduped, non-pid ignored", () => {
+		expect(
+			extractPidPaths(
+				"tail -f /var/run/app.pid && cat /var/run/app.pid ./y.pid",
+			),
+		).toEqual(["/var/run/app.pid", "./y.pid"]);
+		expect(extractPidPaths("x.pids /a/b.pidtxt dir/named.pidfile")).toEqual([]);
+		expect(extractPidPaths("")).toEqual([]);
+	});
+
+	test("caps at 5 paths, each at 300 chars", () => {
+		const seven = [1, 2, 3, 4, 5, 6, 7].map((i) => `/t/f${i}.pid`).join(" ");
+		expect(extractPidPaths(seven)).toHaveLength(5);
+	});
+});
+
+// ---- extractInlinePids ----------------------------------------------------------------
+
+describe("extractInlinePids", () => {
+	test("each reference shape", () => {
+		expect(extractInlinePids("--pid 123")).toEqual([{ pid: 123 }]);
+		expect(extractInlinePids("--pid=123")).toEqual([{ pid: 123 }]);
+		expect(extractInlinePids("kill 123")).toEqual([{ pid: 123 }]);
+		expect(extractInlinePids("kill -0 123")).toEqual([{ pid: 123 }]);
+		expect(extractInlinePids("wait 123")).toEqual([{ pid: 123 }]);
+	});
+
+	test("dedupes across patterns and never a watcher loop's sleep seconds", () => {
+		expect(extractInlinePids("kill 123 --pid 123")).toEqual([{ pid: 123 }]);
+		expect(extractInlinePids("while kill -0 5229; do sleep 600; done")).toEqual(
+			[{ pid: 5229 }],
+		);
+	});
+
+	test("pid 1 excluded, >7 digits unmatched, cap 5", () => {
+		expect(extractInlinePids("kill 1")).toEqual([]);
+		expect(extractInlinePids("--pid 12345678")).toEqual([]);
+		const eight = [11, 22, 33, 44, 55, 66, 77, 88]
+			.map((p) => `kill ${p}`)
+			.join("; ");
+		expect(extractInlinePids(eight)).toHaveLength(5);
+	});
+});
+
+// ---- extractPorts ----------------------------------------------------------------
+
+describe("extractPorts", () => {
+	test("each reference shape", () => {
+		for (const text of [
+			"--port 3000",
+			"--port=3000",
+			"nc -z host 3000",
+			"curl localhost:3000",
+			"curl 127.0.0.1:3000",
+			"curl 0.0.0.0:3000",
+			"PORT=3000 ./serve",
+		])
+			expect(extractPorts(text)).toEqual([{ port: 3000 }]);
+	});
+
+	test("range filter, dedupe across patterns, cap 5", () => {
+		expect(extractPorts("--port 0")).toEqual([]);
+		expect(extractPorts("--port 99999")).toEqual([]);
+		expect(extractPorts("--port 65535")).toEqual([{ port: 65535 }]);
+		expect(extractPorts("--port 3000 curl localhost:3000")).toEqual([
+			{ port: 3000 },
+		]);
+		const nine = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+			.map((p) => `--port ${p}`)
+			.join(" ");
+		expect(extractPorts(nine)).toHaveLength(5);
+	});
+});
+
+// ---- normalizeCmd ----------------------------------------------------------------
+
+describe("normalizeCmd", () => {
+	test("collapses whitespace runs and trims, caps at 300", () => {
+		expect(normalizeCmd("  a   b\nc\t ")).toBe("a b c");
+		expect(normalizeCmd(`x ${"a".repeat(400)}`)).toHaveLength(300);
+	});
+});
+
+// ---- portListeners ----------------------------------------------------------------
+
+describe("portListeners", () => {
+	test("counts LISTEN entries for the port across tcp and tcp6", () => {
+		expect(portListeners(8080, procDir)).toBe(2); // tcp LISTEN + tcp6 LISTEN
+		expect(portListeners(22, procDir)).toBe(1); // the ESTABLISHED 8080 line never counts
+		expect(portListeners(9999, procDir)).toBe(0);
+		expect(portListeners(4444, procDir)).toBe(0);
+	});
+
+	test("an unreadable table is never a zero", () => {
+		expect(portListeners(8080, join(root, "no-proc-root"))).toBeNull();
+	});
+});
+
 // ---- lastToolCall ----------------------------------------------------------------
 
 describe("lastToolCall", () => {
@@ -411,6 +568,7 @@ describe("tickMap and busyDescendant", () => {
 // ---- diagnoseStale ----------------------------------------------------------------
 
 describe("diagnoseStale", () => {
+	const pidPath = "/var/tmp/gate-1191/tmp/ott-stryker.pid";
 	test("OTTR-1191: one allowed dead-pid lock → stale-lock", () => {
 		const fix = diagnoseStale({
 			probe: probe1191(
@@ -420,7 +578,12 @@ describe("diagnoseStale", () => {
 			worktree: wt,
 			prevTicks: prev1191,
 		});
-		expect(fix).toEqual({ kind: "stale-lock", path: lockPath, pid: 5229 });
+		expect(fix).toEqual({
+			kind: "stale-lock",
+			path: lockPath,
+			pid: 5229,
+			expect: { sessionCommand: loopCmd },
+		});
 	});
 
 	test("live pid in the lock → unsure, no fix", () => {
@@ -453,10 +616,30 @@ describe("diagnoseStale", () => {
 			});
 			expect(fix.kind).toBe("unsure");
 			if (fix.kind === "unsure")
-				expect(fix.reason).toContain(
-					`names dead pid 5229 outside the card's own dirs`,
+				expect(fix.reason).toBe(
+					`waits on ${path} naming dead pid 5229 outside the card's own dirs`,
 				);
 		}
+	});
+
+	test("blocker 4: a foreign dead lock never falls through to the kill", () => {
+		const foreign = "/var/tmp/gate-1244/tmp/ott-stryker.lock";
+		const fix = diagnoseStale({
+			probe: probe1191(
+				[{ path: foreign, exists: true, pid: 5229, alive: false }],
+				{
+					tool: "bash",
+					command: loopCmd,
+					timeout: 0,
+				},
+			),
+			worktree: wt,
+			prevTicks: prev1191,
+		});
+		// The matching idle timeout-0 child exists, but the ask wins, not the kill.
+		expect(fix.kind).toBe("unsure");
+		if (fix.kind === "unsure")
+			expect(fix.reason).toContain("outside the card's own dirs");
 	});
 
 	test("several allowed dead locks → unsure, refuses to guess", () => {
@@ -498,12 +681,23 @@ describe("diagnoseStale", () => {
 			worktree: wt,
 			prevTicks: prev1191,
 		});
-		expect(fix).toEqual({ kind: "stale-lock", path: lockPath, pid: 5229 });
+		expect(fix).toEqual({
+			kind: "stale-lock",
+			path: lockPath,
+			pid: 5229,
+			expect: { sessionCommand: loopCmd },
+		});
 	});
 
-	test("hung child: timeout-0 last tool whose shell sat idle", () => {
+	test("hung child: allowed dead pid file + matching idle shell → pidfile dep", () => {
 		const fix = diagnoseStale({
-			probe: probe1191([], { tool: "bash", command: loopCmd, timeout: 0 }),
+			probe: probe1191(
+				[],
+				{ tool: "bash", command: loopCmd, timeout: 0 },
+				{
+					pidFiles: [{ path: pidPath, exists: true, pid: 5229, alive: false }],
+				},
+			),
 			worktree: wt,
 			prevTicks: prev1191,
 		});
@@ -511,16 +705,146 @@ describe("diagnoseStale", () => {
 			kind: "hung-child",
 			pid: 5300,
 			command: `bash -c ${loopCmd}`,
+			expect: {
+				sessionCommand: loopCmd,
+				ticks: 3,
+				dep: { kind: "pidfile", path: pidPath, pid: 5229 },
+			},
 		});
+	});
+
+	test("blocker 3: idle timeout-0 sleep with no dependency asks, never kills", () => {
+		const fix = diagnoseStale({
+			probe: probe1191(
+				[],
+				{ tool: "bash", command: "sleep 30", timeout: 0 },
+				{
+					procs: [
+						{ pid: 329, ppid: 1, ticks: 100, command: "node omp.ts" },
+						{ pid: 5300, ppid: 329, ticks: 3, command: "sleep 30" },
+					],
+				},
+			),
+			worktree: wt,
+			prevTicks: prev1191,
+		});
+		expect(fix.kind).toBe("unsure");
+		if (fix.kind === "unsure")
+			expect(fix.reason).toBe(
+				"idle timeout-0 child 5300 (sleep 30) has no dead dependency; approving a stop needs the owner",
+			);
+	});
+
+	test("dead inline pid → hung-child with inline dep", () => {
+		const inlineCmd = "while kill -0 5229; do sleep 600; done";
+		const fix = diagnoseStale({
+			probe: probe1191(
+				[],
+				{ tool: "bash", command: inlineCmd, timeout: 0 },
+				{
+					procs: [
+						{ pid: 329, ppid: 1, ticks: 100, command: "node omp.ts" },
+						{ pid: 5300, ppid: 329, ticks: 3, command: `bash -c ${inlineCmd}` },
+					],
+					pids: [{ pid: 5229, alive: false }],
+				},
+			),
+			worktree: wt,
+			prevTicks: prev1191,
+		});
+		expect(fix).toEqual({
+			kind: "hung-child",
+			pid: 5300,
+			command: `bash -c ${inlineCmd}`,
+			expect: {
+				sessionCommand: inlineCmd,
+				ticks: 3,
+				dep: { kind: "inline", pid: 5229 },
+			},
+		});
+	});
+
+	test("port named with zero listeners → hung-child with port dep", () => {
+		const portCmd = "while ! nc -z localhost 8080; do sleep 600; done";
+		const fix = diagnoseStale({
+			probe: probe1191(
+				[],
+				{ tool: "bash", command: portCmd, timeout: 0 },
+				{
+					procs: [
+						{ pid: 329, ppid: 1, ticks: 100, command: "node omp.ts" },
+						{ pid: 5300, ppid: 329, ticks: 3, command: `bash -c ${portCmd}` },
+					],
+					ports: [{ port: 8080, listeners: 0 }],
+				},
+			),
+			worktree: wt,
+			prevTicks: prev1191,
+		});
+		expect(fix).toEqual({
+			kind: "hung-child",
+			pid: 5300,
+			command: `bash -c ${portCmd}`,
+			expect: {
+				sessionCommand: portCmd,
+				ticks: 3,
+				dep: { kind: "port", port: 8080 },
+			},
+		});
+	});
+
+	test("a port that still has listeners is not a dead dependency → unsure", () => {
+		const portCmd = "while ! nc -z localhost 8080; do sleep 600; done";
+		const fix = diagnoseStale({
+			probe: probe1191(
+				[],
+				{ tool: "bash", command: portCmd, timeout: 0 },
+				{
+					procs: [
+						{ pid: 329, ppid: 1, ticks: 100, command: "node omp.ts" },
+						{ pid: 5300, ppid: 329, ticks: 3, command: `bash -c ${portCmd}` },
+					],
+					ports: [{ port: 8080, listeners: 2 }],
+				},
+			),
+			worktree: wt,
+			prevTicks: prev1191,
+		});
+		expect(fix.kind).toBe("unsure");
+		if (fix.kind === "unsure")
+			expect(fix.reason).toContain("no dead dependency");
+	});
+
+	test("a live pid file → unsure, no fix", () => {
+		const fix = diagnoseStale({
+			probe: probe1191(
+				[],
+				{ tool: "bash", command: loopCmd, timeout: 0 },
+				{
+					pidFiles: [{ path: pidPath, exists: true, pid: 5300, alive: true }],
+				},
+			),
+			worktree: wt,
+			prevTicks: prev1191,
+		});
+		expect(fix.kind).toBe("unsure");
+		if (fix.kind === "unsure")
+			expect(fix.reason).toBe(`lock ${pidPath} names live pid 5300`);
 	});
 
 	test("whitespace runs in argv normalize away before matching", () => {
 		const fix = diagnoseStale({
-			probe: probe1191([], {
-				tool: "bash",
-				command: `while   [ ! -f /var/tmp/gate-1191/tmp/ott-stryker.lock ];  do sleep 600; done`,
-				timeout: 0,
-			}),
+			probe: probe1191(
+				[],
+				{
+					tool: "bash",
+					command: `while   [ ! -f /var/tmp/gate-1191/tmp/ott-stryker.lock ];  do sleep 600; done`,
+					timeout: 0,
+				},
+				{
+					pidFiles: [{ path: pidPath, exists: true, pid: 5229, alive: false }],
+				},
+			),
 			worktree: wt,
 			prevTicks: prev1191,
 		});
@@ -604,9 +928,10 @@ describe("steer and ask wording", () => {
 		});
 		expect(
 			steer.startsWith(
-				"Supervisor: your last tool call was waiting on state that could not change.\n",
+				"Supervisor: your last tool call was waiting on state that could not change, and the supervisor applied a fix. This note rides your next turn.\n",
 			),
 		).toBe(true);
+		expect(steer).toContain("This note rides your next turn.");
 		expect(steer).toContain(
 			`The lock file ${lockPath} named pid 5229, and that pid is dead on the worker. The lock could never clear. The supervisor is removing the lock file now.`,
 		);
@@ -762,7 +1087,7 @@ describe("lockFacts", () => {
 		join(disDir, "x.lock"),
 		join(root, "gate-1191", "x.lock"), // allowed shape, ENOTDIR: no such file
 	];
-	const facts = lockFacts(paths, wtDir, cardNum);
+	const facts = lockFacts(paths);
 
 	test("dead pid in an allowed lock reads alive: false", () => {
 		expect(facts[0]).toEqual({
@@ -803,25 +1128,81 @@ describe("lockFacts", () => {
 		});
 	});
 
-	test("missing or disallowed paths read exists: false without a read", () => {
+	test("a foreign path is read and reported, never hidden as missing", () => {
+		expect(facts[6]).toEqual({
+			path: join(disDir, "x.lock"),
+			exists: true,
+			pid: deadPid,
+			alive: false,
+		}); // the read feeds the diagnosis and the ask; confinement decides only fixes
+	});
+
+	test("missing paths read exists: false without a fact", () => {
 		expect(facts[5]).toEqual({
 			path: join(wtDir, "gone.lock"),
 			exists: false,
 			pid: null,
 			alive: null,
 		});
-		expect(facts[6]).toEqual({
-			path: join(disDir, "x.lock"),
-			exists: false,
-			pid: null,
-			alive: null,
-		}); // file exists but confinement refuses: no read happened
 		expect(facts[7]).toEqual({
 			path: join(root, "gate-1191", "x.lock"),
 			exists: false,
 			pid: null,
 			alive: null,
 		}); // ENOTDIR grades as missing
+	});
+});
+
+// ---- pidFileFacts ----------------------------------------------------------------
+
+describe("pidFileFacts", () => {
+	// A child that already exited: its pid is proven dead on this host.
+	const deadChild = Bun.spawnSync([process.execPath, "-e", ""]);
+	const deadPid = deadChild.pid;
+	const pidDir = join(root, "pids");
+	mkdirSync(pidDir, { recursive: true });
+	const jsonPath = join(pidDir, "app.pid");
+	const barePath = join(pidDir, "bare.pid");
+	const junkPath = join(pidDir, "junk.pid");
+	writeFileSync(jsonPath, `{"pid":${deadPid},"host":"worker-b"}\n`);
+	writeFileSync(barePath, `${deadPid}\n`);
+	writeFileSync(junkPath, "pid: 5229");
+
+	const facts = pidFileFacts([
+		jsonPath,
+		barePath,
+		junkPath,
+		join(pidDir, "gone.pid"),
+	]);
+
+	test("JSON form and bare integer both parse", () => {
+		expect(facts[0]).toEqual({
+			path: jsonPath,
+			exists: true,
+			pid: deadPid,
+			alive: false,
+		});
+		expect(facts[1]).toEqual({
+			path: barePath,
+			exists: true,
+			pid: deadPid,
+			alive: false,
+		});
+	});
+
+	test("junk reads present but unusable; missing reads missing", () => {
+		expect(facts[2]).toEqual({
+			path: junkPath,
+			exists: true,
+			pid: null,
+			alive: null,
+		});
+		expect(facts[3]).toEqual({
+			path: join(pidDir, "gone.pid"),
+			exists: false,
+			pid: null,
+			alive: null,
+		});
 	});
 });
 
@@ -833,11 +1214,49 @@ describe("staleUnlockLocal", () => {
 	const deadPid = deadChild.pid;
 	const wt = join(root, "unlock-wt");
 	beforeAll(() => mkdirSync(wt, { recursive: true }));
+	const stillWaiting = (naming: string): LastTool => ({
+		tool: "bash",
+		command: `cat ${naming}`,
+		timeout: 0,
+	});
+
+	test("the turn moved on: no re-read, empty command, or a different wait", () => {
+		const lock = join(wt, "moved.lock");
+		writeFileSync(lock, `{"pid":${deadPid}}`);
+		expect(
+			staleUnlockLocal(wt, lock, { sessionCommand: `cat ${lock}` }, null)
+				.reason,
+		).toContain(`the turn moved on: ${lock} is no longer the wait`);
+		expect(
+			staleUnlockLocal(
+				wt,
+				lock,
+				{ sessionCommand: `cat ${lock}` },
+				{ tool: "bash", command: "   ", timeout: 0 },
+			).reason,
+		).toContain("no longer the wait");
+		expect(
+			staleUnlockLocal(
+				wt,
+				lock,
+				{ sessionCommand: `cat ${lock}` },
+				stillWaiting("/other/place.lock"),
+			).reason,
+		).toContain("no longer the wait");
+		expect(existsSync(lock)).toBe(true);
+	});
 
 	test("removes a worktree lock that names a dead pid", () => {
 		const lock = join(wt, "run.lock");
 		writeFileSync(lock, `{"pid":${deadPid}}`);
-		expect(staleUnlockLocal(wt, lock)).toEqual({ ok: true });
+		expect(
+			staleUnlockLocal(
+				wt,
+				lock,
+				{ sessionCommand: `cat ${lock}` },
+				stillWaiting(lock),
+			),
+		).toEqual({ ok: true });
 		expect(existsSync(lock)).toBe(false);
 	});
 
@@ -848,14 +1267,26 @@ describe("staleUnlockLocal", () => {
 		mkdirSync(fakeWt, { recursive: true });
 		const lock = join(scratch, "ott-stryker.lock");
 		writeFileSync(lock, `{"pid":${deadPid}}`);
-		expect(staleUnlockLocal(fakeWt, lock)).toEqual({ ok: true });
+		expect(
+			staleUnlockLocal(
+				fakeWt,
+				lock,
+				{ sessionCommand: `cat ${lock}` },
+				stillWaiting(lock),
+			),
+		).toEqual({ ok: true });
 		expect(existsSync(lock)).toBe(false);
 	});
 
 	test("refuses a live pid and keeps the file", () => {
 		const lock = join(wt, "live.lock");
 		writeFileSync(lock, `{"pid":${process.pid}}`);
-		const res = staleUnlockLocal(wt, lock);
+		const res = staleUnlockLocal(
+			wt,
+			lock,
+			{ sessionCommand: `cat ${lock}` },
+			stillWaiting(lock),
+		);
 		expect(res.ok).toBe(false);
 		expect(res.reason).toContain(`pid ${process.pid} is alive`);
 		expect(existsSync(lock)).toBe(true);
@@ -868,7 +1299,12 @@ describe("staleUnlockLocal", () => {
 		mkdirSync(fakeWt, { recursive: true });
 		const lock = join(scratch, "ott-stryker.lock");
 		writeFileSync(lock, `{"pid":${deadPid}}`);
-		const res = staleUnlockLocal(fakeWt, lock);
+		const res = staleUnlockLocal(
+			fakeWt,
+			lock,
+			{ sessionCommand: `cat ${lock}` },
+			stillWaiting(lock),
+		);
 		expect(res.ok).toBe(false);
 		expect(res.reason).toContain("outside the card's own dirs");
 		expect(existsSync(lock)).toBe(true);
@@ -879,7 +1315,12 @@ describe("staleUnlockLocal", () => {
 		writeFileSync(victim, `{"pid":${deadPid}}`);
 		const link = join(wt, "escape.lock");
 		symlinkSync(victim, link);
-		const res = staleUnlockLocal(wt, link);
+		const res = staleUnlockLocal(
+			wt,
+			link,
+			{ sessionCommand: `cat ${link}` },
+			stillWaiting(link),
+		);
 		expect(res.ok).toBe(false);
 		expect(existsSync(victim)).toBe(true);
 	});
@@ -887,20 +1328,225 @@ describe("staleUnlockLocal", () => {
 	test("refuses an oversize and a pid-1 file", () => {
 		const big = join(wt, "big.lock");
 		writeFileSync(big, `{"pid":${deadPid}}${"x".repeat(5000)}`);
-		expect(staleUnlockLocal(wt, big).ok).toBe(false);
+		expect(
+			staleUnlockLocal(
+				wt,
+				big,
+				{ sessionCommand: `cat ${big}` },
+				stillWaiting(big),
+			).ok,
+		).toBe(false);
 		const one = join(wt, "one.lock");
 		writeFileSync(one, '{"pid":1}');
-		expect(staleUnlockLocal(wt, one).ok).toBe(false);
+		expect(
+			staleUnlockLocal(
+				wt,
+				one,
+				{ sessionCommand: `cat ${one}` },
+				stillWaiting(one),
+			).ok,
+		).toBe(false);
 		expect(existsSync(big)).toBe(true);
 		expect(existsSync(one)).toBe(true);
 	});
 });
 
 describe("staleKillLocal", () => {
-	test("sends SIGTERM to a real child of this process", async () => {
+	// A child that already exited: its pid is proven dead on this host.
+	const deadChild = Bun.spawnSync([process.execPath, "-e", ""]);
+	const deadPid = deadChild.pid;
+	const fixDir = join(root, "killfix");
+	mkdirSync(fixDir, { recursive: true });
+	const noKill = (): void => {
+		throw new Error("must not signal");
+	};
+	const expectFor = (over: Partial<KillExpect> = {}): KillExpect => ({
+		sessionCommand: "bun stryker.ts --watch",
+		ticks: 5,
+		dep: { kind: "inline", pid: deadPid },
+		...over,
+	});
+	const lastToolNow = (over: Partial<LastTool> = {}): LastTool => ({
+		tool: "bash",
+		command: "bun stryker.ts --watch",
+		timeout: 0,
+		...over,
+	});
+	// procDir: 329 ← {5229 (bun stryker.ts --watch, 5 ticks) ← 6000, 800 (no argv), 900}; 77 outside.
+	const opts = (
+		over: {
+			procRoot?: string;
+			currentLastTool?: LastTool | null;
+			kill?: typeof process.kill;
+		} = {},
+	) => ({
+		procRoot: procDir,
+		kill: noKill,
+		currentLastTool: lastToolNow(),
+		...over,
+	});
+
+	test("the never-a-target refusals fire before any read", () => {
+		expect(
+			staleKillLocal(process.pid, 1, expectFor(), opts()).reason,
+		).toContain("pid 1");
+		expect(
+			staleKillLocal(process.pid, process.pid, expectFor(), opts()).reason,
+		).toContain("server's own pid");
+		expect(staleKillLocal(329, 329, expectFor(), opts()).reason).toContain(
+			"run's own pid",
+		);
+	});
+
+	test("tree refusals: gone run pid, pid outside the tree", () => {
+		expect(staleKillLocal(424242, 5229, expectFor(), opts()).reason).toBe(
+			"the run pid is gone",
+		);
+		expect(staleKillLocal(329, 77, expectFor(), opts()).reason).toBe(
+			"pid 77 is not in the turn's process tree",
+		);
+	});
+
+	test("blocker 5: an empty session command refuses without a signal", () => {
+		expect(
+			staleKillLocal(329, 5229, expectFor({ sessionCommand: "" }), opts())
+				.reason,
+		).toBe("no session command to re-check");
+	});
+
+	test("blocker 5: a child whose argv no longer matches refuses", () => {
+		expect(staleKillLocal(329, 6000, expectFor(), opts()).reason).toBe(
+			"the child's command changed",
+		);
+		expect(staleKillLocal(329, 800, expectFor(), opts()).reason).toBe(
+			"the child's command changed",
+		); // no argv at all
+	});
+
+	test("blocker 5: a session that moved on refuses", () => {
+		const moved = "the session's last tool call changed";
+		expect(
+			staleKillLocal(329, 5229, expectFor(), opts({ currentLastTool: null }))
+				.reason,
+		).toBe(moved);
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor(),
+				opts({ currentLastTool: lastToolNow({ command: "tail -f x" }) }),
+			).reason,
+		).toBe(moved);
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor(),
+				opts({ currentLastTool: lastToolNow({ timeout: 30 }) }),
+			).reason,
+		).toBe(moved);
+	});
+
+	test("blocker 5: a resumed child refuses", () => {
+		expect(
+			staleKillLocal(329, 5229, expectFor({ ticks: 0 }), opts()).reason,
+		).toBe("the child resumed: 5 ticks gained");
+	});
+
+	test("blocker 5: a dependency that cleared refuses", () => {
+		const cleared = "the dependency cleared";
+		// inline: the pid came back (the runner's own pid is alive).
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor({ dep: { kind: "inline", pid: process.pid } }),
+				opts(),
+			).reason,
+		).toBe(cleared);
+		// lockfile: the file now names a different, live pid — and a gone file refuses too.
+		const nowLive = join(fixDir, "now-live.lock");
+		writeFileSync(nowLive, `{"pid":${process.pid}}`);
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor({ dep: { kind: "lockfile", path: nowLive, pid: deadPid } }),
+				opts(),
+			).reason,
+		).toBe(cleared);
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor({
+					dep: {
+						kind: "lockfile",
+						path: join(fixDir, "gone.lock"),
+						pid: deadPid,
+					},
+				}),
+				opts(),
+			).reason,
+		).toBe(cleared);
+		// pidfile: bare-integer content that now names a live pid.
+		const nowLivePid = join(fixDir, "now-live.pid");
+		writeFileSync(nowLivePid, `${process.pid}\n`);
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor({ dep: { kind: "pidfile", path: nowLivePid, pid: deadPid } }),
+				opts(),
+			).reason,
+		).toBe(cleared);
+		// port: a listener appeared in the tables.
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor({ dep: { kind: "port", port: 8080 } }),
+				opts(),
+			).reason,
+		).toBe(cleared);
+	});
+
+	test("the happy path signals only after every recheck passes (fake tree)", () => {
+		const signaled: { pid: number; signal: string }[] = [];
+		const kill = (pid: number, signal?: string | number | undefined) => {
+			signaled.push({ pid, signal: String(signal) });
+		};
+		// Port dep with zero listeners in the tables: the last gate before TERM.
+		expect(
+			staleKillLocal(
+				329,
+				5229,
+				expectFor({ dep: { kind: "port", port: 4444 } }),
+				{ ...opts(), kill },
+			),
+		).toEqual({ ok: true });
+		expect(signaled).toEqual([{ pid: 5229, signal: "SIGTERM" }]);
+	});
+
+	test("the real /proc walk signals a real child on the happy path", async () => {
 		const child = Bun.spawn(["sleep", "30"]);
 		try {
-			expect(staleKillLocal(process.pid, child.pid)).toEqual({ ok: true });
+			const sample = readTree(process.pid)?.find((p) => p.pid === child.pid);
+			if (sample === undefined)
+				throw new Error("child missing from the real tree sample");
+			const res = staleKillLocal(
+				process.pid,
+				child.pid,
+				{
+					sessionCommand: "sleep 30",
+					ticks: sample.ticks,
+					dep: { kind: "inline", pid: deadPid },
+				},
+				{ currentLastTool: { tool: "bash", command: "sleep 30", timeout: 0 } },
+			);
+			expect(res).toEqual({ ok: true });
+			// Primary wait is the real exit event; the sleep only bounds a child that
+			// ignores SIGTERM, which fake timers cannot surface.
 			await Promise.race([child.exited, Bun.sleep(2000)]);
 			expect(child.signalCode).toBe("SIGTERM");
 		} finally {
@@ -908,19 +1554,15 @@ describe("staleKillLocal", () => {
 		}
 	});
 
-	test("refusals never signal", () => {
-		const noSignal = () => {
-			throw new Error("must not signal");
-		};
-		expect(staleKillLocal(process.pid, 1, "/proc", noSignal).reason).toContain(
-			"pid 1",
+	test("refusals never signal (seam sanity over the real /proc)", () => {
+		// A run pid that does not exist: the real /proc walk returns null before the
+		// signal seam is ever reached.
+		const res = staleKillLocal(
+			4000000,
+			4194303,
+			{ sessionCommand: "x", ticks: 0, dep: { kind: "inline", pid: deadPid } },
+			{ currentLastTool: lastToolNow({ command: "x" }) },
 		);
-		expect(
-			staleKillLocal(process.pid, process.pid, "/proc", noSignal).reason,
-		).toContain("server's own pid");
-		// A run pid with no such child: readTree over the real /proc cannot name
-		// this process as a descendant of an unrelated run pid.
-		const res = staleKillLocal(4000000, process.pid, "/proc", noSignal);
-		expect(res.ok).toBe(false);
+		expect(res).toEqual({ ok: false, reason: "the run pid is gone" });
 	});
 });

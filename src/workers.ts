@@ -32,17 +32,27 @@ import {
 	type RequirementLine,
 } from "./python.ts";
 import type { RunSink } from "./runner.ts";
+import { sessionFile } from "./session.ts";
 import {
+	BUSY_MIN_TICKS,
 	cardNumOf,
+	type DepProof,
+	extractInlinePids,
 	extractLockPaths,
+	extractPidPaths,
+	extractPorts,
+	type KillExpect,
 	type LastTool,
 	type LockFact,
 	lastToolCall,
 	lockFacts,
 	lockPathAllowed,
-	newestSessionAt,
 	newestSessionFile,
+	normalizeCmd,
 	parseLockPid,
+	parsePidFile,
+	pidFileFacts,
+	portListeners,
 	readTree,
 	type StaleProbe,
 } from "./staleTurn.ts";
@@ -278,8 +288,9 @@ export function serveWorker(opts: {
 	/** Only for tests: the /proc tree /runprobe walks for a run's process tree and
 	 * /stalefix re-checks the descendant chain in, instead of the real one (OTTR-1261). */
 	staleProcRoot?: string;
-	/** Only for tests: the sessions dir /runprobe picks the newest transcript from,
-	 * instead of `<dataDir>/sessions` (OTTR-1261). */
+	/** Only for tests: the sessions dir /runprobe and /stalefix resolve the run's
+	 * session transcript in (by the request's session id, or newest-since-start
+	 * without one), instead of `<dataDir>/sessions` (OTTR-1261). */
 	staleSessionsDir?: string;
 	/** Only for tests: the signal call /stalefix kill uses instead of process.kill, so
 	 * a test can never signal a process it did not create (OTTR-1261). */
@@ -447,6 +458,10 @@ export function serveWorker(opts: {
 			});
 		return new Response("not found", { status: 404 });
 	};
+	// The sessions dir a probe or fix reads (OTTR-1261): the run's own data dir,
+	// captured at spawn; the test seam replaces it wholesale.
+	const staleSessionsDirOf = (e: ActiveRun): string | null =>
+		opts.staleSessionsDir ?? (e.dataDir ? join(e.dataDir, "sessions") : null);
 	const handleRunProbe = async (request: Request): Promise<Response> => {
 		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
 		let body: unknown;
@@ -457,15 +472,25 @@ export function serveWorker(opts: {
 		}
 		if (typeof body !== "object" || body === null)
 			return new Response("bad request", { status: 400 });
-		const { run } = body as { run?: unknown };
+		const { run, sessionId } = body as {
+			run?: unknown;
+			sessionId?: unknown;
+		};
 		if (typeof run !== "string" || run === "")
+			return new Response("bad request", { status: 400 });
+		// The session id selects the run's own transcript: absent, or a short
+		// non-empty string — anything else is a bad body (OTTR-1261).
+		if (!validSessionId(sessionId))
 			return new Response("bad request", { status: 400 });
 		const e = runEntry(run);
 		if (e === undefined || e.pid === null) return unknownRun(run);
-		const sessionsDir =
-			opts.staleSessionsDir ?? (e.dataDir ? join(e.dataDir, "sessions") : null);
 		return Response.json(
-			staleProbeOf(e, opts.staleProcRoot ?? "/proc", sessionsDir),
+			staleProbeOf(
+				e,
+				opts.staleProcRoot ?? "/proc",
+				staleSessionsDirOf(e),
+				sessionId ?? null,
+			),
 		);
 	};
 	const handleStaleFix = async (request: Request): Promise<Response> => {
@@ -478,28 +503,37 @@ export function serveWorker(opts: {
 		}
 		if (typeof body !== "object" || body === null)
 			return new Response("bad request", { status: 400 });
-		const { run, action, path, pid } = body as {
+		const { run, action, path, pid, sessionId, expect } = body as {
 			run?: unknown;
 			action?: unknown;
 			path?: unknown;
 			pid?: unknown;
+			sessionId?: unknown;
+			expect?: unknown;
 		};
 		// The whole request shape validates before any entry lookup: a non-conforming
-		// body is 400 even for a run id this daemon does not know.
+		// body is 400 even for a run id this daemon does not know. Both fixes carry
+		// the diagnosis (expect), so the act-time recheck compares against the
+		// diagnosed facts, never a fresh guess (OTTR-1261).
 		if (typeof run !== "string" || run === "")
 			return new Response("bad request", { status: 400 });
+		if (!validSessionId(sessionId))
+			return new Response("bad request", { status: 400 });
 		if (action === "unlock") {
-			if (typeof path !== "string" || path === "")
+			if (typeof path !== "string" || path === "" || !validUnlockExpect(expect))
 				return new Response("bad request", { status: 400 });
 			const e = runEntry(run);
 			if (e === undefined || e.pid === null) return unknownRun(run);
-			return Response.json(staleUnlock(e, path));
+			return Response.json(
+				staleUnlock(e, path, expect, staleSessionsDirOf(e), sessionId ?? null),
+			);
 		}
 		if (
 			action !== "kill" ||
 			typeof pid !== "number" ||
 			!Number.isInteger(pid) ||
-			pid <= 0
+			pid <= 0 ||
+			!validKillExpect(expect)
 		)
 			return new Response("bad request", { status: 400 });
 		const e = runEntry(run);
@@ -508,8 +542,11 @@ export function serveWorker(opts: {
 			staleKillChild(
 				e,
 				pid,
+				expect,
 				opts.staleProcRoot ?? "/proc",
 				opts.staleKill ?? process.kill,
+				staleSessionsDirOf(e),
+				sessionId ?? null,
 			),
 		);
 	};
@@ -1775,25 +1812,6 @@ const SESSION_TAIL_BYTES = 64 * 1024;
 /** The temp roots a lock may live in when the card-number segment rule passes. */
 const STALE_TEMP_ROOTS = ["/tmp", "/var/tmp"];
 
-/** True when `ancestor` sits in `pid`'s parent chain in one ppid snapshot. The run pid
- * itself is never its own descendant (OTTR-1261: the omp process is no fix target). */
-function isStrictDescendant(
-	ppid: Map<number, number>,
-	pid: number,
-	ancestor: number,
-): boolean {
-	let cur = pid;
-	const seen = new Set<number>();
-	while (!seen.has(cur)) {
-		seen.add(cur);
-		const parent = ppid.get(cur);
-		if (parent === undefined) return false;
-		if (parent === ancestor) return true;
-		cur = parent;
-	}
-	return false;
-}
-
 /** Reads at most `len` bytes at absolute offset `from` of an open file and decodes them
  * tolerantly (a byte cut mid code point never throws). */
 function decodeAt(fd: number, from: number, len: number): string {
@@ -1850,62 +1868,143 @@ function readTailText(path: string, bytes: number): string | null {
 	}
 }
 
+/** The session file a probe or fix reads (OTTR-1261): the run's own file by session
+ * id when the request names one — a missing id resolves to null, never to a foreign
+ * transcript; without an id the newest file since the run started, still only a
+ * signal (nearly every run dispatches its session id within the first events). */
+function staleSessionPath(
+	e: { startedAt: number },
+	sessionsDir: string | null,
+	sessionId: string | null,
+): string | null {
+	if (sessionsDir === null) return null;
+	if (sessionId !== null) return sessionFile(sessionsDir, sessionId);
+	return newestSessionFile(sessionsDir, e.startedAt)?.path ?? null;
+}
+
+/** The last tool call the resolved session tail holds right now, or null. Same
+ * bounded tail read for the probe and both fixes, so the act-time recheck compares
+ * against what the probe diagnosed (OTTR-1261). */
+function staleSessionLastTool(
+	e: { startedAt: number },
+	sessionsDir: string | null,
+	sessionId: string | null,
+): LastTool | null {
+	const path = staleSessionPath(e, sessionsDir, sessionId);
+	if (path === null) return null;
+	try {
+		const tail = readTailText(path, SESSION_TAIL_BYTES);
+		return tail === null ? null : lastToolCall(tail);
+	} catch {
+		return null;
+	}
+}
+
 /** The /runprobe answer for one run entry (OTTR-1261). Every field degrades on its own
  * internal failure — the probe never fails because one fact is unreadable. */
 function staleProbeOf(
 	e: {
 		pid: number | null;
-		cwd: string;
 		startedAt: number;
 		dataDir?: string | null;
 	},
 	procRoot: string,
 	sessionsDir: string | null,
+	sessionId: string | null,
 ): StaleProbe {
 	// readTree is null on an unreadable /proc or a dead run pid: the tree degrades to
 	// empty, and alive below still reports what pidAlive saw. A null entry pid is the
 	// not-yet-spawned case: no tree, not alive.
 	const procs = e.pid === null ? [] : (readTree(e.pid, procRoot) ?? []);
 	const alive = e.pid !== null && pidAlive(e.pid);
+	// sessionAt is the resolved file's mtime — the run's own file by session id, or
+	// the newest since startedAt without one (OTTR-1261). Unreadable fails the
+	// session signal: null, no suspect on a guessed file.
+	const sessionPath = staleSessionPath(e, sessionsDir, sessionId);
 	let sessionAt: number | null = null;
-	let sessionPath: string | null = null;
-	if (sessionsDir !== null) {
-		// sessionAt comes from the shared helper the supervisor's own session signal
-		// reads; the path picker walks the same flat candidate set, so the tail below
-		// opens the file that mtime names.
-		sessionAt = newestSessionAt(sessionsDir, e.startedAt);
-		sessionPath = newestSessionFile(sessionsDir, e.startedAt)?.path ?? null;
-	}
-	let lastTool: LastTool | null = null;
 	if (sessionPath !== null) {
 		try {
-			const tail = readTailText(sessionPath, SESSION_TAIL_BYTES);
-			if (tail !== null) lastTool = lastToolCall(tail);
+			sessionAt = statSync(sessionPath).mtimeMs;
 		} catch {
-			lastTool = null;
+			sessionAt = null;
 		}
 	}
+	const lastTool = staleSessionLastTool(e, sessionsDir, sessionId);
+	// The last tool command is untrusted text: it selects which facts to read, never
+	// what to execute. Confinement is a fix-time decision, so the probe reads every
+	// candidate kind anywhere on this host.
+	const command = lastTool?.command ?? "";
 	let locks: LockFact[] = [];
 	try {
-		locks = lockFacts(
-			extractLockPaths(lastTool?.command ?? ""),
-			e.cwd,
-			cardNumOf(basename(e.cwd)),
-		);
+		locks = lockFacts(extractLockPaths(command));
 	} catch {
 		locks = [];
 	}
-	return { pid: e.pid, alive, procs, sessionAt, lastTool, locks };
+	let pidFiles: LockFact[] = [];
+	try {
+		pidFiles = pidFileFacts(extractPidPaths(command));
+	} catch {
+		pidFiles = [];
+	}
+	let pids: StaleProbe["pids"] = [];
+	try {
+		pids = extractInlinePids(command).map(({ pid }) => ({
+			pid,
+			alive: pidAlive(pid),
+		}));
+	} catch {
+		pids = [];
+	}
+	let ports: StaleProbe["ports"] = [];
+	try {
+		ports = extractPorts(command).map(({ port }) => ({
+			port,
+			listeners: portListeners(port, procRoot),
+		}));
+	} catch {
+		ports = [];
+	}
+	return {
+		pid: e.pid,
+		alive,
+		procs,
+		sessionAt,
+		lastTool,
+		locks,
+		pidFiles,
+		pids,
+		ports,
+	};
 }
 
 /** One /stalefix answer: ok, or the failed precondition by name. A refusal changes
  * nothing (OTTR-1261). */
 type StaleFixResult = { ok: true } | { ok: false; reason: string };
 
-/** The unlock fix: unlink a lock file whose pid is proven dead. Confinement is
- * re-derived from real paths at act time, so a symlink the session text planted
- * cannot widen the set; the card-number scratch rule applies to the real path too. */
-function staleUnlock(e: { cwd: string }, rawPath: string): StaleFixResult {
+/** The unlock fix: unlink a lock file whose pid is proven dead. Act time adds the
+ * session recheck first (OTTR-1261): the session's last tool call must still name
+ * the path — the turn still waits on it — before the existing preconditions run.
+ * The expect payload carries the diagnosed command; this endpoint reads nothing
+ * else from it. Confinement is re-derived from real paths, so a symlink the
+ * session text planted cannot widen the set; the card-number scratch rule applies
+ * to the real path too. A refusal changes nothing. */
+function staleUnlock(
+	e: { cwd: string; startedAt: number; dataDir?: string | null },
+	rawPath: string,
+	_expect: { sessionCommand: string },
+	sessionsDir: string | null,
+	sessionId: string | null,
+): StaleFixResult {
+	const current = staleSessionLastTool(e, sessionsDir, sessionId);
+	if (
+		current === null ||
+		normalizeCmd(current.command) === "" ||
+		!normalizeCmd(current.command).includes(normalizeCmd(rawPath))
+	)
+		return {
+			ok: false,
+			reason: `the turn moved on: ${rawPath} is no longer the wait`,
+		};
 	let realCwd: string;
 	let realPath: string;
 	try {
@@ -1952,27 +2051,63 @@ function staleUnlock(e: { cwd: string }, rawPath: string): StaleFixResult {
 	return { ok: true };
 }
 
-/** The kill fix: SIGTERM one process proven to sit strictly inside the run's tree, in a
- * fresh ppid walk. TERM only — never the omp pid, the daemon pid, or pid 1. */
+/** The kill fix: SIGTERM one process the diagnosis proved hung, with every
+ * precondition re-checked at act time (OTTR-1261), in order: a fresh walk over the
+ * proc seam still shows a strict descendant of the run; its current argv still runs
+ * the diagnosed command; the session's last tool call is still that call, unbounded;
+ * the child gained no BUSY_MIN_TICKS window of ticks since the probe; the diagnosed
+ * dependency is still dead. TERM only — never the omp pid, the daemon pid, or pid 1.
+ * A refused check changes nothing. */
 function staleKillChild(
-	e: { pid: number | null },
+	e: { pid: number | null; startedAt: number; dataDir?: string | null },
 	pid: number,
+	expect: KillExpect,
 	procRoot: string,
 	kill: typeof process.kill,
+	sessionsDir: string | null,
+	sessionId: string | null,
 ): StaleFixResult {
 	if (pid === 1) return { ok: false, reason: "pid 1 is never a fix target" };
 	if (pid === process.pid)
 		return { ok: false, reason: "the daemon's own pid is never a fix target" };
 	if (e.pid === null || pid === e.pid)
 		return { ok: false, reason: "the run's own pid is never a fix target" };
-	let ppid: Map<number, number>;
-	try {
-		ppid = procParents(procRoot);
-	} catch {
-		return { ok: false, reason: "the /proc walk failed" };
-	}
-	if (!isStrictDescendant(ppid, pid, e.pid))
-		return { ok: false, reason: `pid ${pid} is not a descendant of the run` };
+	// (a) Fresh walk over the proc seam: readTree holds the run pid plus its
+	// descendants only, so a hit here is still a strict descendant.
+	const procs = readTree(e.pid, procRoot);
+	if (procs === null) return { ok: false, reason: "the run pid is gone" };
+	const child = procs.find((s) => s.pid === pid);
+	if (child === undefined)
+		return {
+			ok: false,
+			reason: `pid ${pid} is not in the turn's process tree`,
+		};
+	// (b) The child's current argv still runs the diagnosed command. An empty
+	// expect command matches everything, so it refuses instead.
+	const want = normalizeCmd(expect.sessionCommand);
+	if (want === "")
+		return { ok: false, reason: "no session command to re-check" };
+	if (!normalizeCmd(child.command).includes(want))
+		return { ok: false, reason: "the child's command changed" };
+	// (c) The session's last tool call is still the diagnosed call, unbounded —
+	// the agent has not moved on.
+	const current = staleSessionLastTool(e, sessionsDir, sessionId);
+	if (
+		current === null ||
+		normalizeCmd(current.command) !== want ||
+		current.timeout !== 0
+	)
+		return { ok: false, reason: "the session's last tool call changed" };
+	// (d) The child has not resumed: under the BUSY_MIN_TICKS window since the probe.
+	if (child.ticks > expect.ticks + BUSY_MIN_TICKS - 1)
+		return {
+			ok: false,
+			reason: `the child resumed: ${child.ticks - expect.ticks} ticks gained`,
+		};
+	// (e) The diagnosed dependency is still dead.
+	if (!depStillDead(expect.dep, procRoot))
+		return { ok: false, reason: "the dependency cleared" };
+	// (f) Every precondition held on this host: TERM that child only.
 	try {
 		kill(pid, "SIGTERM");
 	} catch (err) {
@@ -1982,6 +2117,19 @@ function staleKillChild(
 		};
 	}
 	return { ok: true };
+}
+
+/** The diagnosed dependency is still dead at act time (OTTR-1261): a lock or pid
+ * file still names the diagnosed pid and that pid is gone on this host, an inline
+ * pid is gone, a port still has no listener. An unreadable file or net table fails
+ * closed — the dependency did not prove dead. */
+function depStillDead(dep: DepProof, procRoot: string): boolean {
+	if (dep.kind === "inline") return !pidAlive(dep.pid);
+	if (dep.kind === "port") return portListeners(dep.port, procRoot) === 0;
+	const text = readHeadText(dep.path, 1024) ?? "";
+	const parsed =
+		dep.kind === "lockfile" ? parseLockPid(text) : parsePidFile(text);
+	return parsed !== null && parsed === dep.pid && !pidAlive(parsed);
 }
 
 /** POST /sweep to a worker: kills the processes whose worktree is gone on that host. */
@@ -2116,6 +2264,23 @@ function isLockFactAnswer(f: unknown): boolean {
 	);
 }
 
+/** One inline pid fact on the wire. */
+function isPidSampleAnswer(s: unknown): boolean {
+	if (typeof s !== "object" || s === null) return false;
+	const o = s as Record<string, unknown>;
+	return typeof o.pid === "number" && typeof o.alive === "boolean";
+}
+
+/** One port fact on the wire. */
+function isPortFactAnswer(s: unknown): boolean {
+	if (typeof s !== "object" || s === null) return false;
+	const o = s as Record<string, unknown>;
+	return (
+		typeof o.port === "number" &&
+		(o.listeners === null || typeof o.listeners === "number")
+	);
+}
+
 /** The /runprobe answer shape; any field off it fails whole. */
 function isStaleProbeAnswer(v: unknown): v is StaleProbe {
 	if (typeof v !== "object" || v === null) return false;
@@ -2128,17 +2293,77 @@ function isStaleProbeAnswer(v: unknown): v is StaleProbe {
 		(o.sessionAt === null || typeof o.sessionAt === "number") &&
 		isLastToolAnswer(o.lastTool) &&
 		Array.isArray(o.locks) &&
-		o.locks.every(isLockFactAnswer)
+		o.locks.every(isLockFactAnswer) &&
+		Array.isArray(o.pidFiles) &&
+		o.pidFiles.every(isLockFactAnswer) &&
+		Array.isArray(o.pids) &&
+		o.pids.every(isPidSampleAnswer) &&
+		Array.isArray(o.ports) &&
+		o.ports.every(isPortFactAnswer)
+	);
+}
+
+/** The request's session id (OTTR-1261): absent, or a non-empty string of at most
+ * 200 chars. It selects the run's own transcript and nothing else. */
+function validSessionId(sessionId: unknown): sessionId is string | undefined {
+	return (
+		sessionId === undefined ||
+		(typeof sessionId === "string" &&
+			sessionId !== "" &&
+			sessionId.length <= 200)
+	);
+}
+
+/** One dependency proof on the wire (OTTR-1261): where the diagnosed dead state
+ * lives. A lock or pid file names a path and the pid it held; inline names a pid;
+ * port names a port number (0 allowed). */
+function validDepProof(dep: unknown): dep is DepProof {
+	if (typeof dep !== "object" || dep === null) return false;
+	const d = dep as Record<string, unknown>;
+	const pidOk = (v: unknown): v is number =>
+		typeof v === "number" && Number.isInteger(v) && v > 0;
+	if (d.kind === "inline") return pidOk(d.pid);
+	if (d.kind === "port")
+		return (
+			typeof d.port === "number" && Number.isInteger(d.port) && d.port >= 0
+		);
+	if (d.kind === "lockfile" || d.kind === "pidfile")
+		return typeof d.path === "string" && d.path !== "" && pidOk(d.pid);
+	return false;
+}
+
+/** The unlock request's expect (OTTR-1261): the diagnosed command rides with the
+ * fix; the worker's unlock re-checks read nothing else from it. */
+function validUnlockExpect(
+	expect: unknown,
+): expect is { sessionCommand: string } {
+	if (typeof expect !== "object" || expect === null) return false;
+	return typeof (expect as Record<string, unknown>).sessionCommand === "string";
+}
+
+/** The kill request's expect payload (OTTR-1261): the diagnosis the act-time
+ * recheck compares against — the diagnosed command, the child's probe ticks, and
+ * the dead dependency. */
+function validKillExpect(expect: unknown): expect is KillExpect {
+	if (typeof expect !== "object" || expect === null) return false;
+	const e = expect as Record<string, unknown>;
+	if (typeof e.sessionCommand !== "string") return false;
+	if (!validDepProof(e.dep)) return false;
+	return (
+		typeof e.ticks === "number" && Number.isInteger(e.ticks) && e.ticks >= 0
 	);
 }
 
 /** POST /runprobe to a worker: the read-only stale-turn facts for one run id
- * (OTTR-1261). Null when the worker answered 200 with a body off the StaleProbe shape;
+ * (OTTR-1261). The session id picks the run's own transcript on the worker when the
+ * caller knows it; null/absent keeps the newest-since-start fallback (still only a
+ * signal). Null when the worker answered 200 with a body off the StaleProbe shape;
  * transport failures and non-200 answers throw WorkerConnectError. */
 export async function probeRun(
 	target: WorkerTarget,
 	url: string,
 	runId: string,
+	sessionId?: string | null,
 ): Promise<StaleProbe | null> {
 	let res: Response;
 	try {
@@ -2148,7 +2373,7 @@ export async function probeRun(
 				"content-type": "application/json",
 				...(target.token ? { "x-otwr-token": target.token } : {}),
 			},
-			body: JSON.stringify({ run: runId }),
+			body: JSON.stringify({ run: runId, ...(sessionId && { sessionId }) }),
 			// redirect: "manual": the worker token must never follow a redirect off-host.
 			redirect: "manual",
 			signal: AbortSignal.timeout(10_000),
@@ -2169,15 +2394,29 @@ export async function probeRun(
 }
 
 /** POST /stalefix to a worker: one allowlisted stale-turn fix, with the act-time
- * preconditions re-checked on the worker that owns the run (OTTR-1261). Null when the
- * 200 body is off the fix-answer shape; transport failures and non-200 answers throw
- * WorkerConnectError. */
+ * preconditions re-checked on the worker that owns the run (OTTR-1261). Both fixes
+ * carry the diagnosis (`expect`); `sessionId` picks the run's own transcript for the
+ * act-time session recheck when the caller knows it. The request passes through
+ * verbatim. Null when the 200 body is off the fix-answer shape; transport failures
+ * and non-200 answers throw WorkerConnectError. */
 export async function staleFix(
 	target: WorkerTarget,
 	url: string,
 	req:
-		| { run: string; action: "unlock"; path: string }
-		| { run: string; action: "kill"; pid: number },
+		| {
+				run: string;
+				action: "unlock";
+				path: string;
+				expect: { sessionCommand: string };
+				sessionId?: string;
+		  }
+		| {
+				run: string;
+				action: "kill";
+				pid: number;
+				expect: KillExpect;
+				sessionId?: string;
+		  },
 ): Promise<{ ok: boolean; reason?: string } | null> {
 	let res: Response;
 	try {
