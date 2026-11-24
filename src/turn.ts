@@ -3906,7 +3906,8 @@ export function createTurnLoop(
 				t.stage === "merging" &&
 				(t.state === "running" ||
 					t.state === "preparing" ||
-					(t.state === "queued" && mergeHold(live, t) === null)),
+					(t.state === "queued" &&
+						mergeHold(live, t, { now: Date.now() }) === null)),
 		);
 	}
 

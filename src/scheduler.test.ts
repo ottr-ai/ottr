@@ -51,11 +51,14 @@ import {
 	pickRunnable,
 	pushHold,
 	queueOrder,
+	REVIEW_HOLD_MAX_MS,
+	type ReviewHoldDetail,
 	releaseHeldMerges,
 	repeatedBugClasses,
 	resolveDep,
 	reviewBlocked,
 	reviewFindings,
+	reviewHoldsFor,
 	SILENT_LOG_MS,
 	selectFindings,
 	silentSince,
@@ -670,7 +673,163 @@ describe("pickRunnable", () => {
 		expect(mergeHold([review, other, finding], other)).toBe(
 			"waiting for the review to finish",
 		);
-		expect(pickRunnable([review, other, finding], opts)).toEqual([finding]);
+		// The pick runs on the real clock (mergeSlot), so pin one inside the 48 h bound.
+		expect(
+			pickRunnable([review, other, finding], {
+				...opts,
+				now: review.createdAt + 60_000,
+			}),
+		).toEqual([finding]);
+	});
+
+	test("an architecture review whose gate never passes frees unrelated merges past the cap (OTTR-1253)", () => {
+		// The OTTR-1186 stall: the review sits in_progress (needs_you on a mutation run that
+		// cannot pass) while every queued merge waits. Inside the bound the hold still gates;
+		// past it the unrelated merge lands (fails before the fix: the hold never expired).
+		const review = task({
+			kind: "review",
+			stage: "in_progress",
+			state: "needs_you",
+			createdAt: 1_000,
+		});
+		const waiting = task({ stage: "merging", queuedAt: 2_000 });
+		const now = 1_000 + REVIEW_HOLD_MAX_MS;
+		expect(mergeHold([review, waiting], waiting, { now: now - 1 })).toBe(
+			"waiting for the review to finish",
+		);
+		expect(mergeHold([review, waiting], waiting, { now })).toBeNull();
+		expect(pickRunnable([review, waiting], { ...opts, now })).toEqual([
+			waiting,
+		]);
+	});
+
+	test("a done review's open findings stop holding merges past the cap (OTTR-1253)", () => {
+		const review = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 900,
+			doneAt: 1_000,
+		});
+		const finding = task({ followUpOf: review.id, createdAt: 950 });
+		const waiting = task({ stage: "merging", queuedAt: 100 });
+		const now = 1_000 + REVIEW_HOLD_MAX_MS;
+		expect(mergeHold([review, finding, waiting], waiting)).toBe(
+			"waiting for the review's findings to be implemented",
+		);
+		expect(mergeHold([review, finding, waiting], waiting, { now })).toBeNull();
+	});
+
+	test("a done review's finding is not held by another review's running hold (OTTR-1253, OTTR-940 class)", () => {
+		// The observed cycle: review R runs a gate whose score needs finding F's fix, and R's
+		// running hold kept F from merging. F is the older review's finding, so it must stay
+		// schedulable (fails before the fix: "waiting for the review to finish").
+		const done = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		const finding = task({
+			followUpOf: done.id,
+			createdAt: 300,
+			stage: "merging",
+			queuedAt: 600,
+		});
+		const running = task({
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			createdAt: 400,
+		});
+		expect(mergeHold([done, finding, running], finding)).toBeNull();
+		expect(pickRunnable([done, finding, running], opts)).toEqual([finding]);
+		// The running review still holds work that is nobody's finding (it gates first
+		// when it comes first, and a bare mergeHold call never expires its holds).
+		const unrelated = task({ stage: "merging", queuedAt: 100 });
+		expect(mergeHold([running, done, finding, unrelated], unrelated)).toBe(
+			"waiting for the review to finish",
+		);
+	});
+
+	test("a finding still waits for an open release past the cap (OTTR-1253 keeps the release hold)", () => {
+		const release = task({
+			stage: "merging",
+			state: "needs_you",
+			releaseVersion: "v1.2.0",
+			createdAt: 100,
+		});
+		const done = task({
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 200,
+			doneAt: 300,
+		});
+		const finding = task({
+			followUpOf: done.id,
+			createdAt: 250,
+			stage: "merging",
+			queuedAt: 400,
+		});
+		const now = 100 + REVIEW_HOLD_MAX_MS;
+		expect(mergeHold([release, done, finding], finding, { now })).toBe(
+			"waiting for release v1.2.0",
+		);
+	});
+
+	test("reviewHoldsFor names the review, the anchor and the cap of each hold (OTTR-1253)", () => {
+		const review = task({
+			id: "OTTR-1186",
+			kind: "review",
+			stage: "in_progress",
+			state: "needs_you",
+			createdAt: 1_000,
+		});
+		const release = task({
+			id: "OTTR-2",
+			stage: "merging",
+			state: "needs_you",
+			releaseVersion: "v3.0.0",
+			createdAt: 2_000,
+		});
+		const waiting = task({ stage: "merging", queuedAt: 100 });
+		const holds = reviewHoldsFor([review, release, waiting], waiting, 3_000);
+		const running = holds.find(
+			(h) => h.hold === "waiting for the review to finish",
+		);
+		const rel = holds.find((h) => h.hold === "waiting for release v3.0.0");
+		expect((running as ReviewHoldDetail).reviewId).toBe("OTTR-1186");
+		expect((running as ReviewHoldDetail).since).toBe(1_000);
+		expect((running as ReviewHoldDetail).capAt).toBe(
+			1_000 + REVIEW_HOLD_MAX_MS,
+		);
+		expect((rel as ReviewHoldDetail).reviewId).toBe("OTTR-2");
+		expect((rel as ReviewHoldDetail).capAt).toBeNull();
+		// Past the cap the running hold is gone; the uncapped release hold stays.
+		expect(
+			reviewHoldsFor(
+				[review, release, waiting],
+				waiting,
+				1_000 + REVIEW_HOLD_MAX_MS,
+			).map((h) => h.hold),
+		).toEqual(["waiting for release v3.0.0"]);
+		// A card without a finite createdAt never expires (report fixtures).
+		const stampless = task({
+			id: "OTTR-3",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			createdAt: Number.NaN,
+		});
+		expect(
+			reviewHoldsFor(
+				[stampless, waiting],
+				waiting,
+				Number.MAX_SAFE_INTEGER,
+			).map((h) => h.hold),
+		).toEqual(["waiting for the review to finish"]);
 	});
 
 	test("releaseHeldMerges names the queued merges an open release holds", () => {
@@ -835,7 +994,12 @@ describe("pickRunnable", () => {
 		expect(mergeHold([review, finding, other], other)).toBe(
 			"waiting for the review's findings to be implemented",
 		);
-		expect(pickRunnable([review, finding, other], opts)).toEqual([finding]);
+		expect(
+			pickRunnable([review, finding, other], {
+				...opts,
+				now: review.createdAt + 60_000,
+			}),
+		).toEqual([finding]);
 		const fixed = {
 			...finding,
 			stage: "done" as const,
@@ -940,7 +1104,12 @@ describe("pickRunnable", () => {
 		});
 		const other = task({ stage: "merging", queuedAt: 100 });
 		expect(mergeHold([review, finding, other], other)).toBe(FINDINGS_HOLD);
-		expect(pickRunnable([review, finding, other], opts)).toEqual([finding]);
+		expect(
+			pickRunnable([review, finding, other], {
+				...opts,
+				now: (review.doneAt ?? review.createdAt) + 60_000,
+			}),
+		).toEqual([finding]);
 	});
 
 	test("an older release's finding does not wait for a newer open release's findings (OTTR-940)", () => {

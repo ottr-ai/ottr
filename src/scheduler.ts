@@ -169,7 +169,7 @@ export function reviewFindings<T extends ReviewTask>(
  * optional work, not a commitment, so it never holds the review's Done. A lead (the
  * "Needs validation" tag) and a batch validation run never hold it in any stage
  * (OTTR-1128): a promoted lead and its review would otherwise wait on each other.
- * Shared by findingsOpen and reviewHoldFor so the two open rules cannot drift. */
+ * Shared by findingsOpen and reviewHoldDetail so the two open rules cannot drift. */
 function findingOpen(
 	f: Pick<Task, "cancelledAt" | "stage" | "kind"> & LeadMark,
 ): boolean {
@@ -212,7 +212,7 @@ export function pushHold(
 }
 
 /** One live review's findings plus every finding id in the array, for mergeHold and
- * reviewHoldFor. Cached per tasks array (OTTR-940): the state build's release stamps
+ * reviewHoldsFor. Cached per tasks array (OTTR-940): the state build's release stamps
  * and stall warnings call mergeHold once per task per release on one array, and
  * reviewFindings walks every card per review — uncached that repeats the whole walk
  * per call. The array is read-only while cached: every call site passes a fresh store
@@ -242,21 +242,90 @@ function reviewClosure(tasks: readonly ReviewTask[]): {
 	return c;
 }
 
-/** The hold `merge` waits under while the open review `r` gates the target, else null when
- * `merge` is exempt (it is `r` itself, or one of `r`'s findings — those never wait).
- * `findings` is `r`'s findings from the shared reviewClosure; `mergeIsFinding` says
- * `mergeId` is a finding of some review, not necessarily `r`. */
-function reviewHoldFor(
+/** The bound after which the review-running and findings holds stop gating a queued merge
+ * (docs/specs/review-hold-throughput.md, OTTR-1253): a review, its findings, and its gates
+ * must never hold every other merge for days. The release hold stays uncapped. */
+export const REVIEW_HOLD_MAX_MS = 48 * 60 * 60_000;
+
+/** One review hold on a queued merge, with the facts the board report names: the review
+ * that holds, the anchor the hold counts from, and when the cap frees the merge (null for
+ * the uncapped release hold, or when the anchor is not a finite timestamp). */
+export type ReviewHoldDetail = {
+	reviewId: string;
+	hold: string;
+	since: number;
+	capAt: number | null;
+};
+
+/** Builds one hold under the cap, or null once `now` is past it. A `now` of undefined
+ * keeps the hold: every caller without `now` keeps the uncapped legacy behavior. A
+ * non-finite anchor (a card without createdAt, as in report fixtures) never expires. */
+function cappedHold(
+	reviewId: string,
+	hold: string,
+	since: number,
+	now: number | undefined,
+): ReviewHoldDetail | null {
+	const capAt = since + REVIEW_HOLD_MAX_MS;
+	if (!Number.isFinite(capAt)) return { reviewId, hold, since: 0, capAt: null };
+	if (now !== undefined && now >= capAt) return null;
+	return { reviewId, hold, since, capAt };
+}
+
+/** The holds the open reviews put on `merge`, in review order — the first one gates. Each
+ * carries its review id, anchor, and cap time. Pure. `now` turns the 48 h cap on
+ * (OTTR-1253); without it the holds never expire, so existing callers keep their behavior. */
+export function reviewHoldsFor(
+	tasks: readonly ReviewTask[],
+	merge: Pick<Task, "id">,
+	now?: number,
+): ReviewHoldDetail[] {
+	const { byReview, anyFinding } = reviewClosure(tasks);
+	const out: ReviewHoldDetail[] = [];
+	for (const r of tasks) {
+		if (r.id === merge.id || r.cancelledAt !== null || !isReview(r)) continue;
+		const held = reviewHoldDetail(
+			byReview.get(r.id) ?? [],
+			r,
+			merge.id,
+			anyFinding.has(merge.id),
+			now,
+		);
+		if (held !== null) out.push(held);
+	}
+	return out;
+}
+
+/** The hold the open review `r` puts on `merge`, else null when `merge` is exempt: it is
+ * `r` itself, one of `r`'s findings, or — OTTR-1253 — a finding of some other review. A
+ * finding never waits for a review to finish or for that review's findings, so a review
+ * whose gate needs a finding's fix cannot hold the fix it needs (OTTR-940 broke this cycle
+ * for the findings hold; the exemption now also covers the running hold). `findings` is
+ * `r`'s findings from the shared reviewClosure; `mergeIsFinding` says `mergeId` is a
+ * finding of some review, not necessarily `r`. */
+function reviewHoldDetail(
 	findings: readonly ReviewTask[],
 	r: ReviewTask,
 	mergeId: string,
 	mergeIsFinding: boolean,
-): string | null {
+	now: number | undefined,
+): ReviewHoldDetail | null {
 	if (findings.some((f) => f.id === mergeId)) return null;
 	if (r.releaseVersion !== null && r.stage !== "done")
-		return `waiting for release ${r.releaseVersion}`;
+		return {
+			reviewId: r.id,
+			hold: `waiting for release ${r.releaseVersion}`,
+			since: r.createdAt,
+			capAt: null,
+		};
+	if (mergeIsFinding) return null;
 	if (r.stage === "todo" || r.stage === "in_progress")
-		return "waiting for the review to finish";
+		return cappedHold(
+			r.id,
+			"waiting for the review to finish",
+			r.createdAt,
+			now,
+		);
 	// Parked at merging until its findings are done (findingsHold); a done review reaches
 	// this with open findings only through a finding that was a commitment when it
 	// finished. A finding the store flagged as a parked backlog lead at doneAt never
@@ -265,51 +334,41 @@ function reviewHoldFor(
 	// promotes later must not park every merge the review's done had freed. The flag is
 	// the store's record of the stage at doneAt (runTaskUpdate stamps it when the review
 	// lands done; the migration backfills it from the stage history), so a re-queue
-	// cannot blur it the way the queuedAt stamp would. A finding of another review never
-	// takes this hold (OTTR-940): it is the only hold edge that can close a wait cycle
-	// through a finding — a release's own completion waits only on its findings, which
-	// are exempt from their own review above — so this exemption breaks every cycle. The
-	// release and review-running holds stay: an open release can gate a finding, and it
-	// settles once its own findings merge.
+	// cannot blur it the way the queuedAt stamp would.
 	if (
-		!mergeIsFinding &&
-		(r.stage === "merging" ||
-			findings.some(
-				(f) => findingOpen(f) && (r.stage !== "done" || !f.leadAtDone),
-			))
+		r.stage === "merging" ||
+		findings.some(
+			(f) => findingOpen(f) && (r.stage !== "done" || !f.leadAtDone),
+		)
 	)
-		return "waiting for the review's findings to be implemented";
+		return cappedHold(r.id, FINDINGS_HOLD, r.doneAt ?? r.createdAt, now);
 	return null;
 }
 
-/** Why the tracker holds a queued merge, else null. While a review runs, and until its findings are
- * done, only its findings merge; every other card waits in merging. So the next review counts from
- * exactly the commit this one saw, and a release ships only reviewed work plus the fixes it asked
- * for. Findings themselves never wait for a findings hold — not for their own review's, and not
- * (OTTR-940) for another review's: an older done review's finding and a newer open release would
- * otherwise hold each other and park every merge of the project. They still wait for an open
- * release itself and for a running review. A done review holds other merges only behind findings
- * that were commitments when it finished: a finding that was still a parked backlog lead at doneAt
- * stays optional work after the user promotes it and never holds (OTTR-963). While local main has
- * commits origin lacks (a rejected server push, `o.mainUnpushed`), every
- * queued merge but the rejected card's rebase retry waits too (pushHold). With `o.prMode`, main
- * is never written locally, so that hold is inert. */
+/** Why the tracker holds a queued merge, else null. While a review runs, and until its
+ * findings are done, only findings merge; every other card waits in merging. OTTR-1253
+ * bounds the two review holds: past `REVIEW_HOLD_MAX_MS` from the review's anchor (the
+ * card's createdAt for the running hold, its doneAt for the findings hold) the hold stops
+ * gating, so a review whose gate cannot pass never stalls the project for days. A finding
+ * of any live review never takes either hold (OTTR-940, OTTR-1253): a review that needs a
+ * finding's fix cannot hold that fix. The release hold stays uncapped, and a done review
+ * holds other merges only behind findings that were commitments when it finished: a
+ * finding that was still a parked backlog lead at doneAt stays optional work after the
+ * user promotes it and never holds (OTTR-963). While local main has commits origin lacks
+ * (a rejected server push, `o.mainUnpushed`), every queued merge but the rejected card's
+ * rebase retry waits too (pushHold). With `o.prMode`, main is never written locally, so
+ * that hold is inert. `o.now` turns the cap on; without it the holds never expire. */
 export function mergeHold(
 	tasks: readonly ReviewTask[],
 	merge: Pick<Task, "id" | "stage" | "state" | "pushRetries" | "pendingBy">,
-	o: { mainUnpushed?: boolean; prMode?: boolean } = {},
+	o: {
+		now?: number;
+		mainUnpushed?: boolean;
+		prMode?: boolean;
+	} = {},
 ): string | null {
-	const { byReview, anyFinding } = reviewClosure(tasks);
-	for (const r of tasks) {
-		if (r.id === merge.id || r.cancelledAt !== null || !isReview(r)) continue;
-		const held = reviewHoldFor(
-			byReview.get(r.id) ?? [],
-			r,
-			merge.id,
-			anyFinding.has(merge.id),
-		);
-		if (held !== null) return held;
-	}
+	const held = reviewHoldsFor(tasks, merge, o.now)[0]?.hold ?? null;
+	if (held !== null) return held;
 	if (o.mainUnpushed === true && o.prMode !== true) {
 		const held = pushHold(true, merge);
 		if (held !== null) return held;
@@ -712,6 +771,9 @@ function mergeSlot(
 			(t) =>
 				t.stage === "merging" &&
 				mergeHold(live, t, {
+					// Same default as pickRunnable's holdUntil check: the cap runs on real
+					// time unless the caller pins a clock.
+					now: o.now ?? Date.now(),
 					mainUnpushed: o.mainUnpushed === true,
 					prMode: o.prMode === true,
 				}) === null &&

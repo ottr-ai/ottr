@@ -26,6 +26,7 @@ export type Card = {
 	holdUntil?: number | null;
 	cancelledAt?: number | null;
 	followUpOf?: string | null;
+	createdAt?: number;
 	updatedAt?: number;
 	/** Carried by real TaskCard rows (src/types.ts); mergeHold's isReview reads them. */
 	kind?: string;
@@ -239,41 +240,78 @@ export type MergeHold = (
 		pushRetries?: number;
 		pendingBy?: string | null;
 	},
+	o?: { now?: number },
 ) => string | null;
 
 /** leadValidationHold's shape (src/scheduler.ts) over the same loose view. */
 export type LeadHold = (lead: Card) => string | null;
 
-/** Loads mergeHold and leadValidationHold from the first candidate that imports; nulls
- * with the collected errors when none does — report() prints the errors and renders the
- * rest without the scheduler holds. */
+/** One review hold as reviewHoldsFor returns it (src/scheduler.ts, docs/specs/review-hold-throughput.md). */
+export type ReviewHoldDetail = {
+	reviewId: string;
+	hold: string;
+	since: number;
+	capAt: number | null;
+};
+
+/** reviewHoldsFor's shape; null when the loaded scheduler predates the review-hold cap — the report
+ * then falls back to the bare mergeHold strings. */
+export type ReviewHoldsFor = (
+	tasks: Card[],
+	merge: { id: string },
+	now?: number,
+) => ReviewHoldDetail[];
+
+/** Loads mergeHold, leadValidationHold and reviewHoldsFor from the first candidate that
+ * imports; nulls with the collected errors when none does — report() prints the errors
+ * and renders the rest without the scheduler holds. */
 export async function resolveMergeHold(candidates: readonly string[]): Promise<{
 	mergeHold: MergeHold | null;
 	leadHold: LeadHold | null;
+	reviewHoldsFor: ReviewHoldsFor | null;
 	error: string;
 }> {
 	const errors: string[] = [];
 	for (const c of candidates) {
 		try {
-			const mod = (await import(c)) as {
-				mergeHold?: unknown;
-				leadValidationHold?: unknown;
+			const mod = (await import(c)) as Record<string, unknown>;
+			if (typeof mod.mergeHold !== "function") {
+				errors.push(`${c}: no mergeHold export`);
+				continue;
+			}
+			return {
+				mergeHold: mod.mergeHold as MergeHold,
+				leadHold:
+					typeof mod.leadValidationHold === "function"
+						? (mod.leadValidationHold as LeadHold)
+						: null,
+				reviewHoldsFor:
+					typeof mod.reviewHoldsFor === "function"
+						? (mod.reviewHoldsFor as ReviewHoldsFor)
+						: null,
+				error: "",
 			};
-			if (typeof mod.mergeHold === "function")
-				return {
-					mergeHold: mod.mergeHold as MergeHold,
-					leadHold:
-						typeof mod.leadValidationHold === "function"
-							? (mod.leadValidationHold as LeadHold)
-							: null,
-					error: "",
-				};
-			errors.push(`${c}: no mergeHold export`);
 		} catch (e) {
 			errors.push(`${c}: ${String(e).slice(0, 120)}`);
 		}
 	}
-	return { mergeHold: null, leadHold: null, error: errors.join("; ") };
+	return {
+		mergeHold: null,
+		leadHold: null,
+		reviewHoldsFor: null,
+		error: errors.join("; "),
+	};
+}
+
+/** A hold duration as one short token: Xm below an hour, one-decimal hours below the
+ * 48 h cap, one-decimal days past it. Non-finite input (a card without createdAt) gives null. */
+export function holdDuration(ms: number): string | null {
+	if (!Number.isFinite(ms) || ms < 0) return null;
+	const m = Math.round(ms / 60_000);
+	if (m < 60) return `${m}m`;
+	const h = ms / 3_600_000;
+	if (h < 48) return `${h.toFixed(1)}h`;
+	return `${(ms / 86_400_000).toFixed(1)}d`;
 }
 
 const ORDER: Record<string, number> = {
@@ -303,18 +341,41 @@ function logAgeSeconds(c: Card, now: number): number | null {
 		? Math.round((now - statSync(log).mtimeMs) / 1000)
 		: null;
 }
-
-/** mergeHold's hold for the merging card c, null for other cards or when mergeHold
- * answers null, an error note in place of the hold when mergeHold throws. */
-function mergeHoldFor(
+/** One queued merge's hold note: the hold string mergeHold returns, enriched with the
+ * holding review, the held time and the cap when the loaded scheduler exposes
+ * reviewHoldsFor (the review-hold cap). Records the hold for the Open reviews section.
+ * Null for other cards than merging ones or when no scheduler loaded. */
+function holdNote(
 	c: Card,
-	tasks: Card[],
-	mergeHold: MergeHold | null,
+	sameProject: Card[],
+	now: number,
+	mergeHold: MergeHold,
+	reviewHoldsFor: ReviewHoldsFor | null,
+	holdByReview: Map<string, { count: number; d: ReviewHoldDetail; project: string }>,
 ): string | null {
-	if (mergeHold === null || c.stage !== "merging") return null;
-	const sameProject = tasks.filter((t) => t.project === c.project);
 	try {
-		return mergeHold(sameProject, c);
+		const hold = mergeHold(sameProject, c, { now });
+		const d = (reviewHoldsFor?.(sameProject, c, now) ?? [])[0];
+		if (d === undefined) return hold;
+		const dur = holdDuration(now - d.since);
+		const note =
+			d.hold +
+			(dur !== null
+				? ` (review ${d.reviewId}, held ${dur}${
+						d.capAt !== null
+							? `, cap frees at ${new Date(d.capAt).toISOString()}`
+							: ", no cap"
+					})`
+				: "");
+		if (c.state === "queued") {
+			const seen = holdByReview.get(d.reviewId);
+			holdByReview.set(d.reviewId, {
+				count: (seen?.count ?? 0) + 1,
+				d,
+				project: c.project,
+			});
+		}
+		return note;
 	} catch (e) {
 		return `hold unknown: ${String(e).slice(0, 80)}`;
 	}
@@ -371,6 +432,32 @@ function checkoutLine(p: Project): string {
 	return `- ${p.name}: ${head}${files.length > 0 ? ` DIRTY: ${files.join(" ; ")}` : " clean"}${flag}`;
 }
 
+/** The "Open reviews holding merges" section: per holding review, the count of queued
+ * merges it gates, its hold string, how long it has held, and when the cap frees the
+ * merges (the review-hold cap). Empty while no queued merge names a holding review. */
+function openReviewsSection(
+	holdByReview: Map<
+		string,
+		{ count: number; d: ReviewHoldDetail; project: string }
+	>,
+	now: number,
+): string[] {
+	if (holdByReview.size === 0) return [];
+	const out: string[] = ["", "## Open reviews holding merges"];
+	const held = [...holdByReview.entries()].sort(
+		(a, b) => b[1].count - a[1].count,
+	);
+	for (const [id, h] of held) {
+		const cap =
+			h.d.capAt !== null ? new Date(h.d.capAt).toISOString() : "no cap";
+		const frees = h.d.capAt !== null && h.d.capAt <= now;
+		out.push(
+			`- ${h.project}/${id}: holds ${h.count} queued merge${h.count === 1 ? "" : "s"} — "${h.d.hold}" held ${holdDuration(now - h.d.since) ?? "unknown time"} (cap: ${cap}${frees ? ", EXPIRED — the next merge slot ignores it" : ""}).`,
+		);
+	}
+	return out;
+}
+
 export async function report(s: BoardState, now: number): Promise<string> {
 	const open = s.tasks.filter(
 		(t) =>
@@ -380,6 +467,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 	const {
 		mergeHold,
 		leadHold: leadHoldOf,
+		reviewHoldsFor,
 		error,
 	} = await resolveMergeHold(SCHEDULER_CANDIDATES);
 	const running = open.filter(runsOrPrepares).length;
@@ -398,12 +486,29 @@ export async function report(s: BoardState, now: number): Promise<string> {
 		"|---|---|---|---|---|",
 	);
 	const questions: string[] = [];
+	/** The active review holds per holding review, for the Open reviews section. */
+	const holdByReview = new Map<
+		string,
+		{ count: number; d: ReviewHoldDetail; project: string }
+	>();
 	const rows = open
 		.map((c) => {
+			const sameProject = s.tasks.filter((t) => t.project === c.project);
+			const hold =
+				mergeHold !== null && c.stage === "merging"
+					? holdNote(
+							c,
+							sameProject,
+							now,
+							mergeHold,
+							reviewHoldsFor,
+							holdByReview,
+						)
+					: null;
 			const v = verdict(c, {
 				now,
 				logAgeS: logAgeSeconds(c, now),
-				hold: mergeHoldFor(c, s.tasks, mergeHold),
+				hold,
 				leadHold: leadHoldFor(c, leadHoldOf),
 				depsOpen: openDeps(c, byId),
 				drain,
@@ -422,6 +527,8 @@ export async function report(s: BoardState, now: number): Promise<string> {
 		out.push(
 			`| ${c.project}/${c.id} ${cell((c.title ?? "").slice(0, 50))} | ${c.stage}/${c.state} | ${v.verdict} | ${cell(v.note)} | ${cell(c.needsReason ?? "")} |`,
 		);
+	if (holdByReview.size > 0)
+		out.push(...openReviewsSection(holdByReview, now));
 	out.push("", "## Main checkouts");
 	for (const p of s.projects) out.push(checkoutLine(p));
 	if (questions.length > 0) out.push("", "## Questions", ...questions);

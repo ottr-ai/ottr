@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type BoardState,
 	type Card,
 	type Facts,
 	report,
@@ -616,6 +617,75 @@ describe("report", () => {
 			);
 			// The rest of the report still renders.
 			expect(out).toContain("## Main checkouts");
+		} finally {
+			SCHEDULER_CANDIDATES.splice(0, SCHEDULER_CANDIDATES.length, ...original);
+		}
+	});
+
+	test("the merge note names the holding review, the held time and the cap (OTTR-1253)", async () => {
+		// Pin the checkout scheduler: candidates[0] is this container's /app image copy,
+		// which predates OTTR-1253 and has no reviewHoldsFor. The server container's /app
+		// copy is the one production should read.
+		const original = [...SCHEDULER_CANDIDATES];
+		try {
+			SCHEDULER_CANDIDATES.splice(
+				0,
+				SCHEDULER_CANDIDATES.length,
+				SCHEDULER_CANDIDATES[1]!,
+			);
+			const now = F.now;
+			const review = card({
+				id: "OTTR-1186",
+				project: "br",
+				title: "Architecture review",
+				kind: "review",
+				releaseVersion: null,
+				stage: "in_progress",
+				state: "needs_you",
+				createdAt: now - 47 * 3_600_000,
+			});
+			const release = card({
+				id: "OTTR-2",
+				project: "br",
+				kind: "task",
+				releaseVersion: "v3.0.0",
+				stage: "merging",
+				state: "needs_you",
+				createdAt: now - 3_600_000,
+			});
+			const merge = card({
+				id: "T-9",
+				project: "br",
+				stage: "merging",
+				state: "queued",
+				kind: "task",
+				releaseVersion: null,
+			});
+			const state: BoardState = {
+				tasks: [review, release, merge],
+				projects: [{ name: "br", path: "/tmp/unused-br", gitless: true }],
+				maxTotal: 2,
+				drainUntil: null,
+			};
+			const out = await report(state, now);
+			// The running review's note names the review, the held time and the cap instant.
+			expect(out).toContain(
+				`waiting for the review to finish (review OTTR-1186, held 47.0h, cap frees at ${new Date(now + 3_600_000).toISOString()})`,
+			);
+			// The open reviews section counts each review's held merges.
+			expect(out).toContain("## Open reviews holding merges");
+			expect(out).toContain(
+				`- br/OTTR-1186: holds 1 queued merge — "waiting for the review to finish" held 47.0h (cap: ${new Date(now + 3_600_000).toISOString()}).`,
+			);
+
+			// Without the running review, the release's uncapped hold names its review too.
+			const out2 = await report({ ...state, tasks: [release, merge] }, now);
+			expect(out2).toContain(
+				`waiting for release v3.0.0 (review OTTR-2, held 1.0h, no cap)`,
+			);
+			expect(out2).toContain(
+				`- br/OTTR-2: holds 1 queued merge — "waiting for release v3.0.0" held 1.0h (cap: no cap).`,
+			);
 		} finally {
 			SCHEDULER_CANDIDATES.splice(0, SCHEDULER_CANDIDATES.length, ...original);
 		}

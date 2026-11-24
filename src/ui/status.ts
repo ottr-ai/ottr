@@ -299,11 +299,12 @@ export function holdFor(
 	},
 	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
 	foreign?: DepIndex,
+	now?: number,
 ): string | null {
 	if (t.stage === "done") return null;
 	if (t.stage === "merging") {
 		const held =
-			mergeHold(tasks, t) ?? (t.pushHold === true ? PUSH_HOLD : null);
+			mergeHold(tasks, t, { now }) ?? (t.pushHold === true ? PUSH_HOLD : null);
 		if (held !== null) return held;
 	}
 	// A card waiting on its dependencies would not dispatch even with a free microVM, so the

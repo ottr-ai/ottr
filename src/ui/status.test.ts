@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { type DepIndex, type DepProject, findDep } from "../scheduler.ts";
+import {
+	type DepIndex,
+	type DepProject,
+	findDep,
+	REVIEW_HOLD_MAX_MS,
+} from "../scheduler.ts";
 import type { TaskCard } from "../types.ts";
 import {
 	alarmLabel,
@@ -310,6 +315,21 @@ test("holdFor merging: an open review holds the other merges, never its findings
 	const finding = card({ id: "f1", stage: "merging", followUpOf: "r1" });
 	expect(holdFor(finding, [open, finding])).toBeNull();
 	expect(holdFor(merge, [merge])).toBeNull();
+});
+
+test("holdFor: past the 48 h cap the running review no longer holds (OTTR-1253)", () => {
+	const open = review({
+		stage: "in_progress",
+		state: "running",
+		createdAt: 1_000,
+	});
+	const merge = card({ id: "m1", stage: "merging", state: "queued" });
+	expect(
+		holdFor(merge, [open, merge], undefined, 1_000 + REVIEW_HOLD_MAX_MS),
+	).toBeNull();
+	expect(
+		holdFor(merge, [open, merge], undefined, 1_000 + REVIEW_HOLD_MAX_MS - 1),
+	).toBe(MERGE_HOLD);
 });
 
 test("holdFor never holds a card outside todo and merging", () => {

@@ -179,7 +179,7 @@ stage `backlog` when its review finished:
   field is outside `TaskPatch`), and the write only ever sets 1. A re-queue
   rewrites `queuedAt` — the stamp of the last entry into state `queued` — but
   never this flag, so the scheduler can trust it.
-- The scheduler (`reviewHoldFor`, `src/scheduler.ts`): for a review at
+- The scheduler (`reviewHoldDetail`, `src/scheduler.ts`): for a review at
   `stage: "done"`, an open finding holds other merges only when it carries no
   stamp. A stamped finding never holds, also after it leaves the backlog. A
   finding without the stamp was a commitment when the review finished and keeps
@@ -577,7 +577,7 @@ validated lead (for example a confirmed lead) stay normal work.
 - Scheduler: `workSlotReady` never picks a pending sandbox lead for a work
   turn, in stage `todo` or `in_progress`. The grill slot (a backlog card that
   the user starts) does not change.
-- Hold: the shared `findingOpen` rule (`findingsOpen`, `reviewHoldFor`,
+- Hold: the shared `findingOpen` rule (`findingsOpen`, `reviewHoldsFor`,
   `mergeHold`) skips every lead, in every stage, validated or not. It also
   skips every card of kind `validation`. So no lead and no validation run
   holds the review's Done, the release publish, other merges, or the project's
@@ -829,7 +829,7 @@ before the run resolves.
 28. app (red, OTTR-1128): `POST /api/projects/:project/tasks/:id/validate`
     on a review at `merging`/`idle` with backlog leads files exactly one
     validation run.
-29. scheduler (red, OTTR-1128): `reviewHoldFor` returns null when the only
+29. scheduler (red, OTTR-1128): `reviewHoldDetail` returns null when the only
     open findings are leads in `todo` or `in_progress`. `workSlotReady` never
     picks a pending sandbox lead, and still picks an answered deployment-fact
     lead and a confirmed lead.

@@ -368,7 +368,7 @@ A held review uses `merging/idle` plus a non-null reason. This is distinct from 
 
 [`settleReviews`, `turn.ts:3204-3222`](../../src/turn.ts#L3204-L3222) requires a project target. It uses a tick snapshot, excludes cancelled cards from merge-in-flight checks, and waits while a merge can push. [`heldReviewCard`, `turn.ts:3041-3061`](../../src/turn.ts#L3041-L3061) requires merging/idle, a reason, review kind, base, and null latch. [`settleHeldReview`, `turn.ts:3175-3196`](../../src/turn.ts#L3175-L3196) claims local `settling` and `preparing` sets. Those claims do not write task state.
 
-[`reviewFindings`, `scheduler.ts:141-157`](../../src/scheduler.ts#L141-L157) follows finding children and dependencies before the review's `doneAt` cutoff. [`findingOpen`, `scheduler.ts:163-171`](../../src/scheduler.ts#L163-L171) excludes cancelled, done, and backlog findings. Both the review-done hold and `reviewHoldFor` use this predicate. See [`scheduler.ts:198-213`](../../src/scheduler.ts#L198-L213). An unverified backlog lead therefore does not retain a completed review's merge hold.
+[`reviewFindings`, `scheduler.ts:141-157`](../../src/scheduler.ts#L141-L157) follows finding children and dependencies before the review's `doneAt` cutoff. [`findingOpen`, `scheduler.ts:163-171`](../../src/scheduler.ts#L163-L171) excludes cancelled, done, and backlog findings. Both the review-done hold and `reviewHoldDetail` use this predicate. See [`scheduler.ts:198-213`](../../src/scheduler.ts#L198-L213). An unverified backlog lead therefore does not retain a completed review's merge hold.
 
 | Writer and branch | Actual guard | Lifecycle patch |
 | --- | --- | --- |
