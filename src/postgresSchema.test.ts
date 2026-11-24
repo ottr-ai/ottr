@@ -119,9 +119,10 @@ class MigrationProbeDb {
 	) {
 		this.cardFiledIndexdef = cardFiledIndexdef;
 	}
-	/** Rows the step SELECTs read back; the migration loop's only query is the
-	 * OTTR-1252 legacy-lead SELECT, so one array serves the whole run. */
-	queryResults: unknown[] = [];
+	/** Row sets the step SELECTs read back, matched by statement substring:
+	 * the migration loop's queries are the OTTR-1252 findings SELECT and the
+	 * legacy-lead SELECT, so seeds serve the whole run. */
+	querySeeds: { match: string; rows: unknown[] }[] = [];
 
 	exec(statement: string): void {
 		this.executed.push(statement);
@@ -170,7 +171,9 @@ class MigrationProbeDb {
 					? { version }
 					: null;
 			},
-			all: async () => this.queryResults,
+			all: async () =>
+				this.querySeeds.find((seed) => statement.includes(seed.match))?.rows ??
+				[],
 		};
 	}
 
@@ -341,60 +344,84 @@ describe("PostgreSQL migration surface", () => {
 
 	test("the lead wait step converges undecided legacy rows and leaves decided rows alone (OTTR-1252)", async () => {
 		const db = new MigrationProbeDb();
-		// The undecided set: never validated, newest outcome still blocked, and a
-		// deployment result its question card has not settled. The decided set: a
-		// confirmed result, and the operator's applies answer (marker in the
-		// prompt). A duplicate ALTER on a fresh database is impossible here — the
-		// probe has no tables — so the fresh-database ordering is covered by the
+		// The undecided set: never validated, newest outcome still blocked, a
+		// deployment result its question card has not settled, and a grilled
+		// lead whose wiped details hide a blocked finding — the finding record
+		// survives the wipe and rules. The decided set: a confirmed result
+		// (segment and finding agree), the operator's applies answer (marker in
+		// the prompt), and a validated row with no readable record anywhere
+		// (recorded through the started-lead branch, which keeps no findings).
+		// A duplicate ALTER on a fresh database is impossible here — the probe
+		// has no tables — so the fresh-database ordering is covered by the
 		// real-driver suite and the step's outside-projectStepOne placement pin.
-		db.queryResults = [
+		db.querySeeds = [
 			{
-				id: "L1",
-				prompt: "Needs validation: suspicious retry loop",
-				validated_at: null,
-				details: null,
+				match: "FROM review_findings",
+				rows: [
+					{ prompt: "Validation: #L6 blocked" },
+					{ prompt: "Validation: #L4 confirmed" },
+				],
 			},
 			{
-				id: "L2",
-				prompt: "Needs validation: flaky retry",
-				validated_at: 950,
-				details:
-					"\nValidated by validation run #9 on 2026-11-20: still blocked — no retry control.",
-			},
-			{
-				id: "L3",
-				prompt:
-					"Needs validation: proxy header\nBlocker: sandbox run: header control",
-				validated_at: 960,
-				details:
-					"\nValidated by validation run #10 on 2026-11-21: deployment — Which proxy terminates TLS?",
-			},
-			{
-				id: "L4",
-				prompt: "Needs validation: confirmed finding",
-				validated_at: 900,
-				details: "\nValidated by validation run #11 on 2026-11-22: confirmed.",
-			},
-			{
-				id: "L5",
-				prompt:
-					"Needs validation: proxy header\n\nThe user answered the review's question: Applies",
-				validated_at: null,
-				details: null,
-			},
-			{
-				// A later grill replaced the details with its report and wiped the
-				// confirmed segment: validatedAt survives, so the row stays decided.
-				id: "L6",
-				prompt: "Needs validation: grilled confirmed lead",
-				validated_at: 900,
-				details: "Grilled definition of ready",
+				match: "FROM tasks",
+				rows: [
+					{
+						id: "L1",
+						prompt: "Needs validation: suspicious retry loop",
+						validated_at: null,
+						details: null,
+					},
+					{
+						id: "L2",
+						prompt: "Needs validation: flaky retry",
+						validated_at: 950,
+						details:
+							"\nValidated by validation run #9 on 2026-11-20: still blocked — no retry control.",
+					},
+					{
+						id: "L3",
+						prompt:
+							"Needs validation: proxy header\nBlocker: sandbox run: header control",
+						validated_at: 960,
+						details:
+							"\nValidated by validation run #10 on 2026-11-21: deployment — Which proxy terminates TLS?",
+					},
+					{
+						id: "L4",
+						prompt: "Needs validation: confirmed finding",
+						validated_at: 900,
+						details:
+							"\nValidated by validation run #11 on 2026-11-22: confirmed.",
+					},
+					{
+						id: "L5",
+						prompt:
+							"Needs validation: proxy header\n\nThe user answered the review's question: Applies",
+						validated_at: null,
+						details: null,
+					},
+					{
+						// A later grill replaced the details with its report and wiped
+						// the blocked segment; the finding above still says blocked.
+						id: "L6",
+						prompt: "Needs validation: grilled blocked lead",
+						validated_at: 900,
+						details: "Grilled definition of ready",
+					},
+				],
 			},
 		];
 		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
+		// The step consults the findings first: the authoritative outcome source
+		// that a details wipe cannot erase.
+		expect(
+			db.queried.some((statement) =>
+				statement.includes("FROM review_findings"),
+			),
+		).toBe(true);
 		const converged = db.runArgs
 			.filter(([statement]) => statement === CONVERGE_LEAD_WAIT_SQL)
 			.map(([, args]) => (args as unknown[])[0]);
-		expect(converged).toEqual(["L1", "L2", "L3"]);
+		expect(converged).toEqual(["L1", "L2", "L3", "L6"]);
 	});
 });

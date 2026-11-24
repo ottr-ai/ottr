@@ -3600,37 +3600,60 @@ describe("OTTR-1252: the legacy-lead convergence decision reads the newest outco
 	test("legacyLeadWaits waits for undecided rows and keeps decided rows", () => {
 		const prompt = "Needs validation: suspicious retry loop";
 		// Undecided: never validated, still blocked, unanswered deployment.
-		expect(legacyLeadWaits(prompt, null, null)).toBe(true);
-		expect(legacyLeadWaits(prompt, 950, `unverified.${BLOCKED}`)).toBe(true);
-		expect(legacyLeadWaits(prompt, 960, `unverified.${DEPLOYMENT}`)).toBe(true);
+		expect(legacyLeadWaits(prompt, null, null, null)).toBe(true);
+		expect(legacyLeadWaits(prompt, 950, `unverified.${BLOCKED}`, null)).toBe(
+			true,
+		);
+		expect(legacyLeadWaits(prompt, 960, `unverified.${DEPLOYMENT}`, null)).toBe(
+			true,
+		);
 		// Decided: confirmed work, a refuted lead, and the operator's applies
 		// answer (its marker rides the prompt, set by the reply route).
-		expect(legacyLeadWaits(prompt, 900, `unverified.${CONFIRMED}`)).toBe(false);
+		expect(legacyLeadWaits(prompt, 900, `unverified.${CONFIRMED}`, null)).toBe(
+			false,
+		);
 		expect(
-			legacyLeadWaits(prompt, 900, `unverified.${CONFIRMED_WITH_EVIDENCE}`),
+			legacyLeadWaits(
+				prompt,
+				900,
+				`unverified.${CONFIRMED_WITH_EVIDENCE}`,
+				null,
+			),
 		).toBe(false);
 		expect(
 			legacyLeadWaits(
 				`${prompt}\n\nThe user answered the review's question: Applies`,
 				null,
 				null,
+				null,
 			),
 		).toBe(false);
-		// A validatedAt with no readable segment is decided: a later grill
-		// replaces details with its report, wiping the outcome segment — the
-		// recorded outcome predates the wipe, and re-locking the row would
-		// strand work no route can unlock (batching needs validatedAt null, the
-		// reset needs a blocked segment).
-		expect(legacyLeadWaits(prompt, 900, "Grilled definition of ready")).toBe(
-			false,
-		);
-		expect(legacyLeadWaits(prompt, 950, "Grilled definition of ready")).toBe(
-			false,
-		);
+		// The finding record is authoritative and survives a later grill's
+		// details wipe: a grilled lead whose finding says blocked waits again,
+		// and a finding confirmed keeps the row decided even when the details
+		// segment still reads blocked.
+		expect(
+			legacyLeadWaits(prompt, 950, "Grilled definition of ready", "blocked"),
+		).toBe(true);
+		expect(
+			legacyLeadWaits(prompt, 900, "Grilled definition of ready", "confirmed"),
+		).toBe(false);
+		expect(
+			legacyLeadWaits(prompt, 900, `unverified.${BLOCKED}`, "confirmed"),
+		).toBe(false);
+		// A validatedAt with no readable record anywhere is decided: the outcome
+		// was recorded through the started-lead branch, which keeps no findings,
+		// and a later grill wiped the segment — re-locking the row would strand
+		// work no route can unlock (batching needs validatedAt null, the reset
+		// needs a blocked segment).
+		expect(
+			legacyLeadWaits(prompt, 900, "Grilled definition of ready", null),
+		).toBe(false);
 		// Not a lead: the question cards' prefix carries the hyphen.
 		expect(
 			legacyLeadWaits(
 				"Needs-validation lead questions from rev1: reply",
+				null,
 				null,
 				null,
 			),

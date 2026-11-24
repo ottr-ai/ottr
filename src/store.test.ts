@@ -6827,6 +6827,19 @@ describe("review findings storage", () => {
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		raw.exec(PRE_WAITS_TASKS_DDL);
 		raw.exec(EVENTS_DDL);
+		// The findings table exists in every database that reaches the
+		// convergence pass: open's SCHEMA exec creates it before the migration
+		// sequence runs. The legacy shape here models exactly that.
+		raw.exec(`CREATE TABLE IF NOT EXISTS review_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  model TEXT,
+  rank INTEGER,
+  security TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(card_id, prompt)
+)`);
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
 			VALUES
@@ -6846,6 +6859,22 @@ Blocker: sandbox run: header control', 'backlog', 'idle', 'work', 700, 950, 'rev
 					'Unverified lead from review rev1.
 Validated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?'),
 				('grilled1', 'grilled confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 800, 1000, 'rev1', NULL, 900,
+					'Grilled definition of ready')`);
+		// A validation card plus the recorded findings: the authoritative outcome
+		// record that survives the grill's details wipe. The blocked finding
+		// turns a grilled, wiped lead back into undecided work; the confirmed
+		// finding keeps its row decided.
+		raw.exec(`INSERT INTO tasks
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of)
+			VALUES
+				('valcard1', 'validation run', 'Batch validation of 2 lead(s) of review.', 'done', 'idle', 'validation', 900, 950, 'rev1')`);
+		raw.exec(`INSERT INTO review_findings (card_id, prompt, created_at) VALUES
+			('valcard1', 'Validation: #grilled2 blocked', 900),
+			('valcard1', 'Validation: #grilled1 confirmed', 910)`);
+		raw.exec(`INSERT INTO tasks
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
+			VALUES
+				('grilled2', 'grilled blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 850, 1100, 'rev1', NULL, 920,
 					'Grilled definition of ready')`);
 		raw.close();
 
@@ -6895,12 +6924,21 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 		expect(deploy.queuedAt).toBe(950);
 		expect(deploy.validatedAt).toBe(960);
 		// A later grill replaced the confirmed lead's details with its report and
-		// wiped the outcome segment; validatedAt survives, so the row stays
-		// decided work — re-locking it would strand work no route can unlock.
+		// wiped the outcome segment; the finding record still says confirmed, so
+		// the row stays decided work.
 		const grilled = (await store.getTask("grilled1"))!;
 		expect(grilled.stage).toBe("backlog");
 		expect(grilled.waitsValidation).toBe(false);
 		expect(grilled.validatedAt).toBe(900);
+		// The grill wiped the blocked lead's details too, but its recorded
+		// finding says blocked — undecided work that waits again, so a move to
+		// todo cannot start it unconfirmed (batching and the blocked-only reset
+		// can both still decide it).
+		const grilledBlocked = (await store.getTask("grilled2"))!;
+		expect(grilledBlocked.stage).toBe("todo");
+		expect(grilledBlocked.waitsValidation).toBe(true);
+		expect(grilledBlocked.queuedAt).toBe(1100);
+		expect(grilledBlocked.validatedAt).toBe(920);
 
 		// The marker is caller-settable (unlike lead_at_done): the patch round-trips
 		// on getTask and on the list rows.

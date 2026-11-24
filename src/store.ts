@@ -9,7 +9,11 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { retitleBareLeadTitles } from "./auditLeads.ts";
+import {
+	leadCardTitle,
+	retitleBareLeadTitles,
+	validationResult,
+} from "./auditLeads.ts";
 import { mkdirBelow, writeBelow } from "./confine.ts";
 import {
 	closeLocked,
@@ -44,7 +48,12 @@ import {
 	shortTitle,
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
-import { isReview, legacyLeadWaits, queueOrder } from "./scheduler.ts";
+import {
+	isReview,
+	type LeadFindingOutcome,
+	legacyLeadWaits,
+	queueOrder,
+} from "./scheduler.ts";
 import {
 	cleanTitle,
 	firstSessionTitle,
@@ -2827,6 +2836,21 @@ export class ProjectStore {
 						"validated_at",
 					].every((c) => cols.includes(c))
 				) {
+					// The newest recorded outcome per lead id, from review_findings:
+					// the authoritative record that survives a later grill's details
+					// wipe. Ascending order, so the newest row wins the map. The table
+					// predates validated_at, which this block already requires, so it
+					// exists in every database that reaches this pass.
+					const newestOutcome = new Map<string, string>();
+					for (const finding of await db
+						.query<{ prompt: string }, []>(
+							"SELECT prompt FROM review_findings WHERE prompt LIKE 'Validation: #%' ORDER BY created_at ASC, id ASC",
+						)
+						.all()) {
+						const parsed = validationResult(finding.prompt);
+						if (parsed !== null)
+							newestOutcome.set(parsed.leadId, parsed.outcome);
+					}
 					const legacy = await db
 						.query<
 							{
@@ -2841,7 +2865,15 @@ export class ProjectStore {
 						)
 						.all();
 					for (const row of legacy)
-						if (legacyLeadWaits(row.prompt, row.validated_at, row.details))
+						if (
+							legacyLeadWaits(
+								row.prompt,
+								row.validated_at,
+								row.details,
+								(newestOutcome.get(row.id) as LeadFindingOutcome | undefined) ??
+									null,
+							)
+						)
 							await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);
 				}
 				// OTTR-1056: the answered PR-head CI failure. The key is

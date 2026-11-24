@@ -29,6 +29,8 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    then converges per row, idempotent on every open:
 
    ```sql
+   SELECT prompt FROM review_findings
+   WHERE prompt LIKE 'Validation: #%' ORDER BY created_at ASC, id ASC;
    SELECT id, prompt, details, validated_at FROM tasks
    WHERE stage = 'backlog' AND cancelled_at IS NULL
      AND prompt LIKE 'Needs validation%'
@@ -38,19 +40,21 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    ```
 
    Only undecided leads converge (`legacyLeadWaits`, src/scheduler.ts): the
-   newest `Validated by ` segment of the details rules — a confirmed result is
-   normal work the operator may park, a refuted lead stays cancelled, and the
-   operator's applies answer rides its own marker in the prompt — while a
-   never-validated lead, a still-blocked result, or an unanswered deployment
-   result waits. Decided rows keep their stage: their outcome excludes both
-   batching and the blocked-result reset, so re-locking them would strand the
-   work. A validatedAt with no readable segment is decided too — the settle
-   writes a segment in every branch, so a wiped details text (a later grill
-   replaces details with its report) means an outcome was recorded before the
-   text went, and re-locking would strand work no route can unlock. The
-   per-row decision runs in TypeScript because "newest segment" needs
-   newest-wins reading that no LIKE can do. (`Needs-validation lead
-   questions...` does not match the pattern: the hyphen.)
+   newest recorded outcome rules — a confirmed result is normal work the
+   operator may park, a refuted lead stays cancelled, and the operator's
+   applies answer rides its own marker in the prompt — while a never-validated
+   lead, a still-blocked result, or an unanswered deployment result waits.
+   The outcome source, in order: the lead's newest review_findings record
+   (written by every applied result, wiped by nothing), then the newest
+   `Validated by ` segment of the details, then — when neither reads an
+   outcome — a validatedAt means an outcome was recorded through a path that
+   kept no record (the started-lead details-only branch, later wiped by a
+   grill's details replacement), and the row stays decided, because re-locking
+   it would strand work that batching (validatedAt null) and the
+   blocked-only reset (a blocked segment) can never unlock. The per-row
+   decision runs in TypeScript because "newest segment" needs newest-wins
+   reading that no LIKE can do. (`Needs-validation lead questions...` does not
+   match the pattern: the hyphen.)
 3. PostgreSQL: the column lives only in a numbered step, never in
    `projectStepOne` — the steps run on fresh databases too, so a stepOne
    column plus the step's ALTER fails with duplicate_column (the

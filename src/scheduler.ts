@@ -1668,29 +1668,42 @@ export function leadValidationOutcome(
 					: null;
 }
 
+/** The per-lead outcome vocabulary a validation run records in review_findings
+ * (auditLeads.ts validationResult): "blocked" there, "still blocked" in the
+ * details segment the settle also writes. */
+export type LeadFindingOutcome =
+	| "confirmed"
+	| "refuted"
+	| "blocked"
+	| "deployment";
+
 /** Whether a legacy backlog lead row takes the waiting form on convergence
  * (OTTR-1252). Rows that are already decided keep their stage — a confirmed
  * result is normal work, a refuted lead stays cancelled, and the operator's
  * applies answer rides its own marker in the prompt (`The user answered the
  * review's question`, written by the reply route). Everything undecided waits:
  * never validated, the newest result still blocked, or a deployment result its
- * question card has not settled. A validatedAt with no readable segment is
- * decided too: the settle writes a segment in every branch, so a wiped details
- * text (a later grill replaces details with its report) means an outcome was
- * recorded before the text went — keep the row rather than re-lock decided
- * work no route can unlock (batching needs validatedAt null, the reset needs
- * a blocked segment). Unreadable outcomes on never-validated rows wait — for
- * a lead, starting unvalidated work is the failure mode, and the validate
- * flows can still decide it later. Pure. */
+ * question card has not settled. The authoritative outcome is the lead's
+ * newest review_findings record (`newestFindingOutcome`): the settle writes it
+ * for every applied result and no later path wipes it, so it rules even when
+ * the details text went — a later grill replaces details with its report.
+ * Without a finding, the details segment decides the same way; with neither,
+ * a validatedAt means an outcome was recorded through a path that kept no
+ * record (the started-lead details-only branch, later wiped) — keep the row
+ * rather than re-lock work no route can unlock (batching needs validatedAt
+ * null, the reset needs a blocked segment), while a never-validated row
+ * waits: for a lead, starting unvalidated work is the failure mode, and the
+ * validate flows can still decide it later. Pure. */
 export function legacyLeadWaits(
 	prompt: string,
 	validatedAt: number | null,
 	details: string | null,
+	newestFindingOutcome: LeadFindingOutcome | null,
 ): boolean {
 	if (!prompt.startsWith("Needs validation")) return false;
 	if (prompt.includes("\nThe user answered the review's question"))
 		return false;
-	const outcome = leadValidationOutcome(details);
+	const outcome = newestFindingOutcome ?? leadValidationOutcome(details);
 	if (outcome === "confirmed" || outcome === "refuted") return false;
 	if (outcome !== null) return true;
 	return validatedAt === null;

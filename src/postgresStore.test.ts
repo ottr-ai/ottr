@@ -212,11 +212,21 @@ try {
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-answered', 'parked answered lead', E'Needs validation: proxy header\\nThe user answered the review''s question: Applies', 'backlog', 'idle', 'work', 300, 650, 'legacy-review')");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-blocked', 'parked blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 400, 700, 'legacy-review', 750, E'Unverified lead from review legacy-review.\\nValidated by validation run #10 on 2026-11-21: still blocked — no retry control.')");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at) VALUES ('legacy-plain', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 500, 800)");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-valcard', 'validation run', 'Batch validation of 2 lead(s) of review.', 'done', 'idle', 'validation', 600, 850, 'legacy-review')");
+        // The grilled leads: a later grill replaced their details with its
+        // report and wiped the outcome segments, but the recorded findings
+        // survive — blocked waits again, confirmed stays decided work.
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-grilled-blocked', 'grilled blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 700, 900, 'legacy-review', 910, 'Grilled definition of ready')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-grilled-confirmed', 'grilled confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 800, 950, 'legacy-review', 920, 'Grilled definition of ready')");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-blocked blocked', 900)");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-confirmed confirmed', 910)");
       });
       await applyPostgresMigrations(leadDb, projectMigrations);
       assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id LIKE 'legacy-%' ORDER BY id").all()), [
         { id: 'legacy-answered', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
         { id: 'legacy-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 700, validated_at: 750 },
+        { id: 'legacy-grilled-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 900, validated_at: 910 },
+        { id: 'legacy-grilled-confirmed', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 920 },
         { id: 'legacy-lead', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 500, validated_at: null },
         { id: 'legacy-parked', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 700 },
         { id: 'legacy-plain', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
