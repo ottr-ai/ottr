@@ -8,6 +8,7 @@ import { describe, expect, test } from "bun:test";
 import type { PostgresDatabase } from "./postgresDriver.ts";
 import {
 	applyPostgresMigrations,
+	CONVERGE_LEAD_WAIT_SQL,
 	projectMigrationCount,
 	projectMigrations,
 	projectStepFour,
@@ -100,6 +101,8 @@ function codeScanAlertIndexes(
 class MigrationProbeDb {
 	readonly schema = "p_probe_000000000000";
 	readonly executed: string[] = [];
+	readonly runArgs: unknown[][] = [];
+	readonly queried: string[] = [];
 	readonly applied = new Set<number>();
 
 	/** The stub's indexdef state for the card_filed index, null when absent.
@@ -116,6 +119,9 @@ class MigrationProbeDb {
 	) {
 		this.cardFiledIndexdef = cardFiledIndexdef;
 	}
+	/** Rows the step SELECTs read back; the migration loop's only query is the
+	 * OTTR-1252 legacy-lead SELECT, so one array serves the whole run. */
+	queryResults: unknown[] = [];
 
 	exec(statement: string): void {
 		this.executed.push(statement);
@@ -137,6 +143,7 @@ class MigrationProbeDb {
 
 	run(statement: string, args?: unknown[]): void {
 		this.executed.push(statement);
+		this.runArgs.push([statement, args]);
 		if (
 			statement.startsWith("INSERT INTO schema_migrations") &&
 			typeof args?.[0] === "number"
@@ -144,16 +151,17 @@ class MigrationProbeDb {
 			this.applied.add(args[0]);
 	}
 
-	query(sql: string): {
+	query(statement: string): {
 		get: (...params: unknown[]) => Promise<unknown>;
 		all: () => Promise<unknown[]>;
 	} {
+		this.queried.push(statement);
 		return {
 			get: async (...params: unknown[]) => {
 				// The pg_indexes probe reads the stub's tracked index state: the
 				// stub cannot run pg_catalog, so the repair step's reader decision
 				// runs against this staged state.
-				if (sql.includes("pg_catalog.pg_indexes"))
+				if (statement.includes("pg_catalog.pg_indexes"))
 					return this.cardFiledIndexdef === null
 						? null
 						: { indexdef: this.cardFiledIndexdef };
@@ -162,7 +170,7 @@ class MigrationProbeDb {
 					? { version }
 					: null;
 			},
-			all: async () => [],
+			all: async () => this.queryResults,
 		};
 	}
 
@@ -250,13 +258,18 @@ describe("PostgreSQL migration surface", () => {
 		expect(db.executed).toContain(
 			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
 		);
+		// The step really consults the legacy rows (the SELECT carries the cheap
+		// prefilters; the newest-outcome decision runs per row in TypeScript,
+		// which no LIKE can read), and the per-row write is the shared statement.
 		expect(
-			db.executed.some((statement) =>
-				statement.includes(
-					"WHERE stage = 'backlog' AND cancelled_at IS NULL\n\t\t\tAND validated_at IS NULL",
-				),
+			db.queried.some((statement) =>
+				statement.includes("prompt NOT LIKE '%The user answered the review%'"),
 			),
 		).toBe(true);
+		expect(
+			db.executed.filter((statement) => statement === CONVERGE_LEAD_WAIT_SQL),
+			"the probe's SELECT returns no rows, so no convergence write may run",
+		).toEqual([]);
 		// Every step version carries its record; the count derives from the real
 		// step list, so a new store step never desyncs the pin.
 		expect([...db.applied].sort()).toEqual(
@@ -324,5 +337,51 @@ describe("PostgreSQL migration surface", () => {
 		expect(db.cardFiledIndexdef).toBe(
 			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
 		);
+	});
+
+	test("the lead wait step converges undecided legacy rows and leaves decided rows alone (OTTR-1252)", async () => {
+		const db = new MigrationProbeDb();
+		// The undecided set: never validated, newest outcome still blocked, and a
+		// deployment result its question card has not settled. The decided set: a
+		// confirmed result, and the operator's applies answer (marker in the
+		// prompt). A duplicate ALTER on a fresh database is impossible here — the
+		// probe has no tables — so the fresh-database ordering is covered by the
+		// real-driver suite and the step's outside-projectStepOne placement pin.
+		db.queryResults = [
+			{
+				id: "L1",
+				prompt: "Needs validation: suspicious retry loop",
+				details: null,
+			},
+			{
+				id: "L2",
+				prompt: "Needs validation: flaky retry",
+				details:
+					"\nValidated by validation run #9 on 2026-11-20: still blocked — no retry control.",
+			},
+			{
+				id: "L3",
+				prompt:
+					"Needs validation: proxy header\nBlocker: sandbox run: header control",
+				details:
+					"\nValidated by validation run #10 on 2026-11-21: deployment — Which proxy terminates TLS?",
+			},
+			{
+				id: "L4",
+				prompt: "Needs validation: confirmed finding",
+				details: "\nValidated by validation run #11 on 2026-11-22: confirmed.",
+			},
+			{
+				id: "L5",
+				prompt:
+					"Needs validation: proxy header\n\nThe user answered the review's question: Applies",
+				details: null,
+			},
+		];
+		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
+		const converged = db.runArgs
+			.filter(([statement]) => statement === CONVERGE_LEAD_WAIT_SQL)
+			.map(([, args]) => (args as unknown[])[0]);
+		expect(converged).toEqual(["L1", "L2", "L3"]);
 	});
 });

@@ -1634,6 +1634,60 @@ export function validatableReview(
 	);
 }
 
+/** The per-lead outcome vocabulary the validation settle records. */
+export type LeadValidationOutcome =
+	| "confirmed"
+	| "refuted"
+	| "still blocked"
+	| "deployment";
+
+/** The newest recorded validation outcome in a lead's details, else null: the
+ * settle and reset paths append one `Validated by ` segment per result, newest
+ * last, so the last segment rules. The confirmed branch's segment carries the
+ * evidence after the outcome word (`confirmed. <evidence>`), the others split
+ * it off with an em dash — a prefix match reads both. Pure. */
+export function leadValidationOutcome(
+	details: string | null,
+): LeadValidationOutcome | null {
+	if (details === null) return null;
+	const start = details.lastIndexOf("\nValidated by ");
+	if (start === -1) return null;
+	const next = details.indexOf("\nValidated by ", start + 1);
+	const segment = details.slice(start, next === -1 ? undefined : next);
+	const at = segment.indexOf(": ");
+	if (at === -1) return null;
+	const outcome = segment.slice(at + 2).trim();
+	return outcome.startsWith("still blocked")
+		? "still blocked"
+		: outcome.startsWith("confirmed")
+			? "confirmed"
+			: outcome.startsWith("deployment")
+				? "deployment"
+				: outcome.startsWith("refuted")
+					? "refuted"
+					: null;
+}
+
+/** Whether a legacy backlog lead row takes the waiting form on convergence
+ * (OTTR-1252). Rows that are already decided keep their stage — a confirmed
+ * result is normal work, a refuted lead stays cancelled, and the operator's
+ * applies answer rides its own marker in the prompt (`The user answered the
+ * review's question`, written by the reply route). Everything undecided waits:
+ * never validated, the newest result still blocked, or a deployment result its
+ * question card has not settled. Unreadable outcomes wait too — for a lead,
+ * starting unvalidated work is the failure mode, and the validate flows can
+ * still decide it later. Pure. */
+export function legacyLeadWaits(
+	prompt: string,
+	details: string | null,
+): boolean {
+	if (!prompt.startsWith("Needs validation")) return false;
+	if (prompt.includes("\nThe user answered the review's question"))
+		return false;
+	const outcome = leadValidationOutcome(details);
+	return outcome !== "confirmed" && outcome !== "refuted";
+}
+
 /** The needs_you reason for a diverging loop: the blocker counts per round, then the rule(s)
  * that fired — the did-not-drop claim only when the counts rule fired, plus each repeated
  * bug class with its blockers. Pure. */

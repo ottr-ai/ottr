@@ -348,6 +348,7 @@ import {
 	lastReviewBase,
 	leadBlocker,
 	leadValidationStartRefusal,
+	leadValidationOutcome,
 	liveCardOf,
 	mergeAnywayPatch,
 	openWorkBlockers,
@@ -13083,10 +13084,15 @@ export async function createApp(deps: AppDeps) {
 		if (isLead(task) && task.waitsValidation === true) {
 			if (task.followUpOf === null)
 				return json({ error: "the lead does not name a review" }, 409);
-			// A deployment-fact lead never enters a batch (pendingSandboxLead reads
-			// the blocker line): its review's question card decides it, so a run
-			// for this lead cannot exist and the filing would only take siblings.
-			if (leadBlocker(task.prompt).kind === "deployment")
+			// A deployment decision never enters a batch (pendingSandboxLead reads
+			// the blocker line, and a recorded deployment outcome set validatedAt):
+			// its review's question card decides it, so a run for this lead cannot
+			// exist and the filing would only take siblings. The blocker line rides
+			// the prompt; a recorded outcome rides the details — either rules.
+			if (
+				leadBlocker(task.prompt).kind === "deployment" ||
+				leadValidationOutcome(task.details) === "deployment"
+			)
 				return json(
 					{
 						error:

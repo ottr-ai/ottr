@@ -4,6 +4,7 @@ import {
 	getPostgresDatabase,
 	type PostgresDatabase,
 } from "./postgresDriver.ts";
+import { legacyLeadWaits } from "./scheduler.ts";
 
 export function projectSchemaName(name: string): string {
 	const stem = name
@@ -277,28 +278,39 @@ export const projectMigrations: readonly PostgresMigration[] = [
 		);
 	},
 	// OTTR-1252: the lead wait marker — the same convergence the SQLite open runs
-	// (docs/specs/lead-waits-validation.md). Step 1 keeps the column on fresh
-	// databases; this step adds it to schemas from before waiting leads existed
-	// and moves their backlog leads into the waiting form. Only never-validated
-	// leads converge: a lead with a recorded outcome parked in backlog (a
-	// confirmed or applies answer the operator parked) is normal work and keeps
-	// its stage — its outcome prevents both batching and the blocked-result
-	// reset, so re-locking it would strand the work. Idempotent: only
-	// stage-backlog rows match, so a converged lead (now todo) and every done,
-	// cancelled or validated row never match again, and queued_at is never
-	// restamped. The 'Needs-validation lead questions' prefix does not match
-	// (the hyphen), so the question cards stay untouched.
+	// (docs/specs/lead-waits-validation.md). The column lives in this step, not in
+	// projectStepOne: the steps run on fresh databases too, so a stepOne column
+	// plus this step's ALTER would fail with duplicate_column (source_issue and
+	// posted_via follow the same outside-stepOne rule). Only undecided leads
+	// converge — legacyLeadWaits reads the newest Validated-by segment, which no
+	// LIKE can do (newest-wins), so the pass decides per row: a confirmed result,
+	// a refuted lead, or the operator's applies answer (marker in the prompt) is
+	// decided work that keeps its stage; never-validated, still-blocked and
+	// unanswered deployment leads take the waiting form. Idempotent: only
+	// stage-backlog rows match, so a converged lead (now todo) never matches
+	// again, and queued_at is never restamped. The 'Needs-validation lead
+	// questions' prefix does not match (the hyphen), so the question cards stay
+	// untouched.
 	async (db) => {
 		await db.exec(
 			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
 		);
-		await db.run(`UPDATE tasks SET stage = 'todo', state = 'queued',
-			waits_validation = 1, queued_at = updated_at
-		WHERE stage = 'backlog' AND cancelled_at IS NULL
-			AND validated_at IS NULL
-			AND prompt LIKE 'Needs validation%'`);
+		const legacy = await db
+			.query<{ id: string; prompt: string; details: string | null }, []>(
+				"SELECT id, prompt, details FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+			)
+			.all();
+		for (const row of legacy)
+			if (legacyLeadWaits(row.prompt, row.details))
+				await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);
 	},
 ];
+
+/** One legacy backlog lead row's convergence write (OTTR-1252): the waiting
+ * form, queued_at stamped from the row's updated_at. The SQLite open and the
+ * PostgreSQL step share the statement so both engines converge identically. */
+export const CONVERGE_LEAD_WAIT_SQL =
+	"UPDATE tasks SET stage = 'todo', state = 'queued', waits_validation = 1, queued_at = updated_at WHERE id = ?";
 
 /** How many versioned steps the store's own project migrations carry. The PG
  * tests probe rollback behavior on the next free version, so their probe steps
@@ -414,7 +426,6 @@ export const projectStepOne: readonly string[] = [
 		merge_head text, follow_up_of_project text, context_tokens bigint,
 		uncommitted_files text NOT NULL DEFAULT '[]', proposal_summary text,
 		findings_checked_at bigint, lead_at_done bigint, validated_at bigint,
-		waits_validation bigint NOT NULL DEFAULT 0,
 		ci_pr_answered_key text, ci_pr_answered_info text
 	)`,
 	`CREATE TABLE trending_verdict (

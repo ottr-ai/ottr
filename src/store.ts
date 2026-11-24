@@ -26,6 +26,7 @@ import {
 	type StoreDatabase,
 } from "./postgresDriver.ts";
 import {
+	CONVERGE_LEAD_WAIT_SQL,
 	initializeProjectSchema,
 	projectSchemaName,
 } from "./postgresSchema.ts";
@@ -43,7 +44,7 @@ import {
 	shortTitle,
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
-import { isReview, queueOrder } from "./scheduler.ts";
+import { isReview, legacyLeadWaits, queueOrder } from "./scheduler.ts";
 import {
 	cleanTitle,
 	firstSessionTitle,
@@ -2798,15 +2799,19 @@ export class ProjectStore {
 					"ALTER TABLE tasks ADD COLUMN waits_validation INTEGER NOT NULL DEFAULT 0",
 				);
 				// OTTR-1252: the pre-marker backlog leads converge to the waiting form
-				// (todo/queued, queued_at = updated_at, marker set) on every open.
-				// Only never-validated leads converge: a lead with a recorded outcome
-				// parked in backlog (a confirmed or applies answer the operator parked)
-				// is normal work and must keep its stage — its outcome prevents both
-				// batching and the blocked-result reset, so re-locking it would strand
-				// the work. Guarded like the backfills above: a tasks table old enough
-				// to miss cancelled_at predates review findings entirely, so it holds
-				// no leads. Idempotent: only stage-backlog rows match, so a converged
-				// lead (now todo) and every done, cancelled or validated row never
+				// (todo/queued, queued_at = updated_at, marker set) on every open, but
+				// only undecided ones — see legacyLeadWaits: a confirmed result, a
+				// refuted lead, or the operator's applies answer (its marker rides the
+				// prompt) is decided work that keeps its stage, because its outcome
+				// excludes both batching and the blocked-result reset, so re-locking
+				// it would strand the work. A per-row decision in TypeScript, not one
+				// UPDATE, because "newest recorded outcome" needs the last Validated-by
+				// segment of the details text — a LIKE cannot read newest-wins. The
+				// SELECT prefilter drops answered rows cheaply; the helper re-checks.
+				// Guarded like the backfills above: a tasks table old enough to miss
+				// cancelled_at or details predates review findings entirely, so it
+				// holds no leads. Idempotent: only stage-backlog rows match, so a
+				// converged lead (now todo) and every done or cancelled row never
 				// match again, and queued_at is never restamped. The 'Needs-validation
 				// lead questions' prefix does not match (the hyphen), so the question
 				// cards stay untouched.
@@ -2818,16 +2823,19 @@ export class ProjectStore {
 						"prompt",
 						"queued_at",
 						"updated_at",
+						"details",
 						"validated_at",
 					].every((c) => cols.includes(c))
-				)
-					await db.run(`
-						UPDATE tasks SET stage = 'todo', state = 'queued',
-							waits_validation = 1, queued_at = updated_at
-						WHERE stage = 'backlog' AND cancelled_at IS NULL
-							AND validated_at IS NULL
-							AND prompt LIKE 'Needs validation%'
-					`);
+				) {
+					const legacy = await db
+						.query<{ id: string; prompt: string; details: string | null }, []>(
+							"SELECT id, prompt, details FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+						)
+						.all();
+					for (const row of legacy)
+						if (legacyLeadWaits(row.prompt, row.details))
+							await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);
+				}
 				// OTTR-1056: the answered PR-head CI failure. The key is
 				// `<pushSha>:<runId>#<attempt>[,...]`; a matching key keeps ciPrHeadReply from
 				// replying again to the same head and run, also after the same head ships

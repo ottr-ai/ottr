@@ -46,6 +46,7 @@ import {
 	leadValidationHold,
 	leadValidationStartRefusal,
 	leadBlocker,
+	leadValidationOutcome,
 	liveCardOf,
 	queueOrder,
 	reviewFindings,
@@ -15383,15 +15384,17 @@ export function Drawer({
 		if (short === "") return date === "" ? fallback : date;
 		return date === "" ? short : `${short} — ${date}`;
 	})();
-	// OTTR-1252: a deployment-fact lead never enters a batch (the filing reads
-	// the blocker line): its review's question card decides it, so there is no
-	// run to start and a Validate now button would promise an action the route
-	// refuses (409). The list row carries no prompt (OTTR-965), so the blocker
-	// line reads from the fetched detail.
+	// OTTR-1252: a deployment decision never takes a run — the blocker line may
+	// ride the prompt, or a recorded deployment outcome may have overruled a
+	// sandbox blocker line (the settle keeps the prompt, sets validatedAt and
+	// asks the question card). Either way the button would promise an action
+	// the route refuses (409). The list row carries no prompt (OTTR-965), so
+	// both reads prefer the fetched detail.
 	const deploymentLead =
 		task.waitsValidation === true &&
 		!cancelled &&
-		leadBlocker(detail?.prompt ?? "").kind === "deployment";
+		(leadBlocker(detail?.prompt ?? "").kind === "deployment" ||
+			leadValidationOutcome(detail?.details ?? null) === "deployment");
 	useEffect(() => {
 		setRefileError(null);
 	}, [rerunTaskId]);

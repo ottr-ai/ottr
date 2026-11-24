@@ -196,21 +196,27 @@ try {
       assert.deepEqual(Array.from(await upgradeDb.query('SELECT version FROM schema_migrations ORDER BY version').all()),
         Array.from({ length: projectMigrationCount }, (_, index) => ({ version: index + 1 })));
     } finally { await upgradeDb.close(); }
-    // OTTR-1252: the lead-wait step converges a pre-marker schema's never-validated
-    // backlog leads into the waiting form and leaves a lead with a recorded outcome
-    // parked in backlog alone — its confirmed result is normal work (batching and
-    // the blocked-result reset both exclude it), so re-locking it would strand it.
+    // OTTR-1252: the lead-wait step converges a pre-marker schema's undecided
+    // backlog leads into the waiting form and leaves decided rows alone — a
+    // confirmed result, a refuted lead, or the operator's applies answer
+    // (marker in the prompt) is normal work; never-validated, still-blocked
+    // and unanswered deployment leads wait. The newest outcome rules, read
+    // per row from the details' last Validated-by segment.
     const leadDb = await getPostgresDatabase(projectSchemaName('legacy lead upgrade'));
     try {
       await leadDb.exec('CREATE SCHEMA "' + leadDb.schema + '"');
       await applyPostgresMigrations(leadDb, projectMigrations.slice(0, projectMigrationCount - 1));
       await leadDb.createQueue().transaction(async () => {
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-lead', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'legacy-review')");
-        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at) VALUES ('legacy-parked', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 200, 600, 'legacy-review', 700)");
-        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at) VALUES ('legacy-plain', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 300, 800)");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-parked', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 200, 600, 'legacy-review', 700, E'Unverified lead from review legacy-review.\\nValidated by validation run #9 on 2026-11-20: confirmed.')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-answered', 'parked answered lead', E'Needs validation: proxy header\\nThe user answered the review''s question: Applies', 'backlog', 'idle', 'work', 300, 650, 'legacy-review')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-blocked', 'parked blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 400, 700, 'legacy-review', 750, E'Unverified lead from review legacy-review.\\nValidated by validation run #10 on 2026-11-21: still blocked — no retry control.')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at) VALUES ('legacy-plain', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 500, 800)");
       });
       await applyPostgresMigrations(leadDb, projectMigrations);
       assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id LIKE 'legacy-%' ORDER BY id").all()), [
+        { id: 'legacy-answered', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
+        { id: 'legacy-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 700, validated_at: 750 },
         { id: 'legacy-lead', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 500, validated_at: null },
         { id: 'legacy-parked', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 700 },
         { id: 'legacy-plain', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },

@@ -40,6 +40,8 @@ import {
 	leadBlocker,
 	leadValidationHold,
 	leadValidationStartRefusal,
+	leadValidationOutcome,
+	legacyLeadWaits,
 	liveCard,
 	liveCardOf,
 	mergeAnywayPatch,
@@ -3561,5 +3563,61 @@ describe("OTTR-1252: a lead waiting for its review's validation never runs and n
 		const other = task({ stage: "merging", queuedAt: 100 });
 		expect(mergeHold([review, committed, other], other)).toBe(FINDINGS_HOLD);
 		expect(mergeHold([review, confirmedLead, other], other)).toBeNull();
+	});
+});
+
+describe("OTTR-1252: the legacy-lead convergence decision reads the newest outcome", () => {
+	const BLOCKED =
+		"\nValidated by validation run #10 on 2026-11-21: still blocked — no retry control.";
+	const CONFIRMED =
+		"\nValidated by validation run #9 on 2026-11-20: confirmed.";
+	const DEPLOYMENT =
+		"\nValidated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?";
+	const CONFIRMED_WITH_EVIDENCE =
+		"\nValidated by #12 on 2026-11-23: confirmed. The job reproduces the race.";
+
+	test("leadValidationOutcome reads the newest segment, newest wins", () => {
+		expect(leadValidationOutcome(null)).toBeNull();
+		expect(leadValidationOutcome("no marker at all")).toBeNull();
+		expect(leadValidationOutcome(`unverified.${BLOCKED}`)).toBe(
+			"still blocked",
+		);
+		// An older blocked segment under a newer confirmed one: confirmed rules.
+		expect(
+			leadValidationOutcome(
+				`unverified.${BLOCKED}\nValidated by validation run #11 on 2026-11-22: confirmed.`,
+			),
+		).toBe("confirmed");
+		// The confirmed branch writes the evidence right after the outcome word.
+		expect(leadValidationOutcome(`unverified.${CONFIRMED_WITH_EVIDENCE}`)).toBe(
+			"confirmed",
+		);
+		expect(leadValidationOutcome(`unverified.${DEPLOYMENT}`)).toBe(
+			"deployment",
+		);
+	});
+
+	test("legacyLeadWaits waits for undecided rows and keeps decided rows", () => {
+		const prompt = "Needs validation: suspicious retry loop";
+		// Undecided: never validated, still blocked, unanswered deployment.
+		expect(legacyLeadWaits(prompt, null)).toBe(true);
+		expect(legacyLeadWaits(prompt, `unverified.${BLOCKED}`)).toBe(true);
+		expect(legacyLeadWaits(prompt, `unverified.${DEPLOYMENT}`)).toBe(true);
+		// Decided: confirmed work, a refuted lead, and the operator's applies
+		// answer (its marker rides the prompt, set by the reply route).
+		expect(legacyLeadWaits(prompt, `unverified.${CONFIRMED}`)).toBe(false);
+		expect(
+			legacyLeadWaits(prompt, `unverified.${CONFIRMED_WITH_EVIDENCE}`),
+		).toBe(false);
+		expect(
+			legacyLeadWaits(
+				`${prompt}\n\nThe user answered the review's question: Applies`,
+				null,
+			),
+		).toBe(false);
+		// Not a lead: the question cards' prefix carries the hyphen.
+		expect(
+			legacyLeadWaits("Needs-validation lead questions from rev1: reply", null),
+		).toBe(false);
 	});
 });

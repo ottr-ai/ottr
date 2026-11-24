@@ -26,25 +26,34 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    precedent keeps `leadAtDone` out; this one must be writable by update patches).
 2. SQLite: `ProjectStore.open` adds the column with the additive `addCol` pattern
    (`ALTER TABLE tasks ADD COLUMN waits_validation INTEGER NOT NULL DEFAULT 0`),
-   then converges in plain SQL, idempotent on every open:
+   then converges per row, idempotent on every open:
 
    ```sql
-   UPDATE tasks SET stage = 'todo', state = 'queued',
-     waits_validation = 1, queued_at = updated_at
+   SELECT id, prompt, details FROM tasks
    WHERE stage = 'backlog' AND cancelled_at IS NULL
-     AND validated_at IS NULL
      AND prompt LIKE 'Needs validation%'
+     AND prompt NOT LIKE '%The user answered the review%'
+   -- per row: UPDATE tasks SET stage = 'todo', state = 'queued',
+   --   waits_validation = 1, queued_at = updated_at WHERE id = ?
    ```
 
-   Only never-validated leads converge. A lead with a recorded outcome parked
-   in backlog — a confirmed or applies answer the operator parked — is normal
-   work: its outcome prevents both batching and the blocked-result reset, so
-   re-locking it would strand the work. (`Needs-validation lead questions...`
-   does not match the pattern: the hyphen.)
-3. PostgreSQL: fresh databases get `waits_validation bigint NOT NULL DEFAULT 0`
-   in `projectStepOne`; a new numbered step runs the same ALTER and the same
-   UPDATE, so old schemas converge. Versioned step, atomic with its version
-   record (the `applyPostgresMigrations` shape).
+   Only undecided leads converge (`legacyLeadWaits`, src/scheduler.ts): the
+   newest `Validated by ` segment of the details rules — a confirmed result is
+   normal work the operator may park, a refuted lead stays cancelled, and the
+   operator's applies answer rides its own marker in the prompt — while a
+   never-validated lead, a still-blocked result, or an unanswered deployment
+   result waits. Decided rows keep their stage: their outcome excludes both
+   batching and the blocked-result reset, so re-locking them would strand the
+   work. The per-row decision runs in TypeScript because "newest segment"
+   needs newest-wins reading that no LIKE can do. (`Needs-validation lead
+   questions...` does not match the pattern: the hyphen.)
+3. PostgreSQL: the column lives only in a numbered step, never in
+   `projectStepOne` — the steps run on fresh databases too, so a stepOne
+   column plus the step's ALTER fails with duplicate_column (the
+   `source_issue` and `posted_via` precedent). The step runs the same ALTER
+   and the same per-row decision as SQLite (`legacyLeadWaits`), one
+   transaction with its version record (`CONVERGE_LEAD_WAIT_SQL` is the
+   shared per-row write).
 4. No new enum value: the stage and state CHECK lists stay untouched, so no
    table rebuild happens.
 5. The shared fresh-SQLite vs fresh-PostgreSQL schema comparison test stays green.
@@ -88,10 +97,12 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
 - `POST /api/projects/:project/tasks/:id/validate` gains a lead path: the id
   resolves to a waiting lead, `followUpOf` names a validatable review, and the
   call files with `first = {lead id}` and `again = { before: now + 1, lead: id }`
-  (resets only this lead, only a blocked outcome). A deployment-fact lead
-  (blocker line `deployment fact`) refuses with 409 before the review lookup:
-  it never enters a batch, so no run can take it — its review's question card
-  decides it. An open validation run in the project answers 409 with
+  (resets only this lead, only a blocked outcome). A deployment decision
+  refuses with 409 before the review lookup — the blocker line rides the
+  prompt (`deployment fact`), or a recorded deployment outcome overruled a
+  sandbox blocker line (newest `Validated by ` segment, `leadValidationOutcome`);
+  either way no run can take the lead — its review's question card decides it.
+  An open validation run in the project answers 409 with
   `{ error, id: <open run id> }`. Response: the filed run's view plus `reset`.
 - `deps.validateLeads` (app.ts) and the server.ts wiring gain the widened
   `again` and an optional `first` parameter, passed to `filePendingValidationRun`.
@@ -113,7 +124,8 @@ For a waiting lead the drawer renders:
   "Validate now" (new, posts the lead validate route). "Validate now" is
   disabled with the open run's card id in its title while `openValidationRun`
   is set;
-- a deployment-fact lead (blocker line `deployment fact`): only "Cancel task".
+- a deployment decision (blocker line `deployment fact`, or a recorded
+  deployment outcome overruling a sandbox blocker line): only "Cancel task".
   No run can take the lead, so there is no Validate now button;
 - one hint line under the actions linking the review card: a sandbox lead
   reads "The review #<id> starts this lead's validation run by itself.
@@ -135,17 +147,22 @@ waiting lead instead of "queued with no hold found".
 1. A review files its lead in todo with the marker; `pickRunnable` returns it
    neither with `validatedAt` null nor with a blocked result.
 2. A confirmed result clears the marker; `pickRunnable` returns the lead.
-3. An old-schema database with an open never-validated backlog lead converges
-   to the waiting form on open, on SQLite and PostgreSQL; a lead with a
-   recorded outcome parked in backlog keeps its stage and marker; the shared
-   schema comparison stays green.
+3. An old-schema database converges its undecided backlog leads to the
+   waiting form on open, on SQLite and PostgreSQL: never-validated, still
+   blocked, and unanswered deployment leads take the marker; a parked
+   confirmed lead, a refuted lead, and an applies-answered lead keep their
+   stage and marker; the shared schema comparison stays green. The
+   PostgreSQL column lives outside `projectStepOne`, so fresh databases
+   initialize without a duplicate column.
 4. The validate-now route files with the lead first, answers 409 with the open
    run's id when a run is open, resets only this lead's `validatedAt` when its
    newest outcome was blocked (both blocked stamps sit before the cutoff, so
-   losing the scope fails the test), and refuses a deployment-fact lead.
-5. The drawer renders exactly Cancel and Validate now for a sandbox-blocker
-   lead, and only Cancel plus the question-flow hint for a deployment-fact
-   lead, with accessible names; a screenshot is attached.
+   losing the scope fails the test), and refuses a deployment decision — from
+   the prompt's blocker line or from a recorded deployment outcome.
+5. The drawer renders exactly Cancel and Validate now for a sandbox lead with
+   no recorded deployment outcome, and only Cancel plus the question-flow hint
+   when the blocker line or the newest recorded outcome says deployment, with
+   accessible names; a screenshot is attached.
 6. A done release review with a waiting lead in todo does not hold the release
    (mergeHold null) and does not hold its review's Done (findingsOpen false).
    The done stamp covers the waiting todo form, so a confirmed lead whose

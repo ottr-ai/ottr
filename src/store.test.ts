@@ -6821,19 +6821,30 @@ describe("review findings storage", () => {
 		validated_at INTEGER
 	)`,
 	)}`;
-	test("open adds waits_validation and converges backlog leads to the waiting form (OTTR-1252)", async () => {
+	test("open adds waits_validation and converges undecided backlog leads to the waiting form (OTTR-1252)", async () => {
 		const dir = join(root, "waits-validation-upgrade");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		raw.exec(PRE_WAITS_TASKS_DDL);
 		raw.exec(EVENTS_DDL);
 		raw.exec(`INSERT INTO tasks
-			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at)
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
 			VALUES
-				('lead1', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'rev1', NULL, NULL),
-				('plain1', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 200, 600, NULL, NULL, NULL),
-				('gone1', 'cancelled lead', 'Needs validation: lost report', 'backlog', 'idle', 'work', 300, 700, 'rev1', 400, NULL),
-				('park1', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 400, 800, 'rev1', NULL, 900)`);
+				('lead1', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'rev1', NULL, NULL, NULL),
+				('plain1', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 200, 600, NULL, NULL, NULL, NULL),
+				('gone1', 'cancelled lead', 'Needs validation: lost report', 'backlog', 'idle', 'work', 300, 700, 'rev1', 400, NULL, NULL),
+				('park1', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 400, 800, 'rev1', NULL, 900,
+					'Unverified lead from review rev1.
+Validated by validation run #9 on 2026-11-20: confirmed.'),
+				('blocked1', 'parked blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 500, 850, 'rev1', NULL, 950,
+					'Unverified lead from review rev1.
+Validated by validation run #10 on 2026-11-21: still blocked — no retry control.'),
+				('answered1', 'parked answered lead', 'Needs validation: proxy header
+The user answered the review''s question: Applies', 'backlog', 'idle', 'work', 600, 900, 'rev1', NULL, NULL, NULL),
+				('deploy1', 'unanswered deployment lead', 'Needs validation: proxy header
+Blocker: sandbox run: header control', 'backlog', 'idle', 'work', 700, 950, 'rev1', NULL, 960,
+					'Unverified lead from review rev1.
+Validated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?')`);
 		raw.close();
 
 		const store = await open(dir);
@@ -6852,14 +6863,35 @@ describe("review findings storage", () => {
 		const gone = (await store.getTask("gone1"))!;
 		expect(gone.stage).toBe("backlog");
 		expect(gone.waitsValidation).toBe(false);
-		// A lead with a recorded outcome parked in backlog is normal work: the
-		// operator parked it after its confirmed result, and converging it would
-		// strand the work (its outcome prevents both batching and the reset).
+		// A lead with a recorded confirmed outcome parked in backlog is normal
+		// work: the operator parked it after its confirmed result, and converging
+		// it would strand the work (its outcome prevents both batching and the
+		// reset). Newest outcome rules, so an older blocked segment under a newer
+		// confirmed one stays decided too.
 		const parked = (await store.getTask("park1"))!;
 		expect(parked.stage).toBe("backlog");
 		expect(parked.state).toBe("idle");
 		expect(parked.waitsValidation).toBe(false);
 		expect(parked.validatedAt).toBe(900);
+		// The user's applies answer is decided work as well, decided before any
+		// run recorded a result: the answer marker rides the prompt.
+		const answered = (await store.getTask("answered1"))!;
+		expect(answered.stage).toBe("backlog");
+		expect(answered.waitsValidation).toBe(false);
+		expect(answered.validatedAt).toBeNull();
+		// Undecided leads take the waiting form: a still-blocked result (the
+		// blocked-result reset and a fresh batch can still decide it) and an
+		// unanswered deployment result (its question card decides it).
+		const blocked = (await store.getTask("blocked1"))!;
+		expect(blocked.stage).toBe("todo");
+		expect(blocked.waitsValidation).toBe(true);
+		expect(blocked.queuedAt).toBe(850);
+		expect(blocked.validatedAt).toBe(950);
+		const deploy = (await store.getTask("deploy1"))!;
+		expect(deploy.stage).toBe("todo");
+		expect(deploy.waitsValidation).toBe(true);
+		expect(deploy.queuedAt).toBe(950);
+		expect(deploy.validatedAt).toBe(960);
 
 		// The marker is caller-settable (unlike lead_at_done): the patch round-trips
 		// on getTask and on the list rows.

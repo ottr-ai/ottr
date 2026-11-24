@@ -13595,6 +13595,36 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		}
 	});
 
+	test("a recorded deployment outcome refuses Validate now even on a sandbox blocker line", async () => {
+		// The run can overrule a lead's sandbox blocker line with a deployment
+		// result: the settle keeps the prompt, sets validatedAt and asks the
+		// question card. No run can take the lead after that — the route refuses
+		// on the recorded outcome, not only on the prompt's blocker line.
+		const { review, lead } = await doneReviewWithWaitingLead();
+		await store.updateTask(lead.id, {
+			validatedAt: Date.now(),
+			details:
+				"Unverified lead from review.\nValidated by validation run #14 on 2026-11-22: deployment — Which proxy terminates TLS?",
+		});
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"this lead's blocker is a deployment fact: the review's question card answers it, not a validation run",
+			);
+			expect(filed).toBe(0);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
 	test("a waiting lead with an open validation card answers 409 with its id", async () => {
 		const { review, lead } = await doneReviewWithWaitingLead();
 		const run = await store.createTask(

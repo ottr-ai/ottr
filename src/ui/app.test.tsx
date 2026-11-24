@@ -5041,6 +5041,37 @@ describe("Waiting lead drawer actions", () => {
 		}
 	});
 
+	test("a recorded deployment outcome hides Validate now on a sandbox blocker line too", async () => {
+		// The run overruled the sandbox blocker line with a deployment result: the
+		// prompt still reads sandbox, but the newest recorded outcome rules — no
+		// run can take the lead, so the drawer keeps Cancel and the question hint.
+		const { container, close } = await mountLead(
+			leadCard({
+				validatedAt: 1_764_000_000_000,
+				details:
+					"Unverified lead from review.\nValidated by validation run #14 on 2026-11-22: deployment — Which proxy terminates TLS?",
+			}),
+		);
+		try {
+			const names = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].map((b) => b.textContent?.trim());
+			expect(names).toEqual(["Cancel task"]);
+			expect(container.textContent).toContain(
+				"asks this lead's deployment question; your answer decides the lead.",
+			);
+			expect(container.textContent).not.toContain("Validate now");
+			// The last-result line reads the deployment outcome.
+			expect(container.textContent).toContain(
+				"Last result: deployment — Which proxy terminates TLS? — 2026-11-22",
+			);
+		} finally {
+			await close();
+		}
+	});
+
 	test("a deployment-fact lead gets no Validate now and names its question flow", async () => {
 		// A deployment-fact lead never enters a batch, so there is no run to
 		// start: the drawer keeps Cancel and the hint names the question card
