@@ -439,6 +439,8 @@ let validateLeadsImpl:
 			reviewId: string,
 			strictReview?: boolean,
 			again?: { before: number },
+			first?: ReadonlySet<string>,
+			park?: string,
 	  ) => Promise<
 			{ id: string; reset: string[] } | { error: string; status: number }
 	  >)
@@ -454,10 +456,12 @@ const loopStubs = () => ({
 		reviewId: string,
 		strictReview?: boolean,
 		again?: { before: number },
+		first?: ReadonlySet<string>,
+		park?: string,
 	) => {
 		if (!validateLeadsImpl)
 			return Promise.reject(new Error("validateLeads not stubbed"));
-		return validateLeadsImpl(e, reviewId, strictReview, again);
+		return validateLeadsImpl(e, reviewId, strictReview, again, first, park);
 	},
 });
 // Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
@@ -12295,6 +12299,138 @@ describe("manual validation start route (OTTR-1047)", () => {
 			await store.updateTask(review.id, { cancelledAt: Date.now() });
 			await store.updateTask(lead.id, { cancelledAt: Date.now() });
 		}
+	});
+
+	// OTTR-1247: body.lead names one queued pending sandbox lead the filing parks
+	// into the batch inside its transaction. These tests pin the route's gates
+	// around the seam; the parking itself is the loop's filing (turn.test.ts).
+	describe("body.lead", () => {
+		/** A done review with one todo/queued sandbox lead child. */
+		const doneReviewWithQueuedLead = async () => {
+			const review = await store.createTask(
+				"done review for a queued lead",
+				null,
+				"review",
+			);
+			await store.updateTask(review.id, { stage: "done", state: "idle" });
+			const lead = await store.createTask(
+				"Needs validation: parked lead\nBlocker: sandbox run: cq",
+			);
+			await store.updateTask(lead.id, {
+				followUpOf: review.id,
+				stage: "todo",
+				state: "queued",
+				queuedAt: Date.now(),
+			});
+			return { review, lead };
+		};
+
+		test("a queued lead joins the batch: the seam sees park and first", async () => {
+			const { review, lead } = await doneReviewWithQueuedLead();
+			const seen: Array<{
+				reviewId: string;
+				first?: ReadonlySet<string>;
+				park?: string;
+			}> = [];
+			validateLeadsImpl = async (e, reviewId, _s, _a, first, park) => {
+				seen.push({ reviewId, first, park });
+				const card = await e.store.createTask(
+					"Batch validation of 1 lead(s) of review.",
+					null,
+					"validation",
+				);
+				await e.store.updateTask(card.id, {
+					followUpOf: reviewId,
+					promptAuthor: "board",
+				});
+				return { id: card.id, reset: [] };
+			};
+			try {
+				const res = await post(`/api/projects/p1/tasks/${review.id}/validate`, {
+					lead: lead.id,
+				});
+				expect(res.status).toBe(200);
+				expect(seen).toHaveLength(1);
+				expect(seen[0]!.reviewId).toBe(review.id);
+				// The parked lead sorts ahead of the severity order.
+				expect(seen[0]!.park).toBe(lead.id);
+				expect(seen[0]!.first?.has(lead.id)).toBe(true);
+			} finally {
+				validateLeadsImpl = null;
+				await store.updateTask(review.id, { cancelledAt: Date.now() });
+				await store.updateTask(lead.id, { cancelledAt: Date.now() });
+			}
+		});
+
+		test("a bad lead is refused before the filing and nothing files", async () => {
+			const { review, lead } = await doneReviewWithQueuedLead();
+			const other = await store.createTask(
+				"done review that owns nothing",
+				null,
+				"review",
+			);
+			await store.updateTask(other.id, { stage: "done", state: "idle" });
+			let filed = 0;
+			validateLeadsImpl = async () => {
+				filed++;
+				return { id: "nope", reset: [] };
+			};
+			try {
+				// A lead that belongs to another review.
+				await store.updateTask(lead.id, { followUpOf: other.id });
+				const mismatch = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{ lead: lead.id },
+				);
+				expect(mismatch.status).toBe(409);
+				expect(await errorOf(mismatch)).toBe(
+					"the lead does not belong to this review",
+				);
+				// A prompt without the Needs validation tag is no lead.
+				await store.updateTask(lead.id, {
+					followUpOf: review.id,
+					prompt: "plain work",
+				});
+				const notLead = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{ lead: lead.id },
+				);
+				expect(notLead.status).toBe(409);
+				expect(await errorOf(notLead)).toBe(
+					"only a pending sandbox lead can join a batch",
+				);
+				// A started lead or a queued reply cannot join.
+				await store.updateTask(lead.id, {
+					prompt: "Needs validation: parked lead\nBlocker: sandbox run: cq",
+					state: "running",
+				});
+				const running = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{ lead: lead.id },
+				);
+				expect(running.status).toBe(409);
+				expect(await errorOf(running)).toBe(
+					"only a queued lead without a worktree can join a batch",
+				);
+				// An unknown id answers 404 and a wrong type answers 400.
+				const unknown = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{ lead: "no-such-lead" },
+				);
+				expect(unknown.status).toBe(404);
+				const badType = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{ lead: 5 },
+				);
+				expect(badType.status).toBe(400);
+				expect(filed).toBe(0);
+			} finally {
+				validateLeadsImpl = null;
+				await store.updateTask(review.id, { cancelledAt: Date.now() });
+				await store.updateTask(other.id, { cancelledAt: Date.now() });
+				await store.updateTask(lead.id, { cancelledAt: Date.now() });
+			}
+		});
 	});
 
 	test("a review that is not done or idle at merging is refused before the filing", async () => {

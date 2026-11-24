@@ -13358,7 +13358,7 @@ function DrawerActions(p: {
 					<label htmlFor="lead-validate">Start validation run</label>
 					<div className="reply-actions">
 						<BusyButton
-							title={`Parks this lead in its review's backlog and files a batch validation run of review ${leadValidate.id} that takes it`}
+							title={`Files a batch validation run of review ${leadValidate.id}; the filing parks this lead in the review's backlog and takes it first`}
 							run={runLeadValidate}
 						>
 							Start validation run
@@ -13366,18 +13366,19 @@ function DrawerActions(p: {
 					</div>
 				</div>
 			)}
-			{leadValidate !== null && leadValidateError !== null && (
+			{/* The error and confirmation read only their flags: a filing refusal or a
+				    board refresh that moves the lead (the filing parked it) must never hide
+				    them while the drawer holds this card. */}
+			{leadValidateError !== null && (
 				<p className="auth-error" role="alert">
 					{leadValidateError}
 				</p>
 			)}
-			{leadValidate !== null &&
-				leadValidateDone &&
-				leadValidateError === null && (
-					<p className="hint" role="status">
-						Validation run filed.
-					</p>
-				)}
+			{leadValidateDone && leadValidateError === null && (
+				<p className="hint" role="status">
+					Validation run filed.
+				</p>
+			)}
 			{/* OTTR-1129: a done review card can clear the blocked results its leads
 			    got before a chosen time and file a fresh validation run. The datetime
 			    starts empty and stays required: the board tracks no sandbox-fix time
@@ -14516,15 +14517,15 @@ export function Drawer({
 	};
 	// OTTR-1247: a queued pending sandbox lead never runs as a work turn (its status
 	// line names the wait), and its review's batch validation run is the only way
-	// forward. The filing only takes backlog leads, so the action first parks the
-	// lead in its review's backlog — the same move the routing tick makes for a
-	// started lead — and then files the run on the review's validate route. The
-	// parent resolves through the lineage fetch too: the Done window can drop the
-	// review from the board's task list while its card stays linkable. A new card's
-	// drawer starts without the last card's result.
+	// forward. One POST names the lead: the filing parks it into the review's
+	// backlog inside its own transaction, so a refusal leaves the lead — and this
+	// drawer's hold and error — untouched. The parent resolves through the lineage
+	// fetch too: the Done window can drop the review from the board's task list.
+	// A new card's drawer starts without the last card's result.
 	const leadValidate =
 		!cancelled &&
 		task.state === "queued" &&
+		task.worktree === null &&
 		leadValidationHold(task) !== null &&
 		parentCard !== null &&
 		validatableReview(parentCard)
@@ -14543,12 +14544,8 @@ export function Drawer({
 		setLeadValidateError(null);
 		try {
 			await post(
-				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/backlog`,
-				{ to: "backlog" },
-			);
-			await post(
 				`/api/projects/${encodeURIComponent(leadValidate.project)}/tasks/${encodeURIComponent(leadValidate.id)}/validate`,
-				{},
+				{ lead: task.id },
 			);
 			setLeadValidateDone(true);
 			return true;

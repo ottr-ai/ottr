@@ -668,6 +668,10 @@ interface AppDeps {
 		reviewId: string,
 		strictReview?: boolean,
 		again?: { before: number },
+		first?: ReadonlySet<string>,
+		/** OTTR-1247: one queued pending sandbox lead of the review the filing parks
+		 * into the batch inside its transaction (the drawer's Start validation run). */
+		park?: string,
 	): Promise<
 		{ id: string; reset: string[] } | { error: string; status: number }
 	>;
@@ -12420,7 +12424,9 @@ export async function createApp(deps: AppDeps) {
 	 * turn loop (deps.validateLeads, filePendingValidationRun); the route only gates the
 	 * input and schedules after the filing. OTTR-1129: an optional body adds
 	 * validate-again — `{ again: "blocked", before: <ISO> }` — and the response wraps the
-	 * card's view with the reset list. */
+	 * card's view with the reset list. OTTR-1247: `{ lead: "<task id>" }` names one
+	 * queued pending sandbox lead of this review; the filing parks it into the batch
+	 * inside its transaction, so a refusal leaves the lead untouched. */
 	async function handlePOSTProjectsTasksValidateByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/validate">,
 	): Promise<Response> {
@@ -12468,10 +12474,52 @@ export async function createApp(deps: AppDeps) {
 			if ("error" in parsed) return json({ error: parsed.error }, 400);
 			again = parsed;
 		}
+		// OTTR-1247: an optional body.lead parks one queued pending sandbox lead of
+		// this review into the batch inside the filing's transaction, so a refusal
+		// leaves the lead untouched and the drawer keeps showing the hold and the
+		// error. The gates run here for good status codes and again inside the
+		// transaction against the fresh rows (routeStartedLeads' recheck pattern).
+		let park: string | undefined;
+		if (body.lead !== undefined) {
+			if (typeof body.lead !== "string" || body.lead.length === 0)
+				return json({ error: "body.lead must be a task id" }, 400);
+			const lead = await e.store.getTask(body.lead);
+			if (lead === null || lead.cancelledAt !== null)
+				return json({ error: "unknown lead" }, 404);
+			if (lead.followUpOf !== task.id)
+				return json({ error: "the lead does not belong to this review" }, 409);
+			if (!pendingSandboxLead(lead))
+				return json(
+					{ error: "only a pending sandbox lead can join a batch" },
+					409,
+				);
+			if (
+				!(
+					(lead.stage === "todo" || lead.stage === "in_progress") &&
+					lead.state === "queued"
+				) ||
+				lead.pendingPrompt !== null ||
+				lead.worktree !== null
+			)
+				return json(
+					{
+						error: "only a queued lead without a worktree can join a batch",
+					},
+					409,
+				);
+			park = lead.id;
+		}
 		const fileRun = deps.validateLeads;
 		if (fileRun === undefined)
 			return json({ error: "validation filing is not wired" }, 500);
-		const filed = await fileRun(e, task.id, true, again);
+		const filed = await fileRun(
+			e,
+			task.id,
+			true,
+			again,
+			park === undefined ? undefined : new Set([park]),
+			park,
+		);
 		if ("error" in filed) return json({ error: filed.error }, filed.status);
 		await deps.schedule();
 		// OTTR-1129: the response adds the reset list — the ids whose validatedAt

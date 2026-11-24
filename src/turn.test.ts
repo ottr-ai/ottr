@@ -29701,6 +29701,129 @@ describe("stored review findings", () => {
 		}
 	});
 
+	test("filing with park moves a queued todo lead into the batch atomically (OTTR-1247)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await validationCase(record);
+		const review = await doneReview(store, "main");
+		const f = mkFinding(
+			"Needs validation: parked lead\nBlocker: sandbox run: cq",
+			1,
+		);
+		await store.appendReviewFinding(review.id, f);
+		const lead = await leadCard(store, review.id, f.prompt);
+		// The drawer's case: the lead sits queued in a work lane, and the manual
+		// start names it so the filing parks it into the batch itself.
+		await store.updateTask(lead.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: 1,
+			needsReason: "leftover reason",
+		});
+
+		const filed = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			undefined,
+			new Set([lead.id]),
+			lead.id,
+		);
+		expect("id" in filed).toBe(true);
+		if (!("id" in filed)) throw new Error("no validation run filed");
+		const card = (await store.getTask(filed.id))!;
+		expect(card.details).toBe(
+			`Batch validation of 1 lead(s) of review ${review.id}.`,
+		);
+		// The parked lead took the batch first, straight from the todo lane.
+		expect(card.prompt).toBe(
+			validationRunPrompt({
+				reviewId: review.id,
+				leads: [{ id: lead.id, prompt: f.prompt }],
+			}),
+		);
+		// The park is part of the filing: backlog, out of the queue, reason cleared.
+		const moved = (await store.getTask(lead.id))!;
+		expect(moved.stage).toBe("backlog");
+		expect(moved.state).toBe("idle");
+		expect(moved.queuedAt).toBeNull();
+		expect(moved.needsReason).toBeNull();
+	});
+
+	test("a refused park inside the filing leaves the lead untouched (OTTR-1247)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await validationCase(record);
+		const review = await doneReview(store, "main");
+		const f = mkFinding(
+			"Needs validation: waiting lead\nBlocker: sandbox run: cr",
+			1,
+		);
+		await store.appendReviewFinding(review.id, f);
+		const lead = await leadCard(store, review.id, f.prompt);
+		await store.updateTask(lead.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: 1,
+		});
+		// A backlog lead the plain sweep can take, so a run opens and blocks.
+		const other = mkFinding(
+			"Needs validation: batchable lead\nBlocker: sandbox run: cs",
+			2,
+		);
+		await store.appendReviewFinding(review.id, other);
+		const batchable = await leadCard(store, review.id, other.prompt);
+
+		// An open run blocks before any write: the lead stays queued in todo.
+		const first = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in first).toBe(true);
+		const refused = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			undefined,
+			new Set([lead.id]),
+			lead.id,
+		);
+		expect("error" in refused).toBe(true);
+		const queued = (await store.getTask(lead.id))!;
+		expect(queued.stage).toBe("todo");
+		expect(queued.state).toBe("queued");
+
+		// A stale park target (here: a lead of another review) refuses inside the
+		// transaction and still writes nothing. Cancelling the first run clears the
+		// open-run block; the strict start overrides the declined review.
+		await store.updateTask("id" in first ? first.id : "", {
+			cancelledAt: Date.now(),
+		});
+		const otherReview = await doneReview(store, "other");
+		const stray = await leadCard(store, otherReview.id, f.prompt);
+		await store.updateTask(stray.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: 1,
+		});
+		const stale = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			undefined,
+			new Set([stray.id]),
+			stray.id,
+		);
+		expect("error" in stale).toBe(true);
+		if ("error" in stale)
+			expect(stale.error).toBe(
+				"the lead to park must be a queued pending sandbox lead of this review",
+			);
+		const untouched = (await store.getTask(stray.id))!;
+		expect(untouched.stage).toBe("todo");
+		expect(untouched.state).toBe("queued");
+		// The parked lead of this review sits in the cancelled run's batch list;
+		// the refusal moved nothing here either.
+		const stillQueued = (await store.getTask(lead.id))!;
+		expect(stillQueued.stage).toBe("todo");
+		expect((await store.getTask(batchable.id))!.stage).toBe("backlog");
+	});
+
 	test("a validation run's settle applies the first result per lead (OTTR-1047)", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, batches } = await validationCase(record);

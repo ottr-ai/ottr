@@ -1659,12 +1659,16 @@ export interface TurnLoop {
 	 * call it without one and fall back to the next candidate. With `again` (OTTR-1129
 	 * validate-again) the call first clears the stale validatedAt of the review's
 	 * blocked-before-`again.before` sandbox leads inside the same transaction and returns
-	 * their ids in `reset` ([] without the flag). */
+	 * their ids in `reset` ([] without the flag). OTTR-1247: `park` names one queued
+	 * pending sandbox lead of the review the filing parks into the batch inside its
+	 * transaction; `first` sorts it ahead of the severity order. */
 	filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
 		again?: { before: number },
+		first?: ReadonlySet<string>,
+		park?: string,
 	): Promise<
 		{ id: string; reset: string[] } | { error: string; status: number }
 	>;
@@ -9990,6 +9994,7 @@ export function createTurnLoop(
 		strictReview?: boolean,
 		again?: { before: number },
 		first: ReadonlySet<string> = new Set(),
+		park?: string,
 	): Promise<
 		{ id: string; reset: string[] } | { error: string; status: number }
 	> {
@@ -10019,6 +10024,25 @@ export function createTurnLoop(
 				// The batchable gate reads the fresh list: a reset lead counts like a
 				// never-validated lead.
 				tasks = await e.store.listTasks();
+			// OTTR-1247: the manual start may name one queued lead of this review
+			// (the drawer's Start validation run). The park happens inside this
+			// transaction, so a refusal leaves the lead exactly where it was and the
+			// batchable gate below sees it in the backlog. The gates mirror
+			// routeStartedLeads: a started lead with a worktree or a queued reply
+			// never moves; the route checks them for good status codes, these are
+			// the binding ones against the fresh rows.
+			const parkLead =
+				park !== undefined ? (tasks.find((t) => t.id === park) ?? null) : null;
+			const parkOk =
+				park !== undefined &&
+				reviewId !== undefined &&
+				parkLead !== null &&
+				parkLead.cancelledAt === null &&
+				parkLead.followUpOf === reviewId &&
+				pendingSandboxLead(parkLead) &&
+				(parkLead.stage === "todo" || parkLead.stage === "in_progress") &&
+				parkLead.state === "queued" &&
+				parkLead.pendingPrompt === null;
 			const batchableOf = (review: ListedTask): ListedTask[] =>
 				tasks.filter(
 					(t) =>
@@ -10053,7 +10077,9 @@ export function createTurnLoop(
 					(t) =>
 						validatableReview(t) &&
 						(t.id === reviewId || !declined(t)) &&
-						batchableOf(t).length > 0,
+						// A review with only a parked-now lead qualifies through the park
+						// gate: without it the strict start would 409 before the park.
+						(batchableOf(t).length > 0 || (t.id === reviewId && parkOk)),
 				)
 				.sort((a, b) => {
 					if (a.id === reviewId) return -1;
@@ -10073,6 +10099,24 @@ export function createTurnLoop(
 							: `no batchable leads for review ${reviewId}`,
 					status: 409,
 				};
+			if (park !== undefined) {
+				if (!parkOk || parkLead === null)
+					return {
+						error:
+							"the lead to park must be a queued pending sandbox lead of this review",
+						status: 409,
+					};
+				await e.store.updateTask(park, {
+					stage: "backlog",
+					state: "idle",
+					queuedAt: null,
+					needsReason: null,
+					holdUntil: null,
+				});
+				// The batchable gate reads the fresh list: the parked lead counts
+				// like a backlog lead from this filing on.
+				tasks = await e.store.listTasks();
+			}
 			const leads = batchableOf(review);
 			const ranks = new Map<string, number>();
 			for (const finding of await e.store.listReviewFindings(review.id))

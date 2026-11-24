@@ -13329,10 +13329,11 @@ describe("Drawer validate blocked leads again action", () => {
 
 describe("Drawer start validation run on a queued lead", () => {
 	// OTTR-1247: a queued pending sandbox lead's drawer offers the manual start of
-	// its review's batch validation run. The filing only takes backlog leads, so
-	// the action parks the lead in the review's backlog first and then files the
-	// run on the review's validate route. The review resolves through the lineage
-	// fetch too, because the Done window can drop it from the board's task list.
+	// its review's batch validation run. One POST names the lead: the filing parks
+	// it in the review's backlog inside its own transaction, so a refusal leaves
+	// the hold, the button and the error untouched. The review resolves through
+	// the lineage fetch too, because the Done window can drop it from the board's
+	// task list.
 	installBrowserGlobals([
 		"Event",
 		"HTMLElement",
@@ -13416,12 +13417,11 @@ describe("Drawer start validation run on a queued lead", () => {
 		throw new Error("no Start validation run button");
 	};
 
-	test("parks the lead, then POSTs to the review's validate route", async () => {
+	test("POSTs the validate route with the lead id", async () => {
 		await withLeadDrawer(
 			leadCard(),
 			reviewCard(),
 			[
-				{ suffix: "/tasks/t1/backlog", status: 200, body: { id: "t1" } },
 				{
 					suffix: "/tasks/r9/validate",
 					status: 200,
@@ -13433,17 +13433,84 @@ describe("Drawer start validation run on a queued lead", () => {
 					onClickOf(startButton(container))({});
 				});
 				await act(async () => {});
-				expect(posts).toHaveLength(2);
-				expect(posts[0]?.url.endsWith("/tasks/t1/backlog")).toBe(true);
-				expect(posts[0]?.body).toEqual({ to: "backlog" });
-				expect(posts[1]?.url.endsWith("/tasks/r9/validate")).toBe(true);
-				expect(posts[1]?.body).toEqual({});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.url.endsWith("/tasks/r9/validate")).toBe(true);
+				// One atomic POST: the filing parks the lead in its transaction.
+				expect(posts[0]?.body).toEqual({ lead: "t1" });
 				const statuses = [...container.querySelectorAll('p[role="status"]')];
 				expect(
 					statuses.some((s) =>
 						s.textContent?.includes("Validation run filed."),
 					),
 				).toBe(true);
+			},
+		);
+	});
+
+	test("an in_progress queued lead renders the button and POSTs once", async () => {
+		// The hold shows for in_progress too, and the filing's park handles that
+		// stage server-side — no backlog route involved (OTTR-1247 send-back 2).
+		await withLeadDrawer(
+			leadCard({ stage: "in_progress" }),
+			reviewCard(),
+			[
+				{
+					suffix: "/tasks/r9/validate",
+					status: 200,
+					body: { id: "v1", reset: [] },
+				},
+			],
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(startButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.url.endsWith("/tasks/r9/validate")).toBe(true);
+			},
+		);
+	});
+
+	test("a started lead with a worktree renders no validate control", async () => {
+		await withLeadDrawer(
+			leadCard({ worktree: "/tmp/lead-worktree" }),
+			reviewCard(),
+			[],
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Start validation run");
+			},
+		);
+	});
+
+	test("a failed filing keeps the error and the button visible", async () => {
+		// The filing refused (another run open): the lead never moved, so the hold
+		// and the action stay — the operator can retry or cancel (send-back 2).
+		await withLeadDrawer(
+			leadCard(),
+			reviewCard(),
+			[
+				{
+					suffix: "/tasks/r9/validate",
+					status: 409,
+					body: { error: "a validation run is already open" },
+				},
+			],
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(startButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				const alerts = [...container.querySelectorAll('p[role="alert"]')];
+				expect(
+					alerts.some((a) =>
+						a.textContent?.includes("a validation run is already open"),
+					),
+				).toBe(true);
+				expect(container.textContent?.includes("Start validation run")).toBe(
+					true,
+				);
+				expect(container.textContent).not.toContain("Validation run filed.");
 			},
 		);
 	});
@@ -13466,34 +13533,6 @@ describe("Drawer start validation run on a queued lead", () => {
 			[],
 			async ({ container }) => {
 				expect(container.textContent).not.toContain("Start validation run");
-			},
-		);
-	});
-
-	test("a failed park surfaces the message as an inline alert", async () => {
-		await withLeadDrawer(
-			leadCard(),
-			reviewCard(),
-			[
-				{
-					suffix: "/tasks/t1/backlog",
-					status: 409,
-					body: { error: "a reply or steer is still queued" },
-				},
-			],
-			async ({ posts, container }) => {
-				await act(async () => {
-					onClickOf(startButton(container))({});
-				});
-				await act(async () => {});
-				expect(posts).toHaveLength(1);
-				const alerts = [...container.querySelectorAll('p[role="alert"]')];
-				expect(
-					alerts.some((a) =>
-						a.textContent?.includes("a reply or steer is still queued"),
-					),
-				).toBe(true);
-				expect(container.textContent).not.toContain("Validation run filed.");
 			},
 		);
 	});

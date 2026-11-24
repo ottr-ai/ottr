@@ -1104,8 +1104,15 @@ const app = await createApp({
 	projects,
 	cancel: loop.cancel,
 	// OTTR-1047: the manual start is strict — it files for the named review only.
-	validateLeads: (e, reviewId, strictReview, again) =>
-		loop.filePendingValidationRun(e, reviewId, strictReview ?? true, again),
+	validateLeads: (e, reviewId, strictReview, again, first, park) =>
+		loop.filePendingValidationRun(
+			e,
+			reviewId,
+			strictReview ?? true,
+			again,
+			first,
+			park,
+		),
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
 	creditHoldActive: loop.creditHoldActive,
