@@ -6844,7 +6844,9 @@ The user answered the review''s question: Applies', 'backlog', 'idle', 'work', 6
 				('deploy1', 'unanswered deployment lead', 'Needs validation: proxy header
 Blocker: sandbox run: header control', 'backlog', 'idle', 'work', 700, 950, 'rev1', NULL, 960,
 					'Unverified lead from review rev1.
-Validated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?')`);
+Validated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?'),
+				('grilled1', 'grilled confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 800, 1000, 'rev1', NULL, 900,
+					'Grilled definition of ready')`);
 		raw.close();
 
 		const store = await open(dir);
@@ -6892,6 +6894,13 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 		expect(deploy.waitsValidation).toBe(true);
 		expect(deploy.queuedAt).toBe(950);
 		expect(deploy.validatedAt).toBe(960);
+		// A later grill replaced the confirmed lead's details with its report and
+		// wiped the outcome segment; validatedAt survives, so the row stays
+		// decided work — re-locking it would strand work no route can unlock.
+		const grilled = (await store.getTask("grilled1"))!;
+		expect(grilled.stage).toBe("backlog");
+		expect(grilled.waitsValidation).toBe(false);
+		expect(grilled.validatedAt).toBe(900);
 
 		// The marker is caller-settable (unlike lead_at_done): the patch round-trips
 		// on getTask and on the list rows.

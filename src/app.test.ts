@@ -13625,6 +13625,29 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		}
 	});
 
+	test("a race-lost filing passes the open run's id from the seam refusal through", async () => {
+		// Two concurrent validate-now requests can both pass the route's pre-check;
+		// the transactional refusal then carries the open run's id, and the route
+		// maps it into the 409 body (acceptance item 4).
+		const { review, lead } = await doneReviewWithWaitingLead();
+		validateLeadsImpl = async () => ({
+			error: "a validation run is already open",
+			status: 409,
+			id: "P1-the-race-winner",
+		});
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(409);
+			const b = (await res.json()) as { error: string; id: string };
+			expect(b.error).toBe("a validation run is already open");
+			expect(b.id).toBe("P1-the-race-winner");
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
 	test("a waiting lead with an open validation card answers 409 with its id", async () => {
 		const { review, lead } = await doneReviewWithWaitingLead();
 		const run = await store.createTask(

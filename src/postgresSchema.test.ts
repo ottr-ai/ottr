@@ -351,11 +351,13 @@ describe("PostgreSQL migration surface", () => {
 			{
 				id: "L1",
 				prompt: "Needs validation: suspicious retry loop",
+				validated_at: null,
 				details: null,
 			},
 			{
 				id: "L2",
 				prompt: "Needs validation: flaky retry",
+				validated_at: 950,
 				details:
 					"\nValidated by validation run #9 on 2026-11-20: still blocked — no retry control.",
 			},
@@ -363,19 +365,30 @@ describe("PostgreSQL migration surface", () => {
 				id: "L3",
 				prompt:
 					"Needs validation: proxy header\nBlocker: sandbox run: header control",
+				validated_at: 960,
 				details:
 					"\nValidated by validation run #10 on 2026-11-21: deployment — Which proxy terminates TLS?",
 			},
 			{
 				id: "L4",
 				prompt: "Needs validation: confirmed finding",
+				validated_at: 900,
 				details: "\nValidated by validation run #11 on 2026-11-22: confirmed.",
 			},
 			{
 				id: "L5",
 				prompt:
 					"Needs validation: proxy header\n\nThe user answered the review's question: Applies",
+				validated_at: null,
 				details: null,
+			},
+			{
+				// A later grill replaced the details with its report and wiped the
+				// confirmed segment: validatedAt survives, so the row stays decided.
+				id: "L6",
+				prompt: "Needs validation: grilled confirmed lead",
+				validated_at: 900,
+				details: "Grilled definition of ready",
 			},
 		];
 		await applyPostgresMigrations(db.asDatabase(), projectMigrations);

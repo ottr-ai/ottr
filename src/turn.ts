@@ -1684,7 +1684,8 @@ export interface TurnLoop {
 		first?: ReadonlySet<string>,
 		park?: string,
 	): Promise<
-		{ id: string; reset: string[] } | { error: string; status: number }
+		| { id: string; reset: string[] }
+		| { error: string; status: number; id?: string }
 	>;
 	/** OTTR-1139: the periodic catch-up sweep, on the supervisor tick's cadence.
 	 * Calls filePendingValidationRun(e) for every project, so a done review whose
@@ -10156,21 +10157,28 @@ export function createTurnLoop(
 		first: ReadonlySet<string> = new Set(),
 		park?: string,
 	): Promise<
-		{ id: string; reset: string[] } | { error: string; status: number }
+		| { id: string; reset: string[] }
+		| { error: string; status: number; id?: string }
 	> {
 		return await e.store.transaction(async () => {
 			let tasks = await e.store.listTasks();
 			// One open validation run per project: the manual route's 409 and the
 			// triggers' quiet no-op come from this single check.
-			if (
-				tasks.some(
-					(t) =>
-						t.kind === "validation" &&
-						t.cancelledAt === null &&
-						t.stage !== "done",
-				)
-			)
-				return { error: "a validation run is already open", status: 409 };
+			// OTTR-1252: the refusal names the open run's card id, so a request that
+			// lost the race against a concurrent filing (both passed the route's
+			// pre-check) still answers with the id acceptance item 4 promises.
+			const openRun = tasks.find(
+				(t) =>
+					t.kind === "validation" &&
+					t.cancelledAt === null &&
+					t.stage !== "done",
+			);
+			if (openRun !== undefined)
+				return {
+					error: "a validation run is already open",
+					status: 409,
+					id: openRun.id,
+				};
 			// OTTR-1129: validate-again clears the stale validatedAt inside this
 			// transaction, after the open-run 409 and before any other return: past
 			// this point every failure throws, so the rollback keeps the old validated

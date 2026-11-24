@@ -30155,8 +30155,8 @@ describe("stored review findings", () => {
 		const ld = await leadCard(store, review.id, d.prompt);
 
 		const filed = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in filed).toBe(true);
-		if (!("id" in filed)) throw new Error("no validation run filed");
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error("no validation run filed");
 		const card = (await store.getTask(filed.id))!;
 		// Exactly one queued validation card, linked to the review, on the plan role.
 		expect(card.kind).toBe("validation");
@@ -30354,8 +30354,8 @@ describe("stored review findings", () => {
 		);
 		const stranger = await store.createTask("not a lead of the review");
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		const date = new Date().toISOString().slice(0, 10);
 		// The run records one result per lead; the blocked lead's duplicate confirmed
 		// result loses to the first. The stranger's result applies nowhere.
@@ -30464,8 +30464,8 @@ describe("stored review findings", () => {
 			"Needs validation: last one\nBlocker: sandbox run: cz",
 		);
 		const v2 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v2).toBe(true);
-		if (!("id" in v2)) throw new Error("no validation run filed");
+		expect("error" in v2).toBe(false);
+		if ("error" in v2) throw new Error("no validation run filed");
 		await loop.runTurn(store.name, v2.id);
 		const parked = await settled(store, v2.id);
 		expect(parked.state).toBe("needs_you");
@@ -30586,8 +30586,8 @@ describe("stored review findings", () => {
 			"Needs validation: proxy header\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
 		);
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		// The filing gate already kept the deployment-fact lead out of the batch.
 		expect((await store.getTask(v1.id))!.prompt).not.toContain(
 			`#${deployment.id}`,
@@ -30647,8 +30647,8 @@ describe("stored review findings", () => {
 
 		// The first filing takes the older review and caps the batch at two.
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		const card1 = (await store.getTask(v1.id))!;
 		expect(card1.followUpOf).toBe(r1.id);
 		expect(card1.prompt).toContain(`#${l1.id}`);
@@ -30656,11 +30656,14 @@ describe("stored review findings", () => {
 		expect(card1.prompt).not.toContain(`#${l3.id}`);
 		expect(card1.prompt).not.toContain(`#${m1.id}`);
 
-		// One open run per project: a second call (also for the other review) waits.
+		// One open run per project: a second call (also for the other review) waits,
+		// and the transactional refusal names the open run's card id — a request
+		// that lost the race against a concurrent filing answers with it too.
 		const again = await loop.filePendingValidationRun(entryOf(projects, store));
 		expect(again).toEqual({
 			error: "a validation run is already open",
 			status: 409,
+			id: v1.id,
 		});
 
 		// The run confirms both leads; the settle's chain files r1's remainder.
@@ -30706,8 +30709,8 @@ describe("stored review findings", () => {
 			entryOf(projects, store),
 			r2.id,
 		);
-		expect("id" in manual).toBe(true);
-		if (!("id" in manual)) throw new Error("no validation run filed");
+		expect("error" in manual).toBe(false);
+		if ("error" in manual) throw new Error("no validation run filed");
 		const card4 = (await store.getTask(manual.id))!;
 		expect(card4.followUpOf).toBe(r2.id);
 		expect(card4.prompt).toContain(`#${m1.id}`);
@@ -30810,8 +30813,8 @@ describe("stored review findings", () => {
 			"Needs validation: held lead\nBlocker: sandbox run: ch",
 		);
 		const filed = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in filed).toBe(true);
-		if (!("id" in filed)) throw new Error("no validation run filed");
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error("no validation run filed");
 
 		// The pure scheduler sees a plain work-slot card: it takes a slot, holds no
 		// merge, and blocks no next review (it is created after the review's doneAt,
@@ -31045,8 +31048,8 @@ describe("stored review findings", () => {
 			"Needs validation: stuck lead\nBlocker: sandbox run: cs",
 		);
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		// Every parsed result names a lead id no card carries: the run applies
 		// nothing, so landing done would refile the same batch forever.
 		batches.push([mkFinding("Validation: #no-such-card confirmed\nevidence")]);
@@ -31103,8 +31106,8 @@ describe("stored review findings", () => {
 		// Non-strict (the chain): the call still falls back to the next
 		// candidate review, here B.
 		const chain = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in chain).toBe(true);
-		if (!("id" in chain)) throw new Error("no validation run filed");
+		expect("error" in chain).toBe(false);
+		if ("error" in chain) throw new Error("no validation run filed");
 		const card = (await store.getTask(chain.id))!;
 		expect(card.followUpOf).toBe(b.id);
 		expect(card.prompt).toContain(`#${bLead.id}`);
@@ -31136,8 +31139,8 @@ describe("stored review findings", () => {
 		// Run 1 lands A "blocked" and C "deployment"; the chain files the
 		// remainder and run 2 lands B "blocked" later.
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		batches.push([
 			mkFinding(`Validation: #${la.id} blocked\nthe sandbox lacks the control`),
 			mkFinding(
@@ -31170,8 +31173,8 @@ describe("stored review findings", () => {
 			review.id,
 			true,
 		);
-		expect("id" in v2).toBe(true);
-		if (!("id" in v2)) throw new Error("no second validation run filed");
+		expect("error" in v2).toBe(false);
+		if ("error" in v2) throw new Error("no second validation run filed");
 		await loop.runTurn(store.name, v2.id);
 		await settled(store, v2.id);
 
@@ -31186,8 +31189,8 @@ describe("stored review findings", () => {
 			true,
 			{ before: cutoff },
 		);
-		expect("id" in again).toBe(true);
-		if (!("id" in again)) throw new Error("no validation run filed");
+		expect("error" in again).toBe(false);
+		if ("error" in again) throw new Error("no validation run filed");
 		expect(again.reset).toEqual([la.id]);
 
 		// A lost its validatedAt and its settle marker (the marker was the
@@ -31237,8 +31240,8 @@ describe("stored review findings", () => {
 		await store.appendReviewFinding(review.id, a);
 		const la = await leadCard(store, review.id, a.prompt);
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		batches.push([mkFinding(`Validation: #${la.id} blocked\nstill fails`)]);
 		await loop.runTurn(store.name, v1.id);
 		await settled(store, v1.id);
@@ -31287,8 +31290,8 @@ describe("stored review findings", () => {
 		// remainder and run 2 confirms G and re-records both leads: D flips to
 		// "deployment", E flips to "blocked". Both runs land before the cutoff.
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		batches.push([
 			mkFinding(`Validation: #${ld.id} blocked\nno control in the sandbox`),
 			mkFinding(
@@ -31323,8 +31326,8 @@ describe("stored review findings", () => {
 			review.id,
 			true,
 		);
-		expect("id" in v2).toBe(true);
-		if (!("id" in v2)) throw new Error("no second validation run filed");
+		expect("error" in v2).toBe(false);
+		if ("error" in v2) throw new Error("no second validation run filed");
 		await loop.runTurn(store.name, v2.id);
 		await settled(store, v2.id);
 		const validatedAt = (await store.getTask(ld.id))!.validatedAt;
@@ -31338,8 +31341,8 @@ describe("stored review findings", () => {
 			true,
 			{ before: validatedAt + 1 },
 		);
-		expect("id" in again).toBe(true);
-		if (!("id" in again)) throw new Error("no validation run filed");
+		expect("error" in again).toBe(false);
+		if ("error" in again) throw new Error("no validation run filed");
 		// The newest outcome wins: D's newest record is deployment, so only E resets.
 		expect(again.reset).toEqual([le.id]);
 		const fullD = (await store.getTask(ld.id))!;
@@ -31398,8 +31401,8 @@ describe("stored review findings", () => {
 		await store.updateTask(lb.id, { validatedAt: Date.now() });
 
 		const filed = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in filed).toBe(true);
-		if (!("id" in filed)) throw new Error("no validation run filed");
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error("no validation run filed");
 		const card = (await store.getTask(filed.id))!;
 		expect(card.prompt).toContain(`#${la.id}`);
 		expect(card.prompt).not.toContain(`#${lb.id}`);
@@ -31456,8 +31459,8 @@ describe("stored review findings", () => {
 			true,
 			{ before: 1500, lead: la.id },
 		);
-		expect("id" in again).toBe(true);
-		if (!("id" in again)) throw new Error("no validation run filed");
+		expect("error" in again).toBe(false);
+		if ("error" in again) throw new Error("no validation run filed");
 		expect(again.reset).toEqual([la.id]);
 		// Only A's stamp cleared; B keeps its marker and stays out of the batch.
 		expect((await store.getTask(la.id))!.validatedAt).toBeNull();
@@ -31490,8 +31493,8 @@ describe("stored review findings", () => {
 		const refuted = await waitingLead(store, review.id, rf.prompt);
 
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error("no validation run filed");
 		// The waiting leads all entered the batch despite their todo stages.
 		expect((await store.getTask(v1.id))!.prompt).toContain(`#${confirmed.id}`);
 		batches.push([

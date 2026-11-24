@@ -2828,12 +2828,20 @@ export class ProjectStore {
 					].every((c) => cols.includes(c))
 				) {
 					const legacy = await db
-						.query<{ id: string; prompt: string; details: string | null }, []>(
-							"SELECT id, prompt, details FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+						.query<
+							{
+								id: string;
+								prompt: string;
+								details: string | null;
+								validated_at: number | null;
+							},
+							[]
+						>(
+							"SELECT id, prompt, details, validated_at FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
 						)
 						.all();
 					for (const row of legacy)
-						if (legacyLeadWaits(row.prompt, row.details))
+						if (legacyLeadWaits(row.prompt, row.validated_at, row.details))
 							await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);
 				}
 				// OTTR-1056: the answered PR-head CI failure. The key is

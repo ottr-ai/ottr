@@ -711,7 +711,8 @@ interface AppDeps {
 		 * into the batch inside its transaction (the drawer's Start validation run). */
 		park?: string,
 	): Promise<
-		{ id: string; reset: string[] } | { error: string; status: number }
+		| { id: string; reset: string[] }
+		| { error: string; status: number; id?: string }
 	>;
 	/** OTTR-1261: `reason` parks the stopped card with it instead of the plain
 	 * stopped reason; the stale-ask's Stop answer names the stale park. */
@@ -13130,7 +13131,13 @@ export async function createApp(deps: AppDeps) {
 				{ before: Date.now() + 1, lead: task.id },
 				new Set([task.id]),
 			);
-			if ("error" in filed) return json({ error: filed.error }, filed.status);
+			if ("error" in filed)
+				return json(
+					filed.id === undefined
+						? { error: filed.error }
+						: { error: filed.error, id: filed.id },
+					filed.status,
+				);
 			await deps.schedule();
 			const t = await e.store.getTask(filed.id);
 			if (t === null) return json({ error: "unknown task" }, 404);
@@ -13216,7 +13223,13 @@ export async function createApp(deps: AppDeps) {
 			park === undefined ? undefined : new Set([park]),
 			park,
 		);
-		if ("error" in filed) return json({ error: filed.error }, filed.status);
+		if ("error" in filed)
+			return json(
+				filed.id === undefined
+					? { error: filed.error }
+					: { error: filed.error, id: filed.id },
+				filed.status,
+			);
 		await deps.schedule();
 		// OTTR-1129: the response adds the reset list — the ids whose validatedAt
 		// the call cleared, [] without the again flag — around the card's view.

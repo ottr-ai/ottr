@@ -29,7 +29,7 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    then converges per row, idempotent on every open:
 
    ```sql
-   SELECT id, prompt, details FROM tasks
+   SELECT id, prompt, details, validated_at FROM tasks
    WHERE stage = 'backlog' AND cancelled_at IS NULL
      AND prompt LIKE 'Needs validation%'
      AND prompt NOT LIKE '%The user answered the review%'
@@ -44,8 +44,12 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    never-validated lead, a still-blocked result, or an unanswered deployment
    result waits. Decided rows keep their stage: their outcome excludes both
    batching and the blocked-result reset, so re-locking them would strand the
-   work. The per-row decision runs in TypeScript because "newest segment"
-   needs newest-wins reading that no LIKE can do. (`Needs-validation lead
+   work. A validatedAt with no readable segment is decided too — the settle
+   writes a segment in every branch, so a wiped details text (a later grill
+   replaces details with its report) means an outcome was recorded before the
+   text went, and re-locking would strand work no route can unlock. The
+   per-row decision runs in TypeScript because "newest segment" needs
+   newest-wins reading that no LIKE can do. (`Needs-validation lead
    questions...` does not match the pattern: the hyphen.)
 3. PostgreSQL: the column lives only in a numbered step, never in
    `projectStepOne` — the steps run on fresh databases too, so a stepOne
@@ -155,10 +159,12 @@ waiting lead instead of "queued with no hold found".
    PostgreSQL column lives outside `projectStepOne`, so fresh databases
    initialize without a duplicate column.
 4. The validate-now route files with the lead first, answers 409 with the open
-   run's id when a run is open, resets only this lead's `validatedAt` when its
-   newest outcome was blocked (both blocked stamps sit before the cutoff, so
-   losing the scope fails the test), and refuses a deployment decision — from
-   the prompt's blocker line or from a recorded deployment outcome.
+   run's id when a run is open — including when the request loses the race and
+   the transactional filing refuses, whose 409 carries the same id — resets
+   only this lead's `validatedAt` when its newest outcome was blocked (both
+   blocked stamps sit before the cutoff, so losing the scope fails the test),
+   and refuses a deployment decision — from the prompt's blocker line or from
+   a recorded deployment outcome.
 5. The drawer renders exactly Cancel and Validate now for a sandbox lead with
    no recorded deployment outcome, and only Cancel plus the question-flow hint
    when the blocker line or the newest recorded outcome says deployment, with

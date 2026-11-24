@@ -1674,18 +1674,26 @@ export function leadValidationOutcome(
  * applies answer rides its own marker in the prompt (`The user answered the
  * review's question`, written by the reply route). Everything undecided waits:
  * never validated, the newest result still blocked, or a deployment result its
- * question card has not settled. Unreadable outcomes wait too — for a lead,
- * starting unvalidated work is the failure mode, and the validate flows can
- * still decide it later. Pure. */
+ * question card has not settled. A validatedAt with no readable segment is
+ * decided too: the settle writes a segment in every branch, so a wiped details
+ * text (a later grill replaces details with its report) means an outcome was
+ * recorded before the text went — keep the row rather than re-lock decided
+ * work no route can unlock (batching needs validatedAt null, the reset needs
+ * a blocked segment). Unreadable outcomes on never-validated rows wait — for
+ * a lead, starting unvalidated work is the failure mode, and the validate
+ * flows can still decide it later. Pure. */
 export function legacyLeadWaits(
 	prompt: string,
+	validatedAt: number | null,
 	details: string | null,
 ): boolean {
 	if (!prompt.startsWith("Needs validation")) return false;
 	if (prompt.includes("\nThe user answered the review's question"))
 		return false;
 	const outcome = leadValidationOutcome(details);
-	return outcome !== "confirmed" && outcome !== "refuted";
+	if (outcome === "confirmed" || outcome === "refuted") return false;
+	if (outcome !== null) return true;
+	return validatedAt === null;
 }
 
 /** The needs_you reason for a diverging loop: the blocker counts per round, then the rule(s)

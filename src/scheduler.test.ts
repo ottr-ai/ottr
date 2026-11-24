@@ -3600,24 +3600,40 @@ describe("OTTR-1252: the legacy-lead convergence decision reads the newest outco
 	test("legacyLeadWaits waits for undecided rows and keeps decided rows", () => {
 		const prompt = "Needs validation: suspicious retry loop";
 		// Undecided: never validated, still blocked, unanswered deployment.
-		expect(legacyLeadWaits(prompt, null)).toBe(true);
-		expect(legacyLeadWaits(prompt, `unverified.${BLOCKED}`)).toBe(true);
-		expect(legacyLeadWaits(prompt, `unverified.${DEPLOYMENT}`)).toBe(true);
+		expect(legacyLeadWaits(prompt, null, null)).toBe(true);
+		expect(legacyLeadWaits(prompt, 950, `unverified.${BLOCKED}`)).toBe(true);
+		expect(legacyLeadWaits(prompt, 960, `unverified.${DEPLOYMENT}`)).toBe(true);
 		// Decided: confirmed work, a refuted lead, and the operator's applies
 		// answer (its marker rides the prompt, set by the reply route).
-		expect(legacyLeadWaits(prompt, `unverified.${CONFIRMED}`)).toBe(false);
+		expect(legacyLeadWaits(prompt, 900, `unverified.${CONFIRMED}`)).toBe(false);
 		expect(
-			legacyLeadWaits(prompt, `unverified.${CONFIRMED_WITH_EVIDENCE}`),
+			legacyLeadWaits(prompt, 900, `unverified.${CONFIRMED_WITH_EVIDENCE}`),
 		).toBe(false);
 		expect(
 			legacyLeadWaits(
 				`${prompt}\n\nThe user answered the review's question: Applies`,
 				null,
+				null,
 			),
 		).toBe(false);
+		// A validatedAt with no readable segment is decided: a later grill
+		// replaces details with its report, wiping the outcome segment — the
+		// recorded outcome predates the wipe, and re-locking the row would
+		// strand work no route can unlock (batching needs validatedAt null, the
+		// reset needs a blocked segment).
+		expect(legacyLeadWaits(prompt, 900, "Grilled definition of ready")).toBe(
+			false,
+		);
+		expect(legacyLeadWaits(prompt, 950, "Grilled definition of ready")).toBe(
+			false,
+		);
 		// Not a lead: the question cards' prefix carries the hyphen.
 		expect(
-			legacyLeadWaits("Needs-validation lead questions from rev1: reply", null),
+			legacyLeadWaits(
+				"Needs-validation lead questions from rev1: reply",
+				null,
+				null,
+			),
 		).toBe(false);
 	});
 });
