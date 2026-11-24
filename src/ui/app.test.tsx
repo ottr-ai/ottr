@@ -6692,6 +6692,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		state,
 		reviewedHead: "c".repeat(40),
 		head: "d".repeat(40),
+		headReviewed: false,
 		postedHead: null,
 		postedUrl: null,
 		postedLogin: null,
@@ -6805,21 +6806,13 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(reButton(html)).toContain("quiet wait");
 	});
 
-	test("the re-review tooltip names a fresh review when the head already has one", () => {
+	test("the re-review tooltip names a fresh review for an already-reviewed head", () => {
+		// headReviewed is the store's per-head history, so it holds for a reverted
+		// head too (H1 reviewed and posted, H2 reviewed and posted, back to H1):
+		// neither row field names the head any more, the history still does.
 		const html = section(waitingReview(), "## Summary\nreview", {
 			...prView("open"),
-			head: "c".repeat(40),
-		});
-		expect(reButton(html)).toContain("fresh full review");
-	});
-
-	test("the re-review tooltip names a fresh review for a reverted head too", () => {
-		// A later draft holds reviewedHead, but the posted review sits on the
-		// current head (the H1 -> H2 -> H1 revert): the promise still shows.
-		const html = section(waitingReview(), "## Summary\nreview", {
-			...prView("open"),
-			reviewedHead: "c".repeat(40),
-			postedHead: "d".repeat(40),
+			headReviewed: true,
 		});
 		expect(reButton(html)).toContain("fresh full review");
 	});
@@ -7029,6 +7022,7 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 		state: "open",
 		reviewedHead: "c".repeat(40),
 		head: "d".repeat(40),
+		headReviewed: false,
 		postedHead: null,
 		postedUrl: null,
 		postedLogin: null,

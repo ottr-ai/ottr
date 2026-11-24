@@ -21,12 +21,7 @@ import {
 } from "./prInline.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
-import {
-	type OpenPrsView,
-	type PrReviewRow,
-	type PrRunState,
-	prHeadHasReview,
-} from "./types.ts";
+import type { OpenPrsView, PrReviewRow, PrRunState } from "./types.ts";
 
 export type ReviewFn = (
 	messages: Array<{ role: "system" | "user"; content: string }>,
@@ -1643,11 +1638,12 @@ async function reviewOnce(
 		// OTTR-1248: the Re-review now request (note "") promises a fresh full
 		// review, so with the head already reviewed no earlier review enters the
 		// prompt: the posted review's paragraph must not narrow the findings.
-		// prHeadHasReview also names the reverted head whose posted review sits on
-		// it while a later draft holds reviewedHead. A reply (note text) and
-		// watcher runs (note undefined) keep the context.
+		// prHeadReviewed reads the store's per-head history, so it holds for a
+		// reverted head too: H1 reviewed and posted, H2 drafted and posted, back
+		// to H1 still finds H1's saved draft. A reply (note text) and watcher
+		// runs (note undefined) keep the context.
 		earlier =
-			note === "" && prHeadHasReview(row.head, row.reviewedHead, row.postedHead)
+			note === "" && (await store.prHeadReviewed(row.number, row.head))
 				? null
 				: await fetchReReviewContext({
 						repo,

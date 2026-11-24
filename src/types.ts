@@ -525,6 +525,8 @@ export interface PrReviewView {
 	state: PrState;
 	/** The PR's current head: the head the next draft reviews. */
 	head: string;
+	/** True once a draft of this head was saved (the store's per-head review history), so a re-review of it runs in full. */
+	headReviewed: boolean;
 	reviewedHead: string | null;
 	postedHead: string | null;
 	/** html_url of the posted review; null until a Post succeeds. */
@@ -2004,17 +2006,6 @@ export const PR_REVIEW_WAITING =
 /** The card's needsReason while the posted review waits for the PR author or the merge. */
 export const PR_REVIEW_POSTED =
 	"Review posted; waits for the author or the merge.";
-
-/** True when `head` already has a review: the latest draft or the board's posted
- * review sits on it (a push followed by a revert included). The Re-review now
- * request and its drawer tooltip share this one rule. */
-export function prHeadHasReview(
-	head: string,
-	reviewedHead: string | null,
-	postedHead: string | null,
-): boolean {
-	return reviewedHead === head || postedHead === head;
-}
 
 /** Time ranges the performance dashboard can filter by. */
 export const PERF_RANGES = ["1h", "24h", "7d", "30d", "90d", "all"] as const;

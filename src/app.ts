@@ -6864,6 +6864,7 @@ export async function createApp(deps: AppDeps) {
 							),
 							state: pr.state,
 							head: pr.head,
+							headReviewed: await e.store.prHeadReviewed(pr.number, pr.head),
 							reviewedHead: pr.reviewedHead,
 							postedHead: pr.postedHead,
 							postedUrl: pr.postedUrl,

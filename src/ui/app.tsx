@@ -75,7 +75,6 @@ import {
 	type ProjectView,
 	type ProvisioningResponse,
 	type PrReviewView,
-	prHeadHasReview,
 	type QuotaResetCredits,
 	type QuotaState,
 	REVIEW_BODY_MAX,
@@ -9702,7 +9701,7 @@ export function PrReviewSection({
 							// Plain, not primary: a done drawer keeps exactly one primary (Post review).
 							disabled={waiting}
 							title={
-								prHeadHasReview(pr.head, pr.reviewedHead, pr.postedHead)
+								pr.headReviewed
 									? "The current head already has a review; this starts a fresh full review"
 									: "Skips the quiet wait and starts a new draft for the current head"
 							}

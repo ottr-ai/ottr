@@ -1729,6 +1729,55 @@ describe("createPrWatcher", () => {
 		// The run saved a fresh draft on the restored head.
 		expect((await s.store.getPrReview(22))!.reviewedHead).toBe(sha("a"));
 	});
+	test("the re-review-now request gives a twice-posted reverted head a fresh full review", async () => {
+		// H1 reviewed and posted, H2 reviewed and posted, back to H1: neither
+		// reviewedHead nor postedHead names H1 any more, and the store's per-head
+		// run history still does. The empty-note request must run a first review,
+		// not H2's earlier-review triage.
+		const s = await setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(22))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("b"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(22))!,
+			postedHead: sha("b"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-2`,
+			postedLogin: "bot",
+		});
+		s.setReviews([
+			ghReview(
+				1,
+				sha("a"),
+				"Earlier on a: the error panel leaks state",
+				"2026-01-01T00:00:00Z",
+			),
+			ghReview(
+				2,
+				sha("b"),
+				"Earlier on b: the retry swallows the second failure",
+				"2026-01-02T00:00:00Z",
+			),
+		]);
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.reviewNow({ project: "p", number: 22, note: "" });
+		const msg = s.prompts.at(-1)!;
+		expect(msg).not.toContain("EARLIER REVIEW");
+		expect(msg).not.toContain("already reviewed at an earlier head");
+		expect(msg).not.toContain("Earlier on b");
+		// The run saved a fresh draft on the restored head.
+		expect((await s.store.getPrReview(22))!.reviewedHead).toBe(sha("a"));
+	});
 	test("a retried over-budget re-review logs the dropped block once", async () => {
 		const s = await setup();
 		s.setOpen([pr(22, sha("a"))]);

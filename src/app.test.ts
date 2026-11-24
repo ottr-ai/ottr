@@ -22527,6 +22527,8 @@ describe(
 					url: "https://github.com/acme/widget/pull/8",
 					state: "open",
 					head: H1,
+					// reviewed(8, H1) saved a draft of H1: the per-head history holds it.
+					headReviewed: true,
 					reviewedHead: H1,
 					postedHead: null,
 					postedUrl: null,
