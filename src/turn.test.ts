@@ -27458,7 +27458,11 @@ describe("microVM pool hold (OTTR-1142)", () => {
 
 describe("writeVmFiles", () => {
 	test("writes the report and shots/ into the worktree; refuses every other path", async () => {
-		const wt = mkdtempSync(join(tmpdir(), "ottr-vmfiles-"));
+		// wt sits below the temp root so "../x" resolves inside this test's own
+		// tree; asserting against /tmp would read foreign files on a shared host.
+		const root = mkdtempSync(join(tmpdir(), "ottr-vmfiles-"));
+		const wt = join(root, "wt");
+		mkdirSync(wt);
 		const outside = mkdtempSync(join(tmpdir(), "ottr-vmfiles-out-"));
 		mkdirSync(join(wt, "src"));
 		mkdirSync(join(wt, "shots"));
@@ -27484,12 +27488,12 @@ describe("writeVmFiles", () => {
 			"# Report\n",
 		);
 		expect(readFileSync(join(wt, "shots", "sub", "a.png"), "utf8")).toBe("png");
-		expect(existsSync(join(dirname(wt), "x"))).toBe(false);
+		expect(existsSync(join(root, "x"))).toBe(false);
 		expect(existsSync(join(wt, "src", "x.ts"))).toBe(false);
 		expect(existsSync(join(wt, "src", "y.ts"))).toBe(false);
 		expect(readdirSync(outside)).toEqual([]);
 		expect(logs).toHaveLength(5);
-		rmSync(wt, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
 		rmSync(outside, { recursive: true, force: true });
 	});
 });
