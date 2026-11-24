@@ -245,6 +245,7 @@ const {
 	draftGithubSource,
 	OrphanNotice,
 	SeedFailedLine,
+	SeedPartialLine,
 	ProvisionErrorLine,
 	SetupChecklist,
 	ranOnLabel,
@@ -472,6 +473,7 @@ describe("appNoticeKeys upstream updates", () => {
 			null,
 			false,
 			0,
+			null,
 			null,
 			null,
 			false,
@@ -3155,6 +3157,93 @@ describe("SeedFailedLine", () => {
 		expect(
 			renderToStaticMarkup(
 				<SeedFailedLine fail={null} inboxKey={undefined} fresh={false} />,
+			),
+		).toBe("");
+	});
+});
+
+describe("SeedPartialLine", () => {
+	const partial = {
+		commit: "e".repeat(40),
+		since: 1730990000000,
+		count: 3,
+		items: [
+			{
+				name: "user/agents/skills/ffmpeg-skill",
+				rule: "hidden character U+200D",
+			},
+			{
+				name: "user/agents/skills/shorts",
+				rule: "incomplete dependency coverage",
+			},
+			{ name: "user/omp/agent/skills/ghost-editor", rule: "inconclusive" },
+		],
+	};
+
+	test("the amber notice names the commit, the count, and the items", () => {
+		const html = renderToStaticMarkup(
+			<SeedPartialLine
+				partial={partial}
+				inboxKey="seed-partial:1730990000000"
+				fresh
+			/>,
+		);
+		expect(html).toContain('role="note"');
+		expect(html).toContain('data-inbox-key="seed-partial:1730990000000"');
+		expect(html).toContain("mark-warn");
+		expect(html).toContain(
+			`Agent layer at ${"e".repeat(12)}: 3 skills left out`,
+		);
+		const doc = parseMarkup(html);
+		expect(doc.querySelectorAll(".notif-details").length).toBe(1);
+		const details = doc.querySelector(".notif-details");
+		expect(details?.querySelector("summary")?.textContent).toBe("Details");
+		expect(details?.textContent).toContain(
+			"user/agents/skills/ffmpeg-skill — hidden character U+200D",
+		);
+		expect(details?.textContent).toContain(
+			"user/agents/skills/shorts — incomplete dependency coverage",
+		);
+		expect(details?.textContent).toContain(
+			"user/omp/agent/skills/ghost-editor — inconclusive",
+		);
+		// The collapsed line names no item, so a long list never floods it.
+		doc.querySelectorAll(".notif-details").forEach((d) => {
+			d.remove();
+		});
+		expect(doc.body.textContent).not.toContain("ffmpeg-skill");
+		expect(html).toContain('class="new-tag"');
+	});
+
+	test("a single left-out skill keeps the singular headline", () => {
+		const html = renderToStaticMarkup(
+			<SeedPartialLine
+				partial={{ ...partial, count: 1 }}
+				inboxKey="seed-partial:1"
+				fresh={false}
+			/>,
+		);
+		expect(html).toContain("Agent layer at");
+		expect(html).toContain(": 1 skill left out");
+		expect(html).not.toContain("skills left out");
+	});
+
+	test("an unknown commit renders the unknown-commit headline", () => {
+		const html = renderToStaticMarkup(
+			<SeedPartialLine
+				partial={{ ...partial, commit: "" }}
+				inboxKey={undefined}
+				fresh={false}
+			/>,
+		);
+		expect(html).toContain("Agent layer at unknown commit: 3 skills left out");
+		expect(html).not.toContain("e".repeat(12));
+	});
+
+	test("a null partial renders nothing", () => {
+		expect(
+			renderToStaticMarkup(
+				<SeedPartialLine partial={null} inboxKey={undefined} fresh={false} />,
 			),
 		).toBe("");
 	});
@@ -16220,6 +16309,8 @@ const panelBase = {
 	restartWaitKey: null,
 	seedFailed: null,
 	seedFailKey: null,
+	seedPartial: null,
+	seedPartialKey: null,
 	provisionError: null,
 	provisionErrKey: null,
 	state: null,

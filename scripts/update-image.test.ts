@@ -26,10 +26,12 @@ const realWorktree = { ...worktree };
 const { gitExe } = worktree;
 
 import {
+	classifySeedResults,
 	type Deps,
 	dropBunDotenv,
 	envFileValues,
 	seedOnlyUpdate,
+	seedPartialRecord,
 	updateImage,
 	updateLockPath,
 } from "./update-image.ts";
@@ -121,10 +123,17 @@ interface FakeOptions {
 	seedFailRecord?: string;
 	/** Exit code of the seed-failed record write. */
 	seedFailWriteCode?: number;
-	/** Exit code of `rm -f /etc/ottr/seed-failed`. */
+	/** Exit code of the rm that clears the seed-failed (and seed-partial) records. */
 	seedFailRmCode?: number;
 	/** Exit code of the board-seed run. */
 	seedCode?: number;
+	/** The results file install-user wrote (the board-seed one-off `cat` reads it);
+	 *  unset = no file in the volume, the read fails. */
+	seedResults?: string;
+	/** The seed-partial record the volume already holds ("" = none; a write replaces it). */
+	seedPartialRecord?: string;
+	/** Exit code of the seed-partial record write (the board-seed printf exec). */
+	seedPartialWriteCode?: number;
 	/** Output of `compose ps -q alate` (a container id when the project's alate runs). */
 	alatePs?: string;
 	/** The image the project's alate container runs (`inspect .Config.Image`). */
@@ -253,6 +262,10 @@ interface FakeRecord {
 	seedFailRecords: string[];
 	/** The stored seed-failed record: the `cat` answers it, the write sets it, the rm clears it. */
 	seedFailState: { value: string };
+	/** The seed-partial record writes (`printf %s '<json>' > /etc/ottr/seed-partial`), in order. */
+	seedPartialRecords: string[];
+	/** The stored seed-partial record: a write sets it, the rm clears it. */
+	seedPartialState: { value: string };
 	/** The OTTR_VERSION each compose build ran with, in order. */
 	buildStamps: (string | undefined)[];
 	built: FakeRun["built"];
@@ -271,6 +284,31 @@ function boardSeedExec(
 		code: o.seedCode ?? 0,
 		out: o.seedCode ? "the seed step failed\n" : "",
 	};
+}
+
+/** The seed's other board-seed one-offs (`--entrypoint sh`): the results file read
+ *  answers the scripted file text (unset = no file, the read fails), the
+ *  seed-partial printf write sets the stored record. */
+function seedOneOffExec(
+	line: string,
+	o: FakeOptions,
+	rec: FakeRecord,
+): ExecResult {
+	rec.calls.push(line);
+	if (line.includes("cat /etc/ottr/seed-results.json"))
+		return o.seedResults === undefined
+			? {
+					code: 1,
+					out: "cat: can't open /etc/ottr/seed-results.json: No such file\n",
+				}
+			: { code: 0, out: o.seedResults };
+	rec.seedPartialRecords.push(line);
+	const code = o.seedPartialWriteCode ?? 0;
+	if (code === 0) {
+		const m = /printf %s '(.*)' > \/etc\/ottr\/seed-partial$/.exec(line);
+		rec.seedPartialState.value = m?.[1] ?? "";
+	}
+	return { code, out: "" };
 }
 
 /** The record `cat` execs: the wait start, the deployed commit, or the seed commit. */
@@ -297,6 +335,7 @@ function recordExec(
 			};
 		if (line.includes("rm -f")) {
 			rec.seedFailState.value = "";
+			if (line.includes("seed-partial")) rec.seedPartialState.value = "";
 			return { code: o.seedFailRmCode ?? 0, out: "" };
 		}
 		rec.seedFailRecords.push(line);
@@ -600,6 +639,8 @@ function fakes(o: FakeOptions = {}): FakeRun {
 	const restartWaits: string[] = [];
 	const seedFailRecords: string[] = [];
 	const seedFailState = { value: o.seedFailRecord ?? "" };
+	const seedPartialRecords: string[] = [];
+	const seedPartialState = { value: o.seedPartialRecord ?? "" };
 	const buildStamps: (string | undefined)[] = [];
 	const logs: string[] = [];
 	const waits: number[] = [];
@@ -627,6 +668,8 @@ function fakes(o: FakeOptions = {}): FakeRun {
 		restartWaits,
 		seedFailRecords,
 		seedFailState,
+		seedPartialRecords,
+		seedPartialState,
 		buildStamps,
 		built,
 	};
@@ -649,7 +692,12 @@ function fakes(o: FakeOptions = {}): FakeRun {
 			const line = args.join(" ");
 			const flags = dockerFlags(line);
 			if (flags.drain) drains.push(line);
-			if (args.includes("board-seed")) return boardSeedExec(line, o, rec);
+			if (args.includes("board-seed")) {
+				// The install run itself has no --entrypoint; the results read and
+				// the partial-record write ride the one-off sh.
+				if (args.includes("--entrypoint")) return seedOneOffExec(line, o, rec);
+				return boardSeedExec(line, o, rec);
+			}
 			const record = recordExec(line, o, rec);
 			if (record !== null) return record;
 			if (line.startsWith("ps --filter name="))
@@ -683,6 +731,8 @@ function fakes(o: FakeOptions = {}): FakeRun {
 		restartWaits,
 		seedFailRecords,
 		seedFailState,
+		seedPartialRecords,
+		seedPartialState,
 	};
 }
 
@@ -706,7 +756,10 @@ const CFGJSON = "compose -f c.yml config --format json";
 const CAT_SEEDFAIL =
 	"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-failed";
 const RM_SEEDFAIL =
-	"compose -f c.yml exec -T server sh -c rm -f /etc/ottr/seed-failed";
+	"compose -f c.yml exec -T server sh -c rm -f /etc/ottr/seed-failed /etc/ottr/seed-partial";
+/** The env flag that makes install-user write its structured results file for the seed to classify. */
+const SEED_RESULTS_ENV =
+	"-e ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json";
 const SEEDFAIL_WRITE = (record: {
 	since: number;
 	commit: string;
@@ -720,6 +773,22 @@ function seedFailRecordOf(
 ): { since: number; commit: string; text: string } {
 	const m = /printf %s '(.*)' > \/etc\/ottr\/seed-failed$/.exec(
 		f.seedFailRecords[n] ?? "",
+	);
+	expect(m).toBeTruthy();
+	return JSON.parse(m![1]!);
+}
+/** The JSON payload of the n-th seed-partial record write, parsed. */
+function seedPartialRecordOf(
+	f: FakeRun,
+	n = 0,
+): {
+	commit: string;
+	since: number;
+	count: number;
+	items: { name: string; rule: string }[];
+} {
+	const m = /printf %s '(.*)' > \/etc\/ottr\/seed-partial$/.exec(
+		f.seedPartialRecords[n] ?? "",
 	);
 	expect(m).toBeTruthy();
 	return JSON.parse(m![1]!);
@@ -853,6 +922,10 @@ interface FakeRun {
 	seedFailRecords: string[];
 	/** The stored seed-failed record: the `cat` answers it, a write sets it, the rm clears it. */
 	seedFailState: { value: string };
+	/** The seed-partial record writes (`printf %s '<json>' > /etc/ottr/seed-partial`), in order. */
+	seedPartialRecords: string[];
+	/** The stored seed-partial record: a write sets it, the rm clears it. */
+	seedPartialState: { value: string };
 	/** The restart-wait record writes (`printf %s '<json>' > /etc/ottr/restart-wait`), in order. */
 	restartWaits: string[];
 }
@@ -2512,7 +2585,7 @@ describe("rolling restart", () => {
 		const data = checkout();
 		const head = must(data.main, "rev-parse", "HEAD");
 		const unrecorded = "0".repeat(40);
-		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+		const seedRun = `compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`;
 		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
 		const f = fakes({
 			running: RUNNING3,
@@ -2562,7 +2635,7 @@ describe("rolling restart", () => {
 		const { main } = checkout();
 		const data = checkout();
 		const head = must(data.main, "rev-parse", "HEAD");
-		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+		const seedRun = `compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`;
 		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
 		// The images are unchanged, so the workers do not roll and worker-a stays
 		// busy into the server step; the seed alone moves the server.
@@ -3627,7 +3700,7 @@ describe("rolling restart", () => {
 			`compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit`,
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
-			`compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`,
+			`compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`,
 			RM_SEEDFAIL,
 			GET,
 			CAT_WAIT,
@@ -3797,7 +3870,7 @@ describe("board seed", () => {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(0);
-		const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+		const seedRun = `compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`;
 		expect(f.seedRuns).toEqual([seedRun]);
 		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
 		// A seeded layer joins the image change as a restart reason: the hold happens, and
@@ -4175,14 +4248,14 @@ describe("board seed", () => {
 		expect(remotes.flat().join(" ")).not.toContain(token);
 		// No ref means main; the board-seed gets the repo value as written.
 		expect(f.seedRuns).toEqual([
-			"compose -f c.yml run --rm --no-deps board-seed --repo example/data",
+			`compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} board-seed --repo example/data`,
 		]);
 		expect(f.seedWrites).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`,
 			DEPLOYED(main),
 		]);
 		expect(g.seedRuns).toEqual([
-			"compose -f c.yml run --rm --no-deps board-seed --repo example/data@seed",
+			`compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} board-seed --repo example/data@seed`,
 		]);
 		expect(g.seedWrites).toEqual([
 			`compose -f c.yml exec -T server sh -c printf %s '${other}' > /etc/ottr/seed-commit`,
@@ -4311,6 +4384,426 @@ describe("board seed", () => {
 		for (const f of [dated, undated, badDate, refused, thrown])
 			expect(f.logs.join("\n")).not.toContain(token);
 	}, 60_000);
+
+	const RESULTS_READ =
+		"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat /etc/ottr/seed-results.json";
+	const SEED_BASE = {
+		seedRecord: unrecorded,
+		alatePs: "alate123",
+		alateInspect: "alate:current",
+	};
+
+	test("a partial seed records the commit, writes the left-out items, and seeds nothing again", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const results = JSON.stringify({
+			fatal: false,
+			error: null,
+			items: [
+				{ item: "user/omp/agent/skills/demo", status: "installed", rule: null },
+				{
+					item: "user/omp/agent/skills/ghost-editor",
+					status: "unchanged",
+					rule: null,
+				},
+				{
+					item: "user/omp/agent/skills/tiktok",
+					status: "unchanged",
+					rule: null,
+				},
+				{
+					item: "user/agents/skills/ffmpeg-skill",
+					status: "rejected",
+					rule: "hidden character U+200D",
+					at: "SKILL.md:7",
+				},
+				{
+					item: "user/agents/skills/shorts",
+					status: "rejected",
+					rule: "incomplete dependency coverage",
+				},
+				{
+					item: "user/omp/agent/skills/slow",
+					status: "inconclusive",
+					rule: null,
+				},
+			],
+		});
+		const partial = {
+			commit: head,
+			since: Date.UTC(2026, 9, 16),
+			count: 3,
+			items: [
+				{
+					name: "user/agents/skills/ffmpeg-skill",
+					rule: "hidden character U+200D",
+				},
+				{
+					name: "user/agents/skills/shorts",
+					rule: "incomplete dependency coverage",
+				},
+				{ name: "user/omp/agent/skills/slow", rule: "inconclusive" },
+			],
+		};
+		const f = fakes({
+			...SEED_BASE,
+			seedCode: 1,
+			seedResults: results,
+			seedFailRecord: JSON.stringify({
+				since: 1,
+				commit: "a".repeat(40),
+				text: "old failure",
+			}),
+			seedPartialRecord: JSON.stringify({
+				commit: "b".repeat(40),
+				since: 5,
+				count: 1,
+				items: [{ name: "old", rule: "old rule" }],
+			}),
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.seedRuns).toEqual([
+			`compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`,
+		]);
+		// The write replaced the earlier partial record; the failure record cleared.
+		expect(f.seedPartialRecords).toEqual([
+			`compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c printf %s '${JSON.stringify(partial)}' > /etc/ottr/seed-partial`,
+		]);
+		expect(seedPartialRecordOf(f)).toEqual(partial);
+		expect(f.seedPartialState.value).toBe(JSON.stringify(partial));
+		expect(f.seedFailState.value).toBe("");
+		// The partial seed counts as done: the deploy settles and records the commit.
+		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
+		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
+		const log = f.logs.join("\n");
+		expect(log).toContain(
+			`board seed partial at ${head.slice(0, 12)}: 3 items left out: user/agents/skills/ffmpeg-skill, user/agents/skills/shorts, user/omp/agent/skills/slow`,
+		);
+		expect(log).not.toContain("board seed failed");
+		// The next run reads the recorded commit and runs no board-seed again.
+		const next = fakes({ seedRecord: head });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], next.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(next.seedRuns).toEqual([]);
+	}, 60_000);
+
+	/** Runs a failing seed with the scripted results file and asserts today's red path. */
+	async function expectFailedSeed(
+		seedResults: string | undefined,
+	): Promise<void> {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = fakes({ ...SEED_BASE, seedCode: 1, seedResults });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		// The read ran and could not answer: the red path stays today's path.
+		expect(f.calls).toContain(RESULTS_READ);
+		expect(f.seedFailRecords).toHaveLength(1);
+		expect(seedFailRecordOf(f)).toEqual({
+			since: Date.UTC(2026, 9, 16),
+			commit: head,
+			text: "the seed step failed",
+		});
+		expect(f.seedWrites.filter((l) => l.includes("seed-commit"))).toEqual([]);
+		expect(f.seedPartialRecords).toEqual([]);
+		expect(f.logs.join("\n")).toContain(
+			"board seed failed: the seed step failed",
+		);
+	}
+
+	test("a seed run that leaves no results file fails like before", async () => {
+		await expectFailedSeed(undefined);
+	}, 60_000);
+
+	test("a results file no JSON parser takes fails the seed", async () => {
+		await expectFailedSeed("{not json");
+	}, 60_000);
+
+	test("a fatal flag or an unknown status fails, and a no-origin item counts as left out", async () => {
+		const fatalRun = async (seedResults: string): Promise<FakeRun> => {
+			const { main } = checkout();
+			const data = checkout();
+			const f = fakes({ ...SEED_BASE, seedCode: 1, seedResults });
+			expect(
+				await updateImage(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(1);
+			return f;
+		};
+		const fatal = await fatalRun(
+			JSON.stringify({
+				fatal: true,
+				error: "install blew up",
+				items: [{ item: "user/x", status: "rejected", rule: "r" }],
+			}),
+		);
+		expect(fatal.seedFailRecords).toHaveLength(1);
+		expect(fatal.seedPartialRecords).toEqual([]);
+		const unknown = await fatalRun(
+			JSON.stringify({
+				fatal: false,
+				items: [{ item: "user/x", status: "skipped" }],
+			}),
+		);
+		expect(unknown.seedFailRecords).toHaveLength(1);
+		expect(unknown.seedPartialRecords).toEqual([]);
+		// A no-origin item is left out the same way a rejected one is.
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const noOrigin = fakes({
+			...SEED_BASE,
+			seedCode: 1,
+			seedResults: JSON.stringify({
+				fatal: false,
+				items: [
+					{ item: "user/a", status: "unchanged" },
+					{ item: "user/b", status: "no-origin" },
+				],
+			}),
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], noOrigin.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(seedPartialRecordOf(noOrigin)).toEqual({
+			commit: head,
+			since: Date.UTC(2026, 9, 16),
+			count: 1,
+			items: [{ name: "user/b", rule: "no origin" }],
+		});
+	}, 60_000);
+
+	test("a successful seed removes the failure and the stale partial record in one exec", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			...SEED_BASE,
+			seedFailRecord: JSON.stringify({
+				since: 1,
+				commit: "a".repeat(40),
+				text: "old failure",
+			}),
+			seedPartialRecord: JSON.stringify({
+				commit: "b".repeat(40),
+				since: 2,
+				count: 1,
+				items: [{ name: "old", rule: "old rule" }],
+			}),
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// One rm took both records; the deploy's own restart-wait rm is not the seed's.
+		expect(f.calls.filter((l) => l.includes("rm -f /etc/ottr/seed"))).toEqual([
+			RM_SEEDFAIL,
+		]);
+		expect(f.seedFailState.value).toBe("");
+		expect(f.seedPartialState.value).toBe("");
+		expect(f.seedFailRecords).toEqual([]);
+		expect(f.seedPartialRecords).toEqual([]);
+	}, 60_000);
+
+	test("an old Alate that writes no results file seeds ok on exit 0", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes(SEED_BASE);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.seedRuns).toHaveLength(1);
+		// Exit 0 decides ok on its own: the run never reads the results file.
+		expect(
+			f.calls.some(
+				(l) => l.includes("seed-results.json") && l.includes("--entrypoint"),
+			),
+		).toBe(false);
+		// No record writes, and the clear now takes both records.
+		expect(f.seedFailRecords).toEqual([]);
+		expect(f.seedPartialRecords).toEqual([]);
+		expect(f.calls).toContain(RM_SEEDFAIL);
+	}, 60_000);
+
+	test("a failed seed-partial write stays advisory and keeps the outcome", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const f = fakes({
+			...SEED_BASE,
+			seedCode: 1,
+			seedResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "user/x", status: "rejected", rule: "r" }],
+			}),
+			seedPartialWriteCode: 1,
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.logs.join("\n")).toContain(
+			"the seed-partial record write failed: the board cannot show the notice",
+		);
+		expect(f.seedPartialRecords).toHaveLength(1);
+		expect(f.seedPartialState.value).toBe("");
+		// The partial outcome stands: the commit record landed, and the red notice cleared.
+		expect(f.seedWrites.some((l) => l.includes("seed-commit"))).toBe(true);
+		expect(f.seedFailState.value).toBe("");
+	}, 60_000);
+
+	test("the partial record redacts secrets, control bytes and quotes, caps at 20 items, and drops a garbage commit", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const secret = "ghp_supersecretvalue99";
+		const long = "x".repeat(250);
+		const items = Array.from({ length: 25 }, (_, i) => ({
+			item: `user/agents/skills/skill-${i}`,
+			status: "rejected",
+			rule:
+				i === 0
+					? `token ${secret} and\ncontrol\x00byte and it's quoted and ${long}`
+					: `rule ${i}`,
+		}));
+		const f = fakes({
+			...SEED_BASE,
+			seedCode: 1,
+			seedResults: JSON.stringify({ fatal: false, items }),
+		});
+		// The recipe's redaction model: secret-shaped env values never reach the record.
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+				GH_TOKEN: secret,
+			}),
+		).toBe(0);
+		expect(f.seedPartialRecords).toHaveLength(1);
+		const record = seedPartialRecordOf(f);
+		expect(record.count).toBe(25);
+		expect(record.items).toHaveLength(20);
+		expect(record.commit).toBe(head);
+		const text = f.seedPartialRecords[0]!;
+		expect(text).not.toContain(secret);
+		// The argv line's shell quotes are not payload; the record itself holds no quote.
+		expect(JSON.stringify(record)).not.toContain("'");
+		// No control byte, not even in its JSON escape, reaches the shell string.
+		expect(text).not.toContain("\\n");
+		expect(text).not.toContain("\\u0000");
+		expect(text).not.toMatch(/\p{Cc}/u);
+		for (const item of record.items) {
+			expect(item.name.length).toBeLessThanOrEqual(200);
+			expect(item.rule.length).toBeLessThanOrEqual(200);
+		}
+		expect(record.items[0]!.rule).toContain("and control byte and its quoted");
+		// The log names the first 20 items only.
+		const log = f.logs.join("\n");
+		expect(log).toContain("user/agents/skills/skill-19");
+		expect(log).not.toContain("user/agents/skills/skill-20");
+		// A garbage sha records an empty commit: the record builder alone takes it.
+		const g = fakes();
+		await seedPartialRecord(
+			g.deps,
+			["-f", "c.yml"],
+			"garbage",
+			[{ name: "user/x", rule: "rejected" }],
+			{},
+		);
+		expect(seedPartialRecordOf(g)).toEqual({
+			commit: "",
+			since: Date.UTC(2026, 9, 16),
+			count: 1,
+			items: [{ name: "user/x", rule: "rejected" }],
+		});
+	}, 60_000);
+});
+
+describe("classifySeedResults", () => {
+	test("exit 0 is ok whatever the results text holds", () => {
+		expect(classifySeedResults(0, null)).toEqual({ kind: "ok" });
+		expect(classifySeedResults(0, "garbage")).toEqual({ kind: "ok" });
+		expect(classifySeedResults(0, "")).toEqual({ kind: "ok" });
+	});
+
+	test("a missing, unparseable, or shapeless file on a non-zero exit is failed", () => {
+		expect(classifySeedResults(1, null)).toEqual({ kind: "failed" });
+		expect(classifySeedResults(1, "{not json")).toEqual({ kind: "failed" });
+		expect(classifySeedResults(1, "42")).toEqual({ kind: "failed" });
+	});
+
+	test("fatal false with left-out items is partial, and the rule falls back to the status word", () => {
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "user/a", status: "unchanged" }],
+				}),
+			),
+		).toEqual({ kind: "failed" }); // no left-out item at all
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [
+						{ item: "user/a", status: "installed" },
+						{ item: "user/b", status: "rejected", rule: "bad rule" },
+						{ item: "user/c", status: "no-origin", rule: null },
+						{ item: "user/d", status: "inconclusive", rule: "" },
+					],
+				}),
+			),
+		).toEqual({
+			kind: "partial",
+			leftOut: [
+				{ name: "user/b", rule: "bad rule" },
+				{ name: "user/c", rule: "no origin" },
+				{ name: "user/d", rule: "inconclusive" },
+			],
+		});
+	});
+
+	test("fatal true, missing or empty or non-array items, unknown statuses, and shapeless items are failed", () => {
+		const fail = (results: string) =>
+			expect(classifySeedResults(1, results)).toEqual({ kind: "failed" });
+		fail(
+			JSON.stringify({
+				fatal: true,
+				items: [{ item: "x", status: "rejected" }],
+			}),
+		);
+		// fatal missing is not false.
+		fail(JSON.stringify({ items: [{ item: "x", status: "rejected" }] }));
+		fail(JSON.stringify({ fatal: false }));
+		fail(JSON.stringify({ fatal: false, items: [] }));
+		fail(JSON.stringify({ fatal: false, items: "x" }));
+		fail(
+			JSON.stringify({
+				fatal: false,
+				items: [{ item: "x", status: "skipped" }],
+			}),
+		);
+		fail(JSON.stringify({ fatal: false, items: ["rejected"] }));
+		fail(JSON.stringify({ fatal: false, items: [{ status: "rejected" }] }));
+	});
 });
 
 describe("seed-only", () => {
@@ -4378,8 +4871,7 @@ describe("seed-only", () => {
 			join(github, "example", "data"),
 		);
 		const head = must(data.main, "rev-parse", "HEAD");
-		const seedRun =
-			"compose -f c.yml run --rm --no-deps board-seed --repo example/data";
+		const seedRun = `compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} board-seed --repo example/data`;
 		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
 		const f = fakes({
 			seedRecord: unrecorded,
@@ -5721,7 +6213,7 @@ describe("sidecar and seed survivor kills", () => {
 		test("the seed runs in the image its discovery reads", async () => {
 			const { main } = checkout();
 			const data = checkout();
-			const seedRun = `compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`;
+			const seedRun = `compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`;
 			const write = `compose -f c.yml exec -T server sh -c printf %s '${must(data.main, "rev-parse", "HEAD")}' > /etc/ottr/seed-commit`;
 			const alate = [{ name: "alate", image: "alate:ps" }];
 			const cases: {

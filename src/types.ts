@@ -1690,6 +1690,11 @@ export interface StateResponse {
 	 *  record next to the board home); null when no record exists, the seed succeeded,
 	 *  or the record fails to sanitize. */
 	seedFailed: SeedFailedView | null;
+	/** Advisory: the hourly board seed left scan-gate items out of the agent layer
+	 *  (docs/specs/board-seed-partial.md, the update script's record next to the board
+	 *  home); null when no record exists, the seed succeeded, or the record fails to
+	 *  sanitize. */
+	seedPartial: SeedPartialView | null;
 	/** Advisory: the last failed alate provision attempt (the U9 trigger or the manual
 	 *  button); null after a success, or when alate reports no pending import. */
 	alateProvisionError: string | null;
@@ -1726,6 +1731,20 @@ export interface SeedFailedView {
 	/** The redacted tail of the failure text (the script cuts it to about 1000
 	 *  characters); "" when nothing readable survived the cut. */
 	text: string;
+}
+
+/** A partial board seed of the agent layer: the items the scan gate left out, the
+ *  update script's record next to the board home (/etc/ottr/seed-partial,
+ *  docs/specs/board-seed-partial.md). */
+export interface SeedPartialView {
+	/** The data-repo sha the partial seed recorded; "" when absent. */
+	commit: string;
+	/** Epoch ms of the partial seed. */
+	since: number;
+	/** Left-out item total before the 20-item list cap. */
+	count: number;
+	/** The capped, sanitized item list. */
+	items: { name: string; rule: string }[];
 }
 
 /** One provider usage window, e.g. Anthropic's 5-hour or 7-day limit. */

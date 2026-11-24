@@ -83,6 +83,7 @@ import {
 	type RestartWaitView,
 	recommendsSteps,
 	type SeedFailedView,
+	type SeedPartialView,
 	type Stage,
 	type StateResponse,
 	type SystemCard,
@@ -16936,6 +16937,43 @@ export function SeedFailedLine({
 	);
 }
 
+/** The partial board seed (docs/specs/board-seed-partial.md): the update script's
+ *  record of the agent-layer items the scan gate left out. One amber line: the commit
+ *  the layer sits at and the left-out total; each item and its rule live behind the
+ *  Details disclosure. Null renders nothing. */
+export function SeedPartialLine({
+	partial,
+	inboxKey,
+	fresh,
+}: {
+	partial: SeedPartialView | null;
+	inboxKey?: string;
+	fresh: boolean;
+}) {
+	if (partial === null) return null;
+	return (
+		// A div: the Details disclosure is flow content, which a <p> cannot hold.
+		<div className="notif-line" role="note" data-inbox-key={inboxKey}>
+			<Mark kind="warn" />
+			<span>
+				Agent layer at{" "}
+				{partial.commit !== "" ? partial.commit.slice(0, 12) : "unknown commit"}
+				: {partial.count} skill{partial.count === 1 ? "" : "s"} left out
+				<details className="notif-details">
+					<summary>Details</summary>
+					{partial.items.map((item, i) => (
+						<Fragment key={`${item.name}:${i}`}>
+							{i > 0 && <br />}
+							{item.name} — {item.rule}
+						</Fragment>
+					))}
+				</details>
+			</span>
+			{fresh && <span className="new-tag">New</span>}
+		</div>
+	);
+}
+
 /** OTTR-753: the last failed provision attempt (Settings → Alate → Provision now, or
  *  the board's own trigger). One red line, so a failed provision is not settings-only;
  *  a success or a settled health poll drops it. Null renders nothing. */
@@ -17249,8 +17287,8 @@ function appServerNotices(state: StateResponse | null): {
 }
 
 /** Update-banner values: how far behind the board is, the pending commits, the restart
- * wait, the failed seed, and the provider sign-in advisories. Hosted mode drops the
- * host-owned ones. */
+ * wait, the failed seed, the partial seed, and the provider sign-in advisories.
+ * Hosted mode drops the host-owned ones. */
 function appUpdateNotices(
 	hosted: boolean,
 	update: { behind: number; commits: string[] } | null,
@@ -17260,6 +17298,7 @@ function appUpdateNotices(
 	behindCommits: string[];
 	restartWait: RestartWaitView | null;
 	seedFailed: SeedFailedView | null;
+	seedPartial: SeedPartialView | null;
 	signinAdvisories: DeadSignIn[];
 } {
 	// Shared notification lines: the inbox panel renders the same content the
@@ -17272,8 +17311,17 @@ function appUpdateNotices(
 	// OTTR-753: the update task's hourly seed of the agent layer failed; the host owns
 	// the record, so hosted mode drops it like the restart wait.
 	const seedFailed = hosted ? null : (state?.seedFailed ?? null);
+	// The partial seed's amber notice is host-owned too; hosted mode drops it the same way.
+	const seedPartial = hosted ? null : (state?.seedPartial ?? null);
 	const signinAdvisories = hosted ? [] : (state?.deadSignIns ?? []);
-	return { behind, behindCommits, restartWait, seedFailed, signinAdvisories };
+	return {
+		behind,
+		behindCommits,
+		restartWait,
+		seedFailed,
+		seedPartial,
+		signinAdvisories,
+	};
 }
 
 /** Inbox entry keys for the board's notice lines: occurrence keys so a recurrence
@@ -17288,6 +17336,7 @@ export function appNoticeKeys(
 	behind: number,
 	restartWait: RestartWaitView | null,
 	seedFailed: SeedFailedView | null,
+	seedPartial: SeedPartialView | null,
 	draining: boolean,
 	orphanList: OrphanProcess[],
 	orphansError: string | null,
@@ -17303,6 +17352,7 @@ export function appNoticeKeys(
 	behindKey: string | null;
 	restartWaitKey: string | null;
 	seedFailKey: string | null;
+	seedPartialKey: string | null;
 	provisionErrKey: string | null;
 	updatesKey: string | null;
 	orphansErrorKey: string | null;
@@ -17342,6 +17392,9 @@ export function appNoticeKeys(
 	// OTTR-753: `since` in the key too, so a new failure episode counts as new again.
 	const seedFailKey =
 		seedFailed !== null ? `seed-failed:${seedFailed.since}` : null;
+	// The partial seed: `since` in the key again, so a new partial episode counts as new.
+	const seedPartialKey =
+		seedPartial !== null ? `seed-partial:${seedPartial.since}` : null;
 	// The last failed provision attempt: shortKey hashes the error text, so a
 	// changed failure is a new occurrence, and the same failure stays one.
 	const provisionErr = hosted ? null : (state?.alateProvisionError ?? null);
@@ -17371,6 +17424,7 @@ export function appNoticeKeys(
 		behindKey,
 		restartWaitKey,
 		seedFailKey,
+		seedPartialKey,
 		provisionErrKey,
 		updatesKey,
 		orphansErrorKey,
@@ -17548,6 +17602,8 @@ export function AppInboxPanel(p: {
 	restartWaitKey: string | null;
 	seedFailed: SeedFailedView | null;
 	seedFailKey: string | null;
+	seedPartial: SeedPartialView | null;
+	seedPartialKey: string | null;
 	provisionError: string | null;
 	provisionErrKey: string | null;
 	state: StateResponse | null;
@@ -17595,6 +17651,8 @@ export function AppInboxPanel(p: {
 		restartWaitKey,
 		seedFailed,
 		seedFailKey,
+		seedPartial,
+		seedPartialKey,
 		provisionError,
 		provisionErrKey,
 		state,
@@ -17794,6 +17852,8 @@ export function AppInboxPanel(p: {
 					restartWaitKey={restartWaitKey}
 					seedFailed={seedFailed}
 					seedFailKey={seedFailKey}
+					seedPartial={seedPartial}
+					seedPartialKey={seedPartialKey}
 					provisionError={provisionError}
 					provisionErrKey={provisionErrKey}
 					isNew={isNew}
@@ -17971,6 +18031,8 @@ function AppInfoLines(p: {
 	restartWaitKey: string | null;
 	seedFailed: SeedFailedView | null;
 	seedFailKey: string | null;
+	seedPartial: SeedPartialView | null;
+	seedPartialKey: string | null;
 	provisionError: string | null;
 	provisionErrKey: string | null;
 	isNew: (key: string) => boolean;
@@ -17992,6 +18054,8 @@ function AppInfoLines(p: {
 		restartWaitKey,
 		seedFailed,
 		seedFailKey,
+		seedPartial,
+		seedPartialKey,
 		provisionError,
 		provisionErrKey,
 		isNew,
@@ -18006,6 +18070,7 @@ function AppInfoLines(p: {
 			drainNotice ||
 			restartWait !== null ||
 			seedFailed !== null ||
+			seedPartial !== null ||
 			provisionError !== null
 		)
 	)
@@ -18077,6 +18142,11 @@ function AppInfoLines(p: {
 				inboxKey={seedFailKey ?? undefined}
 				fresh={seedFailKey !== null && isNew(seedFailKey)}
 				cards={p.cards}
+			/>
+			<SeedPartialLine
+				partial={seedPartial}
+				inboxKey={seedPartialKey ?? undefined}
+				fresh={seedPartialKey !== null && isNew(seedPartialKey)}
 			/>
 			<ProvisionErrorLine
 				error={provisionError}
@@ -19806,8 +19876,14 @@ export function App() {
 		orphansError,
 		keptCount,
 	} = appServerNotices(state);
-	const { behind, behindCommits, restartWait, seedFailed, signinAdvisories } =
-		appUpdateNotices(hosted, update, state);
+	const {
+		behind,
+		behindCommits,
+		restartWait,
+		seedFailed,
+		seedPartial,
+		signinAdvisories,
+	} = appUpdateNotices(hosted, update, state);
 	// Occurrence keys of the inbox entries; null when the source is absent. shortKey hashes a
 	// long body (an error text, an id list), so no key outgrows the seen route's limit.
 	const nowMs = Date.now();
@@ -19820,6 +19896,7 @@ export function App() {
 		behindKey,
 		restartWaitKey,
 		seedFailKey,
+		seedPartialKey,
 		provisionErrKey,
 		updatesKey,
 		orphansErrorKey,
@@ -19835,6 +19912,7 @@ export function App() {
 		behind,
 		restartWait,
 		seedFailed,
+		seedPartial,
 		draining,
 		orphanList,
 		orphansError,
@@ -19849,6 +19927,7 @@ export function App() {
 		behindKey,
 		restartWaitKey,
 		seedFailKey,
+		seedPartialKey,
 		provisionErrKey,
 		orphansErrorKey,
 		orphansKey,
@@ -20054,6 +20133,8 @@ export function App() {
 						restartWaitKey={restartWaitKey}
 						seedFailed={seedFailed}
 						seedFailKey={seedFailKey}
+						seedPartial={seedPartial}
+						seedPartialKey={seedPartialKey}
 						provisionError={
 							hosted ? null : (state?.alateProvisionError ?? null)
 						}

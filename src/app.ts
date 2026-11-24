@@ -467,6 +467,7 @@ import {
 	type RestartWaitView,
 	recommendsSteps,
 	type SeedFailedView,
+	type SeedPartialView,
 	type ServerMessage,
 	type StateResponse,
 	type SystemHolds,
@@ -4421,6 +4422,62 @@ export async function createApp(deps: AppDeps) {
 		const text = redact(rawText.trim(), gitSecrets());
 		return { since, commit, text };
 	}
+	/** The partial board seed the update script records next to the board home: the
+	 *  agent-layer items the scan gate left out (docs/specs/board-seed-partial.md). A
+	 *  notice only once every field sanitizes; any read, parse, shape, size, or
+	 *  control-character failure stays advisory null, like seedFailedView. Host-written
+	 *  file content, so a stored secret redacts out at view time. */
+	function seedPartialView(): SeedPartialView | null {
+		const raw = readBoardHomeFile("seed-partial");
+		if (raw === null || raw.length > 12000) return null;
+		let record: unknown;
+		try {
+			record = JSON.parse(raw);
+		} catch {
+			return null;
+		}
+		if (record === null || typeof record !== "object") return null;
+		const r = record as Record<string, unknown>;
+		const since = r.since;
+		const count = r.count;
+		const rawCommit = r.commit;
+		const rawItems = r.items;
+		if (
+			typeof since !== "number" ||
+			!Number.isInteger(since) ||
+			since <= 0 ||
+			typeof count !== "number" ||
+			!Number.isInteger(count) ||
+			count < 0 ||
+			count > 100_000 ||
+			!Array.isArray(rawItems) ||
+			rawItems.length > 20
+		)
+			return null;
+		const items: { name: string; rule: string }[] = [];
+		for (const entry of rawItems) {
+			if (entry === null || typeof entry !== "object") return null;
+			const { name, rule } = entry as Record<string, unknown>;
+			if (
+				typeof name !== "string" ||
+				name.length > 200 ||
+				/[\p{Cc}]/u.test(name) ||
+				typeof rule !== "string" ||
+				rule.length > 200 ||
+				/[\p{Cc}]/u.test(rule)
+			)
+				return null;
+			items.push({
+				name: redact(name.trim(), gitSecrets()),
+				rule: redact(rule.trim(), gitSecrets()),
+			});
+		}
+		const commit =
+			typeof rawCommit === "string" && /^[0-9a-f]{7,40}$/.test(rawCommit)
+				? rawCommit
+				: "";
+		return { commit, since, count, items };
+	}
 	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
 	async function layout422(fn: () => Promise<Response>): Promise<Response> {
 		try {
@@ -6926,6 +6983,7 @@ export async function createApp(deps: AppDeps) {
 			deadSignIns: dead,
 			restartWait: restartWaitView(),
 			seedFailed: seedFailedView(),
+			seedPartial: seedPartialView(),
 			updateCycle: cycle,
 			// Read at frame assembly, not at build start: the card loop spans seconds
 			// (OTTR-866), so a count taken early goes stale before the frame ships (OTTR-1143).

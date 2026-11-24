@@ -52,6 +52,7 @@ describe("parseServerMessage", () => {
 						deadSignIns: [],
 						restartWait: null,
 						seedFailed: null,
+						seedPartial: null,
 						alateProvisionError: null,
 					},
 				}),
@@ -92,6 +93,7 @@ describe("parseServerMessage", () => {
 				deadSignIns: [],
 				restartWait: null,
 				seedFailed: null,
+				seedPartial: null,
 				alateProvisionError: null,
 			},
 		});

@@ -576,7 +576,16 @@ async function repoSeed(
 	}
 	return {
 		wanted,
-		args: ["run", "--rm", "--no-deps", "board-seed", "--repo", ALATE_DATA_REPO],
+		args: [
+			"run",
+			"--rm",
+			"--no-deps",
+			"-e",
+			"ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json",
+			"board-seed",
+			"--repo",
+			ALATE_DATA_REPO,
+		],
 		tokenExpires,
 	};
 }
@@ -619,6 +628,8 @@ async function seedSource(
 			"run",
 			"--rm",
 			"--no-deps",
+			"-e",
+			"ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json",
 			"-v",
 			`${ALATE_DATA}:/data:ro`,
 			"board-seed",
@@ -900,6 +911,18 @@ async function readSeedRecord(
 	return read !== "" ? read : null;
 }
 
+/** The env's secret-shaped values: a credential-looking name with a long value. */
+function secretValues(env: Record<string, string | undefined>): string[] {
+	return Object.entries(env)
+		.filter(
+			([name, value]) =>
+				value !== undefined &&
+				value.length >= 8 &&
+				/TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL|KEY/i.test(name),
+		)
+		.map(([, value]) => value as string);
+}
+
 /**
  * The seed-failure record the board reads for its red bell notice: the first failure's
  * time (a later failed run keeps it, like the wait clock), the data-repo sha the seed
@@ -935,15 +958,7 @@ async function seedFailRecord(
 			// An unreadable record restarts the first-failure clock.
 		}
 	}
-	const secrets = Object.entries(env)
-		.filter(
-			([name, value]) =>
-				value !== undefined &&
-				value.length >= 8 &&
-				/TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL|KEY/i.test(name),
-		)
-		.map(([, value]) => value as string);
-	const text = redact(failText, secrets)
+	const text = redact(failText, secretValues(env))
 		// Control characters become spaces so a multi-line failure stays one readable
 		// line, and a single quote is dropped: it would end the printf's shell string.
 		.replace(/[\p{Cc}]+/gu, " ")
@@ -964,9 +979,15 @@ async function seedFailRecord(
 		);
 }
 
-/** A successful seed removes the record, so the notice goes with the failure. Advisory:
- * a failed removal only keeps a stale notice until the next successful seed. */
-async function seedFailClear(d: Deps, compose: string[]): Promise<void> {
+/** A successful or partial seed clears the notice records. `files` names what one rm
+ * removes: a success takes the failure and the stale partial record together, a
+ * partial seed takes only the failure record — its own write replaces the partial
+ * record. Advisory: a failed removal keeps a stale notice until the next seed. */
+async function seedFailClear(
+	d: Deps,
+	compose: string[],
+	files: string,
+): Promise<void> {
 	const w = await d.docker(
 		"compose",
 		...compose,
@@ -975,10 +996,176 @@ async function seedFailClear(d: Deps, compose: string[]): Promise<void> {
 		"server",
 		"sh",
 		"-c",
-		"rm -f /etc/ottr/seed-failed",
+		`rm -f ${files}`,
 	);
 	if (w.code !== 0)
 		d.log("the seed-failed record removal failed: the board keeps the notice");
+}
+
+/** The seed verdict: ok on exit 0, partial when install-user left items out, failed
+ *  otherwise. */
+type SeedVerdict =
+	| { kind: "ok" }
+	| { kind: "partial"; leftOut: { name: string; rule: string }[] }
+	| { kind: "failed" };
+
+/** install-user's known item statuses: the four normal ones and the three that leave
+ *  an item out of the layer. */
+const SEED_ITEM_STATUSES = [
+	"installed",
+	"unchanged",
+	"added",
+	"updated",
+	"rejected",
+	"no-origin",
+	"inconclusive",
+];
+const SEED_LEFT_OUT_STATUSES = ["rejected", "no-origin", "inconclusive"];
+
+/** One item of install-user's results file after the verdict fold: the item installs,
+ *  it is left out with its notice fields, or the item's shape or status is unknown,
+ *  which breaks the whole file. */
+type SeedItemVerdict =
+	| { kind: "kept" }
+	| { kind: "leftOut"; name: string; rule: string }
+	| { kind: "broken" };
+
+/** The results file's item array, or null when the text does not parse, `fatal` is
+ *  not false, or the items are missing, empty, or not an array. */
+function seedItemsOf(resultsText: string | null): unknown[] | null {
+	if (resultsText === null) return null;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(resultsText);
+	} catch {
+		return null;
+	}
+	if (typeof parsed !== "object" || parsed === null) return null;
+	const { fatal, items } = parsed as { fatal?: unknown; items?: unknown };
+	if (fatal !== false) return null;
+	if (!Array.isArray(items) || items.length === 0) return null;
+	return items;
+}
+
+/** Folds one raw results item. Only a left-out item needs its `item` key: a normal
+ *  item never names itself in the verdict. The rule is the item's own rule when that
+ *  is a non-empty string, else the status word. */
+function seedItemVerdict(item: unknown): SeedItemVerdict {
+	if (typeof item !== "object" || item === null) return { kind: "broken" };
+	const it = item as { item?: unknown; status?: unknown; rule?: unknown };
+	if (typeof it.status !== "string" || !SEED_ITEM_STATUSES.includes(it.status))
+		return { kind: "broken" };
+	if (!SEED_LEFT_OUT_STATUSES.includes(it.status)) return { kind: "kept" };
+	if (typeof it.item !== "string") return { kind: "broken" };
+	return {
+		kind: "leftOut",
+		name: it.item,
+		rule:
+			typeof it.rule === "string" && it.rule !== ""
+				? it.rule
+				: it.status.replaceAll("-", " "),
+	};
+}
+
+/**
+ * Pure seed classification from install-user's structured results file, never the
+ * stdout text. Exit 0 is ok on its own: an old Alate image writes no results file and
+ * must keep seeding as ok. A non-zero exit counts as partial only when the results
+ * file parses, `fatal` is false, every item status is known, and at least one item is
+ * left out (rejected, no-origin, inconclusive); anything else is today's failure.
+ */
+export function classifySeedResults(
+	exitCode: number,
+	resultsText: string | null,
+): SeedVerdict {
+	if (exitCode === 0) return { kind: "ok" };
+	const items = seedItemsOf(resultsText);
+	if (items === null) return { kind: "failed" };
+	const leftOut: { name: string; rule: string }[] = [];
+	for (const item of items) {
+		const verdict = seedItemVerdict(item);
+		if (verdict.kind === "broken") return { kind: "failed" };
+		if (verdict.kind === "leftOut")
+			leftOut.push({ name: verdict.name, rule: verdict.rule });
+	}
+	if (leftOut.length === 0) return { kind: "failed" };
+	return { kind: "partial", leftOut };
+}
+
+/**
+ * Reads install-user's results file back through the same board-seed one-off, so the
+ * read needs no running server and runs as the volume's own image user. Null when the
+ * read fails (no file: an old Alate, or an install error before the write). Must run
+ * inside runSeed's ALATE_IMAGE discovery window, so a discovered image reaches this
+ * run too.
+ */
+async function readSeedResults(
+	d: Deps,
+	compose: string[],
+): Promise<string | null> {
+	const r = await d.docker(
+		"compose",
+		...compose,
+		"run",
+		"--rm",
+		"--no-deps",
+		"--entrypoint",
+		"sh",
+		"board-seed",
+		"-c",
+		"cat /etc/ottr/seed-results.json",
+	);
+	return r.code === 0 ? r.out : null;
+}
+
+/**
+ * The seed-partial record the board reads for its amber notice: the commit the
+ * partial seed installed, its time, and the left-out items (the first 20; `count`
+ * stays the true total). Each string takes the seedFailRecord recipe — secret-shaped
+ * env values redact out, control characters become spaces, single quotes drop (the
+ * JSON reaches the file through printf's shell string), 200 characters cap. A garbage
+ * sha records an empty commit. Advisory: a failed write only loses the notice, never
+ * the outcome.
+ */
+export async function seedPartialRecord(
+	d: Deps,
+	compose: string[],
+	wantedSha: string,
+	leftOut: { name: string; rule: string }[],
+	env: Record<string, string | undefined>,
+): Promise<void> {
+	const secrets = secretValues(env);
+	const clean = (s: string) =>
+		redact(s, secrets)
+			.replace(/[\p{Cc}]+/gu, " ")
+			.replaceAll("'", "")
+			.trim()
+			.slice(0, 200);
+	const record = {
+		commit: /^[0-9a-f]{7,40}$/.test(wantedSha) ? wantedSha : "",
+		since: d.now(),
+		count: leftOut.length,
+		items: leftOut.slice(0, 20).map((item) => ({
+			name: clean(item.name),
+			rule: clean(item.rule),
+		})),
+	};
+	const w = await d.docker(
+		"compose",
+		...compose,
+		"run",
+		"--rm",
+		"--no-deps",
+		"--entrypoint",
+		"sh",
+		"board-seed",
+		"-c",
+		`printf %s '${JSON.stringify(record)}' > /etc/ottr/seed-partial`,
+	);
+	if (w.code !== 0)
+		d.log(
+			"the seed-partial record write failed: the board cannot show the notice",
+		);
 }
 
 /** Runs the board-seed service once, discovering ALATE_IMAGE for the child when needed. */
@@ -1010,6 +1197,29 @@ async function runSeed(
 	try {
 		const run = await d.docker("compose", ...compose, ...seed.args);
 		if (run.code !== 0) {
+			const results = await readSeedResults(d, compose);
+			const verdict = classifySeedResults(run.code, results);
+			if (verdict.kind === "partial") {
+				// The layer switched with items left out: the amber notice, and the
+				// run counts as done for its commit.
+				const names = verdict.leftOut
+					.slice(0, 20)
+					.map((item) => item.name)
+					.join(", ");
+				const count = verdict.leftOut.length;
+				d.log(
+					`board seed partial at ${seed.wanted.slice(0, 12)}: ${count} ${count === 1 ? "item" : "items"} left out: ${names}`,
+				);
+				await seedFailClear(d, compose, "/etc/ottr/seed-failed");
+				await seedPartialRecord(
+					d,
+					compose,
+					outcome.wantedSha,
+					verdict.leftOut,
+					env,
+				);
+				return { ...outcome, seeded: true };
+			}
 			d.log(
 				`board seed failed: ${run.out.trim().split("\n").slice(-3).join("\n")}`,
 			);
@@ -1017,7 +1227,11 @@ async function runSeed(
 			return { ...outcome, failed: true };
 		}
 		d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
-		await seedFailClear(d, compose);
+		await seedFailClear(
+			d,
+			compose,
+			"/etc/ottr/seed-failed /etc/ottr/seed-partial",
+		);
 		return { ...outcome, seeded: true };
 	} finally {
 		if (found.discovered) {

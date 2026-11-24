@@ -30909,6 +30909,136 @@ describe("seed failed notice", () => {
 	});
 });
 
+describe("seed partial notice", () => {
+	// Pinned board home: the seed-partial record lands next to it, as the update
+	// script writes it (dirname of the home).
+	const home = mkdtempSync(join(tmpdir(), "ottr-seed-partial-"));
+	const savedOmp = process.env.OTTR_BOARD_OMP_HOME;
+	const SHA = "e".repeat(40);
+	const ITEMS = [
+		{
+			name: "user/agents/skills/ffmpeg-skill",
+			rule: "hidden character U+200D",
+		},
+		{
+			name: "user/agents/skills/shorts",
+			rule: "incomplete dependency coverage",
+		},
+		{ name: "user/omp/agent/skills/ghost-editor", rule: "inconclusive" },
+	];
+	const write = (name: string, content: string) =>
+		writeFileSync(join(home, name), content);
+	const record = (
+		over: Partial<{
+			commit: string;
+			since: number;
+			count: number;
+			items: { name: string; rule: string }[];
+			pad: string;
+		}> = {},
+	) =>
+		JSON.stringify({
+			commit: SHA,
+			since: Date.now() - 60_000,
+			count: 3,
+			items: ITEMS,
+			...over,
+		});
+	beforeAll(() => {
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+	});
+	afterAll(() => {
+		if (savedOmp === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+		else process.env.OTTR_BOARD_OMP_HOME = savedOmp;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	const state = async () =>
+		(await (await get("/api/state")).json()) as {
+			seedPartial: {
+				commit: string;
+				since: number;
+				count: number;
+				items: { name: string; rule: string }[];
+			} | null;
+		};
+
+	test("the notice when the record exists", async () => {
+		write("seed-partial", `${record()}\n`);
+		const view = (await state()).seedPartial;
+		expect(view).toEqual({
+			commit: SHA,
+			since: expect.any(Number) as number,
+			count: 3,
+			items: ITEMS,
+		});
+	});
+
+	test("no notice when the record is absent, malformed, or out of shape", async () => {
+		rmSync(join(home, "seed-partial"), { force: true });
+		expect((await state()).seedPartial).toBeNull();
+		write("seed-partial", "{not json");
+		expect((await state()).seedPartial).toBeNull();
+		write("seed-partial", record({ since: 0 }));
+		expect((await state()).seedPartial).toBeNull();
+		write("seed-partial", record({ count: -1 }));
+		expect((await state()).seedPartial).toBeNull();
+		write("seed-partial", record({ count: 100_001 }));
+		expect((await state()).seedPartial).toBeNull();
+		write(
+			"seed-partial",
+			record({ items: Array.from({ length: 21 }, () => ITEMS[0]!) }),
+		);
+		expect((await state()).seedPartial).toBeNull();
+		write(
+			"seed-partial",
+			record({
+				items: [{ name: `${"x".repeat(201)}`, rule: "rejected" }],
+			}),
+		);
+		expect((await state()).seedPartial).toBeNull();
+		write(
+			"seed-partial",
+			record({
+				items: [{ name: "user/agents/skills/x", rule: "bad\u0007name" }],
+			}),
+		);
+		expect((await state()).seedPartial).toBeNull(); // a control character never reaches the UI
+	});
+
+	test("a whole file past the size cap stays null even when its shape is fine", async () => {
+		// The pad key keeps the JSON valid and in shape; only the file size fails.
+		write("seed-partial", record({ pad: "y".repeat(13000) }));
+		expect((await state()).seedPartial).toBeNull();
+	});
+
+	test("a commit that is no sha reads as empty, not as no notice", async () => {
+		write("seed-partial", record({ commit: "zz" }));
+		const view = (await state()).seedPartial;
+		expect(view?.commit).toBe("");
+		expect(view?.items).toEqual(ITEMS);
+	});
+
+	test("the item strings hold no secret", async () => {
+		// Appending a secret no other test uses is inert for later tests.
+		setGitSecrets([...gitSecrets(), "super-secret-token-9f8e"]);
+		write(
+			"seed-partial",
+			record({
+				items: [
+					{
+						name: "user/agents/skills/leak token super-secret-token-9f8e gone",
+						rule: "rejected token super-secret-token-9f8e again",
+					},
+				],
+			}),
+		);
+		const view = (await state()).seedPartial;
+		expect(JSON.stringify(view)).not.toContain("super-secret-token-9f8e");
+		expect(JSON.stringify(view)).toContain("[REDACTED]");
+	});
+});
+
 describe(
 	"omp stats dashboard proxy (docs/specs/omp-stats-dashboard.md)",
 	await (async () => {
