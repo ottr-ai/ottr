@@ -483,6 +483,44 @@ describe("POST /run", () => {
 		expect(done.exitCode).toBe(1);
 	}, 30_000);
 
+	test("a cloneFiles text over the byte cap answers 400", async () => {
+		const branch = "ott/t-clone-file-big";
+		const bare = makeRemote(branch);
+		const url = start();
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { ...AUTH, "content-type": "application/json" },
+			body: runBody({
+				gitUrl: bare,
+				branch,
+				argv: [markerOmp],
+				cloneFiles: [
+					{ path: "code-scan-alerts.md", text: "x".repeat(4_000_001) },
+				],
+			}),
+		});
+		expect(res.status).toBe(400);
+		expect(await res.text()).toBe("bad request");
+	}, 30_000);
+
+	test("a multibyte cloneFiles text within the byte cap runs", async () => {
+		const branch = "ott/t-clone-file-multibyte";
+		const bare = makeRemote(branch);
+		const url = start();
+		// 1,500,000 two-byte characters hold 3,000,000 bytes: inside the byte cap
+		// the old one-million-character cap refused.
+		const text = "é".repeat(1_500_000);
+		const { lines, done } = await runTurn(url, {
+			gitUrl: bare,
+			branch,
+			argv: [cloneFileOmp],
+			cloneFiles: [{ path: "code-scan-alerts.md", text }],
+		});
+		// omp saw the file the board wrote into its clone, bytes intact.
+		expect(JSON.parse(lines[0] ?? "{}")).toEqual({ type: "cloneFile", text });
+		expect(done.exitCode).toBe(0);
+	}, 30_000);
+
 	test("models.yml keeps unrelated keys and routes the turn's providers through /llm", async () => {
 		const branch = "ott/t-7";
 		const bare = makeRemote(branch);

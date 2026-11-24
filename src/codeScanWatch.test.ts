@@ -467,7 +467,7 @@ describe("codeScanCardPrompt", () => {
 		expect(p.endsWith("DATA>>>")).toBe(true);
 	});
 
-	test("property: any alert list yields a prompt inside the limit with every number", () => {
+	test("property: any alert list yields a prompt inside the limit, with every number or the file marker", () => {
 		const arbAlert = fc.record({
 			number: fc.nat({ max: 599 }).map((n) => n + 1),
 			rule: fc.constant("js/x"),
@@ -502,8 +502,11 @@ describe("codeScanCardPrompt", () => {
 					alerts,
 				});
 				expect(p.length).toBeLessThanOrEqual(20_000);
-				for (const n of new Set(alerts.map((a) => a.number)))
-					expect(p).toContain(`#${n}`);
+				// Tiers 1-4 carry every alert number; the guaranteed-fit file
+				// tier delegates the list to the alerts file instead.
+				if (!p.includes(CODE_SCAN_FALLBACK_MARKER))
+					for (const n of new Set(alerts.map((a) => a.number)))
+						expect(p).toContain(`#${n}`);
 			}),
 		);
 	});
@@ -626,25 +629,74 @@ describe("createCodeScanWatcher", () => {
 		expect((await s.store.codeScanCardRows(cards[0]!.id)).length).toBe(3);
 	});
 
-	test("a started card keeps its prompt; its fresh alerts file a follow-up card", async () => {
+	test("a follow-up waits while the started card is in flight and files after it lands", async () => {
 		const s = await setup();
+		await s.store.setSettings({ codeScanAutoStart: true });
 		s.open([alert(1), alert(2)]);
 		await s.watcher.tick();
 		const card = (await s.cards())[0]!;
-		await s.store.updateTask(card.id, { stage: "in_progress" });
+		expect(card.stage).toBe("todo");
+		await s.store.updateTask(card.id, {
+			stage: "in_progress",
+			state: "running",
+		});
 		const before = await s.store.getTask(card.id);
 		s.advance(60_000);
 		s.open([alert(1), alert(2), alert(3)]);
 		await s.watcher.tick();
-		// The started card keeps its prompt and its rows.
+		// The in-flight card keeps its prompt and its rows; no follow-up yet.
+		expect((await s.cards()).length).toBe(1);
 		const after = await s.store.getTask(card.id);
 		expect(after!.cancelledAt).toBeNull();
 		expect(after!.prompt).toBe(before!.prompt);
 		expect((await s.store.codeScanCardRows(card.id)).length).toBe(2);
-		// The fresh alert files a follow-up card on a slot.
-		const fresh = (await s.cards()).find((c) => c.id !== card.id)!;
-		expect(fresh.title).toBe("Code scanning: js/a (1 alerts)");
-		expect(fresh.prompt).toContain("#3 high src/a.ts:7 - msg 3");
+		expect(s.logs).toContain(
+			`code scanning: p: js/a waits for its open card ${card.id} to land (1 new alert(s))`,
+		);
+		// After the card lands, the fresh alert files a follow-up on a slot.
+		await s.store.updateTask(card.id, { stage: "done" });
+		s.advance(60_000);
+		await s.watcher.tick();
+		const followUp = (await s.cards()).find((c) => c.id !== card.id)!;
+		expect(followUp.stage).toBe("todo");
+		expect(followUp.state).toBe("queued");
+		expect(followUp.title).toBe("Code scanning: js/a (1 alerts)");
+		expect(followUp.prompt).toContain("#3 high src/a.ts:7 - msg 3");
+		// The landed card keeps its rows (skipped stays 0), so the rule's
+		// history stays whole.
+		expect((await s.store.codeScanCardRows(card.id)).length).toBe(2);
+		expect((await s.store.codeScanCardRows(followUp.id)).length).toBe(1);
+	});
+
+	test("an accumulated card keeps the prompt inside the limit via the file tier", async () => {
+		const s = await setup();
+		// A fetch at the cap is truncated: the removal pass skips, so rows
+		// accumulate on the one unstarted card across ticks.
+		s.open(Array.from({ length: 500 }, (_, i) => alert(i + 1)));
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		for (let tick = 1; tick <= 5; tick++) {
+			s.advance(60_000);
+			s.open(Array.from({ length: 500 }, (_, i) => alert(tick * 500 + i + 1)));
+			await s.watcher.tick();
+			expect((await s.cards()).length).toBe(1);
+		}
+		// Six truncated 500-alert ticks: 3000 rows on one card.
+		expect((await s.store.codeScanCardRows(card.id)).length).toBe(3000);
+		const task = await s.store.getTask(card.id);
+		expect(task!.prompt.length).toBeLessThanOrEqual(20_000);
+		expect(task!.prompt).toContain(CODE_SCAN_FALLBACK_MARKER);
+		// The prompt delegates to the alerts file, and the file carries every
+		// row; a sample of first, middle, and last suffices.
+		const rows = await s.store.codeScanCardRows(card.id);
+		const file = codeScanAlertsFileText({
+			repo: "o/r",
+			rule: "js/a",
+			rows,
+		});
+		expect(file).toContain("#1 high src/a.ts:7 - msg 1");
+		expect(file).toContain("#1500 high src/a.ts:7 - msg 1500");
+		expect(file).toContain("#3000 high src/a.ts:7 - msg 3000");
 	});
 
 	test("a closed alert leaves its card; an emptied backlog card cancels", async () => {

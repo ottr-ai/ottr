@@ -1371,9 +1371,10 @@ const TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 // OTTR-1014: the newest shots one turn adopts; each candidate past the cap costs a
 // full synchronous PNG decode, so the candidate list is sliced before the loop.
 const MAX_SHOT_CANDIDATES = 8;
-// The vm-runner refuses a clone file text over this many characters, so the
-// dispatch reads at most that much: a bigger file would fail the dispatch 400.
-const CLONE_FILES_MAX_CHARS = 1_000_000;
+// OTTR-1256: one byte cap for a clone file text on every guard: readBelow counts
+// bytes, and the vm-runner and guest guards check the same byte count, so a file
+// the dispatch reads never fails the 400 on a different measure.
+const CLONE_FILES_MAX_BYTES = 4_000_000;
 /** The park reason of a stopped turn (the board's Esc). */
 const TURN_STOPPED_REASON =
 	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
@@ -5479,30 +5480,43 @@ export function createTurnLoop(
 	}
 
 	/** OTTR-1256: the clone files a microVM dispatch carries into the guest: the
-	 * fallback alert file, read back from the worktree after the prep write.
-	 * Undefined when the prompt carries no fallback marker, the run is a special
-	 * one (no worktree file), or the file is missing or over the cap; another
-	 * refusal (a planted symlink) still fails the turn loudly, like the prep write. */
+	 * fallback alert file, read back from the worktree after the prep write. The
+	 * gate reads the card's stored prompt: a saved-session reply's own prompt
+	 * carries no marker, but the card it answers does. Undefined when the card
+	 * prompt carries no fallback marker or the run is a special one (no worktree
+	 * file). A missing or over-cap file throws: the file is required on a marker
+	 * card, so the turn start fails loudly like the prep write's failures, and a
+	 * silent omission is impossible. */
 	async function cloneFilesFor(
 		e: TurnProject,
+		store: ProjectStore,
+		id: string,
 		loc: RunLocation,
-		prompt: string,
 	): Promise<{ path: string; text: string }[] | undefined> {
-		if (!prompt.includes(CODE_SCAN_FALLBACK_MARKER)) return undefined;
-		if (loc.special) return undefined;
-		try {
-			const text = readBelow(
-				worktreeAnchor(e.path, loc.wt),
-				join(loc.wt, CODE_SCAN_ALERTS_FILE),
-				CLONE_FILES_MAX_CHARS,
-			)?.toString("utf8");
-			return text === undefined
-				? undefined
-				: [{ path: join(loc.wt, CODE_SCAN_ALERTS_FILE), text }];
-		} catch (err) {
-			if (!isSizeRefusal(err)) throw err;
+		const card = await store.getTask(id);
+		// The same gate as the prep write (writeCodeScanAlertsFile): topic plus marker.
+		// A plain card that quotes the marker text is not a fallback card and needs
+		// neither the delivery nor the missing-file failure.
+		if (
+			card === null ||
+			card.topic !== "code scanning" ||
+			!card.prompt.includes(CODE_SCAN_FALLBACK_MARKER)
+		)
 			return undefined;
-		}
+		if (loc.special) return undefined;
+		const file = join(loc.wt, CODE_SCAN_ALERTS_FILE);
+		// A size refusal throws with its own "refusing <path>: larger than N bytes"
+		// text, so it names the path and the reason already.
+		const text = readBelow(
+			worktreeAnchor(e.path, loc.wt),
+			file,
+			CLONE_FILES_MAX_BYTES,
+		)?.toString("utf8");
+		if (text === undefined)
+			throw new Error(
+				`code-scan alerts clone file ${file} is missing: the fallback card's dispatch needs it`,
+			);
+		return [{ path: file, text }];
 	}
 
 	/** Creates the card worktree and stamps the card row with it. Null: a cancel landed
@@ -6542,7 +6556,7 @@ export function createTurnLoop(
 		// alert file into the guest; every other run carries none.
 		const vm = vmGrantFor(name, e, id, header, loc, route);
 		const vmCloneFiles =
-			vm === null ? undefined : await cloneFilesFor(e, loc, input.prompt);
+			vm === null ? undefined : await cloneFilesFor(e, store, id, loc);
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>

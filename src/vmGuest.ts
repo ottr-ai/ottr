@@ -61,7 +61,8 @@ export interface GuestRunRequest {
 		project: string;
 		/**
 		 * Board-written card files (e.g. the code scanning alert list) written into the fresh
-		 * clone after the clone and before omp starts; each path sits inside the run's cwd.
+		 * clone after the clone and before omp starts; each path sits inside the run's cwd,
+		 * and each text holds at most 4000000 bytes (the vm-runner guard's cap).
 		 */
 		cloneFiles?: { path: string; text: string }[];
 	};
@@ -138,9 +139,10 @@ const isMapping = (v: unknown): v is Record<string, unknown> =>
 const isStrings = (v: unknown): v is string[] =>
 	Array.isArray(v) && v.every((s) => typeof s === "string");
 
-/** Caps for vm.cloneFiles, matching vm-runner's guard on the sending side. */
+/** Caps for vm.cloneFiles, matching vm-runner's guard on the sending side:
+ * at most 4 files, each text at most 4000000 bytes. */
 const CLONE_FILES_MAX = 4;
-const CLONE_FILE_TEXT_MAX = 1_000_000;
+const CLONE_FILE_MAX_BYTES = 4_000_000;
 
 const isCloneFiles = (
 	v: unknown,
@@ -154,7 +156,7 @@ const isCloneFiles = (
 				typeof file.path === "string" &&
 				isAbsolute(file.path) &&
 				typeof file.text === "string" &&
-				file.text.length <= CLONE_FILE_TEXT_MAX,
+				Buffer.byteLength(file.text, "utf8") <= CLONE_FILE_MAX_BYTES,
 		));
 
 type Loose<T> = { [K in keyof T]?: unknown };

@@ -901,7 +901,7 @@ function checkLists(lists: unknown, what: string): string | null {
 }
 
 /** The 400 reason for vm.cloneFiles, null when it is absent or a list of at most 4
- * files, each an absolute non-empty path plus a text of at most a million characters. */
+ * files, each an absolute non-empty path plus a text of at most 4000000 bytes. */
 function checkCloneFiles(files: unknown): string | null {
 	if (files === undefined) return null;
 	if (!Array.isArray(files)) return "vm.cloneFiles is not a list";
@@ -914,8 +914,8 @@ function checkCloneFiles(files: unknown): string | null {
 			return "vm.cloneFiles holds a path that is not an absolute non-empty string";
 		if (typeof text !== "string")
 			return "vm.cloneFiles holds a text that is not a string";
-		if (text.length > 1_000_000)
-			return "vm.cloneFiles holds a text over 1000000 characters";
+		if (Buffer.byteLength(text, "utf8") > 4_000_000)
+			return "vm.cloneFiles holds a text over 4000000 bytes";
 	}
 	return null;
 }

@@ -218,9 +218,10 @@ function summaryLines(alerts: CodeScanAlert[]): string {
 /**
  * The card prompt: fixed trusted instructions, then the rule's alerts as one untrusted
  * DATA block. The largest tier that fits the board's limit wins, in order: the full
- * per-alert list, the compact per-file form, a per-file number summary, and the bare
- * alert numbers. Every tier carries every alert number, and the last tier always
- * fits at CODE_SCAN_MAX_ALERTS.
+ * per-alert list, the compact per-file form, a per-file number summary, the bare
+ * alert numbers, and an empty list that delegates to the alerts file. Tiers 1-4
+ * carry every alert number; the file tier carries the fallback marker and always
+ * fits the board's limit.
  */
 export function codeScanCardPrompt(o: {
 	repo: string;
@@ -231,6 +232,9 @@ export function codeScanCardPrompt(o: {
 	const alerts = [...o.alerts].sort(bySeverityThenNumber);
 	const head = headLines(o.repo, o.rule, o.total).join("\n");
 	const fallbackHead = `${head}\n${FALLBACK_HEAD}`;
+	// The guaranteed-fit last tier: an empty body cannot overflow, and the marker
+	// line makes the turn-side delivery write the full unbounded alerts file.
+	const fileHead = `${head}\nThe alert list is too large for the prompt. Read every alert from ${CODE_SCAN_ALERTS_FILE} in the worktree root (the board writes the file there when the turn starts).`;
 	const attempts = [
 		{ head, body: alerts.map(alertLines).join("\n") },
 		{ head, body: compactLines(alerts) },
@@ -239,13 +243,14 @@ export function codeScanCardPrompt(o: {
 			head: fallbackHead,
 			body: alerts.map((a) => `#${a.number}`).join(", "),
 		},
+		{ head: fileHead, body: "" },
 	];
 	let prompt = "";
 	for (const attempt of attempts) {
 		prompt = `${attempt.head}\n\n${dataBlock("ALERTS", attempt.body)}`;
 		if (prompt.length <= PROMPT_LIMIT) return prompt;
 	}
-	// Unreachable at CODE_SCAN_MAX_ALERTS; the bare numbers stay the honest last try.
+	// Unreachable: the file tier's empty body always fits.
 	return prompt;
 }
 
@@ -529,14 +534,27 @@ export function createCodeScanWatcher(deps: {
 				}
 				// The append target is the rule's single unstarted card (convergence
 				// keeps at most one). Started cards keep their prompt; their fresh
-				// alerts file a follow-up card on a slot.
+				// alerts wait while a started card is still in flight (open, not
+				// unstarted, not yet done): an early follow-up runs two agents on
+				// one rule at once. When every started card landed (stage done),
+				// the fresh alerts file a follow-up card on a slot.
 				let target: string | null = null;
+				let inFlight: string | null = null;
 				for (const card of cards) {
 					const task = await store.getTask(card.taskId);
-					if (task !== null && unstarted(task)) {
+					if (task === null) continue;
+					if (unstarted(task)) {
 						target = card.taskId;
 						break;
 					}
+					if (task.cancelledAt === null && task.stage !== "done")
+						inFlight = card.taskId;
+				}
+				if (target === null && inFlight !== null) {
+					deps.log(
+						`code scanning: ${project.name}: ${rule} waits for its open card ${inFlight} to land (${fresh.length} new alert(s))`,
+					);
+					continue;
 				}
 				if (target === null) {
 					await fileOne({

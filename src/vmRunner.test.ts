@@ -710,13 +710,30 @@ describe("vm-runner /run", () => {
 				cloneFiles: [
 					{
 						path: "/workspace/proj/.worktrees/P-1/code-scan-alerts.md",
-						text: "x".repeat(1_000_001),
+						text: "x".repeat(4_000_001),
 					},
 				],
 			}),
 		);
 		expect(res.status).toBe(400);
 		expect(r.recs).toHaveLength(0);
+	});
+
+	test("a multibyte clone file within the byte cap is forwarded", async () => {
+		const r = startRunner();
+		// 1,500,000 two-byte characters hold 3,000,000 bytes: inside the byte cap
+		// the old one-million-character cap refused.
+		const cloneFiles = [
+			{
+				path: "/workspace/proj/.worktrees/P-1/code-scan-alerts.md",
+				text: "é".repeat(1_500_000),
+			},
+		];
+		const res = await post(r.url, "/run", request({ cloneFiles }));
+		expect(res.status).toBe(200);
+		await res.text();
+		const body = r.recs[0]!.runBody as { vm: Record<string, unknown> };
+		expect(body.vm.cloneFiles).toEqual(cloneFiles);
 	});
 
 	test("sends the agent layer without credentials, links as links, and the copyIn files", async () => {

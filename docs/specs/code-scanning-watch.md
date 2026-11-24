@@ -123,9 +123,15 @@ largest tier that fits, in order:
    `The messages and URLs did not fit the prompt. Read the full alert list from
    code-scan-alerts.md in the worktree root (the board writes the file there
    when the turn starts).` If even the per-file summary would overflow (many
-   files with 300-character paths), the last tier lists the bare alert numbers
-   `#{n}, #{n}, ...` plus the same head line — every alert number is always in
-   the prompt, and the numbers-only form always fits at `CODE_SCAN_MAX_ALERTS`.
+   files with 300-character paths), the next tier lists the bare alert numbers
+   `#{n}, #{n}, ...` plus the same head line.
+4. **File-only** (rows accumulated past the fetch cap overflow even the bare
+   numbers, e.g. a repo above 500 alerts under truncated fetches): the head
+   gains `The alert list is too large for the prompt. Read every alert from
+   code-scan-alerts.md in the worktree root (the board writes the file there
+   when the turn starts)` with an empty ALERTS body — the marker makes the
+   turn-side delivery write the full file, so every alert still reaches the
+   agent. The 20 000-character guarantee holds for any row count.
 - Prompt instructions tell the agent to: fix the cause of each alert; say in
   the report which alert numbers the fix closes; name false positives in the
   report; and never dismiss or reopen anything on GitHub (dismissal needs the
@@ -147,12 +153,17 @@ largest tier that fits, in order:
 - A microVM guest clones the branch fresh, so the excluded file never crosses
   with the checkout. The turn dispatch carries the file text to vm-runner as
   `cloneFiles` on the VM spec (`{ path, text }`, every path inside the run's
-  cwd, at most 4 files of at most 1 MB each); vm-runner validates the paths
-  against the run's cwd and forwards the list, and the guest writes the files
-  into its clone right after cloning, before the agent starts, then adds their
-  relative paths to the clone's own `.git/info/exclude`, so the guest's
-  `git status` stays clean too. Docker workers need no delivery: they see the
-  host worktree through the workspace bind mount.
+  cwd, at most 4 files of at most 4 000 000 bytes each); vm-runner validates
+  the paths against the run's cwd and forwards the list, and the guest writes
+  the files into its clone right after cloning, before the agent starts, then
+  adds their relative paths to the clone's own `.git/info/exclude`, so the
+  guest's `git status` stays clean too. Docker workers need no delivery: they
+  see the host worktree through the workspace bind mount.
+- Delivery selects on the card's original stored prompt, not the turn prompt:
+  a saved-session reply has no marker in its own text but still needs the
+  file, so replies deliver it too. A marker card whose file is missing or
+  over the byte cap at dispatch fails the turn loudly — the file is required,
+  never silently omitted.
 
 ### Convergence of old part cards (OTTR-1256)
 
@@ -180,9 +191,11 @@ largest tier that fits, in order:
   card: the append target is the rule's single unstarted card (backlog/idle or
   todo/queued — convergence guarantees at most one). The appended card's prompt
   rebuilds and its title count updates. When the rule's only open cards are
-  started, the fresh alerts file a fresh follow-up card on a later tick (one
-  daily-cap slot): a started card keeps its prompt, and new alerts wait for it
-  to land.
+  started, the fresh alerts wait: while a started card is still in flight
+  (open, not cancelled, stage other than done), the tick files nothing and logs
+  one line naming the rule and the card it waits for; a follow-up card with all
+  fresh alerts files on a later tick, after the started card lands (stage
+  done), on one daily-cap slot. A started card keeps its prompt.
 - A closed, fixed, or dismissed alert (absent from a complete fetch) leaves the
   card: its row dies, and the card's prompt rebuilds from the remaining rows.
   The removal pass runs only when the fetch is complete (fewer than

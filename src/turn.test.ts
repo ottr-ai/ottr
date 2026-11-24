@@ -27228,6 +27228,117 @@ describe("microVM dispatch (OTTR-532)", () => {
 		expect(calls[0]!.vm!.cloneFiles![0]!.text).toContain("#12");
 	});
 
+	// OTTR-1256: the clone gate reads the card's stored prompt, not the turn's
+	// input: a saved-session reply's own prompt carries no fallback marker, and
+	// the reply's dispatch must still carry the alert file.
+	test("a saved-session reply's microVM dispatch carries the alert file", async () => {
+		const { store, loop, calls } = await vmSetup();
+		// The prep write's ensureGitExclude runs real git: the project path is a repo
+		// with one commit (the rig's fake createWorktree only mkdirs the worktree).
+		const git = (...args: string[]): void => {
+			execSync(`git ${args.join(" ")}`, {
+				cwd: store.path,
+				stdio: "ignore",
+				env: fixtureGitEnv(),
+			});
+		};
+		git("init", "-q", "-b", "main");
+		git("config", "user.email", "t@t");
+		git("config", "user.name", "t");
+		writeFileSync(join(store.path, "seed.txt"), "seed\n");
+		git("add", ".");
+		git("commit", "-qm", "seed");
+
+		const prompt = [
+			"Code scanning: js/x (2 alerts)",
+			"",
+			`The messages and URLs did not fit the prompt. Read the full alert list from ${CODE_SCAN_FALLBACK_MARKER} (the board writes the file there when the turn starts).`,
+			"",
+			"#{11} high src/a.ts:10 - secret in source",
+			"#{12} medium src/b.ts:20 - another secret",
+		].join("\n");
+		const [card] = await store.fileCodeScanCards({
+			items: [
+				{
+					rule: "js/x",
+					title: "Code scanning: js/x (2 alerts)",
+					prompt,
+					alerts: [
+						{
+							number: 11,
+							rule: "js/x",
+							severity: "high",
+							path: "src/a.ts",
+							line: 10,
+							url: "https://github.test/acme/widget/alert/11",
+							message: "secret in source",
+						},
+						{
+							number: 12,
+							rule: "js/x",
+							severity: "medium",
+							path: "src/b.ts",
+							line: 20,
+							url: "https://github.test/acme/widget/alert/12",
+							message: "another secret",
+						},
+					],
+				},
+			],
+			now: Date.now(),
+			start: true,
+		});
+		await loop.runTurn(store.name, card!.id);
+		expect(calls[0]!.vm!.cloneFiles).toHaveLength(1);
+		// The reply turn of the saved session: its pending text names no fallback
+		// marker, only the card's stored prompt does (the blocker's shape).
+		saveSession(store, "s1");
+		await store.updateTask(card!.id, {
+			sessionId: "s1",
+			pendingPrompt: "also fix the leaking secret",
+			state: "queued",
+			stage: "in_progress",
+			needsReason: null,
+			holdUntil: null,
+			queuedAt: Date.now(),
+		});
+		await loop.runTurn(store.name, card!.id);
+		expect(calls).toHaveLength(2);
+		expect(calls[1]!.resumeId).toBe("s1");
+		expect(calls[1]!.prompt).not.toContain(CODE_SCAN_FALLBACK_MARKER);
+		// The card-prompt gate still clones the alert file into the reply's dispatch,
+		// with the same path the prep wrote and both alert numbers in the text.
+		expect(calls[1]!.vm).not.toBeNull();
+		expect(calls[1]!.vm!.cloneFiles).toEqual([
+			{
+				path: join(calls[1]!.cwd, CODE_SCAN_ALERTS_FILE),
+				text: expect.any(String),
+			},
+		]);
+		expect(calls[1]!.vm!.cloneFiles![0]!.text).toContain("#11");
+		expect(calls[1]!.vm!.cloneFiles![0]!.text).toContain("#12");
+	});
+
+	// The delivery gate matches the prep write's gate (topic plus marker): a card
+	// that only quotes the marker gets neither, and its turn runs normally.
+	test("a plain card that quotes the marker dispatches no clone files", async () => {
+		const { store, loop, calls } = await vmSetup();
+		// A plain card whose prompt quotes the fallback marker (a pasted fallback
+		// notice): the card is no code scanning card, so neither the prep write nor
+		// the dispatch delivery applies, and the turn runs like any plain card.
+		const prompt = [
+			"Look into the alert file naming scheme",
+			"",
+			`The messages and URLs did not fit the prompt. Read the full alert list from ${CODE_SCAN_FALLBACK_MARKER} (the board writes the file there when the turn starts).`,
+		].join("\n");
+		const task = await store.createTask(prompt);
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm!.cloneFiles).toBeUndefined();
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).not.toBe("needs_you");
+	});
+
 	test("a plain card's microVM dispatch carries no clone files", async () => {
 		const { store, loop, calls } = await vmSetup();
 		const task = await store.createTask("queued work");
