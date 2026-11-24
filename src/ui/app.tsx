@@ -42,7 +42,9 @@ import {
 	findDep,
 	isReview,
 	liveCardOf,
+	pendingSandboxLead,
 	queueOrder,
+	validatableReview,
 	waitingOn,
 } from "../scheduler.ts";
 import {
@@ -13189,6 +13191,13 @@ function DrawerActions(p: {
 	runValidateAgain: () => Promise<boolean>;
 	validateAgainError: string | null;
 	validateAgainDone: boolean;
+	/** OTTR-1247: the queued lead's validation group — the start button for its
+	 * review's batch run and its inline lines; null hides the group (the lead has
+	 * no live review that can take a batch now). */
+	leadValidate: { id: string; project: string } | null;
+	runLeadValidate: () => Promise<boolean>;
+	leadValidateError: string | null;
+	leadValidateDone: boolean;
 	runCancel: () => Promise<boolean>;
 	/** A proposal's decision card carries Cancel task in its footer; the row drops it. */
 	cancelInPanel: boolean;
@@ -13218,6 +13227,10 @@ function DrawerActions(p: {
 		runValidateAgain,
 		validateAgainError,
 		validateAgainDone,
+		leadValidate,
+		runLeadValidate,
+		leadValidateError,
+		leadValidateDone,
 		runCancel,
 		cancelInPanel,
 	} = p;
@@ -13336,6 +13349,35 @@ function DrawerActions(p: {
 					</BusyButton>
 				)}
 			</div>
+			{/* OTTR-1247: a queued pending sandbox lead offers the manual start of its
+				    review's batch validation run; the lead's status line already names the
+				    wait. Like the group below, the group and its inline lines render full
+				    width under the actions row. */}
+			{leadValidate !== null && (
+				<div className="reply-form">
+					<label htmlFor="lead-validate">Start validation run</label>
+					<div className="reply-actions">
+						<BusyButton
+							title={`Files a batch validation run of review ${leadValidate.id}; the run takes this lead back into its batch`}
+							run={runLeadValidate}
+						>
+							Start validation run
+						</BusyButton>
+					</div>
+				</div>
+			)}
+			{leadValidate !== null && leadValidateError !== null && (
+				<p className="auth-error" role="alert">
+					{leadValidateError}
+				</p>
+			)}
+			{leadValidate !== null &&
+				leadValidateDone &&
+				leadValidateError === null && (
+					<p className="hint" role="status">
+						Validation run filed.
+					</p>
+				)}
 			{/* OTTR-1129: a done review card can clear the blocked results its leads
 			    got before a chosen time and file a fresh validation run. The datetime
 			    starts empty and stays required: the board tracks no sandbox-fix time
@@ -14472,6 +14514,42 @@ export function Drawer({
 			return false;
 		}
 	};
+	// OTTR-1247: a queued pending sandbox lead never runs as a work turn (its status
+	// line names the wait), and its review's batch validation run is the only way
+	// forward. When the linked review can take a batch (done, or held at merging for
+	// its findings), the drawer offers the manual start on the review's validate
+	// route. A new card's drawer starts without the last card's result.
+	const { parent: leadParent } = followUpParent(row, tasks);
+	const leadValidate =
+		!cancelled &&
+		pendingSandboxLead(task) &&
+		leadParent !== null &&
+		validatableReview(leadParent)
+			? { id: leadParent.id, project: leadParent.project }
+			: null;
+	const [leadValidateError, setLeadValidateError] = useState<string | null>(
+		null,
+	);
+	const [leadValidateDone, setLeadValidateDone] = useState(false);
+	useEffect(() => {
+		setLeadValidateError(null);
+		setLeadValidateDone(false);
+	}, [rerunTaskId]);
+	const runLeadValidate = async (): Promise<boolean> => {
+		if (leadValidate === null) return false;
+		setLeadValidateError(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(leadValidate.project)}/tasks/${encodeURIComponent(leadValidate.id)}/validate`,
+				{},
+			);
+			setLeadValidateDone(true);
+			return true;
+		} catch (e) {
+			setLeadValidateError(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+	};
 	// OTTR-1129: a done review card can clear the blocked results its leads got
 	// before a chosen time and file a fresh validation run for them (OTTR-1166:
 	// a done release card offers the same control through isReview). The datetime
@@ -15176,6 +15254,10 @@ export function Drawer({
 						runValidateAgain={runValidateAgain}
 						validateAgainError={validateAgainError}
 						validateAgainDone={validateAgainDone}
+						leadValidate={leadValidate}
+						runLeadValidate={runLeadValidate}
+						leadValidateError={leadValidateError}
+						leadValidateDone={leadValidateDone}
 						runCancel={runCancel}
 						cancelInPanel={proposal && task.state === "needs_you"}
 					/>

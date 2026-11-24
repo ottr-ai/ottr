@@ -30,6 +30,11 @@ export type Card = {
 	/** Carried by real TaskCard rows (src/types.ts); mergeHold's isReview reads them. */
 	kind?: string;
 	releaseVersion?: string | null;
+	/** The lead fields leadValidationHold reads. Wire rows (GET /api/state)
+	 * stamp `sandboxLead` and ship no prompt; a store row reads the prompt tag. */
+	prompt?: string;
+	validatedAt?: number | null;
+	sandboxLead?: true;
 };
 
 export type Project = { name: string; path: string; gitless?: boolean };
@@ -46,6 +51,9 @@ export type Facts = {
 	now: number;
 	logAgeS: number | null;
 	hold: string | null;
+	/** leadValidationHold's text for this card, computed in report(); null
+	 * when the card is no queued pending sandbox lead (or the scheduler import failed). */
+	leadHold: string | null;
 	depsOpen: string[];
 	drain: boolean;
 	capFull: boolean;
@@ -177,6 +185,7 @@ function queuedHolds(c: Card, f: Facts): string[] {
 			hu > f.now &&
 			`holdUntil ${new Date(hu).toISOString()}`,
 		f.hold,
+		f.leadHold,
 		runsMerge && `a merge runs: ${runsMerge.id}`,
 	].filter((h): h is string => Boolean(h));
 }
@@ -232,23 +241,39 @@ export type MergeHold = (
 	},
 ) => string | null;
 
-/** Loads mergeHold from the first candidate that imports; null with the collected errors
- * when none does — report() prints the errors and renders the rest without merge holds. */
-export async function resolveMergeHold(
-	candidates: readonly string[],
-): Promise<{ mergeHold: MergeHold | null; error: string }> {
+/** leadValidationHold's shape (src/scheduler.ts) over the same loose view. */
+export type LeadHold = (lead: Card) => string | null;
+
+/** Loads mergeHold and leadValidationHold from the first candidate that imports; nulls
+ * with the collected errors when none does — report() prints the errors and renders the
+ * rest without the scheduler holds. */
+export async function resolveMergeHold(candidates: readonly string[]): Promise<{
+	mergeHold: MergeHold | null;
+	leadHold: LeadHold | null;
+	error: string;
+}> {
 	const errors: string[] = [];
 	for (const c of candidates) {
 		try {
-			const mod = (await import(c)) as { mergeHold?: unknown };
+			const mod = (await import(c)) as {
+				mergeHold?: unknown;
+				leadValidationHold?: unknown;
+			};
 			if (typeof mod.mergeHold === "function")
-				return { mergeHold: mod.mergeHold as MergeHold, error: "" };
+				return {
+					mergeHold: mod.mergeHold as MergeHold,
+					leadHold:
+						typeof mod.leadValidationHold === "function"
+							? (mod.leadValidationHold as LeadHold)
+							: null,
+					error: "",
+				};
 			errors.push(`${c}: no mergeHold export`);
 		} catch (e) {
 			errors.push(`${c}: ${String(e).slice(0, 120)}`);
 		}
 	}
-	return { mergeHold: null, error: errors.join("; ") };
+	return { mergeHold: null, leadHold: null, error: errors.join("; ") };
 }
 
 const ORDER: Record<string, number> = {
@@ -292,6 +317,17 @@ function mergeHoldFor(
 		return mergeHold(sameProject, c);
 	} catch (e) {
 		return `hold unknown: ${String(e).slice(0, 80)}`;
+	}
+}
+
+/** leadValidationHold's hold for the card c (OTTR-1247), null when the loader
+ * found no scheduler, an error note in place of the hold when it throws. */
+function leadHoldFor(c: Card, leadHold: LeadHold | null): string | null {
+	if (leadHold === null) return null;
+	try {
+		return leadHold(c);
+	} catch (e) {
+		return `lead hold unknown: ${String(e).slice(0, 80)}`;
 	}
 }
 
@@ -341,7 +377,11 @@ export async function report(s: BoardState, now: number): Promise<string> {
 			t.cancelledAt === null && t.stage !== "done" && t.stage !== "backlog",
 	);
 	const byId = new Map(s.tasks.map((t) => [t.id, t]));
-	const { mergeHold, error } = await resolveMergeHold(SCHEDULER_CANDIDATES);
+	const {
+		mergeHold,
+		leadHold: leadHoldOf,
+		error,
+	} = await resolveMergeHold(SCHEDULER_CANDIDATES);
 	const running = open.filter(runsOrPrepares).length;
 	const drain = s.drainUntil !== null && s.drainUntil > now;
 	const out: string[] = [];
@@ -350,7 +390,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 	);
 	if (mergeHold === null)
 		out.push(
-			`WARNING: merge holds unknown (scheduler import failed: ${error.slice(0, 120)})`,
+			`WARNING: scheduler holds unknown (scheduler import failed: ${error.slice(0, 120)})`,
 		);
 	out.push(
 		"",
@@ -364,6 +404,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 				now,
 				logAgeS: logAgeSeconds(c, now),
 				hold: mergeHoldFor(c, s.tasks, mergeHold),
+				leadHold: leadHoldFor(c, leadHoldOf),
 				depsOpen: openDeps(c, byId),
 				drain,
 				capFull: s.maxTotal !== null && running >= s.maxTotal,

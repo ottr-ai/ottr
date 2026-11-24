@@ -292,6 +292,36 @@ test("holdFor never holds a card outside todo and merging", () => {
 	expect(holdFor(done, [live, done])).toBeNull();
 });
 
+test("holdFor names a queued lead's validation wait over its dependencies", () => {
+	// Wire rows (TaskCard) ship no prompt: the taskView sandboxLead stamp decides.
+	const lead = card({
+		id: "l1",
+		title: "Lead",
+		validatedAt: null,
+		followUpOf: "r1",
+		sandboxLead: true,
+	});
+	expect(holdFor(lead, [])).toBe(
+		"Waits for a validation run of review r1; a work turn has no sandbox_run.",
+	);
+	// The hold outranks a dependency hold: no work turn can ever take the lead.
+	const dep = card({ id: "d1", title: "Dep", stage: "in_progress" });
+	expect(holdFor({ ...lead, dependsOn: ["d1"] }, [dep, lead])).toBe(
+		"Waits for a validation run of review r1; a work turn has no sandbox_run.",
+	);
+	// A lead card without the stamp (a deployment-fact lead, or any other card)
+	// shows no hold.
+	expect(holdFor({ ...lead, sandboxLead: undefined }, [])).toBeNull();
+	// The designed states stay quiet: a validated lead carries no stamp (taskView
+	// stamps only a never-validated lead), so the stamp must go with it.
+	expect(
+		holdFor({ ...lead, validatedAt: 5, sandboxLead: undefined }, []),
+	).toBeNull();
+	expect(holdFor({ ...lead, stage: "backlog" }, [])).toBeNull();
+	expect(holdFor({ ...lead, state: "idle" }, [])).toBeNull();
+	expect(holdFor({ ...lead, cancelledAt: 9 }, [])).toBeNull();
+});
+
 test("holdFor names a foreign dependency through the cross-project lookup", () => {
 	const follower = card({ id: "f1", title: "Follower", dependsOn: ["AD-5"] });
 	const foreignCard = card({

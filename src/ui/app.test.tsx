@@ -13327,6 +13327,129 @@ describe("Drawer validate blocked leads again action", () => {
 	});
 });
 
+describe("Drawer start validation run on a queued lead", () => {
+	// OTTR-1247: a queued pending sandbox lead's drawer offers the manual start of
+	// its review's batch validation run when the review can take a batch; the
+	// POST targets the review's validate route, not the lead's.
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLInputElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
+
+	const leadCard = (over: Partial<TaskCard> = {}): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			prompt: "Needs validation: retry\nBlocker: sandbox run: no network deny",
+			validatedAt: null,
+			followUpOf: "r9",
+			...over,
+		}) as TaskCard;
+
+	const reviewCard = (over: Partial<TaskCard> = {}): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			id: "r9",
+			kind: "review",
+			prompt: "Review the quota changes",
+			stage: "done",
+			state: "idle",
+			...over,
+		}) as TaskCard;
+
+	const withRoot = (
+		lead: TaskCard,
+		review: TaskCard,
+		respond: { status: number; body: unknown },
+		run: (args: DrawerRunArgs) => Promise<void>,
+	): Promise<void> =>
+		withDrawerRoute(
+			{ ...drawerBase, tasks: [lead, review] },
+			lead,
+			"/tasks/r9/validate",
+			respond,
+			run,
+		);
+
+	const startButton = (container: HTMLDivElement): Element => {
+		for (const node of container.querySelectorAll("button"))
+			if (node.textContent?.includes("Start validation run")) return node;
+		throw new Error("no Start validation run button");
+	};
+
+	test("renders the button and POSTs to the review's validate route", async () => {
+		await withRoot(
+			leadCard(),
+			reviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(startButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.url.endsWith("/tasks/r9/validate")).toBe(true);
+				expect(posts[0]?.body).toEqual({});
+				const statuses = [...container.querySelectorAll('p[role="status"]')];
+				expect(
+					statuses.some((s) =>
+						s.textContent?.includes("Validation run filed."),
+					),
+				).toBe(true);
+			},
+		);
+	});
+
+	test("a lead whose review still runs renders no validate control", async () => {
+		await withRoot(
+			leadCard(),
+			reviewCard({ stage: "in_progress", state: "running" }),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Start validation run");
+			},
+		);
+	});
+
+	test("a validated lead renders no validate control", async () => {
+		await withRoot(
+			leadCard({ validatedAt: 5 }),
+			reviewCard(),
+			{ status: 200, body: { id: "v1", reset: [] } },
+			async ({ container }) => {
+				expect(container.textContent).not.toContain("Start validation run");
+			},
+		);
+	});
+
+	test("a failed POST surfaces the message as an inline alert", async () => {
+		await withRoot(
+			leadCard(),
+			reviewCard(),
+			{ status: 409, body: { error: "a validation run is already in flight" } },
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(startButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				const alerts = [...container.querySelectorAll('p[role="alert"]')];
+				expect(
+					alerts.some((a) =>
+						a.textContent?.includes("a validation run is already in flight"),
+					),
+				).toBe(true);
+				expect(container.textContent).not.toContain("Validation run filed.");
+			},
+		);
+	});
+});
+
 describe("AddProjectModal Git URL field error", () => {
 	const { window } = installBrowserGlobals([
 		"HTMLElement",

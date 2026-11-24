@@ -342,6 +342,7 @@ import {
 	mergeAnywayPatch,
 	openWorkBlockers,
 	PROMPT_EDIT_HELD,
+	pendingSandboxLead,
 	pushHold,
 	queueOrder,
 	type ReviewTask,
@@ -6326,6 +6327,10 @@ export async function createApp(deps: AppDeps) {
 			...(progress ? { progress: progress.text } : {}),
 			...(silent !== null ? { silentSince: silent } : {}),
 			...(isLead(t) ? { lead: true as const } : {}),
+			// OTTR-1247: the card ships no prompt, so holdFor and the check-ottr-board
+			// report read this stamp for a pending sandbox lead (a never-validated lead
+			// whose blocker is a sandbox run) instead of the prompt tag.
+			...(pendingSandboxLead(t) ? { sandboxLead: true as const } : {}),
 			...runStartedOf(t, tf, ctx.medians),
 			...(ctx.trendingRepos.has(t.id)
 				? { trendingRepo: ctx.trendingRepos.get(t.id) }

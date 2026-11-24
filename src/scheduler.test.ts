@@ -36,6 +36,7 @@ import {
 	lastFullReviewBase,
 	lastReviewBase,
 	leadBlocker,
+	leadValidationHold,
 	liveCard,
 	liveCardOf,
 	mergeAnywayPatch,
@@ -1575,6 +1576,52 @@ describe("OTTR-1128: a lead never runs as a work turn and never holds its review
 				many,
 			),
 		).toEqual([validated, deployment, normal]);
+	});
+
+	test("leadValidationHold names the review for a queued sandbox lead only", () => {
+		const lead = task({
+			prompt: "Needs validation: retry\nBlocker: sandbox run: no network deny",
+			followUpOf: "id00001",
+		});
+		expect(leadValidationHold(lead)).toBe(
+			"Waits for a validation run of review id00001; a work turn has no sandbox_run.",
+		);
+		// Without a linked review the wait names no id (the routing tick parks the
+		// lead with LEAD_NO_REVIEW_REASON on the next pass).
+		expect(leadValidationHold({ ...lead, followUpOf: null })).toBe(
+			"Waits for a validation run; a work turn has no sandbox_run.",
+		);
+		// A wire row (TaskCard) ships no prompt: the taskView stamp decides instead.
+		expect(
+			leadValidationHold({ ...lead, prompt: undefined, sandboxLead: true }),
+		).toBe(
+			"Waits for a validation run of review id00001; a work turn has no sandbox_run.",
+		);
+		// A wire row of a deployment-fact lead carries no stamp and shows no hold.
+		expect(
+			leadValidationHold({
+				prompt: undefined,
+				validatedAt: null,
+				followUpOf: "id00001",
+				stage: "todo",
+				state: "queued",
+				cancelledAt: null,
+			}),
+		).toBeNull();
+		// The designed states stay quiet.
+		expect(leadValidationHold({ ...lead, stage: "backlog" })).toBeNull();
+		expect(leadValidationHold({ ...lead, validatedAt: 5 })).toBeNull();
+		expect(leadValidationHold({ ...lead, cancelledAt: 9 })).toBeNull();
+		expect(
+			leadValidationHold(
+				task({
+					prompt:
+						"Needs validation: proxy\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
+					followUpOf: "id00001",
+				}),
+			),
+		).toBeNull();
+		expect(leadValidationHold(task())).toBeNull();
 	});
 
 	test("validatableReview: a done review, or one idle at merging", () => {

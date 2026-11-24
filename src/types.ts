@@ -1299,6 +1299,11 @@ export type TaskCard = Omit<
 	 * validation" tag. The card ships no prompt, so the hold rules (scheduler.ts isLead)
 	 * read this mark instead. */
 	lead?: true;
+	/** OTTR-1247: present (true) on a pending sandbox lead: a never-validated lead whose
+	 * blocker is a sandbox run (scheduler.ts pendingSandboxLead). The card ships no
+	 * prompt, so holdFor and the check-ottr-board report read this mark instead of the
+	 * prompt tag; a deployment-fact lead carries no stamp. */
+	sandboxLead?: true;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and
 	 * the unseen comment stamp that key the bell occurrences, plus the board-posted stamp
 	 * (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */

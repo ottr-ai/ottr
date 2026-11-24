@@ -15,6 +15,7 @@ const F: Facts = {
 	now: 1_760_000_000_000,
 	logAgeS: 10,
 	hold: null,
+	leadHold: null,
 	depsOpen: [],
 	drain: false,
 	capFull: false,
@@ -193,6 +194,36 @@ describe("verdict", () => {
 		expect(v.note).toBe("queued with no hold found");
 	});
 
+	test("a queued pending sandbox lead holds on its review's validation run", () => {
+		const holdText =
+			"Waits for a validation run of review T-9; a work turn has no sandbox_run.";
+		// A store-row card: leadValidationHold reads the prompt tag.
+		const fromPrompt = verdict(
+			card({
+				state: "queued",
+				prompt:
+					"Needs validation: retry\nBlocker: sandbox run: no network deny",
+				validatedAt: null,
+				followUpOf: "T-9",
+			}),
+			{ ...F, leadHold: holdText },
+		);
+		expect(fromPrompt.verdict).toBe("OK");
+		expect(fromPrompt.note).toContain("validation run of review T-9");
+		// A wire card (GET /api/state): no prompt, the sandboxLead stamp instead.
+		const fromStamp = verdict(
+			card({
+				state: "queued",
+				sandboxLead: true,
+				validatedAt: null,
+				followUpOf: "T-9",
+			}),
+			{ ...F, leadHold: holdText },
+		);
+		expect(fromStamp.verdict).toBe("OK");
+		expect(fromStamp.note).toContain("validation run of review T-9");
+	});
+
 	test("a queued card behind an open dependency holds on it", () => {
 		const v = verdict(card({ state: "queued" }), {
 			...F,
@@ -362,6 +393,23 @@ describe("resolveMergeHold", () => {
 		expect(
 			r.mergeHold?.(tasks, { id: "T-7", stage: "merging", state: "queued" }),
 		).toBe("waiting for the review's findings to be implemented");
+		// OTTR-1247: the same import carries leadValidationHold for the report's lead hold.
+		expect(r.leadHold).not.toBeNull();
+		// A wire card (GET /api/state): no prompt, the sandboxLead stamp instead.
+		expect(
+			r.leadHold?.({
+				id: "T-8",
+				project: "p",
+				stage: "todo",
+				state: "queued",
+				cancelledAt: null,
+				validatedAt: null,
+				followUpOf: "T-5",
+				sandboxLead: true,
+			}),
+		).toBe(
+			"Waits for a validation run of review T-5; a work turn has no sandbox_run.",
+		);
 	});
 });
 
@@ -564,7 +612,7 @@ describe("report", () => {
 			);
 			const out = await report(s, F.now);
 			expect(out).toContain(
-				"WARNING: merge holds unknown (scheduler import failed: /nonexistent/x.ts",
+				"WARNING: scheduler holds unknown (scheduler import failed: /nonexistent/x.ts",
 			);
 			// The rest of the report still renders.
 			expect(out).toContain("## Main checkouts");

@@ -1379,6 +1379,38 @@ export function pendingSandboxLead(
 	);
 }
 
+/** OTTR-1247: the wait a pending sandbox lead shows while it sits queued in a work lane
+ * (moved to todo, or a started lead whose review still runs): no work turn can take it
+ * (pickRunnable skips it, OTTR-1128), and only its review's batch validation run proves
+ * it, so the hold names that review. The designed states stay quiet: a backlog lead
+ * waits in its batch, a validated lead and a deployment-fact lead run as normal work.
+ * Store rows read the prompt tag; wire rows (TaskCard) ship no prompt and read the
+ * `sandboxLead` stamp taskView writes instead. Null for any other card or state. Pure. */
+export function leadValidationHold(
+	t: Pick<
+		Task,
+		"validatedAt" | "followUpOf" | "stage" | "state" | "cancelledAt"
+	> & {
+		prompt?: string;
+		sandboxLead?: true;
+	},
+): string | null {
+	if (
+		t.cancelledAt !== null ||
+		t.state !== "queued" ||
+		(t.stage !== "todo" && t.stage !== "in_progress")
+	)
+		return null;
+	const pendingSandbox =
+		t.sandboxLead === true ||
+		(t.prompt !== undefined &&
+			pendingSandboxLead({ prompt: t.prompt, validatedAt: t.validatedAt }));
+	if (!pendingSandbox) return null;
+	return t.followUpOf === null
+		? "Waits for a validation run; a work turn has no sandbox_run."
+		: `Waits for a validation run of review ${t.followUpOf}; a work turn has no sandbox_run.`;
+}
+
 /** True for a review whose leads a batch validation run may take: a done review, or one
  * held at merging for its findings (OTTR-1128), so a release validates before it ships. */
 export function validatableReview(

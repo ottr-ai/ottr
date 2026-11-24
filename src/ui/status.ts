@@ -3,6 +3,7 @@ import {
 	type DepIndex,
 	depHold,
 	isReview,
+	leadValidationHold,
 	mergeHold,
 	PUSH_HOLD,
 	queueOrder,
@@ -262,14 +263,25 @@ export function isProposal(
  * findings, as in pickRunnable) or on the push hold the server stamped (`pushHold`, OTTR-506:
  * local main has commits origin lacks; the browser gets no git), then any stage on its
  * unfinished dependencies (one missing from `tasks` counts as done; `foreign` OTTR-708 looks
- * an id up across the board's projects, unresolvable counts as done); a done card is never held. */
+ * an id up across the board's projects, unresolvable counts as done), a queued pending
+ * sandbox lead on its review's validation run (OTTR-1247); a done card is never held. */
 export function holdFor(
 	t: Pick<
 		Task,
-		"id" | "stage" | "state" | "dependsOn" | "pushRetries" | "pendingBy"
+		| "id"
+		| "stage"
+		| "state"
+		| "dependsOn"
+		| "pushRetries"
+		| "pendingBy"
+		| "validatedAt"
+		| "followUpOf"
+		| "cancelledAt"
 	> & {
 		pushHold?: boolean;
 		vmHold?: string;
+		/** The wire stamp (taskView); store rows read the prompt tag instead. */
+		sandboxLead?: true;
 	},
 	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
 	foreign?: DepIndex,
@@ -282,7 +294,11 @@ export function holdFor(
 	}
 	// A card waiting on its dependencies would not dispatch even with a free microVM, so the
 	// dependency hold names the real blocker first; the server stamps vmHold on queued cards.
-	return depHold(tasks, t, foreign) ?? t.vmHold ?? null;
+	// OTTR-1247: a pending sandbox lead queued in a work lane waits for its review's batch
+	// validation — no work turn can ever take it, so that hold outranks the dependency one.
+	return (
+		leadValidationHold(t) ?? depHold(tasks, t, foreign) ?? t.vmHold ?? null
+	);
 }
 
 /** The release card's re-release view, else null: parked for the user (needs_you or idle, not
