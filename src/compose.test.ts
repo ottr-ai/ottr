@@ -151,9 +151,10 @@ describe("the buildkit sidecar compose shape", () => {
 	test("the worker image installs a pinned, checksummed buildctl", () => {
 		for (const line of [
 			"ARG BUILDKIT_VERSION=",
-			"ARG BUILDKIT_SHA256=",
+			"ARG BUILDKIT_SHA256_AMD64=",
+			"ARG BUILDKIT_SHA256_ARM64=",
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: literal Dockerfile ARG expansion, not a TS template
-			"buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz",
+			"buildkit-v${BUILDKIT_VERSION}.linux-${BUILDKIT_ARCH}.tar.gz",
 			"sha256sum -c -",
 			"buildctl --version",
 			"ARG OPENSSL_VERSION=3.5.7-1~deb13u3",

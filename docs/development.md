@@ -159,6 +159,10 @@ It sets the normal `OTTR_DATABASE_URL` to the file's database URL.
 This test-only subprocess use does not permit production URL propagation to workers.
 Do not print either URL, credentials, or nested driver errors.
 
+### Store schema parity
+
+With `OTTR_TEST_PG_URL` set to the isolated service, run `OTTR_REQUIRE_PG_TESTS=1 bun test src/postgresSchema.test.ts src/postgresStore.test.ts` to cover numbered upgrades and compare PostgreSQL with the fully opened SQLite schema. A SQLite column addition also needs an appended PostgreSQL migration for existing project schemas; changing only the fresh schema or rewriting an applied migration leaves older databases behind.
+
 ### Proof boundary
 
 The fixture follows these rules:

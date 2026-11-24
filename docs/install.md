@@ -3,6 +3,7 @@
 ## Requirements
 
 - Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)
+- Container deployments need [Docker Compose ≥ 2.20.0](https://docs.docker.com/reference/compose-file/services/#depends_on), including when it is the provider for `podman compose`. The optional Alate dependency uses `depends_on.required: false`, introduced in that version.
 - `gh` ([GitHub CLI](https://cli.github.com)) only for releases, when **Settings** holds no GitHub token.
 - omp must run its tools without approval prompts; a one-shot `omp -p` run cannot answer them.
 - Ottr seals the token and key fields of `.tasks/tracker.db` at rest with the SecretBox key (`OTTR_SECRET_KEY` env wins, `.tasks/secret.key` next to `tracker.db` is the fallback). The sealed fields are: GitHub token, API key, session secret, per-host git tokens, GitHub App key, Alate key, Hindsight API key, the secret env values, and the Web Push private key. The database snapshots hold the sealed values. Treat that file as a credential store, together with its key, and protect the backup dir the same way. [ADR-0011](adr/0011-sealed-token-fields-encrypted-volumes.md) also records: run the state volume, the backup dir, and the SSH key dir on an encrypted volume.
@@ -128,7 +129,7 @@ Podman runs the stack too. The Windows + podman-compose notes below are as repor
 user on Windows 11 (Podman 6.1.4, rootful, WSL machine; podman-compose 1.6.0) — the
 project has no Windows machine to verify them.
 
-- `podman compose` needs a compose provider. Use Docker Compose v2 (`winget install Docker.DockerCompose`, then `$env:PODMAN_COMPOSE_PROVIDER = "docker-compose"`), or `pip install podman-compose`.
+- `podman compose` delegates to an external compose provider; the Podman version alone does not determine Compose feature support. Use Docker Compose ≥ 2.20.0 (`winget install Docker.DockerCompose`, then `$env:PODMAN_COMPOSE_PROVIDER = "docker-compose"`; on Linux/macOS, `export PODMAN_COMPOSE_PROVIDER=docker-compose`). Check the selected provider with `podman compose version`. The `podman-compose` notes below do not verify its optional dependency or health-gating behavior with this stack; use the Docker Compose provider until those behaviors are checked.
 - Podman has no `local` log driver. Set `OTTR_LOG_DRIVER=k8s-file` (env or `.env`).
 - Windows + podman-compose cannot take the host paths as written: `C:\...` does not parse in a short volume mount, and a POSIX path like `/mnt/c/Users/<you>/.omp/oauth` goes through Python `abspath`, becomes `C:\mnt\c\...`, and podman mounts `/mnt/c/mnt/c/Users/...`. Rootful podman creates the missing source as an empty folder, so the stack starts with an empty oauth folder and `agent.db` as a folder — provider sign-in then fails. The entry script refuses to start on the `agent.db` folder and warns on the empty oauth folder. Use Docker Compose v2 as the provider, or:
   - use paths relative to the compose folder, which podman-compose resolves there and the podman client translates into machine paths. From `C:\Users\<you>\ottr`: `OTTR_OAUTH_DIR=../../../../Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=../../../../Users/<you>/.omp/ottr-agent.db`;
@@ -185,6 +186,26 @@ project has no Windows machine to verify them.
 Podman Desktop shows no containers, or the board times out after you recreate the stack? See [docs/WORKERS.md, Troubleshooting](WORKERS.md#troubleshooting).
 
 ### After the first start
+
+After the server binds successfully, foreground `docker compose up` shows a
+**Startup access** banner with the Ottr URL (including a custom `OTTR_PORT`) and
+the bundled Alate dashboard URL when `COMPOSE_PROFILES` includes `alate` (or `*`);
+otherwise the Alate row reads `off`. Keep profile selection in `COMPOSE_PROFILES`
+so the banner receives it. Startup logs never print the Alate API key; read
+`ALATE_API_KEY` from your Compose `.env` file to sign in to Alate. Ottr uses the
+admin name/password created on first visit, not an API key; passwords and
+worker/provider tokens are not printed. Detached `up -d` hides application logs;
+read the banner with `docker compose logs --tail 30 server`. External Alate
+servers use their own dashboard URL and key.
+
+With the bundled profile enabled, Compose waits for Alate's `/health` endpoint
+before starting Ottr. This prevents the boot-time `GET http://alate:4570/api/updates`
+pull from racing Alate's listener. With the profile off, Ottr can still use an
+external Alate server configured in **Settings → Alate**.
+
+For source deployments, wait until no turns run, then rebuild and recreate with
+`docker compose up --build --force-recreate` after updating the checkout. Existing
+named volumes remain intact; do not use `down -v` to refresh an image.
 
 The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](WORKERS.md#env-settings) tells why).
 

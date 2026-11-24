@@ -13,34 +13,38 @@ LABEL ottr.image=worker
 ARG GIT_VERSION=1:2.47.3-0+deb13u1
 # rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
 # when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.1.0.
-# Static musl build, no glibc deps. A wrong pin 404s the download (fails the build loudly).
+# amd64 uses static musl; arm64 uses glibc. A wrong pin fails the build loudly.
 ARG RTK_VERSION=1.2.0
-# sha256 of rtk-x86_64-unknown-linux-musl.tar.gz from the release's checksums.txt.
-ARG RTK_SHA256=70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
+# Release checksums.txt, one archive per target architecture.
+ARG RTK_SHA256_AMD64=70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
+ARG RTK_SHA256_ARM64=93c1dcd37fd5fcae8fa772a5b5c34a30af142ace4f4081c8f98319146b7a10a4
 # ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
 # (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
 ARG RIPWIRE_VERSION=0.6.10
-# sha256 of ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz, the release asset's GitHub digest.
-ARG RIPWIRE_SHA256=84346e9d487d94c1021810ecb3169ae125bc15529d1662a3463070e851f3be87
+# Release archive digests, one per target architecture.
+ARG RIPWIRE_SHA256_AMD64=84346e9d487d94c1021810ecb3169ae125bc15529d1662a3463070e851f3be87
+ARG RIPWIRE_SHA256_ARM64=c30c28df31357b648d58d2796d64a5c63e5f1e71d0940bafd007b2dd7c8d15f2
 # gitleaks secret scanner: review gates that name it (e.g. ottr-cloud's AGENTS.md) run
-# `gitleaks git .` on workers. Keep the version and checksum equal to the CI pin in
+# `gitleaks git .` on workers. Keep the version and amd64 checksum equal to the CI pin in
 # .github/workflows/ci.yml ("Install gitleaks 8.30.1"). A bump changes both places.
 # A wrong pin 404s the download or fails the checksum (fails the build loudly).
 ARG GITLEAKS_VERSION=8.30.1
-# sha256 of gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz, the release asset's GitHub digest
-# (equal to ci.yml's GITLEAKS_SHA256).
-ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+# Release checksums.txt, one archive per target architecture.
+ARG GITLEAKS_SHA256_AMD64=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+ARG GITLEAKS_SHA256_ARM64=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
 # GitHub token (D6). Host runs 2.103.3. A wrong pin 404s the download (fails the build loudly).
 ARG GH_VERSION=2.104.0
-# sha256 of gh_${GH_VERSION}_linux_amd64.tar.gz from the release's checksums.txt.
-ARG GH_SHA256=98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
+# Release checksums.txt, one archive per target architecture.
+ARG GH_SHA256_AMD64=98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
+ARG GH_SHA256_ARM64=cb34cefc6f4e77b90731374a2b737516bb8f3033c6ca46aa949e5344f68069e3
 # Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).
 ARG NODE_VERSION=24.21.0
-# sha256 of node-v${NODE_VERSION}-linux-x64.tar.gz from the release's SHASUMS256.txt.
-ARG NODE_SHA256=6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
+# Release SHASUMS256.txt, one .tar.gz per target architecture.
+ARG NODE_SHA256_AMD64=6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff
+ARG NODE_SHA256_ARM64=724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5
 # Debian trixie jq version; a wrong pin fails the build loudly (D1).
 ARG JQ_VERSION=1.7.1-6+deb13u4
 # Debian trixie procps version: killTree and the orphan report (src/platform/unix.ts) walk the
@@ -55,8 +59,9 @@ ARG CURL_VERSION=8.14.1-2+deb13u7
 # channel from /opt/google/chrome/chrome. Its shared libraries come from the projects' package
 # lists (see below). A wrong pin 404s the download (fails the build loudly).
 ARG CHROME_VERSION=154.0.8037.92
-# sha256 of chrome-linux64.zip, computed when pinned: Chrome for Testing publishes no checksums.
-ARG CHROME_SHA256=ff43322f335e436b2f4dcdfeeec5db032299e335a7e8c1c618b326e100ce8732
+# Computed archive digests: Chrome for Testing publishes no checksums.
+ARG CHROME_SHA256_AMD64=ff43322f335e436b2f4dcdfeeec5db032299e335a7e8c1c618b326e100ce8732
+ARG CHROME_SHA256_ARM64=c0af361aab66b24c72e36a4326dce4d7edf4bc23f9aede8af988c2cb6ea3fec0
 # Debian trixie git-lfs version. Projects can keep binary assets in LFS, and the
 # server checks worktrees out through its filters before any package list installs, so it
 # is in the image. A wrong pin fails the build loudly (D1).
@@ -99,8 +104,15 @@ RUN apt-get update \
     && openssl version \
     && ssh -V
 
+# ponytail: dpkg describes the target image, so Docker and Podman need no
+# TARGETARCH build arg. Native is the default; --platform still selects a target.
 # rtk on PATH (pinned, checksum-verified) so pix-optimizer's bash rewrite is active.
-RUN bun -e "await Bun.write('/tmp/rtk.tar.gz', await (await fetch('https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz')).bytes())" \
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) RTK_TARGET=x86_64-unknown-linux-musl; RTK_SHA256="${RTK_SHA256_AMD64}" ;; \
+      arm64) RTK_TARGET=aarch64-unknown-linux-gnu; RTK_SHA256="${RTK_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/rtk.tar.gz', await (await fetch('https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-${RTK_TARGET}.tar.gz')).bytes())" \
     && echo "${RTK_SHA256}  /tmp/rtk.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/rtk.tar.gz -C /tmp \
     && install -m 0755 /tmp/rtk /usr/local/bin/rtk \
@@ -108,15 +120,25 @@ RUN bun -e "await Bun.write('/tmp/rtk.tar.gz', await (await fetch('https://githu
     && rtk --version
 
 # ripwire on PATH (pinned, checksum-verified) so turn agents map before they read.
-RUN bun -e "await Bun.write('/tmp/ripwire.tar.gz', await (await fetch('https://github.com/redhat-et/ripwire/releases/download/v${RIPWIRE_VERSION}/ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz')).bytes())" \
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) RIPWIRE_ARCH=x64; RIPWIRE_SHA256="${RIPWIRE_SHA256_AMD64}" ;; \
+      arm64) RIPWIRE_ARCH=arm64; RIPWIRE_SHA256="${RIPWIRE_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/ripwire.tar.gz', await (await fetch('https://github.com/redhat-et/ripwire/releases/download/v${RIPWIRE_VERSION}/ripwire-${RIPWIRE_VERSION}-linux-${RIPWIRE_ARCH}.tar.gz')).bytes())" \
     && echo "${RIPWIRE_SHA256}  /tmp/ripwire.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/ripwire.tar.gz -C /tmp \
-    && install -m 0755 "/tmp/ripwire-${RIPWIRE_VERSION}-linux-x64/ripwire" /usr/local/bin/ripwire \
-    && rm -rf "/tmp/ripwire-${RIPWIRE_VERSION}-linux-x64" /tmp/ripwire.tar.gz \
+    && install -m 0755 "/tmp/ripwire-${RIPWIRE_VERSION}-linux-${RIPWIRE_ARCH}/ripwire" /usr/local/bin/ripwire \
+    && rm -rf "/tmp/ripwire-${RIPWIRE_VERSION}-linux-${RIPWIRE_ARCH}" /tmp/ripwire.tar.gz \
     && ripwire --version
 
 # gitleaks on PATH (pinned, checksum-verified) so review gates that name it run on workers.
-RUN bun -e "await Bun.write('/tmp/gitleaks.tar.gz', await (await fetch('https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz')).bytes())" \
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) GITLEAKS_ARCH=x64; GITLEAKS_SHA256="${GITLEAKS_SHA256_AMD64}" ;; \
+      arm64) GITLEAKS_ARCH=arm64; GITLEAKS_SHA256="${GITLEAKS_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/gitleaks.tar.gz', await (await fetch('https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${GITLEAKS_ARCH}.tar.gz')).bytes())" \
     && echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/gitleaks.tar.gz -C /tmp \
     && install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks \
@@ -125,21 +147,34 @@ RUN bun -e "await Bun.write('/tmp/gitleaks.tar.gz', await (await fetch('https://
 
 # gh on PATH (pinned, checksum-verified). Workers get no GitHub token (D6), so there it reads
 # public data only.
-RUN bun -e "await Bun.write('/tmp/gh.tar.gz', await (await fetch('https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz')).bytes())" \
+RUN GH_ARCH="$(dpkg --print-architecture)" \
+    && case "$GH_ARCH" in \
+      amd64) GH_SHA256="${GH_SHA256_AMD64}" ;; \
+      arm64) GH_SHA256="${GH_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/gh.tar.gz', await (await fetch('https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${GH_ARCH}.tar.gz')).bytes())" \
     && echo "${GH_SHA256}  /tmp/gh.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_amd64/bin/gh" \
-    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
-    && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_amd64" \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" \
+    && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${GH_ARCH}/bin/gh" /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${GH_ARCH}" \
     && gh --version
 
 # buildctl on PATH (pinned, checksum-verified): the client for the rootless BuildKit
 # sidecar (compose `build` profile, docs/specs/turn-image-builds.md). The daemon runs
 # in the compose stack; the image carries only the client. The release names the asset
-# with dots (buildkit-v<version>.linux-amd64.tar.gz) and publishes no checksums file:
-# the SHA-256 was computed when pinned (release day 2026-11-03), like the Chrome pin.
+# with dots (buildkit-v<version>.linux-<arch>.tar.gz) and publishes no checksums file.
+# Each archive is pinned by its release asset's SHA-256 digest.
 ARG BUILDKIT_VERSION=0.34.2
-ARG BUILDKIT_SHA256=b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13
-RUN bun -e "await Bun.write('/tmp/buildkit.tar.gz', await (await fetch('https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz')).bytes())" \
+ARG BUILDKIT_SHA256_AMD64=b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13
+ARG BUILDKIT_SHA256_ARM64=a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3
+RUN BUILDKIT_ARCH="$(dpkg --print-architecture)" \
+    && case "$BUILDKIT_ARCH" in \
+      amd64) BUILDKIT_SHA256="${BUILDKIT_SHA256_AMD64}" ;; \
+      arm64) BUILDKIT_SHA256="${BUILDKIT_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/buildkit.tar.gz', await (await fetch('https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${BUILDKIT_ARCH}.tar.gz')).bytes())" \
     && echo "${BUILDKIT_SHA256}  /tmp/buildkit.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/buildkit.tar.gz -C /tmp bin/buildctl \
     && install -m 0755 /tmp/bin/buildctl /usr/local/bin/buildctl \
@@ -147,21 +182,49 @@ RUN bun -e "await Bun.write('/tmp/buildkit.tar.gz', await (await fetch('https://
     && buildctl --version
 
 # node, npm and npx on PATH (pinned, checksum-verified); they shadow bun's node fallback.
-RUN bun -e "await Bun.write('/tmp/node.tar.gz', await (await fetch('https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz')).bytes())" \
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) NODE_ARCH=x64; NODE_SHA256="${NODE_SHA256_AMD64}" ;; \
+      arm64) NODE_ARCH=arm64; NODE_SHA256="${NODE_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/node.tar.gz', await (await fetch('https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz')).bytes())" \
     && echo "${NODE_SHA256}  /tmp/node.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
-      --exclude="node-v${NODE_VERSION}-linux-x64/*.md" --exclude="node-v${NODE_VERSION}-linux-x64/LICENSE" \
+      --exclude="node-v${NODE_VERSION}-linux-${NODE_ARCH}/*.md" --exclude="node-v${NODE_VERSION}-linux-${NODE_ARCH}/LICENSE" \
     && rm -f /tmp/node.tar.gz \
     && node --version \
     && npx --version
 
 # Chrome on the path chrome-devtools-mcp looks for (pinned, checksum-verified).
-RUN bun -e "await Bun.write('/tmp/chrome.zip', await (await fetch('https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-linux64.zip')).bytes())" \
+RUN case "$(dpkg --print-architecture)" in \
+      amd64) CHROME_PLATFORM=linux64; CHROME_SHA256="${CHROME_SHA256_AMD64}" ;; \
+      arm64) CHROME_PLATFORM=linux-arm64; CHROME_SHA256="${CHROME_SHA256_ARM64}" ;; \
+      *) echo "Unsupported worker architecture" >&2; exit 1 ;; \
+    esac \
+    && bun -e "await Bun.write('/tmp/chrome.zip', await (await fetch('https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/${CHROME_PLATFORM}/chrome-${CHROME_PLATFORM}.zip')).bytes())" \
     && echo "${CHROME_SHA256}  /tmp/chrome.zip" | sha256sum -c - \
     && unzip -q /tmp/chrome.zip -d /opt \
     && rm -f /tmp/chrome.zip \
     && mkdir -p /opt/google/chrome \
-    && ln -s /opt/chrome-linux64/chrome /opt/google/chrome/chrome
+    && ln -s "/opt/chrome-${CHROME_PLATFORM}/chrome" /opt/google/chrome/chrome
+
+# Regression check: emulation must not hide a wrong-architecture tool archive.
+# Chrome's libraries are project packages, so inspect ELF without launching Chrome.
+# Use ordinary RUN syntax so Podman/Buildah needs no Dockerfile heredoc support.
+RUN python3 -c "$(printf '%s\n' \
+    'import struct' \
+    'import subprocess' \
+    '' \
+    'arch = subprocess.check_output(["dpkg", "--print-architecture"], text=True).strip()' \
+    'expected = {"amd64": 62, "arm64": 183}[arch]' \
+    'for path in ("/usr/local/bin/rtk", "/usr/local/bin/ripwire", "/usr/local/bin/gitleaks",' \
+    '             "/usr/local/bin/gh", "/usr/local/bin/buildctl", "/usr/local/bin/node",' \
+    '             "/opt/google/chrome/chrome"):' \
+    '    with open(path, "rb") as binary:' \
+    '        header = binary.read(20)' \
+    '    assert header[:4] == b"\x7fELF" and header[5] == 1, f"{path}: not little-endian ELF"' \
+    '    assert struct.unpack_from("<H", header, 18)[0] == expected, f"{path}: not {arch}"' \
+    'print(f"Worker tools verified: {arch}")')"
 
 # The pinned agent-browser doctor finds Chrome by its standard PATH name.
 RUN bun install -g --ignore-scripts --minimum-release-age 604800 "agent-browser@${AGENT_BROWSER_VERSION}" \
@@ -236,6 +299,9 @@ ENTRYPOINT ["/ottr-entry.sh"]
 # guest gets the worker's tools, omp and /app unchanged. It inherits LABEL ottr.image=worker
 # on purpose: scripts/update-image.ts prunes its superseded builds with the worker's.
 FROM worker AS vm-runner
+# The pinned guest kernel and boot arguments are x86_64-only; worker builds skip this stage.
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    || { echo "vm-runner supports amd64 only; build the worker target on arm64" >&2; exit 1; }
 # Firecracker (VMM) static musl binary from the official release. Host-independent: it
 # needs only /dev/kvm. A wrong pin 404s the download (fails the build loudly).
 ARG FIRECRACKER_VERSION=1.17.0

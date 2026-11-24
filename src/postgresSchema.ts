@@ -231,6 +231,35 @@ export const projectMigrations: readonly PostgresMigration[] = [
 	async (db) => {
 		await retitleBareLeadTitles(db);
 	},
+	// Preserve versions 1–3; converge both fresh and existing project schemas with
+	// SQLite's outside-issue provenance and code-scanning alert storage. LIMIT 1
+	// matches SQLite's scalar lookup when multiple imports reference one card.
+	async (db) => {
+		await db.exec("ALTER TABLE tasks ADD COLUMN source_issue text");
+		await db.run(`UPDATE tasks SET source_issue = (
+			SELECT CAST(w.number AS text) FROM issue_watch w WHERE w.task_id = tasks.id
+			LIMIT 1
+		) WHERE source_issue IS NULL
+			AND EXISTS (SELECT 1 FROM issue_watch w WHERE w.task_id = tasks.id)`);
+		await db.run(`UPDATE tasks SET source_issue = (
+			SELECT j.issue_key FROM jira_imports j WHERE j.task_id = tasks.id
+			LIMIT 1
+		) WHERE source_issue IS NULL
+			AND EXISTS (SELECT 1 FROM jira_imports j WHERE j.task_id = tasks.id)`);
+		await db.exec(`CREATE TABLE code_scan_alert (
+			number bigint PRIMARY KEY, rule text NOT NULL, task_id text NOT NULL,
+			severity text NOT NULL, path text NOT NULL, line bigint NOT NULL,
+			url text NOT NULL, message text NOT NULL,
+			skipped bigint NOT NULL DEFAULT 0 CHECK (skipped IN (0,1)),
+			filed_at bigint NOT NULL, card_filed_at bigint NOT NULL
+		)`);
+		await db.exec(
+			"CREATE INDEX idx_code_scan_alert_task ON code_scan_alert (task_id)",
+		);
+		await db.exec(
+			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
+		);
+	},
 ];
 
 /** How many versioned steps the store's own project migrations carry. The PG

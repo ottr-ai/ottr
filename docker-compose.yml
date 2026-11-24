@@ -125,6 +125,12 @@ services:
     image: ${OTTR_IMAGE:-ottr-worker:local}
     command: bun /app/src/server.ts
     init: true # reaps orphans as on the workers (148 zombies here after 7 hours, 2026-10-12)
+    # With the bundled profile on, the boot-time Alate pull must wait for its listener.
+    # Keep external-Alate deployments valid when the optional service is disabled.
+    depends_on:
+      alate:
+        condition: service_healthy
+        required: false
     logging: *logging
     # Estimate: the board runs merge, release, and retro turns itself (bun test included).
     mem_limit: ${OTTR_SERVER_MEM_LIMIT:-8g}
@@ -267,7 +273,8 @@ services:
       HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
       # Alate pairing (the `alate` profile below): these seed Settings -> Alate while it
       # holds no URL or key, and a value saved there wins at the next boot. With the
-      # profile on, http://alate:4570 is the bundled service; the key never reaches a log.
+      # profile on, http://alate:4570 is the bundled service. Never log the key.
+      COMPOSE_PROFILES: ${COMPOSE_PROFILES:-}
       ALATE_URL: ${ALATE_URL:-}
       ALATE_API_KEY: ${ALATE_API_KEY:-}
       # Provider keys pass through from the host env. Extend this list for
@@ -555,7 +562,7 @@ services:
   # Alate server already runs keeps today's setup. The board reaches it at
   # http://alate:4570 on the default network; the dashboard is loopback-only on the
   # host. ALATE_URL and ALATE_API_KEY (server env above) seed Settings -> Alate, and a
-  # value saved there wins. The key never reaches a log. Alate provisions the agent
+  # value saved there wins. Startup logs never print the key. Alate provisions the agent
   # layer as layers under /root/.alate/layers/<id> and switches /root/.alate/current
   # with one atomic rename; it reads /root/.alate/in-use.json (the board's registry of
   # layers that live runs pinned) before a clean-up, which keeps the current layer, the
@@ -572,6 +579,17 @@ services:
       - -c
       - . /no-proxy.sh && exec node server.ts --host 0.0.0.0 --config /state/server-config.json --db /state/alate.db
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - --input-type=module
+        - -e
+        - "try { process.exit((await fetch('http://127.0.0.1:4570/health', { redirect: 'error', signal: AbortSignal.timeout(4000) })).ok ? 0 : 1); } catch { process.exit(1); }"
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     logging: *logging
     volumes:
       - ./docker/no-proxy.sh:/no-proxy.sh:ro

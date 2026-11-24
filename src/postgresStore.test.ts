@@ -25,7 +25,7 @@ import { join } from "node:path";
 import { ProjectStore } from ${JSON.stringify(new URL("./store.ts", import.meta.url).href)};
 import { GlobalStore } from ${JSON.stringify(new URL("./globalStore.ts", import.meta.url).href)};
 import { getPostgresDatabase, closePostgresBackend } from ${JSON.stringify(new URL("./postgresDriver.ts", import.meta.url).href)};
-import { applyPostgresMigrations, projectMigrationCount, projectSchemaName, reseedPostgresIdentities } from ${JSON.stringify(new URL("./postgresSchema.ts", import.meta.url).href)};
+import { applyPostgresMigrations, projectMigrationCount, projectMigrations, projectSchemaName, reseedPostgresIdentities } from ${JSON.stringify(new URL("./postgresSchema.ts", import.meta.url).href)};
 `;
 
 // These exact scenarios run in fresh processes for both backend selections.
@@ -169,6 +169,29 @@ try {
       return rows;
     })();
   if (backend === 'postgres') {
+    const upgradeDb = await getPostgresDatabase(projectSchemaName('legacy migration upgrade'));
+    try {
+      await upgradeDb.exec('CREATE SCHEMA "' + upgradeDb.schema + '"');
+      await applyPostgresMigrations(upgradeDb, projectMigrations.slice(0, 3));
+      await upgradeDb.createQueue().transaction(async () => {
+        for (const id of ['legacy-issue', 'legacy-jira', 'legacy-plain'])
+          await upgradeDb.run("INSERT INTO tasks (id, prompt, stage, state, created_at, updated_at) VALUES (?, 'preserved prompt', 'todo', 'queued', 1, 1)", [id]);
+        await upgradeDb.run("INSERT INTO issue_watch (number, task_id, filed_at) VALUES (7, 'legacy-issue', 1)");
+        await upgradeDb.run("INSERT INTO jira_imports (site, issue_key, task_id, filed_at) VALUES ('jira.example.com', 'C-1', 'legacy-jira', 1)");
+        await upgradeDb.run("INSERT INTO jira_imports (site, issue_key, task_id, filed_at) VALUES ('jira.example.com', 'C-2', 'legacy-issue', 1)");
+      });
+      await applyPostgresMigrations(upgradeDb, projectMigrations);
+      assert.deepEqual(Array.from(await upgradeDb.query('SELECT id, prompt, source_issue FROM tasks ORDER BY id').all()), [
+        { id: 'legacy-issue', prompt: 'preserved prompt', source_issue: '7' },
+        { id: 'legacy-jira', prompt: 'preserved prompt', source_issue: 'C-1' },
+        { id: 'legacy-plain', prompt: 'preserved prompt', source_issue: null },
+      ]);
+      await upgradeDb.run("UPDATE tasks SET source_issue = 'explicit-source' WHERE id = 'legacy-issue'");
+      await applyPostgresMigrations(upgradeDb, projectMigrations);
+      assert.equal((await upgradeDb.query("SELECT source_issue FROM tasks WHERE id = 'legacy-issue'").get()).source_issue, 'explicit-source');
+      assert.deepEqual(Array.from(await upgradeDb.query('SELECT version FROM schema_migrations ORDER BY version').all()),
+        Array.from({ length: projectMigrationCount }, (_, index) => ({ version: index + 1 })));
+    } finally { await upgradeDb.close(); }
     const snapshot = join(root, 'must-not-exist', 'backup.db');
     await assert.rejects(store.backupTo(snapshot));
     await assert.rejects(global.backupTo(snapshot));

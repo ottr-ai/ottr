@@ -1,2 +1,20 @@
 # dGhlIHNhbXBsZSBub25jZQ== is the RFC 6455 sample nonce used in the WebSocket handshake test.
 045e2c17a7c96fd12d811f41a972a9c3d19a354a:src/app.test.ts:generic-api-key:269
+
+# Historical OTTR-997 redaction fixtures: repeated "a" tests the 8 KiB PEM limit.
+44290a0d049977a4eb1e55b7c0f934f1708deedf:src/forkAnalysis.test.ts:private-key:186
+53a26060d56186dce4ea67d53c19299c80ef88e7:src/forkAnalysis.test.ts:private-key:185
+
+# Historical bounded-token property fixtures use the four-character dummy PEM body MIIB.
+44290a0d049977a4eb1e55b7c0f934f1708deedf:src/forkAnalysis.test.ts:private-key:308
+53a26060d56186dce4ea67d53c19299c80ef88e7:src/forkAnalysis.test.ts:private-key:290
+
+# Historical truncation regressions build dummy PEM bodies from repeated "X" characters.
+44290a0d049977a4eb1e55b7c0f934f1708deedf:src/forkAnalysis.test.ts:private-key:434
+44290a0d049977a4eb1e55b7c0f934f1708deedf:src/forkAnalysis.test.ts:private-key:576
+35cb185757340b66bc1bc04905c96d72676cc778:src/forkAnalysis.test.ts:private-key:610
+043aaf35194d3a8764099947d8b3926998b3e58c:src/forkAnalysis.test.ts:private-key:447
+
+# Historical ssh-keygen stub wraps a fixed ottr-stub passphrase sentinel, not key bytes.
+# Its usable keys are generated at runtime; current stub uses real encrypted PKCS8 export.
+42741447f27ea9935a041a95647c928ac0e7bed0:src/test/sshKeygenStub.ts:private-key:76
