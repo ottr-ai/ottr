@@ -50,7 +50,9 @@ The review runs read-only at a frozen commit and changes no code:
    project host's open dependency, code scanning and secret scanning alerts.
    A cleanup sweep records unused exports and files, stale notes, docs that
    disagree with the code, swallowed errors, network calls with no timeout,
-   and unbounded in-memory growth.
+   and unbounded in-memory growth and code that guards a condition the
+   current code can no longer produce (a retired setting, column, state, or
+   version), with the commit or migration that retired it.
 5. A full security audit with the `security-audit` skill and the
    `codeguard-*` rules that match the files, then an architecture pass over
    module seams, coupling and over-engineering.
