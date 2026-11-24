@@ -6,6 +6,11 @@ import { type StoreChildHandle, spawnStoreChild } from "./storeChild.ts";
 
 const isWindows = process.platform === "win32";
 
+// The inner parent run of the real-timeout acceptance test is a separate process: it
+// imports the helper by a runtime-computed absolute file URL (the path differs between
+// hosts), the same pattern as the config-url imports in scripts/stryker-load.test.ts.
+const helperUrl = new URL("./storeChild.ts", import.meta.url).href;
+
 // A child that records the grandchild pid and then burns the JavaScript thread forever:
 // a synchronous loop never turns the event loop, so no timer inside this process can
 // ever fire. Only an outside supervisor or a group kill can clean this child up.
@@ -85,12 +90,12 @@ describe("spawnStoreChild", () => {
 	);
 
 	test.skipIf(isWindows)(
-		// THE OTTR-1244 acceptance test: the child hard-spins a synchronous loop (no timer
-		// inside it can ever fire), and the parent run it belongs to ends by timeout — the
-		// dead probe's pid is the supervisor's baseline, so from the supervisor's view the
-		// parent is gone at once. The outside supervisor must kill the child within a few
-		// seconds; an in-child watchdog cannot, which is the failure this test pins.
-		"the supervisor group-kills a sync-spinning child and its grandchild when the parent run ends",
+		// Fast mechanism pin for the same fault the real-timeout test below proves: the
+		// child hard-spins a synchronous loop (no timer inside it can ever fire) and the
+		// supervisor's baseline parent is a dead probe, so the supervisor must kill it
+		// within a few seconds; an in-child watchdog cannot, which is the failure this
+		// test pins without paying for a second parent process.
+		"the supervisor group-kills a sync-spinning child and its grandchild when the baseline parent is gone",
 		async () => {
 			const dir = mkdtempSync(join(tmpdir(), "store-child-"));
 			let handle: StoreChildHandle | undefined;
@@ -120,6 +125,82 @@ describe("spawnStoreChild", () => {
 				await assertAllDead([handle.pid, grandPid], 3000);
 			} finally {
 				handle?.killGroup(); // a failed test must not leak its own child
+				rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+			}
+		},
+	);
+
+	test.skipIf(isWindows)(
+		// THE OTTR-1244 acceptance test with the default parentPid: an inner parent run
+		// spawns the store child through the helper with no injected pid (its own pid is the
+		// supervisor's baseline), then a timeout ends that parent run the way a runner's
+		// timeout kill ends a hung test run (SIGKILL). The child hard-spins a synchronous
+		// loop, so nothing inside it can clean itself up; the supervisor must have the child
+		// and its grandchild gone within a few seconds, and leave no helper process behind.
+		"the real parent run ending by timeout leaves the sync-spinning child gone within seconds",
+		async () => {
+			const dir = mkdtempSync(join(tmpdir(), "store-child-"));
+			const pidFile = join(dir, "grand-pid");
+			const statusFile = join(dir, "status.json");
+			// The inner parent run: it spawns the child (default parentPid), reports the
+			// helper's pids, and stays alive until the outer timeout ends it.
+			const innerRun = `
+import { writeFileSync } from "node:fs";
+import { spawnStoreChild } from ${JSON.stringify(helperUrl)};
+const handle = spawnStoreChild({
+	script: ${JSON.stringify(spinWithGrandchild)},
+	env: { GRAND_PID_FILE: process.env.GRAND_PID_FILE },
+});
+writeFileSync(process.env.STATUS_FILE, JSON.stringify({ child: handle.pid, supervisor: handle.supervisor.pid }));
+setInterval(() => {}, 250);
+`;
+			const parent = Bun.spawn([process.execPath, "-e", innerRun], {
+				env: {
+					...process.env,
+					GRAND_PID_FILE: pidFile,
+					STATUS_FILE: statusFile,
+				},
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			let pids: { child: number; supervisor: number } | undefined;
+			try {
+				// Wait until the inner run has spawned the child (its own pid is the
+				// supervisor's baseline — nothing is injected) and the child spawned the
+				// grandchild whose pid the pid file now holds.
+				const deadline = Date.now() + 5000;
+				while (pids === undefined) {
+					try {
+						pids = JSON.parse(readFileSync(statusFile, "utf8"));
+					} catch {
+						// not written yet
+					}
+					if (pids === undefined) {
+						if (Date.now() > deadline)
+							throw new Error("inner run never reported its pids");
+						await Bun.sleep(25);
+					}
+				}
+				const grandPid = await readGrandPid(pidFile);
+				// The timeout that ends the parent run: SIGKILL, the shape of a runner's
+				// per-test timeout kill. After it, only the supervisor can clean up.
+				parent.kill(9);
+				await parent.exited;
+				await assertAllDead([pids.child, pids.supervisor, grandPid], 3000);
+			} finally {
+				// Best effort: a failed test must not leak the parent run or its helper
+				// processes. Every pid below was created by this test.
+				parent.kill(9);
+				for (const pid of [pids?.child, pids?.supervisor]) {
+					if (pid === undefined) continue;
+					try {
+						process.kill(-pid, "SIGKILL");
+					} catch {}
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
 				rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 			}
 		},

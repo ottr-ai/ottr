@@ -12,6 +12,8 @@ export interface StoreChildHandle {
 	exited: Promise<number>; // resolves the child's exit code
 	/** Resolves when the outside supervisor is gone; it self-exits once the child is. */
 	supervisorExited: Promise<number>;
+	/** The outside supervisor process; its death is the child's cleanup guarantee. */
+	supervisor: Bun.Subprocess;
 	/**
 	 * SIGKILLs the child's whole process group (the child is its own group leader) and the
 	 * supervisor. Never throws.
@@ -85,6 +87,7 @@ export function spawnStoreChild(options: {
 		pid,
 		exited: child.exited,
 		supervisorExited: supervisor.exited,
+		supervisor,
 		killGroup(): void {
 			// The group id equals the child pid because detached makes it a leader. ESRCH
 			// after death is normal; errors are swallowed.
