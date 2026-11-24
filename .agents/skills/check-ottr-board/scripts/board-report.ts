@@ -351,7 +351,10 @@ function holdNote(
 	now: number,
 	mergeHold: MergeHold,
 	reviewHoldsFor: ReviewHoldsFor | null,
-	holdByReview: Map<string, { count: number; d: ReviewHoldDetail; project: string }>,
+	holdByReview: Map<
+		string,
+		{ count: number; d: ReviewHoldDetail; project: string }
+	>,
 ): string | null {
 	try {
 		const hold = mergeHold(sameProject, c, { now });
@@ -527,8 +530,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 		out.push(
 			`| ${c.project}/${c.id} ${cell((c.title ?? "").slice(0, 50))} | ${c.stage}/${c.state} | ${v.verdict} | ${cell(v.note)} | ${cell(c.needsReason ?? "")} |`,
 		);
-	if (holdByReview.size > 0)
-		out.push(...openReviewsSection(holdByReview, now));
+	if (holdByReview.size > 0) out.push(...openReviewsSection(holdByReview, now));
 	out.push("", "## Main checkouts");
 	for (const p of s.projects) out.push(checkoutLine(p));
 	if (questions.length > 0) out.push("", "## Questions", ...questions);

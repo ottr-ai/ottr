@@ -7,18 +7,48 @@ rules that caused it, the designs compared, and the chosen fix.
 ## Measured history (live board, 2026-11-24)
 
 Reachable sources from this work container: the card logs under
-`/data/ottr/logs` (2 102 files, 2026-10-14 to 2026-11-24) and a task-store
-snapshot from 2026-10-26 (`/data/ottr/tasks.db.moved-to-server`, ids only up to
-OTTR-185, so it predates OTTR-943 and gives no numbers for the asked range).
-The live store moved to the server volume, and its HTTP API accepts direct
-loopback only, so per-card stage history (the `events` table) was not
-readable. Findings filed per week is therefore not measurable here; a finding
-card's log starts at its first turn, not at its filing. The numbers below cite
-their source.
+`/data/ottr/logs` (2 102 files; the 1 234 display-id logs run 2026-10-14 to
+2026-11-24) and the operator's live-board measurements of 2026-11-24 13:50
+UTC. The live task store is not readable from here, and the attempts are part
+of the record: the store moved to the server volume (`tasks.db.moved-to-server`
+is a 2026-10-26 snapshot whose ids stop at OTTR-185, before OTTR-943), the
+HTTP API serves task state to direct loopback only, the board token this
+container carries files cards (`POST /api/projects/:p/tasks` with
+`x-board-token`) and reads nothing, and the read path's `apiKey` sits in the
+sealed server settings. Per-card stage rows are therefore not readable; every
+number below names the source it came from.
 
-Merge turns executed per ISO week (log headers `== merge turn`, whole board):
+Finding attribution comes from the review logs: when a review turn settles, it
+writes one `- filed ... #OTTR-n` summary line per finding card. Three reviews
+filed in the log era: OTTR-969 (59 findings, its one turn started
+2026-11-15T16:02:20Z), OTTR-943 (5 findings, turns 2026-11-14T14:12:53Z and
+21:50:56Z), and OTTR-1186 (2 findings so far, filed in its second turn
+2026-11-22T14:52:15Z, among them lead OTTR-1196). Work logs quote these lines
+as tool output, so filers are read only from lines that start with `- filed`
+in the filing card's own log.
 
-| Week | Merge turns |
+### Findings filed versus finding merges per week, since OTTR-943
+
+OTTR-943's first turn is the range anchor: 2026-11-14, ISO week 2026-W46.
+A finding counts as merged in the week of the first `== merge turn` header in
+its own log; a finding the log shows neither filed-for-merge nor cancelled
+stays in the open column of the net line, so the net is an upper bound on
+open (cancellations are store rows this container cannot read; the operator's
+live count pins the true open set below).
+
+| Week | Review findings filed | Finding merges seen |
+|---|---|---|
+| 2026-W46 (Nov 9-15) | 64 (OTTR-969: 59, OTTR-943: 5) | 4 |
+| 2026-W47 (Nov 16-22) | 2 (OTTR-1186's two settle filings) | 18 |
+| 2026-W48 (Nov 23-24) | 0 | 1 |
+
+Net filed minus merged over the range: 66 − 23 = 43. That matches the
+operator's live measurement at 2026-11-24 13:50 UTC: 43 of the 67 held merges
+were findings of earlier reviews, 37 of them OTTR-969's open children. Whole
+board, merges of any card ran as before, until the stall (log headers
+`== merge turn`):
+
+| Week | Merge turns, whole board |
 |---|---|
 | 2026-W39 | 51 |
 | 2026-W40 | 286 |
@@ -31,30 +61,100 @@ Merge turns executed per ISO week (log headers `== merge turn`, whole board):
 | 2026-W47 | 150 |
 | 2026-W48 (Nov 23-24) | 1 |
 
-The W48 collapse is the stall, measured. Work-turn headers overcount starts
-(37 cards of the "Needs validation" batch carry 500 to 1 059 repeated headers
-each), so they are not a queue-size signal and are not tabulated.
+Work-turn headers overcount starts (37 cards of the "Needs validation" batch
+carry 500 to 1 059 repeated headers each), so they are not tabulated.
 
-The current stall timeline:
+### The stall's hold, per merge
 
-- 2026-11-22 12:20:41 UTC: the architecture review OTTR-1186's turn starts
-  (first log header; base `d60e96dd24ebb91bd93ddc9422a755566d5026e55`).
-- 2026-11-22 13:52:18 UTC: the mutation gate card OTTR-1191's turn starts
-  (first log header). Its log shows the full-mutation chain planning, per-test
-  timeouts for heavy tests, and repeated kills ("the previous kills came from
-  turn/session lifecycles", that is, host restarts); it measured 79 percent
-  after 15 h 27 min against a break threshold of 90 (operator measurement,
-  2026-11-24).
-- 2026-11-22 14:55 UTC: the oldest of the 67 queued or merging cards started
-  waiting (operator measurement, live board 2026-11-24 13:50 UTC). At that
-  moment: 93 open cards; all 67 merges held by OTTR-1186's
-  "waiting for the review to finish" hold; 43 of the 67 are findings of
-  earlier reviews (37 open children of OTTR-969 alone); the held cards include
-  the repairs the board needs (OTTR-1245 check loop, OTTR-1225 nproc limit,
-  OTTR-1216 phantom runs).
-- The review had recorded 30 findings that become cards only when its turn
-  ends; finishing it would move it to merging and re-hold the 67 merges under
-  the findings hold.
+One hold edge caused the stall: the review OTTR-1186 in `in_progress` gates
+every queued merge under the rule `waiting for the review to finish`. Its
+hold began when the review's turn started, 2026-11-22T12:20:41Z (first log
+header, base `d60e96dd24ebb91bd93ddc9422a755566d5026e55`); the earliest
+observable wait on a held card is OTTR-938's last work turn,
+2026-11-22T14:35:01Z, and the operator's oldest queued wait started
+2026-11-22 14:55 UTC. At the 2026-11-24 13:50 UTC measurement every card in
+the table had waited about 2.0 days on this one hold. The gate card
+OTTR-1191 (its own turn started 2026-11-22T13:52:18Z) held the review open:
+its log shows the full-mutation chain at 79 percent after 15 h 27 min against
+a break threshold of 90, with kills from turn and session lifecycles (host
+restarts), and the review had recorded 30 findings that become cards only
+when its turn ends, so finishing it would move it to merging and re-hold
+these merges under the findings hold.
+
+The 67 held merges (operator's live snapshot; each row: the finding parent
+from the review logs' settle lines, the card's last log turn, and the days
+its log has sat idle at the 2026-11-24 measurement):
+
+| Card | Finding of | Last turn (UTC) | Idle days |
+|---|---|---|---|
+
+| OTTR-938 | - | 2026-11-22T14:35:01 | 2.1 |
+| OTTR-1202 | - | 2026-11-22T17:55:25 | 2.0 |
+| OTTR-1200 | - | 2026-11-22T17:55:25 | 2.0 |
+| OTTR-1198 | - | 2026-11-22T17:55:24 | 2.0 |
+| OTTR-1167 | - | 2026-11-22T17:51:04 | 2.0 |
+| OTTR-1024 | OTTR-969 | 2026-11-22T17:55:26 | 2.0 |
+| OTTR-988 | OTTR-969 | 2026-11-22T17:51:30 | 2.0 |
+| OTTR-985 | OTTR-969 | 2026-11-22T17:55:23 | 2.0 |
+| OTTR-1205 | - | 2026-11-22T21:07:14 | 1.9 |
+| OTTR-1203 | - | 2026-11-22T17:54:52 | 1.9 |
+| OTTR-986 | OTTR-969 | 2026-11-22T17:55:26 | 1.9 |
+| OTTR-1210 | - | 2026-11-22T22:03:06 | 1.8 |
+| OTTR-1217 | - | 2026-11-23T00:54:19 | 1.7 |
+| OTTR-1216 | - | 2026-11-22T22:41:18 | 1.7 |
+| OTTR-1215 | - | 2026-11-22T22:41:15 | 1.7 |
+| OTTR-1214 | - | 2026-11-22T22:29:38 | 1.7 |
+| OTTR-1212 | - | 2026-11-23T00:48:09 | 1.7 |
+| OTTR-1211 | - | 2026-11-23T00:54:39 | 1.7 |
+| OTTR-1209 | - | 2026-11-23T00:16:26 | 1.7 |
+| OTTR-1219 | - | 2026-11-23T02:25:16 | 1.6 |
+| OTTR-1147 | - | 2026-11-23T11:27:27 | 1.3 |
+| OTTR-1224 | - | 2026-11-23T13:37:05 | 1.2 |
+| OTTR-1225 | - | 2026-11-23T15:05:51 | 1.1 |
+| OTTR-1223 | - | 2026-11-23T15:43:35 | 1.1 |
+| OTTR-1156 | - | 2026-11-23T15:14:24 | 1.1 |
+| OTTR-1185 | - | 2026-11-23T16:18:23 | 1.0 |
+| OTTR-1030 | OTTR-969 | 2026-11-23T17:28:22 | 1.0 |
+| OTTR-1025 | OTTR-969 | 2026-11-23T17:00:18 | 1.0 |
+| OTTR-1023 | OTTR-969 | 2026-11-23T17:00:16 | 1.0 |
+| OTTR-1020 | OTTR-969 | 2026-11-23T17:00:16 | 1.0 |
+| OTTR-1016 | OTTR-969 | 2026-11-23T17:00:15 | 1.0 |
+| OTTR-1014 | OTTR-969 | 2026-11-23T17:00:13 | 1.0 |
+| OTTR-1013 | OTTR-969 | 2026-11-23T18:43:39 | 1.0 |
+| OTTR-1011 | OTTR-969 | 2026-11-23T16:40:56 | 1.0 |
+| OTTR-1002 | OTTR-969 | 2026-11-23T16:40:53 | 1.0 |
+| OTTR-1001 | OTTR-969 | 2026-11-23T16:40:53 | 1.0 |
+| OTTR-1240 | - | 2026-11-23T19:45:24 | 0.9 |
+| OTTR-1239 | - | 2026-11-23T19:33:45 | 0.9 |
+| OTTR-1237 | - | 2026-11-23T18:56:49 | 0.9 |
+| OTTR-1233 | - | 2026-11-23T18:20:30 | 0.9 |
+| OTTR-1039 | OTTR-969 | 2026-11-23T20:25:11 | 0.9 |
+| OTTR-1038 | OTTR-969 | 2026-11-23T20:03:21 | 0.9 |
+| OTTR-1037 | OTTR-969 | 2026-11-23T19:19:40 | 0.9 |
+| OTTR-1034 | OTTR-969 | 2026-11-23T19:41:35 | 0.9 |
+| OTTR-1029 | OTTR-969 | 2026-11-23T16:51:55 | 0.9 |
+| OTTR-1027 | OTTR-969 | 2026-11-23T19:41:28 | 0.9 |
+| OTTR-1019 | OTTR-969 | 2026-11-23T17:00:15 | 0.9 |
+| OTTR-1017 | OTTR-969 | 2026-11-23T21:04:08 | 0.9 |
+| OTTR-1015 | OTTR-969 | 2026-11-23T19:27:43 | 0.9 |
+| OTTR-1012 | OTTR-969 | 2026-11-23T18:59:45 | 0.9 |
+| OTTR-1009 | OTTR-969 | 2026-11-23T19:00:35 | 0.9 |
+| OTTR-1006 | OTTR-969 | 2026-11-23T19:00:35 | 0.9 |
+| OTTR-1004 | OTTR-969 | 2026-11-23T19:47:17 | 0.9 |
+| OTTR-1003 | OTTR-969 | 2026-11-23T19:13:41 | 0.9 |
+| OTTR-1000 | OTTR-969 | 2026-11-23T16:40:52 | 0.9 |
+| OTTR-1245 | - | 2026-11-23T23:07:25 | 0.8 |
+| OTTR-1238 | - | 2026-11-23T21:28:29 | 0.8 |
+| OTTR-1227 | - | 2026-11-23T21:04:12 | 0.8 |
+| OTTR-1035 | OTTR-969 | 2026-11-23T20:59:39 | 0.8 |
+| OTTR-1022 | OTTR-969 | 2026-11-23T20:46:43 | 0.8 |
+| OTTR-998 | OTTR-969 | 2026-11-23T21:04:15 | 0.8 |
+| OTTR-1246 | - | 2026-11-24T08:47:24 | 0.4 |
+| OTTR-1244 | - | 2026-11-24T08:57:35 | 0.4 |
+| OTTR-1086 | - | 2026-11-24T08:47:21 | 0.4 |
+| OTTR-1026 | OTTR-969 | 2026-11-24T08:47:10 | 0.4 |
+| OTTR-1010 | OTTR-969 | 2026-11-24T08:47:08 | 0.4 |
+| OTTR-1031 | OTTR-969 | 2026-11-24T09:16:10 | 0.3 |
 
 ## Why one review held every merge
 

@@ -9479,7 +9479,12 @@ function RelatedTasks({
 							>
 								{/* Same alarm marks as the meta line: markup, not ::before. */}
 								{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
-								{statusLine(k, project.hasRules, holdFor(k, tasks, undefined, Date.now()), draining)}
+								{statusLine(
+									k,
+									project.hasRules,
+									holdFor(k, tasks, undefined, Date.now()),
+									draining,
+								)}
 							</span>
 						}
 					/>
@@ -14256,7 +14261,12 @@ export function Drawer({
 		>
 			{/* Same alarm marks as the meta line: markup, not ::before. */}
 			{k.state === "needs_you" && <Mark kind={cardMark(k)} />}
-			{statusLine(k, project.hasRules, holdFor(k, tasks, undefined, Date.now()), draining)}
+			{statusLine(
+				k,
+				project.hasRules,
+				holdFor(k, tasks, undefined, Date.now()),
+				draining,
+			)}
 		</span>
 	);
 	/** A follow-up or proposal row: the linked card with its live state, as the meta line shows it. */
