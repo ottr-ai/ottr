@@ -168,6 +168,7 @@ const watchBaseSettings = {
 	prMode: false,
 	issueWatch: false,
 	codeScanWatch: false,
+	codeScanAutoStart: false,
 	ompWatch: false,
 	dependabotWarn: true,
 	microVm: false,
@@ -1768,6 +1769,7 @@ describe("Project switch cards", () => {
 			prMode: false,
 			issueWatch: false,
 			codeScanWatch: false,
+			codeScanAutoStart: false,
 			ompWatch: false,
 			dependabotWarn: true,
 			microVm: false,
@@ -2173,6 +2175,7 @@ describe("Code scanning watch facts and Check alerts now", () => {
 			prMode: false,
 			issueWatch: false,
 			codeScanWatch,
+			codeScanAutoStart: false,
 			ompWatch: false,
 			dependabotWarn: true,
 			microVm: false,
@@ -2265,6 +2268,44 @@ describe("Code scanning watch facts and Check alerts now", () => {
 		}
 	});
 
+	test("the auto-start row renders its help text and toggles on", async () => {
+		const { container, posted, unmount } = await csForm(project(true, OFF));
+		try {
+			const row = watchRowByLabel(
+				container,
+				"Start code-scanning cards automatically",
+			);
+			expect(row?.textContent).toContain(
+				"Off (default), new cards wait in Backlog for you.",
+			);
+			const input = watchCheckbox(
+				container,
+				"Start code-scanning cards automatically",
+			);
+			expect(input.checked).toBe(false);
+			await act(async () => {
+				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
+			});
+			expect(posted.body).not.toBeUndefined();
+			expect(posted.body?.codeScanAutoStart).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the auto-start row is disabled while the watch is off", async () => {
+		const { container, unmount } = await csForm(project(false, OFF));
+		try {
+			const input = watchCheckbox(
+				container,
+				"Start code-scanning cards automatically",
+			);
+			expect(input.disabled).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
 	test("the on row shows the last and next check and an enabled button", async () => {
 		const { container, unmount } = await csForm(
 			project(true, { lastPollAt: LAST, lastError: null, nextPollAt: NEXT }),
@@ -2336,6 +2377,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 				prMode: false,
 				issueWatch: false,
 				codeScanWatch: false,
+				codeScanAutoStart: false,
 				microVm: false,
 				maxParallel: 2,
 				copyExtra: [],

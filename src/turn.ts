@@ -13,6 +13,11 @@ import {
 } from "./auditLeads.ts";
 import { ensureCheckGuardOverlay } from "./checkGuard.ts";
 import {
+	CODE_SCAN_ALERTS_FILE,
+	CODE_SCAN_FALLBACK_MARKER,
+	codeScanAlertsFileText,
+} from "./codeScanWatch.ts";
+import {
 	copyBelow,
 	isSizeRefusal,
 	readBelow,
@@ -269,6 +274,7 @@ import {
 	checkPinnedRemote,
 	commitMeta,
 	commitSubjects,
+	ensureGitExclude,
 	git,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	parseKeptChoices,
@@ -5438,7 +5444,35 @@ export function createTurnLoop(
 			)
 		)
 			return null;
+		if (!special) await writeCodeScanAlertsFile(e, store, id, task, wt, log);
 		return special ? { special: true, wt } : { special: false, wt, branch };
+	}
+
+	/** Writes the fallback alert list file into the card's worktree when the prompt
+	 * carries the fallback marker (the compact prompt tier overflowed). The repo's
+	 * exclude entry keeps the board-written file out of git status. A failure throws
+	 * like the other prep steps: the turn start fails loudly, nothing is swallowed. */
+	async function writeCodeScanAlertsFile(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		wt: string,
+		log: (line: string) => void | Promise<void>,
+	): Promise<void> {
+		if (task.topic !== "code scanning") return;
+		if (!task.prompt.includes(CODE_SCAN_FALLBACK_MARKER)) return;
+		const rows = await store.codeScanCardRows(id);
+		const repo = e.github === null ? "" : (ownerRepo(e.github) ?? "");
+		writeBelow(
+			worktreeAnchor(e.path, wt),
+			join(wt, CODE_SCAN_ALERTS_FILE),
+			codeScanAlertsFileText({ repo, rule: rows[0]?.rule ?? "", rows }),
+		);
+		await ensureGitExclude(e.path, CODE_SCAN_ALERTS_FILE);
+		await log(
+			`+ code-scan alerts: wrote ${CODE_SCAN_ALERTS_FILE} (${rows.length} alerts)`,
+		);
 	}
 
 	/** Creates the card worktree and stamps the card row with it. Null: a cancel landed

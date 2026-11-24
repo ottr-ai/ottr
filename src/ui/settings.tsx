@@ -9392,9 +9392,8 @@ function ProjectWatchesCard({
 							{project.github === null ? "Needs a GitHub remote. " : ""}
 							{privateNote("code scanning alerts to watch")}
 							Hourly watch of the repo's open CodeQL code scanning alerts; each
-							rule with open alerts becomes a backlog card listing them, at most
-							20 alerts per card. Test-file alerts carry a note. Never dismisses
-							anything on GitHub.{" "}
+							rule with open alerts becomes one card listing all its alerts.
+							Test-file alerts carry a note. Never dismisses anything on GitHub.{" "}
 							{st.codeScanWatch
 								? `Last check: ${csLastCheck}. Next regular check: ${csNextCheck}.`
 								: "Code scanning is off: no checks run."}{" "}
@@ -9413,6 +9412,16 @@ function ProjectWatchesCard({
 							Check alerts now
 						</BusyButton>
 					}
+				/>
+				<CheckRow
+					settingKey="codeScanAutoStart"
+					sub
+					name="Start code-scanning cards automatically"
+					desc="On, the watch files each new code-scanning card in Todo and starts it like any card. Off (default), new cards wait in Backlog for you. Existing cards never move."
+					checked={st.codeScanAutoStart}
+					disabled={!st.codeScanWatch}
+					save={(v) => send({ codeScanAutoStart: v })}
+					act={act}
 				/>
 				<CheckRow
 					settingKey="prReviews"

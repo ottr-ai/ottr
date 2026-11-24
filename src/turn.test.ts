@@ -31,6 +31,10 @@ import { PassThrough } from "node:stream";
 import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
+import {
+	CODE_SCAN_ALERTS_FILE,
+	CODE_SCAN_FALLBACK_MARKER,
+} from "./codeScanWatch.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
@@ -33295,5 +33299,114 @@ describe("queue authorship (OTTR-904 send-back)", () => {
 			"and pin the version",
 		);
 		expect(patch.pendingBy).toBe("user");
+	});
+});
+
+// OTTR-1256: a fallback-tier code scanning card gets code-scan-alerts.md written into
+// its worktree at turn start, and the file stays outside git (common .git/info/exclude).
+describe("turn code scanning fallback file", () => {
+	test("the worktree holds the alert file, git status stays clean, the exclude line lands once", async () => {
+		const store = await freshStore();
+		// ensureGitExclude and the git status proof run real git: the project path is a
+		// repo with one commit, and createWorktree adds a real linked worktree.
+		const git = (...args: string[]): void => {
+			execSync(`git ${args.join(" ")}`, {
+				cwd: store.path,
+				stdio: "ignore",
+				env: fixtureGitEnv(),
+			});
+		};
+		git("init", "-q", "-b", "main");
+		git("config", "user.email", "t@t");
+		git("config", "user.name", "t");
+		writeFileSync(join(store.path, "seed.txt"), "seed\n");
+		git("add", ".");
+		git("commit", "-qm", "seed");
+		mkdirSync(store.worktreesDir, { recursive: true });
+
+		const prompt = [
+			"Code scanning: js/hardcoded-secret (2 alerts)",
+			"",
+			`The messages and URLs did not fit the prompt. Read the full alert list from ${CODE_SCAN_FALLBACK_MARKER} (the board writes the file there when the turn starts).`,
+			"",
+			"#{11} high src/a.ts:10 - secret in source",
+			"#{12} medium src/b.ts:20 - another secret",
+		].join("\n");
+		const [card] = await store.fileCodeScanCards({
+			items: [
+				{
+					rule: "js/hardcoded-secret",
+					title: "Code scanning: js/hardcoded-secret (2 alerts)",
+					prompt,
+					alerts: [
+						{
+							number: 11,
+							rule: "js/hardcoded-secret",
+							severity: "high",
+							path: "src/a.ts",
+							line: 10,
+							url: "https://github.test/acme/widget/alert/11",
+							message: "secret in source",
+						},
+						{
+							number: 12,
+							rule: "js/hardcoded-secret",
+							severity: "medium",
+							path: "src/b.ts",
+							line: 20,
+							url: "https://github.test/acme/widget/alert/12",
+							message: "another secret",
+						},
+					],
+				},
+			],
+			now: Date.now(),
+			start: true,
+		});
+
+		const record = baseRecord();
+		const projects = new Map([
+			[
+				store.name,
+				{ ...fakeProject(store), github: "https://github.com/acme/widget" },
+			],
+		]);
+		const loop = holdFollowUps(
+			projects,
+			fakeOps(record, {
+				createWorktree: async (o: {
+					worktreePath: string;
+					branch: string;
+				}) => {
+					record.createWorktree.push(o);
+					execSync(`git worktree add -q "${o.worktreePath}" -b ${o.branch}`, {
+						cwd: store.path,
+						stdio: "ignore",
+						env: fixtureGitEnv(),
+					});
+				},
+			}),
+		);
+		await loop.runTurn(store.name, card!.id);
+
+		const wt = (await store.getTask(card!.id))!.worktree!;
+		const file = join(wt, CODE_SCAN_ALERTS_FILE);
+		expect(existsSync(file)).toBe(true);
+		const text = readFileSync(file, "utf8");
+		expect(text).toContain("#11");
+		expect(text).toContain("#12");
+		const st = execSync("git status --porcelain --untracked-files=all", {
+			cwd: wt,
+			encoding: "utf8",
+			env: fixtureGitEnv(),
+		});
+		expect(st).toBe("");
+		const exclude = readFileSync(
+			join(store.path, ".git", "info", "exclude"),
+			"utf8",
+		);
+		expect(
+			exclude.split("\n").filter((l) => l === `/${CODE_SCAN_ALERTS_FILE}`),
+		).toHaveLength(1);
 	});
 });

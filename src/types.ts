@@ -314,6 +314,8 @@ export interface ProjectSettings {
 	issueWatch: boolean;
 	/** Hourly code scanning watch: file each open CodeQL alert rule as a backlog card, grouped by rule (off by default; docs/specs/code-scanning-watch.md). */
 	codeScanWatch: boolean;
+	/** Start code-scanning cards automatically: on, the code scanning watch files each new consolidated rule card in Todo (queued) instead of Backlog; existing cards never move (off by default; docs/specs/code-scanning-watch.md). */
+	codeScanAutoStart: boolean;
 	/** When issueWatch last turned on (epoch ms); null while never enabled. */
 	issueWatchSince: number | null;
 	/** Hourly omp release watch: a model reviews each new omp release; fail and bump cards (off by default; docs/specs/omp-watch.md). */

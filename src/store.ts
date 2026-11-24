@@ -116,6 +116,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	prMode: false,
 	issueWatch: false,
 	codeScanWatch: false,
+	codeScanAutoStart: false,
 	issueWatchSince: null,
 	ompWatch: false,
 	dependabotWarn: true,
@@ -1434,6 +1435,7 @@ const SETTINGS_SHAPES = {
 	prMode: "boolean",
 	issueWatch: "boolean",
 	codeScanWatch: "boolean",
+	codeScanAutoStart: "boolean",
 	issueWatchSince: "number",
 	ompWatch: "boolean",
 	dependabotWarn: "boolean",
@@ -3926,7 +3928,9 @@ export class ProjectStore {
 		});
 	}
 
-	/** Files one backlog card per item and records its alert rows in one transaction; throws when an alert number already has a store row. */
+	/** Files one card per item and records its alert rows in one transaction; throws when an alert number already has a store row.
+	 * start: true files the card at the createTask defaults (stage todo, state queued, auto-start); the default backlog-ifies
+	 * (stage backlog, state idle, queuedAt null). */
 	async fileCodeScanCards(o: {
 		items: {
 			rule: string;
@@ -3935,6 +3939,7 @@ export class ProjectStore {
 			alerts: NewCodeScanAlert[];
 		}[];
 		now: number;
+		start?: boolean;
 	}): Promise<Task[]> {
 		return this.queue.transaction(async () => {
 			const filed: Task[] = [];
@@ -3947,15 +3952,21 @@ export class ProjectStore {
 						);
 				}
 				const card = await this.createTask(item.prompt, null, "work");
-				await this.updateTask(card.id, {
-					title: item.title,
-					// The prompt embeds the alerts' GitHub text, which people wrote, so
-					// the card stays user-authored and the prompt gate judges it (OTTR-850).
-					topic: "code scanning",
-					stage: "backlog",
-					state: "idle",
-					queuedAt: null,
-				});
+				// The prompt embeds the alerts' GitHub text, which people wrote, so
+				// the card stays user-authored and the prompt gate judges it (OTTR-850).
+				// start: true keeps the createTask defaults (stage todo, state queued,
+				// auto-start); the default backlog-ifies so the card waits in the backlog.
+				const patch: TaskPatch =
+					o.start === true
+						? { title: item.title, topic: "code scanning" }
+						: {
+								title: item.title,
+								topic: "code scanning",
+								stage: "backlog",
+								state: "idle",
+								queuedAt: null,
+							};
+				await this.updateTask(card.id, patch);
 				for (const a of item.alerts) {
 					await this.db.run(
 						"INSERT INTO code_scan_alert (number, rule, task_id, severity, path, line, url, message, skipped, filed_at, card_filed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
@@ -4011,6 +4022,32 @@ export class ProjectStore {
 					],
 				);
 			}
+		});
+	}
+
+	/** One transaction: moves the open (skipped = 0) rows of every drop card onto keep,
+	 * cancels each drop (cancelled_at only when null) and appends the reason line to its
+	 * prompt; returns the moved row count. */
+	async mergeCodeScanCards(o: {
+		keepTaskId: string;
+		dropTaskIds: string[];
+		reason: string;
+		now: number;
+	}): Promise<number> {
+		return this.queue.transaction(async () => {
+			let moved = 0;
+			for (const drop of o.dropTaskIds) {
+				const r = await this.db.run(
+					"UPDATE code_scan_alert SET task_id = ?, filed_at = ? WHERE task_id = ? AND skipped = 0",
+					[o.keepTaskId, o.now, drop],
+				);
+				moved += r.changes;
+				await this.db.run(
+					"UPDATE tasks SET cancelled_at = ?, prompt = prompt || ? WHERE id = ? AND cancelled_at IS NULL",
+					[o.now, o.reason, drop],
+				);
+			}
+			return moved;
 		});
 	}
 

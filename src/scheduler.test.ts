@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import {
 	mkdtempSync,
 	rmSync,
@@ -71,6 +71,7 @@ import {
 	workCheckDiverged,
 	workCheckDivergeReason,
 } from "./scheduler.ts";
+import { type NewCodeScanAlert, ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
 import type { Task, WorkCheckRun } from "./types.ts";
 import { modelVendor } from "./vendor.ts";
@@ -3207,6 +3208,80 @@ describe("backlog grill slot", () => {
 		const running = task({ stage: "backlog", state: "running" });
 		const kicked = task({ stage: "backlog" });
 		expect(pickRunnable([running, kicked], opts)).toEqual([]);
+	});
+});
+
+describe("pickRunnable code scanning cards", () => {
+	const dirs: string[] = [];
+	const stores: ProjectStore[] = [];
+	const newStore = async (): Promise<ProjectStore> => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-pick-codescan-"));
+		dirs.push(dir);
+		const store = await ProjectStore.open(dir);
+		stores.push(store);
+		return store;
+	};
+	afterEach(async () => {
+		for (const store of stores.splice(0)) await store.close(); // double close is a no-op
+	});
+	afterAll(() => {
+		for (const dir of dirs.splice(0))
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+	});
+
+	/** Deterministic alert for the fixture card; only the number varies. */
+	const alert = (number: number): NewCodeScanAlert => ({
+		number,
+		rule: "js/x",
+		severity: "high",
+		path: "src/a.ts",
+		line: 1,
+		url: `https://github.com/o/r/security/code-scanning/${number}`,
+		message: "m",
+	});
+	const item = {
+		rule: "js/x",
+		title: "Code scanning: js/x (3 alerts)",
+		prompt: "p",
+		alerts: [alert(1), alert(2), alert(3)],
+	};
+	const pickOpts = (now: number) => ({
+		maxParallel: 2,
+		hasRules: true,
+		now,
+	});
+
+	test("an auto-started code scanning card is picked", async () => {
+		const store = await newStore();
+		await store.setSettings({ codeScanAutoStart: true });
+		const now = 1_700_000_000_000;
+		const [card] = await store.fileCodeScanCards({
+			items: [item],
+			now,
+			start: true,
+		});
+		expect(card!.stage).toBe("todo");
+		expect(card!.state).toBe("queued");
+		expect(card!.queuedAt).not.toBeNull();
+		expect(
+			pickRunnable(await store.listTasks(), pickOpts(now)).map(
+				(picked) => picked.id,
+			),
+		).toEqual([card!.id]);
+	});
+
+	test("a backlog code scanning card is not picked", async () => {
+		const store = await newStore();
+		const now = 1_700_000_000_000;
+		const [card] = await store.fileCodeScanCards({ items: [item], now });
+		expect(card!.stage).toBe("backlog");
+		expect(card!.state).toBe("idle");
+		expect(card!.queuedAt).toBeNull();
+		expect(
+			pickRunnable(await store.listTasks(), pickOpts(now)).map(
+				(picked) => picked.id,
+			),
+		).toEqual([]);
 	});
 });
 

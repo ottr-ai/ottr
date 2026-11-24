@@ -22112,6 +22112,20 @@ describe(
 				expect((await store.getSettings()).codeScanWatch).toBe(false);
 			});
 
+			test("codeScanAutoStart rejects a non-boolean, round trips, and starts off", async () => {
+				const bad = await post("/api/projects/p1/settings", {
+					codeScanAutoStart: "yes",
+				});
+				expect(bad.status).toBe(400);
+				expect(await errorOf(bad)).toBe("codeScanAutoStart must be a boolean");
+				// Off is the stored default; a save round trips through the store.
+				expect((await store.getSettings()).codeScanAutoStart).toBe(false);
+				await post("/api/projects/p1/settings", { codeScanAutoStart: true });
+				expect((await store.getSettings()).codeScanAutoStart).toBe(true);
+				await post("/api/projects/p1/settings", { codeScanAutoStart: false });
+				expect((await store.getSettings()).codeScanAutoStart).toBe(false);
+			});
+
 			test("project settings route turns microVm on only with a reachable vm-runner", async () => {
 				const saved = vmState.health;
 				try {

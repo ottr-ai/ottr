@@ -1963,6 +1963,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"prMode",
 	"issueWatch",
 	"codeScanWatch",
+	"codeScanAutoStart",
 	"dependabotWarn",
 	"ompWatch",
 	"microVm",

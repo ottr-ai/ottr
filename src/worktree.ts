@@ -1593,6 +1593,26 @@ async function excludeAndVerify(
 		throw new Error(`worktree not clean after copying rules:\n${st.stdout}`);
 }
 
+/**
+ * Idempotently adds /<rel> to the repo's common .git/info/exclude. A board-written
+ * per-card file (the code scanning fallback alert list) must stay invisible to git
+ * status; this is the same mechanism the copied untracked rules use.
+ */
+export async function ensureGitExclude(
+	mainPath: string,
+	rel: string,
+): Promise<void> {
+	const line = `/${rel.replaceAll("\\", "/")}`;
+	const exclude = await excludeFile(mainPath);
+	const excludeLines = new Set(
+		(readBelow(exclude.anchor, exclude.file, 1024 * 1024) ?? Buffer.alloc(0))
+			.toString("utf8")
+			.split("\n"),
+	);
+	if (excludeLines.has(line)) return;
+	appendLineBelow(exclude.anchor, exclude.file, line);
+}
+
 export async function createWorktree(o: {
 	mainPath: string;
 	worktreePath: string;

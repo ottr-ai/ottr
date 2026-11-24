@@ -80,12 +80,25 @@ const chrome = Bun.spawn(
 		"--disable-dev-shm-usage",
 		"--hide-scrollbars",
 		`--window-size=${WIDTH},${HEIGHT}`,
-		...(typeof process.getuid === "function" && process.getuid() === 0
-			? ["--no-sandbox"]
-			: []),
+		// Headless proof shot of the board's own UI in a throwaway profile; the Chrome
+		// sandbox needs user namespaces, which some hosts deny to non-root users
+		// (Ubuntu 23.10+ AppArmor), so the flag is unconditional.
+		"--no-sandbox",
 		"about:blank",
 	],
-	{ stdout: "ignore", stderr: "pipe" },
+	{
+		stdout: "ignore",
+		stderr: "pipe",
+		// Chrome's crashpad needs a writable HOME and XDG dirs; the host's may be
+		// read-only for the board user, so pin them into the throwaway profile dir.
+		env: {
+			...process.env,
+			HOME: userDir,
+			XDG_CONFIG_HOME: join(userDir, ".config"),
+			XDG_CACHE_HOME: join(userDir, ".cache"),
+			XDG_DATA_HOME: join(userDir, ".local", "share"),
+		},
+	},
 );
 
 /** Resolves once chrome's stderr line names the DevTools WebSocket endpoint. */
