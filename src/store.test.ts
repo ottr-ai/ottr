@@ -6724,6 +6724,58 @@ describe("review findings storage", () => {
 		).toBeNull();
 	});
 
+	test("a review landing done stamps its waiting todo leads, and a confirmed lead stays exempt after its tag is edited away (OTTR-1252)", async () => {
+		const dir = join(root, "lead-flag-waiting");
+		const store = await open(dir);
+		const review = await store.createTask("release review", null, "review");
+		// The new filing form: the lead waits in todo under the marker.
+		const lead = await store.createTask(
+			"Needs validation: unknown deploy target",
+		);
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			waitsValidation: true,
+		});
+		// A committed finding in todo is real work at doneAt: it never takes the
+		// stamp, so it holds until done.
+		const committed = await store.createTask(
+			"Confirmed: unbounded workpool queue",
+		);
+		await store.updateTask(committed.id, { followUpOf: review.id });
+		const other = await store.createTask("unrelated merge");
+		await store.updateTask(other.id, { stage: "merging" });
+
+		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		// The stamp reaches the waiting todo form, and only it.
+		expect((await store.getTask(lead.id))?.leadAtDone).toBe(true);
+		expect((await store.getTask(committed.id))?.leadAtDone).toBe(false);
+
+		// The exact send-back sequence: the run confirms the lead (the marker
+		// clears, the lead becomes normal work), then an edit drops the
+		// "Needs validation" tag. Without the stamp the edited card reads as an
+		// open non-lead finding of a done review and holds every merge.
+		await store.updateTask(lead.id, {
+			waitsValidation: false,
+			validatedAt: Date.now(),
+			prompt: "Fix the unknown deploy target",
+		});
+		const rows = await store.listTasks();
+		const reviewRow = rows.find((t) => t.id === review.id)!;
+		const leadRow = rows.find((t) => t.id === lead.id)!;
+		const committedRow = rows.find((t) => t.id === committed.id)!;
+		const otherRow = rows.find((t) => t.id === other.id)!;
+		expect(leadRow.leadAtDone).toBe(true);
+		expect(leadRow.prompt).toBe("Fix the unknown deploy target");
+		expect(mergeHold([reviewRow, leadRow, otherRow], otherRow)).toBeNull();
+		expect(mergeHold([reviewRow, committedRow, otherRow], otherRow)).toBe(
+			FINDINGS_HOLD,
+		);
+		await store.close();
+	});
+
 	// OTTR-1047: a database from before validation runs existed — the pre-lead-flag
 	// shape above, which carries no validated_at — converges on open, and the stamp
 	// the validation settle writes round-trips.
@@ -6776,11 +6828,12 @@ describe("review findings storage", () => {
 		raw.exec(PRE_WAITS_TASKS_DDL);
 		raw.exec(EVENTS_DDL);
 		raw.exec(`INSERT INTO tasks
-			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at)
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at)
 			VALUES
-				('lead1', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'rev1', NULL),
-				('plain1', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 200, 600, NULL, NULL),
-				('gone1', 'cancelled lead', 'Needs validation: lost report', 'backlog', 'idle', 'work', 300, 700, 'rev1', 400)`);
+				('lead1', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'rev1', NULL, NULL),
+				('plain1', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 200, 600, NULL, NULL, NULL),
+				('gone1', 'cancelled lead', 'Needs validation: lost report', 'backlog', 'idle', 'work', 300, 700, 'rev1', 400, NULL),
+				('park1', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 400, 800, 'rev1', NULL, 900)`);
 		raw.close();
 
 		const store = await open(dir);
@@ -6799,6 +6852,14 @@ describe("review findings storage", () => {
 		const gone = (await store.getTask("gone1"))!;
 		expect(gone.stage).toBe("backlog");
 		expect(gone.waitsValidation).toBe(false);
+		// A lead with a recorded outcome parked in backlog is normal work: the
+		// operator parked it after its confirmed result, and converging it would
+		// strand the work (its outcome prevents both batching and the reset).
+		const parked = (await store.getTask("park1"))!;
+		expect(parked.stage).toBe("backlog");
+		expect(parked.state).toBe("idle");
+		expect(parked.waitsValidation).toBe(false);
+		expect(parked.validatedAt).toBe(900);
 
 		// The marker is caller-settable (unlike lead_at_done): the patch round-trips
 		// on getTask and on the list rows.

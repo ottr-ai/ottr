@@ -31445,9 +31445,10 @@ describe("stored review findings", () => {
 			run.id,
 			mkFinding(`Validation: #${lb.id} blocked\nstill fails`),
 		);
-		// Both leads carry a blocked result's stamp; the cutoff sits between them.
+		// Both leads carry a blocked result's stamp before the cutoff: an unscoped
+		// reset would clear both, so only the lead scope keeps B's stamp.
 		await store.updateTask(la.id, { validatedAt: 1000 });
-		await store.updateTask(lb.id, { validatedAt: 2000 });
+		await store.updateTask(lb.id, { validatedAt: 1200 });
 
 		const again = await loop.filePendingValidationRun(
 			entryOf(projects, store),
@@ -31460,7 +31461,7 @@ describe("stored review findings", () => {
 		expect(again.reset).toEqual([la.id]);
 		// Only A's stamp cleared; B keeps its marker and stays out of the batch.
 		expect((await store.getTask(la.id))!.validatedAt).toBeNull();
-		expect((await store.getTask(lb.id))!.validatedAt).toBe(2000);
+		expect((await store.getTask(lb.id))!.validatedAt).toBe(1200);
 		const card = (await store.getTask(again.id))!;
 		expect(card.prompt).toContain(`#${la.id}`);
 		expect(card.prompt).not.toContain(`#${lb.id}`);

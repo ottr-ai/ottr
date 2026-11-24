@@ -196,6 +196,30 @@ try {
       assert.deepEqual(Array.from(await upgradeDb.query('SELECT version FROM schema_migrations ORDER BY version').all()),
         Array.from({ length: projectMigrationCount }, (_, index) => ({ version: index + 1 })));
     } finally { await upgradeDb.close(); }
+    // OTTR-1252: the lead-wait step converges a pre-marker schema's never-validated
+    // backlog leads into the waiting form and leaves a lead with a recorded outcome
+    // parked in backlog alone — its confirmed result is normal work (batching and
+    // the blocked-result reset both exclude it), so re-locking it would strand it.
+    const leadDb = await getPostgresDatabase(projectSchemaName('legacy lead upgrade'));
+    try {
+      await leadDb.exec('CREATE SCHEMA "' + leadDb.schema + '"');
+      await applyPostgresMigrations(leadDb, projectMigrations.slice(0, projectMigrationCount - 1));
+      await leadDb.createQueue().transaction(async () => {
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-lead', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'legacy-review')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at) VALUES ('legacy-parked', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 200, 600, 'legacy-review', 700)");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at) VALUES ('legacy-plain', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 300, 800)");
+      });
+      await applyPostgresMigrations(leadDb, projectMigrations);
+      assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id LIKE 'legacy-%' ORDER BY id").all()), [
+        { id: 'legacy-lead', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 500, validated_at: null },
+        { id: 'legacy-parked', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 700 },
+        { id: 'legacy-plain', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
+      ]);
+      await applyPostgresMigrations(leadDb, projectMigrations);
+      assert.deepEqual(Array.from(await leadDb.query("SELECT stage, queued_at FROM tasks WHERE id = 'legacy-lead'").all()), [
+        { stage: 'todo', queued_at: 500 },
+      ]);
+    } finally { await leadDb.close(); }
     const snapshot = join(root, 'must-not-exist', 'backup.db');
     await assert.rejects(store.backupTo(snapshot));
     await assert.rejects(global.backupTo(snapshot));

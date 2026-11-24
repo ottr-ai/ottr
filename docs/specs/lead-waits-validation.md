@@ -32,10 +32,15 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    UPDATE tasks SET stage = 'todo', state = 'queued',
      waits_validation = 1, queued_at = updated_at
    WHERE stage = 'backlog' AND cancelled_at IS NULL
+     AND validated_at IS NULL
      AND prompt LIKE 'Needs validation%'
    ```
 
-   (`Needs-validation lead questions...` does not match the pattern: the hyphen.)
+   Only never-validated leads converge. A lead with a recorded outcome parked
+   in backlog — a confirmed or applies answer the operator parked — is normal
+   work: its outcome prevents both batching and the blocked-result reset, so
+   re-locking it would strand the work. (`Needs-validation lead questions...`
+   does not match the pattern: the hyphen.)
 3. PostgreSQL: fresh databases get `waits_validation bigint NOT NULL DEFAULT 0`
    in `projectStepOne`; a new numbered step runs the same ALTER and the same
    UPDATE, so old schemas converge. Versioned step, atomic with its version
@@ -71,17 +76,23 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
   `pendingSandboxLead` check). This guards `pickRunnable` and `pickLowPriority`.
 - Leads never hold a review's Done or a release merge: `findingOpen` already
   exempts every lead in any stage (`!isLead`, OTTR-1128) and `reviewHoldFor`
-  builds on it. Pin both with tests for the todo form; no production change
-  there unless a test shows a gap.
+  builds on it. The store's done stamp (`runTaskUpdate`) freezes the same set:
+  it stamps open backlog children and waiting todo leads (`stage = 'todo' AND
+  waits_validation = 1`) at doneAt, so a confirmed lead whose prompt later
+  loses the tag stays exempt like a promoted backlog lead (OTTR-963's rule,
+  extended to the todo form). Pinned with sequence tests through the real
+  store write.
 
 ## Routes (src/app.ts, src/server.ts)
 
 - `POST /api/projects/:project/tasks/:id/validate` gains a lead path: the id
   resolves to a waiting lead, `followUpOf` names a validatable review, and the
   call files with `first = {lead id}` and `again = { before: now + 1, lead: id }`
-  (resets only this lead, only a blocked outcome). An open validation run in the
-  project answers 409 with `{ error, id: <open run id> }`. Response: the filed
-  run's view plus `reset`.
+  (resets only this lead, only a blocked outcome). A deployment-fact lead
+  (blocker line `deployment fact`) refuses with 409 before the review lookup:
+  it never enters a batch, so no run can take it — its review's question card
+  decides it. An open validation run in the project answers 409 with
+  `{ error, id: <open run id> }`. Response: the filed run's view plus `reset`.
 - `deps.validateLeads` (app.ts) and the server.ts wiring gain the widened
   `again` and an optional `first` parameter, passed to `filePendingValidationRun`.
 - The backlog route refuses a waiting lead in both directions (409).
@@ -98,13 +109,18 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
 
 For a waiting lead the drawer renders:
 
-- exactly two actions: "Cancel task" (existing) and "Validate now" (new,
-  posts the lead validate route). "Validate now" is disabled with the open
-  run's card id in its title while `openValidationRun` is set;
-- one hint line under the actions linking the review card: "The review
-  #<id> starts this lead's validation run by itself. Validate now starts it at
-  once.", plus the last validation result and date when `validatedAt` is set
-  (the newest "Validated by " segment of the fetched details);
+- a sandbox-blocker lead: exactly two actions, "Cancel task" (existing) and
+  "Validate now" (new, posts the lead validate route). "Validate now" is
+  disabled with the open run's card id in its title while `openValidationRun`
+  is set;
+- a deployment-fact lead (blocker line `deployment fact`): only "Cancel task".
+  No run can take the lead, so there is no Validate now button;
+- one hint line under the actions linking the review card: a sandbox lead
+  reads "The review #<id> starts this lead's validation run by itself.
+  Validate now starts it at once."; a deployment-fact lead reads "The review
+  #<id> asks this lead's deployment question; your answer decides the lead.";
+  plus the last validation result and date when `validatedAt` is set (the
+  newest "Validated by " segment of the fetched details);
 - no Move-to-backlog/park button, no Merge anyway, no prompt edit, no reply or
   steer composer, no Start. Gated on `task.waitsValidation`.
 
@@ -119,15 +135,22 @@ waiting lead instead of "queued with no hold found".
 1. A review files its lead in todo with the marker; `pickRunnable` returns it
    neither with `validatedAt` null nor with a blocked result.
 2. A confirmed result clears the marker; `pickRunnable` returns the lead.
-3. An old-schema database with an open backlog lead converges to the waiting
-   form on open, on SQLite and PostgreSQL; the shared schema comparison stays green.
+3. An old-schema database with an open never-validated backlog lead converges
+   to the waiting form on open, on SQLite and PostgreSQL; a lead with a
+   recorded outcome parked in backlog keeps its stage and marker; the shared
+   schema comparison stays green.
 4. The validate-now route files with the lead first, answers 409 with the open
-   run's id when a run is open, and resets only this lead's `validatedAt` when
-   its newest outcome was blocked.
-5. The lead drawer renders exactly Cancel and Validate now with accessible
-   names, plus the hint with the review link; a screenshot is attached.
+   run's id when a run is open, resets only this lead's `validatedAt` when its
+   newest outcome was blocked (both blocked stamps sit before the cutoff, so
+   losing the scope fails the test), and refuses a deployment-fact lead.
+5. The drawer renders exactly Cancel and Validate now for a sandbox-blocker
+   lead, and only Cancel plus the question-flow hint for a deployment-fact
+   lead, with accessible names; a screenshot is attached.
 6. A done release review with a waiting lead in todo does not hold the release
    (mergeHold null) and does not hold its review's Done (findingsOpen false).
+   The done stamp covers the waiting todo form, so a confirmed lead whose
+   prompt later loses the tag stays exempt (sequence test through the real
+   store write and mergeHold).
 7. The board report shows the waiting lead as "waits for validation".
 
 ## Non-goals

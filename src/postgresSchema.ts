@@ -279,11 +279,15 @@ export const projectMigrations: readonly PostgresMigration[] = [
 	// OTTR-1252: the lead wait marker — the same convergence the SQLite open runs
 	// (docs/specs/lead-waits-validation.md). Step 1 keeps the column on fresh
 	// databases; this step adds it to schemas from before waiting leads existed
-	// and moves their backlog leads into the waiting form. Idempotent: only
-	// stage-backlog rows match, so a converged lead (now todo) and every done or
-	// cancelled row never match again, and queued_at is never restamped. The
-	// 'Needs-validation lead questions' prefix does not match (the hyphen), so
-	// the question cards stay untouched.
+	// and moves their backlog leads into the waiting form. Only never-validated
+	// leads converge: a lead with a recorded outcome parked in backlog (a
+	// confirmed or applies answer the operator parked) is normal work and keeps
+	// its stage — its outcome prevents both batching and the blocked-result
+	// reset, so re-locking it would strand the work. Idempotent: only
+	// stage-backlog rows match, so a converged lead (now todo) and every done,
+	// cancelled or validated row never match again, and queued_at is never
+	// restamped. The 'Needs-validation lead questions' prefix does not match
+	// (the hyphen), so the question cards stay untouched.
 	async (db) => {
 		await db.exec(
 			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
@@ -291,6 +295,7 @@ export const projectMigrations: readonly PostgresMigration[] = [
 		await db.run(`UPDATE tasks SET stage = 'todo', state = 'queued',
 			waits_validation = 1, queued_at = updated_at
 		WHERE stage = 'backlog' AND cancelled_at IS NULL
+			AND validated_at IS NULL
 			AND prompt LIKE 'Needs validation%'`);
 	},
 ];

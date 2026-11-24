@@ -45,6 +45,7 @@ import {
 	type LeadStartRefusal,
 	leadValidationHold,
 	leadValidationStartRefusal,
+	leadBlocker,
 	liveCardOf,
 	queueOrder,
 	reviewFindings,
@@ -13868,6 +13869,9 @@ function DrawerActions(p: {
 	/** OTTR-1252: the project's one open validation run id, from the fetched
 	 * detail; while it is set, Validate now waits instead of double-filing. */
 	openValidationRun: string | null;
+	/** OTTR-1252: true when the waiting lead's blocker line names a deployment
+	 * fact — that lead takes no validation run, so it gets no Validate now. */
+	deploymentLead: boolean;
 	/** OTTR-1252: the waiting lead's newest validation result, one short line;
 	 * null when the card carries none. */
 	lastValidation: string | null;
@@ -13908,6 +13912,7 @@ function DrawerActions(p: {
 		runBackToTodo,
 		backToTodoError,
 		openValidationRun,
+		deploymentLead,
 		lastValidation,
 		onOpenTask,
 	} = p;
@@ -14064,11 +14069,13 @@ function DrawerActions(p: {
 						{task.stage === "done" ? "Delete task" : "Cancel task"}
 					</BusyButton>
 				)}
-				{/* OTTR-1252: a waiting lead's second action files the review's batch
-				    validation run with this lead first (POST, no body). While the
+				{/* OTTR-1252: a waiting sandbox lead's second action files the review's
+				    batch validation run with this lead first (POST, no body). While the
 				    project already has one open validation run, the button names its
-				    card and waits: one run at a time, no double-filing. */}
-				{waiting && (
+				    card and waits: one run at a time, no double-filing. A
+				    deployment-fact lead takes no run at all, so it gets no button —
+				    its question card asks the user directly. */}
+				{waiting && !deploymentLead && (
 					<BusyButton
 						title={
 							openValidationRun !== null
@@ -14144,12 +14151,14 @@ function DrawerActions(p: {
 					Validation run filed.
 				</p>
 			)}
-			{/* OTTR-1252: a waiting lead carries one hint line under the actions row:
-			    the review files this lead's batch validation run by itself, and
-			    Validate now starts the same run at once. With a result on the card,
+			{/* OTTR-1252: a waiting lead carries one hint line under the actions row.
+			    A sandbox lead names the review's own batch run, which Validate now
+			    starts at once. A deployment-fact lead names the question flow that
+			    actually decides it — the review's question card, which the user's
+			    applies or does-not-apply reply settles. With a result on the card,
 			    the newest Validated-by segment of the details shows as a second
 			    short line. Full width under the row, like the re-run lines below. */}
-			{waiting && reviewId !== null && (
+			{waiting && reviewId !== null && !deploymentLead && (
 				<p className="hint">
 					The review{" "}
 					<a
@@ -14162,6 +14171,20 @@ function DrawerActions(p: {
 					</a>{" "}
 					starts this lead's validation run by itself. Validate now starts it at
 					once.
+				</p>
+			)}
+			{deploymentLead && reviewId !== null && (
+				<p className="hint">
+					The review{" "}
+					<a
+						className="reason-card-link"
+						href={taskPath(task.followUpOfProject ?? task.project, reviewId)}
+						title={`Review #${reviewId}`}
+						onClick={(e) => navClick(e, () => onOpenTask(reviewId))}
+					>
+						#{reviewId}
+					</a>{" "}
+					asks this lead's deployment question; your answer decides the lead.
 				</p>
 			)}
 			{waiting && lastValidation !== null && (
@@ -15360,6 +15383,15 @@ export function Drawer({
 		if (short === "") return date === "" ? fallback : date;
 		return date === "" ? short : `${short} — ${date}`;
 	})();
+	// OTTR-1252: a deployment-fact lead never enters a batch (the filing reads
+	// the blocker line): its review's question card decides it, so there is no
+	// run to start and a Validate now button would promise an action the route
+	// refuses (409). The list row carries no prompt (OTTR-965), so the blocker
+	// line reads from the fetched detail.
+	const deploymentLead =
+		task.waitsValidation === true &&
+		!cancelled &&
+		leadBlocker(detail?.prompt ?? "").kind === "deployment";
 	useEffect(() => {
 		setRefileError(null);
 	}, [rerunTaskId]);
@@ -16219,6 +16251,7 @@ export function Drawer({
 						runBackToTodo={runBackToTodo}
 						backToTodoError={backToTodoError}
 						openValidationRun={detail?.openValidationRun ?? null}
+						deploymentLead={deploymentLead}
 						lastValidation={lastValidation}
 						onOpenTask={onOpenTask}
 					/>

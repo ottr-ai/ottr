@@ -13556,6 +13556,45 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		}
 	});
 
+	test("a deployment-fact lead is refused: the review's question card decides it", async () => {
+		// A deployment-fact lead never enters a batch (pendingSandboxLead reads the
+		// blocker line), so Validate now cannot file a run for it — the route
+		// refuses before the seam, naming the flow that actually decides the lead.
+		const review = await store.createTask(
+			"done review for deployment lead",
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		const lead = await store.createTask(
+			"Needs validation: proxy header\nBlocker: deployment fact: Which proxy terminates TLS?",
+		);
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			waitsValidation: true,
+		});
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"this lead's blocker is a deployment fact: the review's question card answers it, not a validation run",
+			);
+			expect(filed).toBe(0);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
 	test("a waiting lead with an open validation card answers 409 with its id", async () => {
 		const { review, lead } = await doneReviewWithWaitingLead();
 		const run = await store.createTask(

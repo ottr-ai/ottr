@@ -2799,12 +2799,17 @@ export class ProjectStore {
 				);
 				// OTTR-1252: the pre-marker backlog leads converge to the waiting form
 				// (todo/queued, queued_at = updated_at, marker set) on every open.
-				// Guarded like the backfills above: a tasks table old enough to miss
-				// cancelled_at predates review findings entirely, so it holds no leads.
-				// Idempotent: only stage-backlog rows match, so a converged lead (now
-				// todo) and every done or cancelled row never match again, and queued_at
-				// is never restamped. The 'Needs-validation lead questions' prefix does
-				// not match (the hyphen), so the question cards stay untouched.
+				// Only never-validated leads converge: a lead with a recorded outcome
+				// parked in backlog (a confirmed or applies answer the operator parked)
+				// is normal work and must keep its stage — its outcome prevents both
+				// batching and the blocked-result reset, so re-locking it would strand
+				// the work. Guarded like the backfills above: a tasks table old enough
+				// to miss cancelled_at predates review findings entirely, so it holds
+				// no leads. Idempotent: only stage-backlog rows match, so a converged
+				// lead (now todo) and every done, cancelled or validated row never
+				// match again, and queued_at is never restamped. The 'Needs-validation
+				// lead questions' prefix does not match (the hyphen), so the question
+				// cards stay untouched.
 				if (
 					[
 						"stage",
@@ -2813,12 +2818,14 @@ export class ProjectStore {
 						"prompt",
 						"queued_at",
 						"updated_at",
+						"validated_at",
 					].every((c) => cols.includes(c))
 				)
 					await db.run(`
 						UPDATE tasks SET stage = 'todo', state = 'queued',
 							waits_validation = 1, queued_at = updated_at
 						WHERE stage = 'backlog' AND cancelled_at IS NULL
+							AND validated_at IS NULL
 							AND prompt LIKE 'Needs validation%'
 					`);
 				// OTTR-1056: the answered PR-head CI failure. The key is
@@ -4846,14 +4853,17 @@ export class ProjectStore {
 			// merges, also after the lead leaves the backlog). Direct follow-ups only:
 			// leads file as direct children (fileKeptFindings), and a deeper closure card
 			// that misses the stamp keeps today's hold. The write re-runs when a bounced
-			// release re-lands done; it only ever sets 1.
+			// release re-lands done; it only ever sets 1. OTTR-1252: leads now file as
+			// waiting cards in todo (stage todo, waits_validation set) — the same optional
+			// work a backlog lead was, so the stamp takes that form too; without it a
+			// confirmed lead whose prompt later loses the tag would hold every merge.
 			if (
 				patch.stage === "done" &&
 				patch.stage !== before.stage &&
 				isReview(task)
 			)
 				await this.db.run(
-					"UPDATE tasks SET lead_at_done = 1 WHERE follow_up_of = ? AND created_at <= ? AND stage = 'backlog' AND cancelled_at IS NULL",
+					"UPDATE tasks SET lead_at_done = 1 WHERE follow_up_of = ? AND created_at <= ? AND cancelled_at IS NULL AND (stage = 'backlog' OR (stage = 'todo' AND waits_validation = 1))",
 					[id, now],
 				);
 			return { ok: true, task };

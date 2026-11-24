@@ -5010,9 +5010,7 @@ describe("Waiting lead drawer actions", () => {
 			// The steer composer never renders (the closed Follow-up dialog keeps
 			// its textarea mounted for every drawer, so a blanket textarea probe
 			// would misfire; the steer form is the composer that starts work).
-			expect(
-				container.querySelectorAll("form.steer-form"),
-			).toHaveLength(0);
+			expect(container.querySelectorAll("form.steer-form")).toHaveLength(0);
 			expect(container.textContent).not.toContain("Enter steers");
 			expect(container.textContent).not.toContain(
 				"Not ready — park in backlog",
@@ -5038,6 +5036,39 @@ describe("Waiting lead drawer actions", () => {
 				"Validation run #V-3 is open in this project",
 			);
 			expect(validate?.disabled).toBe(true);
+		} finally {
+			await close();
+		}
+	});
+
+	test("a deployment-fact lead gets no Validate now and names its question flow", async () => {
+		// A deployment-fact lead never enters a batch, so there is no run to
+		// start: the drawer keeps Cancel and the hint names the question card
+		// that decides the lead.
+		const { container, close } = await mountLead(
+			leadCard({
+				prompt:
+					"Needs validation: proxy header\nBlocker: deployment fact: Which proxy terminates TLS?",
+			}),
+		);
+		try {
+			const names = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].map((b) => b.textContent?.trim());
+			expect(names).toEqual(["Cancel task"]);
+			const link = container.querySelector<HTMLAnchorElement>(
+				'a[href="/projects/proj/tasks/R-7"]',
+			);
+			expect(link?.textContent).toBe("#R-7");
+			expect(container.textContent).toContain(
+				"asks this lead's deployment question; your answer decides the lead.",
+			);
+			expect(container.textContent).not.toContain("Validate now");
+			expect(container.textContent).not.toContain(
+				"starts this lead's validation run by itself",
+			);
 		} finally {
 			await close();
 		}

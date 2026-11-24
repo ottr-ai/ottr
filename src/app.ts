@@ -346,6 +346,7 @@ import {
 	LEAD_NOT_APPLY_OPTION_LEGACY,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
+	leadBlocker,
 	leadValidationStartRefusal,
 	liveCardOf,
 	mergeAnywayPatch,
@@ -13082,6 +13083,17 @@ export async function createApp(deps: AppDeps) {
 		if (isLead(task) && task.waitsValidation === true) {
 			if (task.followUpOf === null)
 				return json({ error: "the lead does not name a review" }, 409);
+			// A deployment-fact lead never enters a batch (pendingSandboxLead reads
+			// the blocker line): its review's question card decides it, so a run
+			// for this lead cannot exist and the filing would only take siblings.
+			if (leadBlocker(task.prompt).kind === "deployment")
+				return json(
+					{
+						error:
+							"this lead's blocker is a deployment fact: the review's question card answers it, not a validation run",
+					},
+					409,
+				);
 			const review = await e.store.getTask(task.followUpOf);
 			if (review === null || !validatableReview(review))
 				return json(

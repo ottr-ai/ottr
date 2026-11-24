@@ -252,7 +252,9 @@ describe("PostgreSQL migration surface", () => {
 		);
 		expect(
 			db.executed.some((statement) =>
-				statement.includes("WHERE stage = 'backlog' AND cancelled_at IS NULL"),
+				statement.includes(
+					"WHERE stage = 'backlog' AND cancelled_at IS NULL\n\t\t\tAND validated_at IS NULL",
+				),
 			),
 		).toBe(true);
 		// Every step version carries its record; the count derives from the real
