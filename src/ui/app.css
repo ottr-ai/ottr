@@ -2272,6 +2272,11 @@ button.notif-link {
 	gap: 8px;
 	margin: 0;
 }
+/* The partial seed's amber band (ISA-101: colour only on alarms): the headline
+   takes --alarm, the marker the amber triangle; Details stays normal text. */
+.seed-partial-head {
+	color: var(--alarm);
+}
 .notif-line + .notif-line {
 	margin-top: 8px;
 }

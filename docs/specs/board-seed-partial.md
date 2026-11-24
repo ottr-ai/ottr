@@ -17,20 +17,20 @@ results file, never the stdout text.
 
 - `ok` — the seed run exited 0. Today's success path: clear `seed-failed` and
   `seed-partial`, log the success line, `seeded: true`.
-- `partial` — the seed run exited non-zero, and the results file parses, and
-  `fatal` is `false`, and every item status is a normal status or a left-out status,
-  and at least one item is left out. Actions: clear `seed-failed`, write
-  `seed-partial`, log the partial line, `seeded: true`, `failed: false`. The run
-  exits 0.
-- `failed` — anything else: the results file is absent or unparseable, `fatal` is
+- `partial` — the seed run exited non-zero, and the main results file and the rules
+  sync's own `<results>.rules.json` file both parse, and both hold `fatal` `false`,
+  and every item status is a normal status or a left-out status, and at least one
+  item is left out. Actions: clear `seed-failed`, write `seed-partial`, log the
+  partial line, `seeded: true`, `failed: false`. The run exits 0.
+- `failed` — anything else: a results file is absent or unparseable, a `fatal` is
   `true`, `items` is missing or empty, an item carries an unknown status, or no item
   is left out. Today's failure path: write `seed-failed`, leave `seed-commit` and
   `seed-partial` untouched, `failed: true`, run exits 1.
 
 Normal statuses: `installed`, `unchanged`, `added`, `updated`. Left-out statuses:
-`rejected`, `no-origin`, `inconclusive`. `no-origin` counts as left out: the item is
-excluded the same way, and a seed that reds forever on a missing origin would never
-heal.
+`rejected`, `inconclusive`. The card scopes the partial outcome to those two; a
+`no-origin` item fails the seed like any other unknown shape, so a missing origin
+keeps the red notice.
 
 Exit 0 decides `ok` on its own. A results file that contradicts exit 0 is logged as a
 warning; the exit code stays authoritative, because an old Alate image writes no
@@ -41,9 +41,13 @@ results file at all and must keep seeding as `ok`.
 Already implemented in Alate (`specs/provision-item-by-item.md` in the alate repo, the
 "Machine-readable results file" section). No Alate change is needed.
 
-- The seed passes the results path with a compose run env flag:
-  `docker compose run --rm --no-deps -e ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json board-seed ...`
-  in both `seedSource` arg variants (`--repo` and `--data`).
+- The seed passes a per-run results path with a compose run env flag:
+  `docker compose run --rm --no-deps -e ALATE_PROVISION_RESULTS=/etc/ottr/seed-results-<run>.json board-seed ...`
+  in both `seedSource` arg variants (`--repo` and `--data`). The fresh name every run
+  means a later run can never read the previous run's file: a clone failure before
+  install-user writes leaves the old file in the volume, and a shared path would
+  classify that stale file as this run's outcome. The seed removes both files after
+  the read, so the volume keeps no file per run.
 - install-user writes the file atomically at the end of every run, mode 0600, into the
   `board-config` volume:
   ```json
@@ -63,12 +67,27 @@ Already implemented in Alate (`specs/provision-item-by-item.md` in the alate rep
   run merges its per-item failures into the same `items` array. A nested refusal
   aborts the layer switch and marks the run fatal, so `fatal: false` implies the layer
   switched.
-- The seed reads the file back through the same board-seed service, so the read does
+- The seed reads the files back through the same board-seed service, so the read does
   not depend on the server container or on uid coupling:
-  `docker compose run --rm --no-deps --entrypoint sh board-seed -c 'cat /etc/ottr/seed-results.json'`.
-  The read runs inside `runSeed`'s `ALATE_IMAGE` discovery window. An unreadable or
+  `docker compose run --rm --no-deps --entrypoint sh board-seed -c 'cat <path>'`.
+  The reads run inside `runSeed`'s `ALATE_IMAGE` discovery window. An unreadable or
   unparseable read classifies the run as `failed` when the seed exited non-zero, and
   as `ok` when it exited 0.
+
+## The complete seed pipeline
+
+The board-seed entrypoint is a compound command:
+`install-user.mjs --home /etc/ottr/home` then `sync.mjs /etc/ottr/home/.omp/agent/rules`
+(the flat rules mirror). install-user's layer mode installs the layer rules itself
+through a nested sync and switches the layer, but the flat mirror needs the second
+command, and with `&&` a per-item failure (exit 1, `fatal` `false`) skipped it. The
+entrypoint now runs the flat sync for every install-user run whose results file says
+`fatal: false`, points it at `<results>.rules.json` so its outcome is machine-readable,
+and folds both exit codes into one non-zero exit. A fatal refusal still skips the sync
+(nothing was installed), and a run without the results env — a plain manual
+`docker compose run board-seed` — keeps the old success-only sequence. The
+classification accepts a partial outcome only when the rules file proves the sync ran;
+a missing or fatal rules file fails the seed.
 
 ## Records
 
@@ -134,8 +153,9 @@ failure, like `seedFailedView()`. Bounds: whole file at most 12000 characters,
 `rule` at most 200 characters each, commit matching `^[0-9a-f]{7,40}$` or empty.
 `name` and `rule` redact through `redact(..., gitSecrets())` at view time.
 
-The board renders an amber notice line (`mark-warn`, the seed-failed line's component
-pattern):
+The board renders an amber notice line: the amber alarm triangle (`Mark kind="needs"`,
+`--alarm`) and the headline text in `--alarm`, the seed-failed line's component
+pattern. Details stays normal text.
 
 - Headline: `Agent layer at <commit.slice(0,12)>: <count> skill left out` with plural
   `skills` for counts above 1.
@@ -146,23 +166,39 @@ pattern):
 
 ## Acceptance checks (tests that fail before the change)
 
-1. Host, partial: a seed run that exits non-zero with a results file of 3 rejected or
-   inconclusive items and the rest unchanged writes `/etc/ottr/seed-commit` and
-   `/etc/ottr/seed-partial`, removes `/etc/ottr/seed-failed`, and exits 0. A next run
-   whose `seed-commit` read equals the commit does not run install-user again.
+1. Host, partial: a seed run that exits non-zero with a main results file of 3
+   rejected or inconclusive items, the rest unchanged, and a rules results file with
+   `fatal` false writes `/etc/ottr/seed-commit` and `/etc/ottr/seed-partial`, removes
+   `/etc/ottr/seed-failed`, and exits 0. A next run whose `seed-commit` read equals
+   the commit does not run install-user again.
 2. Host, failed: a seed run with an install error (non-zero exit, no results file)
    writes `seed-failed`, leaves `seed-commit` unwritten, exits 1.
-3. Host: an unparseable or missing results file on a non-zero exit counts as failed.
+3. Host: an unparseable or missing results file on a non-zero exit counts as failed;
+   so does a missing or fatal rules results file, because the pipeline then never
+   completed.
 4. Host: `fatal: true` counts as failed; an unknown item status counts as failed; a
-   `no-origin` item counts as left out.
-5. Host: an `ok` seed removes both `seed-failed` and `seed-partial`.
-6. Host: an old Alate image (exit 0, no results file) stays `ok` with no records.
-7. Host: a failed `seed-partial` write stays advisory and keeps the outcome.
-8. Board: the state carries `seedPartial` only for a well-formed record; malformed,
-   oversized, and control-character records give null; a stored secret redacts out.
-9. Board UI: the amber partial notice renders the headline and the item list; the red
-   notice still renders only for `seed-failed`; hosted mode drops both. UI test plus a
-   screenshot of the amber notice.
+   lone `no-origin` item counts as failed too.
+5. Host, stale result: a partial run leaves its results file in the volume, and a
+   later run whose install-user never wrote (a clone failure) reads no file for its
+   own per-run path — the later run fails with the red notice, records no
+   `seed-commit`, and never adopts the stale items. Each run's files are removed
+   after the read.
+6. Host: the board-seed entrypoint's compound command runs the flat rules sync for
+   every install-user outcome whose results file holds `fatal` false, points the sync
+   at its own `<results>.rules.json`, skips the sync on a fatal refusal and when no
+   results env is set (the old success-only sequence), and folds both exit codes into
+   one non-zero exit.
+7. Host: an `ok` seed removes both `seed-failed` and `seed-partial`.
+8. Host: an old Alate image (exit 0, no results file) stays `ok` with no records.
+9. Host: a failed `seed-partial` write stays advisory and keeps the outcome.
+10. Host: the partial record redacts secrets, control bytes and quotes, caps at 20
+    items, and drops a garbage commit.
+11. Board: the state carries `seedPartial` only for a well-formed record; malformed,
+    oversized, and control-character records give null; a stored secret redacts out.
+12. Board UI: the amber partial notice renders the alarm triangle and the
+    `--alarm`-colored headline with the item list; the red notice still renders only
+    for `seed-failed`; hosted mode drops both. UI test plus a screenshot of the amber
+    notice.
 
 ## Non-goals
 
@@ -181,6 +217,14 @@ pattern):
 - Read the results file through `compose exec server cat`. Rejected: it fails when the
   server is down and couples the read to the server container's uid; the seed-service
   one-off reads its own volume file as the same image user.
+- Count `no-origin` items as left out. Rejected in review: the card scopes the partial
+  outcome to rejected or inconclusive items, and Alate emits `no-origin` for MCP
+  servers and rules too, so the extension would clear the red notice for failures the
+  card never approved.
+- Accept a partial outcome from install-user's file alone. Rejected in review: the
+  compose entrypoint gates the flat rules sync on install-user's exit, so an exit-1
+  run proved nothing about the rules half; the classification now requires the rules
+  sync's own `<results>.rules.json` file with `fatal` false.
 
 ## Risks
 

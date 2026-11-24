@@ -3190,7 +3190,10 @@ describe("SeedPartialLine", () => {
 		);
 		expect(html).toContain('role="note"');
 		expect(html).toContain('data-inbox-key="seed-partial:1730990000000"');
-		expect(html).toContain("mark-warn");
+		// Amber: the alarm triangle and the --alarm-colored headline, not the grey warn.
+		expect(html).toContain("mark-needs");
+		expect(html).toContain("seed-partial-head");
+		expect(html).not.toContain("mark-warn");
 		expect(html).toContain(
 			`Agent layer at ${"e".repeat(12)}: 3 skills left out`,
 		);

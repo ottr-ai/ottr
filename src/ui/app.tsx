@@ -16954,11 +16954,16 @@ export function SeedPartialLine({
 	return (
 		// A div: the Details disclosure is flow content, which a <p> cannot hold.
 		<div className="notif-line" role="note" data-inbox-key={inboxKey}>
-			<Mark kind="warn" />
+			{/* The amber alarm triangle: items left out, the layer itself switched. */}
+			<Mark kind="needs" />
 			<span>
-				Agent layer at{" "}
-				{partial.commit !== "" ? partial.commit.slice(0, 12) : "unknown commit"}
-				: {partial.count} skill{partial.count === 1 ? "" : "s"} left out
+				<span className="seed-partial-head">
+					Agent layer at{" "}
+					{partial.commit !== ""
+						? partial.commit.slice(0, 12)
+						: "unknown commit"}
+					: {partial.count} skill{partial.count === 1 ? "" : "s"} left out
+				</span>
 				<details className="notif-details">
 					<summary>Details</summary>
 					{partial.items.map((item, i) => (

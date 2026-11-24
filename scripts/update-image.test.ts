@@ -128,8 +128,18 @@ interface FakeOptions {
 	/** Exit code of the board-seed run. */
 	seedCode?: number;
 	/** The results file install-user wrote (the board-seed one-off `cat` reads it);
-	 *  unset = no file in the volume, the read fails. */
+	 *  unset = no file in the volume, the read fails. Answers the main results read
+	 *  for every per-run path. */
 	seedResults?: string;
+	/** The rules sync's own `<results>.rules.json` file (the entrypoint's flat rules
+	 *  sync writes it); unset = no file, the read fails. */
+	seedRulesResults?: string;
+	/** When set, it answers BOTH per-run results reads by exact path; a path it
+	 *  leaves undefined reads as no file. The stale-result sequence uses it. */
+	seedResultsFor?: (path: string) => string | undefined;
+	/** Records the per-run results paths raw instead of normalizing them to
+	 *  `<results>`, so the stale-result sequence can tell two runs apart. */
+	rawSeedPaths?: boolean;
 	/** The seed-partial record the volume already holds ("" = none; a write replaces it). */
 	seedPartialRecord?: string;
 	/** Exit code of the seed-partial record write (the board-seed printf exec). */
@@ -286,22 +296,32 @@ function boardSeedExec(
 	};
 }
 
-/** The seed's other board-seed one-offs (`--entrypoint sh`): the results file read
- *  answers the scripted file text (unset = no file, the read fails), the
- *  seed-partial printf write sets the stored record. */
+/** The seed's other board-seed one-offs (`--entrypoint sh`): the per-run results
+ *  reads answer the scripted file texts (unset = no file, the read fails; the main
+ *  read's exec also removes both files), the rm-only exec is the success-path
+ *  cleanup, and the seed-partial printf write sets the stored record. */
 function seedOneOffExec(
 	line: string,
 	o: FakeOptions,
 	rec: FakeRecord,
 ): ExecResult {
 	rec.calls.push(line);
-	if (line.includes("cat /etc/ottr/seed-results.json"))
-		return o.seedResults === undefined
-			? {
-					code: 1,
-					out: "cat: can't open /etc/ottr/seed-results.json: No such file\n",
-				}
-			: { code: 0, out: o.seedResults };
+	if (line.includes("-c rm -f ")) return { code: 0, out: "" };
+	if (line.includes("-c cat ")) {
+		const path = /-c cat (\S+?); (?:rc=\$\?; )?/.exec(line)?.[1] ?? "";
+		const scripted =
+			o.seedResultsFor !== undefined
+				? o.seedResultsFor(path)
+				: path.endsWith(".rules.json")
+					? o.seedRulesResults
+					: o.seedResults;
+		if (scripted === undefined)
+			return {
+				code: 1,
+				out: `cat: can't open ${path}: No such file\n`,
+			};
+		return { code: 0, out: scripted };
+	}
 	rec.seedPartialRecords.push(line);
 	const code = o.seedPartialWriteCode ?? 0;
 	if (code === 0) {
@@ -686,9 +706,21 @@ function fakes(o: FakeOptions = {}): FakeRun {
 	let clock = Date.UTC(2026, 9, 16);
 	const deps: Deps = {
 		docker: async (...raw) => {
-			// The sidecar build's extra compose file gets a fresh temp name each run.
+			// The sidecar build's extra compose file gets a fresh temp name each run,
+			// and the per-run results file a fresh name per seed; both normalize to a
+			// stable token, so the exact-string assertions survive. The stale-result
+			// sequence opts out: it must tell the two runs' paths apart.
 			const extra = raw.find((a) => /ottr-deploy-.*\.yml$/.test(a));
-			const args = raw.map((a) => (a === extra ? "<tree>.yml" : a));
+			const args = raw.map((a) =>
+				a === extra
+					? "<tree>.yml"
+					: o.rawSeedPaths === true
+						? a
+						: a.replaceAll(
+								/\/etc\/ottr\/seed-results-\d+-\d+\.json/g,
+								"<results>",
+							),
+			);
 			const line = args.join(" ");
 			const flags = dockerFlags(line);
 			if (flags.drain) drains.push(line);
@@ -757,9 +789,19 @@ const CAT_SEEDFAIL =
 	"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-failed";
 const RM_SEEDFAIL =
 	"compose -f c.yml exec -T server sh -c rm -f /etc/ottr/seed-failed /etc/ottr/seed-partial";
-/** The env flag that makes install-user write its structured results file for the seed to classify. */
-const SEED_RESULTS_ENV =
-	"-e ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json";
+/** The env flag with the per-run results path; the fake normalizes every run's
+ *  `/etc/ottr/seed-results-<now>-<n>.json` to `<results>`, so the exact-string
+ *  assertions survive the fresh path. */
+const SEED_RESULTS_ENV = "-e ALATE_PROVISION_RESULTS=<results>";
+/** The success-path cleanup one-off (no read happened, exit 0). */
+const RESULTS_RM =
+	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c rm -f <results> <results>.rules.json";
+/** The main results read; its exec also removes both files after the cat. */
+const RESULTS_READ =
+	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>; rc=$?; rm -f <results> <results>.rules.json; exit $rc";
+/** The rules sync's own results read (the entrypoint's flat rules sync wrote it). */
+const RESULTS_RULES_READ =
+	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>.rules.json; exit $rc";
 const SEEDFAIL_WRITE = (record: {
 	since: number;
 	commit: string;
@@ -2607,6 +2649,7 @@ describe("rolling restart", () => {
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
 			seedRun,
+			RESULTS_RM,
 			RM_SEEDFAIL,
 			GET,
 			CAT_WAIT,
@@ -2661,6 +2704,7 @@ describe("rolling restart", () => {
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
 			seedRun,
+			RESULTS_RM,
 			RM_SEEDFAIL,
 			GET,
 			CAT_WAIT,
@@ -3701,6 +3745,7 @@ describe("rolling restart", () => {
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
 			`compose -f c.yml run --rm --no-deps ${SEED_RESULTS_ENV} -v ${data.main}:/data:ro board-seed --data /data`,
+			RESULTS_RM,
 			RM_SEEDFAIL,
 			GET,
 			CAT_WAIT,
@@ -3883,6 +3928,7 @@ describe("board seed", () => {
 			ALATE_PS,
 			ALATE_INSPECT,
 			seedRun,
+			RESULTS_RM,
 			RM_SEEDFAIL,
 			GET,
 			...COMPARE,
@@ -4385,8 +4431,6 @@ describe("board seed", () => {
 			expect(f.logs.join("\n")).not.toContain(token);
 	}, 60_000);
 
-	const RESULTS_READ =
-		"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat /etc/ottr/seed-results.json";
 	const SEED_BASE = {
 		seedRecord: unrecorded,
 		alatePs: "alate123",
@@ -4450,6 +4494,10 @@ describe("board seed", () => {
 			...SEED_BASE,
 			seedCode: 1,
 			seedResults: results,
+			seedRulesResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "a.md", status: "unchanged", rule: null }],
+			}),
 			seedFailRecord: JSON.stringify({
 				since: 1,
 				commit: "a".repeat(40),
@@ -4495,6 +4543,89 @@ describe("board seed", () => {
 		expect(next.seedRuns).toEqual([]);
 	}, 60_000);
 
+	test("a stale results file from an earlier run cannot classify a later failed seed", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// Run 1: a partial seed leaves its per-run results file in the volume.
+		const first = fakes({
+			...SEED_BASE,
+			seedCode: 1,
+			seedResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "user/old", status: "rejected", rule: "old" }],
+			}),
+			seedRulesResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "a.md", status: "unchanged", rule: null }],
+			}),
+			rawSeedPaths: true,
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], first.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		const stalePath =
+			/ALATE_PROVISION_RESULTS=(\/etc\/ottr\/seed-results-[^ ]+\.json)/.exec(
+				first.seedRuns[0] ?? "",
+			)?.[1] ?? "";
+		expect(stalePath).toMatch(/^\/etc\/ottr\/seed-results-\d+-\d+\.json$/);
+		// Run 2 at a new commit: install-user crashes before it writes (a clone
+		// failure), so the read for run 2's own path finds no file. The stale file
+		// from run 1 must not answer for run 2's outcome.
+		const data2 = checkout();
+		const head2 = must(data2.main, "rev-parse", "HEAD");
+		const second = fakes({
+			...SEED_BASE,
+			seedCode: 1,
+			rawSeedPaths: true,
+			seedResultsFor: (path) => (path === stalePath ? "stale" : undefined),
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], second.deps, {
+				ALATE_DATA: data2.main,
+			}),
+		).toBe(1);
+		// The stale file stayed stale: the red path, no commit record, no record write.
+		expect(second.seedFailRecords).toHaveLength(1);
+		expect(seedFailRecordOf(second)).toEqual({
+			since: Date.UTC(2026, 9, 16),
+			commit: head2,
+			text: "the seed step failed",
+		});
+		expect(second.seedPartialRecords).toEqual([]);
+		expect(second.seedWrites.filter((l) => l.includes("seed-commit"))).toEqual(
+			[],
+		);
+	}, 60_000);
+
+	test("the compose seed entrypoint runs the rules sync for every non-fatal install-user outcome", () => {
+		const compose = readFileSync(
+			join(import.meta.dir, "..", "docker-compose.yml"),
+			"utf8",
+		);
+		const block = compose.slice(
+			compose.indexOf("board-seed:"),
+			compose.indexOf("home-repair:"),
+		);
+		const command =
+			/^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
+		// The flat rules sync no longer rides install-user's exit alone: it runs
+		// whenever install-user's results file says fatal false, so a partial seed's
+		// commit is never recorded with the rules half missing.
+		expect(command).toContain('grep -q \'"fatal":true\' "$$R"');
+		// The flat sync writes its own results file, which the classification reads
+		// as the proof that the pipeline completed.
+		expect(command).toContain('ALATE_PROVISION_RESULTS="$$R.rules.json"');
+		// Both exit codes fold into one non-zero exit.
+		expect(command).toContain("exit $$rc");
+		expect(command.match(/\|\| rc=\$\$s/g)?.length).toBe(2);
+		// Two sync invocations, both conditional: the fatal refusal skips the sync,
+		// and without the results env the old success-only sequence holds.
+		expect((command.match(/node sync\.mjs/g) ?? []).length).toBe(2);
+		expect(command).toContain('elif [ "$$rc" -eq 0 ]');
+	});
+
 	/** Runs a failing seed with the scripted results file and asserts today's red path. */
 	async function expectFailedSeed(
 		seedResults: string | undefined,
@@ -4508,8 +4639,9 @@ describe("board seed", () => {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(1);
-		// The read ran and could not answer: the red path stays today's path.
+		// The reads ran and could not answer: the red path stays today's path.
 		expect(f.calls).toContain(RESULTS_READ);
+		expect(f.calls).toContain(RESULTS_RULES_READ);
 		expect(f.seedFailRecords).toHaveLength(1);
 		expect(seedFailRecordOf(f)).toEqual({
 			since: Date.UTC(2026, 9, 16),
@@ -4531,7 +4663,7 @@ describe("board seed", () => {
 		await expectFailedSeed("{not json");
 	}, 60_000);
 
-	test("a fatal flag or an unknown status fails, and a no-origin item counts as left out", async () => {
+	test("a fatal flag, an unknown status, or a lone no-origin item fails", async () => {
 		const fatalRun = async (seedResults: string): Promise<FakeRun> => {
 			const { main } = checkout();
 			const data = checkout();
@@ -4560,10 +4692,10 @@ describe("board seed", () => {
 		);
 		expect(unknown.seedFailRecords).toHaveLength(1);
 		expect(unknown.seedPartialRecords).toEqual([]);
-		// A no-origin item is left out the same way a rejected one is.
-		const { main } = checkout();
-		const data = checkout();
-		const head = must(data.main, "rev-parse", "HEAD");
+		// A no-origin item is outside the card's partial scope: the seed fails.
+		const { main: main2 } = checkout();
+		const data2 = checkout();
+		const head2 = must(data2.main, "rev-parse", "HEAD");
 		const noOrigin = fakes({
 			...SEED_BASE,
 			seedCode: 1,
@@ -4576,16 +4708,19 @@ describe("board seed", () => {
 			}),
 		});
 		expect(
-			await updateImage(main, ["-f", "c.yml"], noOrigin.deps, {
-				ALATE_DATA: data.main,
+			await updateImage(main2, ["-f", "c.yml"], noOrigin.deps, {
+				ALATE_DATA: data2.main,
 			}),
-		).toBe(0);
-		expect(seedPartialRecordOf(noOrigin)).toEqual({
-			commit: head,
+		).toBe(1);
+		expect(seedFailRecordOf(noOrigin)).toEqual({
 			since: Date.UTC(2026, 9, 16),
-			count: 1,
-			items: [{ name: "user/b", rule: "no origin" }],
+			commit: head2,
+			text: "the seed step failed",
 		});
+		expect(noOrigin.seedPartialRecords).toEqual([]);
+		expect(
+			noOrigin.seedWrites.filter((l) => l.includes("seed-commit")),
+		).toEqual([]);
 	}, 60_000);
 
 	test("a successful seed removes the failure and the stale partial record in one exec", async () => {
@@ -4632,9 +4767,7 @@ describe("board seed", () => {
 		expect(f.seedRuns).toHaveLength(1);
 		// Exit 0 decides ok on its own: the run never reads the results file.
 		expect(
-			f.calls.some(
-				(l) => l.includes("seed-results.json") && l.includes("--entrypoint"),
-			),
+			f.calls.some((l) => l.includes("-c cat ") && l.includes("--entrypoint")),
 		).toBe(false);
 		// No record writes, and the clear now takes both records.
 		expect(f.seedFailRecords).toEqual([]);
@@ -4651,6 +4784,10 @@ describe("board seed", () => {
 			seedResults: JSON.stringify({
 				fatal: false,
 				items: [{ item: "user/x", status: "rejected", rule: "r" }],
+			}),
+			seedRulesResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "a.md", status: "unchanged", rule: null }],
 			}),
 			seedPartialWriteCode: 1,
 		});
@@ -4687,6 +4824,10 @@ describe("board seed", () => {
 			...SEED_BASE,
 			seedCode: 1,
 			seedResults: JSON.stringify({ fatal: false, items }),
+			seedRulesResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "a.md", status: "unchanged", rule: null }],
+			}),
 		});
 		// The recipe's redaction model: secret-shaped env values never reach the record.
 		expect(
@@ -4736,19 +4877,50 @@ describe("board seed", () => {
 });
 
 describe("classifySeedResults", () => {
-	test("exit 0 is ok whatever the results text holds", () => {
-		expect(classifySeedResults(0, null)).toEqual({ kind: "ok" });
-		expect(classifySeedResults(0, "garbage")).toEqual({ kind: "ok" });
-		expect(classifySeedResults(0, "")).toEqual({ kind: "ok" });
+	/** A clean rules-sync result: the pipeline completed with every rule installed. */
+	const rulesOk = JSON.stringify({
+		fatal: false,
+		items: [{ item: "a.md", status: "unchanged", rule: null }],
+	});
+	test("exit 0 is ok whatever the results texts hold", () => {
+		expect(classifySeedResults(0, null, null)).toEqual({ kind: "ok" });
+		expect(classifySeedResults(0, "garbage", "garbage")).toEqual({
+			kind: "ok",
+		});
 	});
 
 	test("a missing, unparseable, or shapeless file on a non-zero exit is failed", () => {
-		expect(classifySeedResults(1, null)).toEqual({ kind: "failed" });
-		expect(classifySeedResults(1, "{not json")).toEqual({ kind: "failed" });
-		expect(classifySeedResults(1, "42")).toEqual({ kind: "failed" });
+		expect(classifySeedResults(1, null, rulesOk)).toEqual({ kind: "failed" });
+		expect(classifySeedResults(1, "{not json", rulesOk)).toEqual({
+			kind: "failed",
+		});
+		expect(classifySeedResults(1, "42", rulesOk)).toEqual({ kind: "failed" });
 	});
 
-	test("fatal false with left-out items is partial, and the rule falls back to the status word", () => {
+	test("a missing or fatal rules result fails: the pipeline never completed", () => {
+		const main = JSON.stringify({
+			fatal: false,
+			items: [{ item: "user/a", status: "rejected", rule: "SC2" }],
+		});
+		// The flat rules sync never ran (an old guard, a hidden refusal, a crash).
+		expect(classifySeedResults(1, main, null)).toEqual({ kind: "failed" });
+		expect(classifySeedResults(1, main, "{not json")).toEqual({
+			kind: "failed",
+		});
+		expect(
+			classifySeedResults(
+				1,
+				main,
+				JSON.stringify({
+					fatal: true,
+					error: "the rules sync refused",
+					items: [],
+				}),
+			),
+		).toEqual({ kind: "failed" });
+	});
+
+	test("fatal false with left-out items across both files is partial, and the rule falls back to the status word", () => {
 		expect(
 			classifySeedResults(
 				1,
@@ -4756,6 +4928,7 @@ describe("classifySeedResults", () => {
 					fatal: false,
 					items: [{ item: "user/a", status: "unchanged" }],
 				}),
+				rulesOk,
 			),
 		).toEqual({ kind: "failed" }); // no left-out item at all
 		expect(
@@ -4770,20 +4943,43 @@ describe("classifySeedResults", () => {
 						{ item: "user/d", status: "inconclusive", rule: "" },
 					],
 				}),
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "e.md", status: "inconclusive", rule: null }],
+				}),
 			),
 		).toEqual({
 			kind: "partial",
 			leftOut: [
 				{ name: "user/b", rule: "bad rule" },
-				{ name: "user/c", rule: "no origin" },
+				// no-origin is outside the card's partial scope: it fails the run below.
 				{ name: "user/d", rule: "inconclusive" },
+				{ name: "e.md", rule: "inconclusive" },
 			],
 		});
 	});
 
+	test("a lone no-origin item is failed: the card scopes partial to rejected and inconclusive", () => {
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [
+						{ item: "user/a", status: "unchanged" },
+						{ item: "user/b", status: "no-origin", rule: null },
+					],
+				}),
+				rulesOk,
+			),
+		).toEqual({ kind: "failed" });
+	});
+
 	test("fatal true, missing or empty or non-array items, unknown statuses, and shapeless items are failed", () => {
 		const fail = (results: string) =>
-			expect(classifySeedResults(1, results)).toEqual({ kind: "failed" });
+			expect(classifySeedResults(1, results, rulesOk)).toEqual({
+				kind: "failed",
+			});
 		fail(
 			JSON.stringify({
 				fatal: true,
@@ -4893,6 +5089,7 @@ describe("seed-only", () => {
 			ALATE_PS,
 			ALATE_INSPECT,
 			seedRun,
+			RESULTS_RM,
 			RM_SEEDFAIL,
 			write,
 		]);
@@ -6239,6 +6436,7 @@ describe("sidecar and seed survivor kills", () => {
 						ALATE_PS,
 						DOCKER_PS,
 						seedRun,
+						RESULTS_RM,
 						RM_SEEDFAIL,
 						GET,
 						...COMPARE,

@@ -530,7 +530,12 @@ async function repoSeed(
 	repo: string,
 	ALATE_DATA_REPO: string,
 ): Promise<
-	| { wanted: string; args: string[]; tokenExpires?: string | null }
+	| {
+			wanted: string;
+			args: string[];
+			resultsPath: string;
+			tokenExpires?: string | null;
+	  }
 	| { failed: string }
 > {
 	const { GH_TOKEN } = env;
@@ -574,6 +579,7 @@ async function repoSeed(
 			d.log("board seed token expiry check failed");
 		}
 	}
+	const path = seedResultsPath(d);
 	return {
 		wanted,
 		args: [
@@ -581,11 +587,12 @@ async function repoSeed(
 			"--rm",
 			"--no-deps",
 			"-e",
-			"ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json",
+			`ALATE_PROVISION_RESULTS=${path}`,
 			"board-seed",
 			"--repo",
 			ALATE_DATA_REPO,
 		],
+		resultsPath: path,
 		tokenExpires,
 	};
 }
@@ -602,7 +609,12 @@ async function seedSource(
 	env: Record<string, string | undefined>,
 	repo: string,
 ): Promise<
-	| { wanted: string; args: string[]; tokenExpires?: string | null }
+	| {
+			wanted: string;
+			args: string[];
+			resultsPath: string;
+			tokenExpires?: string | null;
+	  }
 	| { failed: string }
 	| null
 > {
@@ -622,6 +634,7 @@ async function seedSource(
 	const wanted = r.stdout.trim();
 	if (r.code !== 0 || wanted === "")
 		return { failed: `git rev-parse HEAD failed in ${ALATE_DATA}` };
+	const path = seedResultsPath(d);
 	return {
 		wanted,
 		args: [
@@ -629,13 +642,14 @@ async function seedSource(
 			"--rm",
 			"--no-deps",
 			"-e",
-			"ALATE_PROVISION_RESULTS=/etc/ottr/seed-results.json",
+			`ALATE_PROVISION_RESULTS=${path}`,
 			"-v",
 			`${ALATE_DATA}:/data:ro`,
 			"board-seed",
 			"--data",
 			"/data",
 		],
+		resultsPath: path,
 	};
 }
 
@@ -1009,8 +1023,10 @@ type SeedVerdict =
 	| { kind: "partial"; leftOut: { name: string; rule: string }[] }
 	| { kind: "failed" };
 
-/** install-user's known item statuses: the four normal ones and the three that leave
- *  an item out of the layer. */
+/** install-user's known item statuses: the four normal ones and the two the scan gate
+ *  leaves out while the layer still switches. A `no-origin` item is not one of them:
+ *  the card scopes the partial outcome to rejected or inconclusive, so a lone
+ *  `no-origin` failure fails the seed like any other unknown shape. */
 const SEED_ITEM_STATUSES = [
 	"installed",
 	"unchanged",
@@ -1020,7 +1036,15 @@ const SEED_ITEM_STATUSES = [
 	"no-origin",
 	"inconclusive",
 ];
-const SEED_LEFT_OUT_STATUSES = ["rejected", "no-origin", "inconclusive"];
+const SEED_LEFT_OUT_STATUSES = ["rejected", "inconclusive"];
+
+/** Per-run install-user results path: a fresh name every seed, so a run can never read
+ *  the previous run's result — a clone failure before install-user writes leaves the
+ *  old file in the volume, and a shared path would classify that stale file as this
+ *  run's outcome. */
+let seedResultsSeq = 0;
+const seedResultsPath = (d: Deps): string =>
+	`/etc/ottr/seed-results-${d.now()}-${++seedResultsSeq}.json`;
 
 /** One item of install-user's results file after the verdict fold: the item installs,
  *  it is left out with its notice fields, or the item's shape or status is unknown,
@@ -1068,21 +1092,29 @@ function seedItemVerdict(item: unknown): SeedItemVerdict {
 }
 
 /**
- * Pure seed classification from install-user's structured results file, never the
+ * Pure seed classification from install-user's structured results files, never the
  * stdout text. Exit 0 is ok on its own: an old Alate image writes no results file and
- * must keep seeding as ok. A non-zero exit counts as partial only when the results
- * file parses, `fatal` is false, every item status is known, and at least one item is
- * left out (rejected, no-origin, inconclusive); anything else is today's failure.
+ * must keep seeding as ok. A non-zero exit counts as partial only when the main
+ * results file and the rules sync's own file both parse with `fatal` false, every
+ * item status is known, and at least one item is left out (rejected or inconclusive —
+ * the card's scope); anything else is today's failure.
  */
 export function classifySeedResults(
 	exitCode: number,
 	resultsText: string | null,
+	rulesText: string | null,
 ): SeedVerdict {
 	if (exitCode === 0) return { kind: "ok" };
 	const items = seedItemsOf(resultsText);
 	if (items === null) return { kind: "failed" };
+	const ruleItems = seedItemsOf(rulesText);
+	// No rules result is an incomplete pipeline: the compose entrypoint writes the
+	// rules file for every install-user run that was not a fatal refusal, so a
+	// missing file means the rules sync never ran (an old guard, a refusal it hid,
+	// or a crash) and the seed is not done.
+	if (ruleItems === null) return { kind: "failed" };
 	const leftOut: { name: string; rule: string }[] = [];
-	for (const item of items) {
+	for (const item of [...items, ...ruleItems]) {
 		const verdict = seedItemVerdict(item);
 		if (verdict.kind === "broken") return { kind: "failed" };
 		if (verdict.kind === "leftOut")
@@ -1093,15 +1125,18 @@ export function classifySeedResults(
 }
 
 /**
- * Reads install-user's results file back through the same board-seed one-off, so the
- * read needs no running server and runs as the volume's own image user. Null when the
- * read fails (no file: an old Alate, or an install error before the write). Must run
- * inside runSeed's ALATE_IMAGE discovery window, so a discovered image reaches this
- * run too.
+ * Reads install-user's results file back through the same board-seed one-off and
+ * removes both files in the same exec, so a stale file can never answer a later run
+ * and the volume keeps no file per run. The read needs no running server and runs as
+ * the volume's own image user. Null when the read fails (no file: an old Alate, a
+ * clone failure before the write, or a run that never started). Must run inside
+ * runSeed's ALATE_IMAGE discovery window, so a discovered image reaches this run too.
  */
 async function readSeedResults(
 	d: Deps,
 	compose: string[],
+	path: string,
+	alsoClear: boolean,
 ): Promise<string | null> {
 	const r = await d.docker(
 		"compose",
@@ -1113,9 +1148,33 @@ async function readSeedResults(
 		"sh",
 		"board-seed",
 		"-c",
-		"cat /etc/ottr/seed-results.json",
+		alsoClear
+			? `cat ${path}; rc=$?; rm -f ${path} ${path}.rules.json; exit $rc`
+			: `cat ${path}; exit $rc`,
 	);
 	return r.code === 0 ? r.out : null;
+}
+
+/** Clears the run's results files when no read happened (exit 0): the volume keeps no
+ * file per run. Advisory: a failed removal only leaves a small file behind. */
+async function seedResultsClear(
+	d: Deps,
+	compose: string[],
+	path: string,
+): Promise<void> {
+	const r = await d.docker(
+		"compose",
+		...compose,
+		"run",
+		"--rm",
+		"--no-deps",
+		"--entrypoint",
+		"sh",
+		"board-seed",
+		"-c",
+		`rm -f ${path} ${path}.rules.json`,
+	);
+	if (r.code !== 0) d.log("the seed results file cleanup failed");
 }
 
 /**
@@ -1173,7 +1232,7 @@ async function runSeed(
 	d: Deps,
 	compose: string[],
 	env: Record<string, string | undefined>,
-	seed: { wanted: string; args: string[] },
+	seed: { wanted: string; args: string[]; resultsPath: string },
 	outcome: SeedOutcome,
 ): Promise<SeedOutcome> {
 	const found = await alateImage(d, compose, env);
@@ -1197,8 +1256,14 @@ async function runSeed(
 	try {
 		const run = await d.docker("compose", ...compose, ...seed.args);
 		if (run.code !== 0) {
-			const results = await readSeedResults(d, compose);
-			const verdict = classifySeedResults(run.code, results);
+			const results = await readSeedResults(d, compose, seed.resultsPath, true);
+			const rules = await readSeedResults(
+				d,
+				compose,
+				`${seed.resultsPath}.rules.json`,
+				false,
+			);
+			const verdict = classifySeedResults(run.code, results, rules);
 			if (verdict.kind === "partial") {
 				// The layer switched with items left out: the amber notice, and the
 				// run counts as done for its commit.
@@ -1227,6 +1292,7 @@ async function runSeed(
 			return { ...outcome, failed: true };
 		}
 		d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
+		await seedResultsClear(d, compose, seed.resultsPath);
 		await seedFailClear(
 			d,
 			compose,
