@@ -3716,8 +3716,8 @@ describe("Drawer parent chip", () => {
 	});
 
 	test("a duplicate card object renders once", () => {
-		// The store's single-parent links cannot form a reachable cycle; the visited
-		// set also collapses duplicate task objects, so each (project, id) renders once.
+		// Two task objects with the same (project, id) render once: the visited set
+		// keys by card, not by object. The cycle case has its own test below.
 		const html = renderToStaticMarkup(
 			<Drawer
 				{...base}
@@ -3944,8 +3944,10 @@ describe("Drawer parent chip", () => {
 			stage: "done",
 			state: "idle",
 		});
+		// The board list holds the drawer card itself, as the live state does:
+		// only then does K-1's bucket point back at S-1 and close the cycle.
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={self} tasks={[k]} />,
+			<Drawer {...base} task={self} tasks={[self, k]} />,
 		);
 		const rail = railHtml(html);
 		// K-1 renders twice: the parent chip row above this card's node, and its

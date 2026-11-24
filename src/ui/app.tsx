@@ -13980,9 +13980,10 @@ type LineageNode = {
 };
 
 /** Builds the descendant tree under `card`, oldest first at each level, past the
- * depth cap (the counts need the whole subtree). `seen` holds the visited keys: the
- * store's single-parent links cannot form a reachable cycle, and the set also
- * collapses duplicate task objects (OTTR-1258). */
+ * depth cap (the counts need the whole subtree). `seen` holds the visited keys. A
+ * caller-controlled followUpOf can name a descendant as a parent (S-1 -> K-1 ->
+ * S-1), so the walk can come back to the drawer card: the set renders each card
+ * once and stops there. It also collapses duplicate task objects (OTTR-1258). */
 function lineageTree(
 	card: TaskCard,
 	byParent: Map<string, TaskCard[]>,
