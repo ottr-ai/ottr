@@ -9922,14 +9922,15 @@ function LineageCardLink({
 	tag: string;
 	/** Live state of a follow-up row, rendered after the tags. */
 	state?: ReactNode;
-	onOpenTask: (id: string) => void;
+	/** Opens a card; `project` picks the board when ids repeat across projects. */
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	return (
 		<a
 			className="lineage-row"
 			href={taskPath(card.project, card.id)}
 			title={card.sessionTitle ?? card.title}
-			onClick={(e) => navClick(e, () => onOpenTask(card.id))}
+			onClick={(e) => navClick(e, () => onOpenTask(card.id, card.project))}
 		>
 			<span className="lineage-key">{card.id}</span>
 			<span className="lineage-title">{card.sessionTitle ?? card.title}</span>
@@ -10577,7 +10578,7 @@ function DrawerLineage(p: {
 	 * boardTasks). The drawer's context `tasks` list is project-scoped and would
 	 * drop a grandchild filed into another project. */
 	boardTasks: TaskCard[];
-	onOpenTask: (id: string) => void;
+	onOpenTask: (id: string, project?: string) => void;
 	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
 	 * dropped; null when the card sits in the state and nothing fetches. */
 	parentFetch: LineageFetch | null;
@@ -10746,7 +10747,9 @@ function DrawerLineage(p: {
 								<a
 									className="lineage-row"
 									href={taskPath(n.card.project, n.card.id)}
-									onClick={(e) => navClick(e, () => onOpenTask(n.card.id))}
+									onClick={(e) =>
+										navClick(e, () => onOpenTask(n.card.id, n.card.project))
+									}
 								>
 									<span className="lineage-title">+{n.below} more</span>
 								</a>
@@ -14291,7 +14294,7 @@ export function Drawer({
 	 * Optional only for direct fixtures, which hold one list; AppDrawer always
 	 * passes the full loaded board. */
 	boardTasks?: TaskCard[];
-	onOpenTask: (id: string) => void;
+	onOpenTask: (id: string, project?: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 	/** Agents running machine-wide right now, and the global cap they share. */
@@ -14429,17 +14432,24 @@ export function Drawer({
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	// The banner names every card the holds park, deduped by card: the dependency
-	// list, and — at merging, the only stage mergeHold applies to (holdFor) — the
-	// review holds' cards: another review's hold, or this parked review's own
-	// findings hold riding its needsReason.
+	// list, and — at merging, the only stage mergeHold applies to (holdFor), and
+	// never for a cancelled card, which the scheduler skips — the review holds'
+	// cards: another review's hold, or this parked review's own findings hold
+	// riding its needsReason. The scheduler reads one project's store, so the hold
+	// walk reads only this card's project: a foreign child filed off this review
+	// is no finding of it.
+	const holdTasks =
+		row.stage === "merging" && row.cancelledAt === null
+			? tasks.filter((t) => t.project === row.project)
+			: [];
 	const waitSources = [
 		...waiting,
-		...(row.stage === "merging"
+		...(holdTasks.length > 0
 			? [
 					...(row.needsReason === FINDINGS_HOLD
-						? reviewOpenFindings(reviewFindings(tasks, row), row)
+						? reviewOpenFindings(reviewFindings(holdTasks, row), row)
 						: []),
-					...holdWaitCards(tasks, row),
+					...holdWaitCards(holdTasks, row),
 				]
 			: []),
 	];

@@ -3873,6 +3873,120 @@ describe("Drawer parent chip", () => {
 		expect(bystander).not.toContain('id="drawer-waiting"');
 	});
 
+	test("a cancelled merge lists no review that would hold it", () => {
+		// Cancellation can keep the merging stage, but the scheduler skips
+		// cancelled cards, so no review hold applies to them.
+		const cancelled = cardFixture({
+			id: "M-2",
+			stage: "merging",
+			state: "idle",
+			cancelledAt: 400,
+			createdAt: 300,
+		});
+		const running = cardFixture({
+			id: "R-1",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			createdAt: 100,
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={cancelled} tasks={[running]} />,
+		);
+		expect(html).not.toContain('id="drawer-waiting"');
+	});
+
+	test("a foreign child of the review is no finding the banner names", () => {
+		// The scheduler reads only the review's own project store: an open card
+		// filed off the review into another project never holds it.
+		const review = cardFixture({
+			id: "R-1",
+			kind: "review",
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			doneAt: 5000,
+			createdAt: 500,
+		});
+		const foreign = cardFixture({
+			id: "G-1",
+			project: "other",
+			followUpOf: "R-1",
+			followUpOfProject: "proj",
+			createdAt: 1000,
+			stage: "in_progress",
+		});
+		const own = cardFixture({
+			id: "F-1",
+			followUpOf: "R-1",
+			createdAt: 1100,
+			stage: "in_progress",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={review} tasks={[foreign, own]} />,
+		);
+		const waiting = html.slice(html.indexOf('id="drawer-waiting"'));
+		expect(waiting).toContain('href="/projects/proj/tasks/F-1"');
+		expect(waiting).not.toContain('href="/projects/other/tasks/G-1"');
+	});
+
+	test("lineage clicks open the card's own project when ids repeat", async () => {
+		// App.openTask picks the first card with a matching id unless it gets the
+		// project, so a cross-project row and the "+N more" row pass theirs.
+		const chain = [
+			cardFixture({ id: "L-1", followUpOf: "S-1", createdAt: 1000 }),
+			cardFixture({ id: "L-2", followUpOf: "L-1", createdAt: 2000 }),
+			cardFixture({ id: "L-3", followUpOf: "L-2", createdAt: 3000 }),
+			cardFixture({
+				id: "L-4",
+				project: "other",
+				followUpOf: "L-3",
+				followUpOfProject: "proj",
+				createdAt: 4000,
+			}),
+			cardFixture({
+				id: "L-5",
+				project: "other",
+				followUpOf: "L-4",
+				followUpOfProject: "other",
+				createdAt: 5000,
+			}),
+		];
+		const opened: [string, string | undefined][] = [];
+		const { restore } = stubFetch(
+			async () => new Response("{}", { status: 404 }),
+		);
+		const { container, unmount } = await mount(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={chain}
+				onOpenTask={(id, project) => opened.push([id, project])}
+			/>,
+		);
+		try {
+			const click = {
+				button: 0,
+				preventDefault: () => {},
+				currentTarget: { pathname: "/projects/other/tasks/L-4" },
+			};
+			const row = container.querySelector(
+				'.lineage-rail a.lineage-row[href="/projects/other/tasks/L-4"]',
+			);
+			const more = container.querySelector(".lineage-more a.lineage-row");
+			expect(more?.textContent).toBe("+1 more");
+			await act(async () => onClickOf(row as unknown as Element)(click));
+			await act(async () => onClickOf(more as unknown as Element)(click));
+			expect(opened).toEqual([
+				["L-4", "other"],
+				["L-4", "other"],
+			]);
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
 	test("the fold state keys by project and id", async () => {
 		// Real stores reuse ids across projects (src/app.test.ts documents them):
 		// opening one D-1's folded branch must not open the other project's D-1.
