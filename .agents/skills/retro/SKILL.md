@@ -35,6 +35,7 @@ Call propose_task only when all of these are true:
 - the fix is concrete and small, and you can say how to check it;
 - the handoff does not list it as an open or declined proposal.
 Read the handoff's queued lessons before you write the prompt. Use them to state the target repo and the paths as facts. Do not ask the task to check a premise that a queued lesson already answers.
+- Verify each file behavior that the prompt states (arguments, exit codes, output) against the transcript or tool output in your evidence. Write an unverified behavior as a claim of the outcome, never as source fact.
 
 A change to rules, skills or AGENTS.md sources targets the board project that holds the agent data repo (the repo that Alate provisions). Set propose_task's project to that project, and name the data repo and its paths in the prompt. Never edit the data repo checkout from your card.
 Write the prompt as a self-contained task: the problem with its evidence, the change, the target repo and paths, the acceptance check, and the expected gain. If the fix belongs in another repo, name that repo in the first line.
