@@ -885,9 +885,7 @@ export function createForkWatcher(deps: {
 		// Hosted credit hold (docs/specs/hosted-mode.md section 5): re-checked at the
 		// model dispatch, so a stop that lands during the claim starts no gateway call.
 		if (deps.creditHoldActive?.() === true)
-			throw new ForkPausedError(
-				"research paused: the board is out of credit",
-			);
+			throw new ForkPausedError("research paused: the board is out of credit");
 		return (
 			deps.analyze ??
 			((r: ForkRange, p: { titles: string[]; declines: string[] }) =>
