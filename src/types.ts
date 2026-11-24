@@ -759,6 +759,11 @@ export interface Task {
 	 * of a done review from the findings hold, also after the lead leaves the backlog.
 	 * Store column lead_at_done; never caller-settable. */
 	leadAtDone: boolean;
+	/** OTTR-1252: true while the lead waits for its review's validation run: the
+	 * scheduler never starts it as a work turn, also when validatedAt is set.
+	 * Cleared by a confirmed result or the user's applies answer. Store column
+	 * waits_validation; caller-settable so update patches can set and clear it. */
+	waitsValidation: boolean;
 }
 
 /** A task from a list read (ProjectStore.listTasks): every field but diffText, details,
@@ -1323,6 +1328,9 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	 * first. This card's Work steps show their turns; each finding stays a card of its own.
 	 * Absent without findings. */
 	findings?: FindingView[];
+	/** Set only for a waiting lead's card view: the project's open validation run's card
+	 * id, for the drawer's disabled Validate now. */
+	openValidationRun?: string | null;
 }
 
 /** A retro card as its source card's drawer shows it: the facts its Work steps entry reads. */

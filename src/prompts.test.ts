@@ -1137,6 +1137,7 @@ describe("handoffMarkdown research report", () => {
 		findingsCheckedAt: null,
 		validatedAt: null,
 		leadAtDone: false,
+		waitsValidation: false,
 		revision: 1,
 		promptAuthor: "user" as const,
 		gate: null,

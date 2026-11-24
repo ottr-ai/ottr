@@ -27,6 +27,8 @@ export type Card = {
 	cancelledAt?: number | null;
 	followUpOf?: string | null;
 	createdAt?: number;
+	/** Carried by real TaskCard rows (src/types.ts); a lead parked for its review's validation run. */
+	waitsValidation?: boolean;
 	updatedAt?: number;
 	/** Carried by real TaskCard rows (src/types.ts); mergeHold's isReview reads them. */
 	kind?: string;
@@ -228,6 +230,11 @@ function queuedHolds(c: Card, f: Facts): string[] {
 /** The queued branch: OK with the hold notes when a hold explains the wait, check
  * when none does. */
 function queuedVerdict(c: Card, f: Facts): Verdict {
+	if (c.waitsValidation === true)
+		return {
+			verdict: "waits",
+			note: `waits for validation (review #${c.followUpOf ?? "?"})`,
+		};
 	const holds = queuedHolds(c, f);
 	return holds.length > 0
 		? { verdict: "OK", note: holds.join("; ") }

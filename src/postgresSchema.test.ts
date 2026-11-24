@@ -244,6 +244,17 @@ describe("PostgreSQL migration surface", () => {
 				.slice(0, alter)
 				.some((statement) => statement.startsWith("CREATE TABLE pr_review")),
 		).toBe(true);
+		// The OTTR-1252 step really ran: the ALTER and the waiting-form UPDATE
+		// (step 1 keeps the column on fresh databases, this step converges old
+		// schemas; a step that stops consuming its statements fails here).
+		expect(db.executed).toContain(
+			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
+		);
+		expect(
+			db.executed.some((statement) =>
+				statement.includes("WHERE stage = 'backlog' AND cancelled_at IS NULL"),
+			),
+		).toBe(true);
 		// Every step version carries its record; the count derives from the real
 		// step list, so a new store step never desyncs the pin.
 		expect([...db.applied].sort()).toEqual(

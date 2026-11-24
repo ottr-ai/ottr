@@ -13773,25 +13773,28 @@ function DrawerComposer(p: {
 					/>
 				)
 			)}
-			{(task.state === "running" || task.state === "queued") && (
-				<SteerComposer
-					task={task}
-					steerSend={steerSend}
-					sendSteer={sendSteer}
-					steer={steer}
-					setSteer={setSteer}
-					steerImages={steerImages}
-					catalog={catalog}
-					model={model}
-					modelQuery={modelQuery}
-					setModelQuery={setModelQuery}
-					switchModel={switchModel}
-					onModelMenuOpen={onModelMenuOpen}
-					modelConflict={modelConflict}
-					act={act}
-					setViewing={setViewing}
-				/>
-			)}
+			{(task.state === "running" || task.state === "queued") &&
+				// OTTR-1252: a waiting lead must not start, so it takes no steer
+				// either — the steer route refuses it; the affordance goes with it.
+				task.waitsValidation !== true && (
+					<SteerComposer
+						task={task}
+						steerSend={steerSend}
+						sendSteer={sendSteer}
+						steer={steer}
+						setSteer={setSteer}
+						steerImages={steerImages}
+						catalog={catalog}
+						model={model}
+						modelQuery={modelQuery}
+						setModelQuery={setModelQuery}
+						switchModel={switchModel}
+						onModelMenuOpen={onModelMenuOpen}
+						modelConflict={modelConflict}
+						act={act}
+						setViewing={setViewing}
+					/>
+				)}
 		</>
 	);
 }
@@ -13862,6 +13865,14 @@ function DrawerActions(p: {
 	cancelInPanel: boolean;
 	runBackToTodo: () => Promise<boolean>;
 	backToTodoError: string | null;
+	/** OTTR-1252: the project's one open validation run id, from the fetched
+	 * detail; while it is set, Validate now waits instead of double-filing. */
+	openValidationRun: string | null;
+	/** OTTR-1252: the waiting lead's newest validation result, one short line;
+	 * null when the card carries none. */
+	lastValidation: string | null;
+	/** Opens another card's drawer; the hint's review link uses it. */
+	onOpenTask: (id: string) => void;
 }) {
 	const {
 		task,
@@ -13896,7 +13907,38 @@ function DrawerActions(p: {
 		cancelInPanel,
 		runBackToTodo,
 		backToTodoError,
+		openValidationRun,
+		lastValidation,
+		onOpenTask,
 	} = p;
+	// OTTR-1252: a lead that waits for its review's validation run never runs as
+	// a work turn, so its drawer collapses to Cancel plus Validate now: no park,
+	// no merge override, no refile, no re-run.
+	const waiting = task.waitsValidation === true && !cancelled;
+	const reviewId = task.followUpOf;
+	const [validateError, setValidateError] = useState<string | null>(null);
+	// A new card's drawer starts without the previous card's validate error
+	// (the same reset the re-run lines use).
+	const validateTaskId = task.id;
+	useEffect(() => {
+		setValidateError(null);
+	}, [validateTaskId]);
+	// Files the review's batch validation run with this lead first (POST, no
+	// body). The board's socket refresh then shows the run in the title; a
+	// refusal (409, a run already open) surfaces inline like the re-run's.
+	const runValidateNow = async (): Promise<boolean> => {
+		setValidateError(null);
+		try {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/validate`,
+				{},
+			);
+			return true;
+		} catch (e) {
+			setValidateError(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+	};
 	return (
 		<>
 			{" "}
@@ -13935,7 +13977,10 @@ function DrawerActions(p: {
 				)}
 				{task.stage === "todo" &&
 					task.state === "queued" &&
-					task.pendingPrompt === null && (
+					task.pendingPrompt === null &&
+					// OTTR-1252: a waiting lead never parks — it waits for its review's
+					// validation run, and the backlog route refuses the move.
+					!waiting && (
 						<BusyButton
 							title="Parks the idea in the backlog until it is ready to run"
 							run={() =>
@@ -13985,7 +14030,9 @@ function DrawerActions(p: {
 						    moved here so no danger button shares a row with the primary
 						    action. The state guard keeps the old bars' exact reachability. */}
 				{wcMergeable &&
-					(task.state === "needs_you" || task.state === "queued") && (
+					(task.state === "needs_you" || task.state === "queued") &&
+					// OTTR-1252: a waiting lead has no branch to merge, so nothing to override.
+					!waiting && (
 						<button
 							type="button"
 							className="danger"
@@ -14001,7 +14048,7 @@ function DrawerActions(p: {
 				{/* OTTR-604: cards whose text links a GitHub Actions run of the
 					    project's own repository offer a re-run of that run's failed
 					    jobs; the title names the run, errors surface inline. */}
-				{rerunUrl !== null && !cancelled && (
+				{rerunUrl !== null && !cancelled && !waiting && (
 					<BusyButton
 						title={`Re-runs the failed jobs of ${rerunUrl}`}
 						run={rerunFailedJobs}
@@ -14017,9 +14064,28 @@ function DrawerActions(p: {
 						{task.stage === "done" ? "Delete task" : "Cancel task"}
 					</BusyButton>
 				)}
+				{/* OTTR-1252: a waiting lead's second action files the review's batch
+				    validation run with this lead first (POST, no body). While the
+				    project already has one open validation run, the button names its
+				    card and waits: one run at a time, no double-filing. */}
+				{waiting && (
+					<BusyButton
+						title={
+							openValidationRun !== null
+								? `Validation run #${openValidationRun} is open in this project`
+								: "Files this review's batch validation run with this lead first"
+						}
+						disabled={openValidationRun !== null}
+						run={runValidateNow}
+					>
+						Validate now
+					</BusyButton>
+				)}
 				{/* OTTR-781: a cancelled Dependabot card blocks its PR; Refile files a
-						    fresh card for the same PR so the ship step can adopt it. */}
-				{refileAvailable && (
+						    fresh card for the same PR so the ship step can adopt it. A
+						    waiting lead is never cancelled, so the gate keeps the rule
+						    explicit even though the two states exclude each other. */}
+				{refileAvailable && !waiting && (
 					<BusyButton
 						title="Files a fresh card for this Dependabot PR with the same prompt and source-PR fields; a card that still covers the PR blocks the refile"
 						run={runRefile}
@@ -14044,7 +14110,7 @@ function DrawerActions(p: {
 				    steer's queued reply, a started lead, or a review that cannot take a
 				    batch yet. Like the group below, the group and its inline lines render
 				    full width under the actions row. */}
-			{leadValidate !== null && (
+			{!waiting && leadValidate !== null && (
 				<div className="reply-form">
 					<label htmlFor="lead-validate">Start validation run</label>
 					<div className="reply-actions">
@@ -14076,6 +14142,34 @@ function DrawerActions(p: {
 			{leadValidateDone && leadValidateError === null && (
 				<p className="hint" role="status">
 					Validation run filed.
+				</p>
+			)}
+			{/* OTTR-1252: a waiting lead carries one hint line under the actions row:
+			    the review files this lead's batch validation run by itself, and
+			    Validate now starts the same run at once. With a result on the card,
+			    the newest Validated-by segment of the details shows as a second
+			    short line. Full width under the row, like the re-run lines below. */}
+			{waiting && reviewId !== null && (
+				<p className="hint">
+					The review{" "}
+					<a
+						className="reason-card-link"
+						href={taskPath(task.followUpOfProject ?? task.project, reviewId)}
+						title={`Review #${reviewId}`}
+						onClick={(e) => navClick(e, () => onOpenTask(reviewId))}
+					>
+						#{reviewId}
+					</a>{" "}
+					starts this lead's validation run by itself. Validate now starts it at
+					once.
+				</p>
+			)}
+			{waiting && lastValidation !== null && (
+				<p className="hint">Last result: {lastValidation}</p>
+			)}
+			{waiting && validateError !== null && (
+				<p className="auth-error" role="alert">
+					{validateError}
 				</p>
 			)}
 			{/* OTTR-1129: a done review card can clear the blocked results its leads
@@ -14697,6 +14791,10 @@ function drawerEditFlags(
 		((task.stage === "todo" && task.state === "queued") ||
 			(task.stage === "backlog" && task.state === "idle")) &&
 		task.turns.length === 0 &&
+		// OTTR-1252: a waiting lead's prompt stays as the review filed it — the
+		// edit route refuses it (an edit that drops the Needs-validation tag
+		// would strand the marker), so the affordance goes with the refusal.
+		task.waitsValidation !== true &&
 		!cancelled;
 	const editValid =
 		edit !== null && edit.trim().length > 0 && edit.trim().length <= 20000;
@@ -15234,6 +15332,34 @@ export function Drawer({
 		cancelled &&
 		(task.prompt.split("\n", 1)[0] ?? "").startsWith("Dependabot PR #");
 	const [refileError, setRefileError] = useState<string | null>(null);
+	// OTTR-1252: a waiting lead's newest validation result as one short line.
+	// The fetched details carry one newline-prefixed "Validated by " segment per
+	// run — "Validated by validation run #<id> on <date>: <outcome>" — and the
+	// newest is the last. Defensive: a segment that lost its " on <date>: "
+	// shape, or no segment at all, falls back to the result date alone.
+	const lastValidation = (() => {
+		if (task.waitsValidation !== true || cancelled || task.validatedAt === null)
+			return null;
+		const fallback = new Date(task.validatedAt).toISOString().slice(0, 10);
+		const details = detail?.details ?? "";
+		const marker = "\nValidated by ";
+		const start = details.lastIndexOf(marker);
+		if (start < 0) return fallback;
+		let end = details.indexOf(marker, start + 1);
+		if (end < 0) end = details.length;
+		const seg = details.slice(start + 1, end);
+		const on = seg.indexOf(" on ");
+		if (on < 0) return fallback;
+		const after = seg.slice(on + 4);
+		const split = after.indexOf(": ");
+		const date = (split >= 0 ? after.slice(0, split) : after).trim();
+		const outcome = (split >= 0 ? after.slice(split + 2) : "").trim();
+		// The outcome carries the evidence, so it truncates like a notice line.
+		const short =
+			outcome === "" ? "" : shortNoticeText(outcome.replace(/\.$/, ""), 120);
+		if (short === "") return date === "" ? fallback : date;
+		return date === "" ? short : `${short} — ${date}`;
+	})();
 	useEffect(() => {
 		setRefileError(null);
 	}, [rerunTaskId]);
@@ -16092,6 +16218,9 @@ export function Drawer({
 						cancelInPanel={proposal && task.state === "needs_you"}
 						runBackToTodo={runBackToTodo}
 						backToTodoError={backToTodoError}
+						openValidationRun={detail?.openValidationRun ?? null}
+						lastValidation={lastValidation}
+						onOpenTask={onOpenTask}
 					/>
 					<DrawerMeta
 						task={task}

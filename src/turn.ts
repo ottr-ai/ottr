@@ -559,7 +559,7 @@ function readyReportText(outcome: Outcome | null, finalText: string): string {
 }
 
 /** OTTR-1128: a batch filing refused inside routeStartedLeads' transaction; thrown to roll
- * the leads' backlog moves back, then caught by the same pass. */
+ * the leads' moves back, then caught by the same pass. */
 class LeadFilingRefused extends Error {}
 
 /** Log marker of the UI-shot guard; a second miss is recognized by finding it in the task log. */
@@ -1680,7 +1680,7 @@ export interface TurnLoop {
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
-		again?: { before: number },
+		again?: { before: number; lead?: string },
 		first?: ReadonlySet<string>,
 		park?: string,
 	): Promise<
@@ -9829,10 +9829,11 @@ export function createTurnLoop(
 	 * the card's stored findings unioned with this run's recorded set, dedupe by prompt,
 	 * stored first (the review check's union rule) — and apply the first result per lead,
 	 * in order. A result applies only when its lead is a direct child of the card's review,
-	 * not cancelled, never validated, still a backlog card, and a batchable lead (the
-	 * filing predicate: the lead tag plus a sandbox blocker); a deployment-fact lead or
-	 * another backlog child logs only, and a lead the user already started keeps its
-	 * state and records the outcome in its details only. Every other
+	 * not cancelled, never validated, a backlog card or a waiting lead (the OTTR-1252
+	 * marker), and a batchable lead (the filing predicate: the lead tag plus a sandbox
+	 * blocker); a deployment-fact lead or another backlog child logs only, and a started
+	 * lead that is not waiting keeps its state and records the outcome in its details
+	 * only. Every other
 	 * result lands in the card log. Zero parsed results park the card at needs_you and
 	 * touch no lead; otherwise the done Next passes through unchanged and the chain
 	 * trigger files the review's remainder. */
@@ -9902,13 +9903,11 @@ export function createTurnLoop(
 				);
 				continue;
 			}
-			// A started lead (any stage beyond backlog, or a backlog lead whose grill is
-			// queued or running) keeps its run state: confirmed, blocked and deployment
-			// record the outcome in its details only, so no run state and no prompt is
-			// overwritten (the OTTR-869 rule). A refuted verdict ends the lead even
-			// when it started: the sanctioned cancel stops the queued start or the
-			// running grill and never deletes unsaved work (OTTR-1227).
-			const started = full.stage !== "backlog" || full.state !== "idle";
+			// A started lead keeps its run state unless it waits for validation.
+			// A refuted result still cancels a started lead and preserves unsaved work.
+			const started =
+				!full.waitsValidation &&
+				(full.stage !== "backlog" || full.state !== "idle");
 			if (result.outcome === "refuted") {
 				const reason = `Refuted by validation run #${st.id} on ${date}: ${result.evidence}`;
 				if (!started) {
@@ -9968,6 +9967,8 @@ export function createTurnLoop(
 					state: "queued",
 					queuedAt: now,
 					validatedAt: now,
+					// OTTR-1252: the confirmed result is the lead's unlock.
+					waitsValidation: false,
 					prompt: `${lead.prompt}\n\nValidated ${date} by validation run #${st.id}${evidence === "" ? "" : `: ${evidence}`}`,
 					details: `${full.details ?? ""}\nValidated by #${st.id} on ${date}: confirmed.${evidence === "" ? "" : ` ${evidence}`}`,
 				});
@@ -10048,7 +10049,9 @@ export function createTurnLoop(
 
 	/** OTTR-1129 validate-again: clears validatedAt on the review's sandbox leads whose
 	 * newest recorded outcome was "blocked" and whose validatedAt predates `before` (the
-	 * broken-sandbox window). Newest run wins: the review's validation cards newest
+	 * broken-sandbox window). With `lead` set, only that lead id is considered
+	 * (OTTR-1252's validate-now route). The stage gate takes a backlog lead or a waiting
+	 * lead (the OTTR-1252 marker). Newest run wins: the review's validation cards newest
 	 * first (createdAt desc, ties by id — the declined helper's comparison), and the
 	 * first parsed result per lead inside a card, like the settle's first-result rule.
 	 * Each reset lead loses the settle's newest marker segment from its details and logs
@@ -10058,6 +10061,7 @@ export function createTurnLoop(
 		store: ProjectStore,
 		reviewId: string,
 		before: number,
+		lead?: string,
 	): Promise<string[]> {
 		const tasks = await store.listTasks();
 		const newest = new Map<string, { outcome: string; runId: string }>();
@@ -10079,20 +10083,21 @@ export function createTurnLoop(
 					newest.set(r.leadId, { outcome: r.outcome, runId: card.id });
 			}
 		const reset: string[] = [];
-		for (const lead of tasks) {
+		for (const t of tasks) {
+			if (lead !== undefined && t.id !== lead) continue;
 			if (
-				lead.followUpOf !== reviewId ||
-				!lead.prompt.startsWith("Needs validation") ||
-				lead.stage !== "backlog" ||
-				lead.cancelledAt !== null ||
-				lead.validatedAt === null ||
-				lead.validatedAt >= before ||
-				leadBlocker(lead.prompt).kind !== "sandbox"
+				t.followUpOf !== reviewId ||
+				!t.prompt.startsWith("Needs validation") ||
+				!(t.stage === "backlog" || t.waitsValidation) ||
+				t.cancelledAt !== null ||
+				t.validatedAt === null ||
+				t.validatedAt >= before ||
+				leadBlocker(t.prompt).kind !== "sandbox"
 			)
 				continue;
-			const last = newest.get(lead.id);
+			const last = newest.get(t.id);
 			if (last === undefined || last.outcome !== "blocked") continue;
-			const full = await store.getTask(lead.id);
+			const full = await store.getTask(t.id);
 			if (full === null) continue;
 			// The settle's marker segment for the cleared run: from its last occurrence
 			// through the next `Validated by ` marker, or the end of the string. No
@@ -10109,13 +10114,13 @@ export function createTurnLoop(
 				).trim();
 				patch.details = cleared === "" ? null : cleared;
 			}
-			await store.updateTask(lead.id, patch);
+			await store.updateTask(t.id, patch);
 			await appendLog(
 				store,
-				lead.id,
+				t.id,
 				`- validation result cleared for re-validation: was "still blocked" (validation run #${last.runId})`,
 			);
-			reset.push(lead.id);
+			reset.push(t.id);
 		}
 		return reset;
 	}
@@ -10139,14 +10144,15 @@ export function createTurnLoop(
 	 * capped at `validationBatchSize` (below 1 behaves as 1). With `again` (OTTR-1129
 	 * validate-again) the call first clears the validatedAt of the review's sandbox
 	 * leads whose newest recorded outcome was blocked and whose validatedAt predates
-	 * `again.before`, inside this transaction, and the response carries the cleared
+	 * `again.before`, restricted to the id in `again.lead` when set (OTTR-1252's
+	 * validate-now route), inside this transaction, and the response carries the cleared
 	 * ids in `reset`. The leads in `first` (OTTR-1128: the ones the user just started)
 	 * sort ahead of the severity order. */
 	async function filePendingValidationRun(
 		e: TurnProject,
 		reviewId?: string,
 		strictReview?: boolean,
-		again?: { before: number },
+		again?: { before: number; lead?: string },
 		first: ReadonlySet<string> = new Set(),
 		park?: string,
 	): Promise<
@@ -10172,7 +10178,12 @@ export function createTurnLoop(
 			// below still apply.
 			const reset =
 				again !== undefined && reviewId !== undefined
-					? await resetValidatedLeads(e.store, reviewId, again.before)
+					? await resetValidatedLeads(
+							e.store,
+							reviewId,
+							again.before,
+							again.lead,
+						)
 					: [];
 			if (reset.length > 0)
 				// The batchable gate reads the fresh list: a reset lead counts like a
@@ -10198,7 +10209,9 @@ export function createTurnLoop(
 						// card (a backlog child too, and leadBlocker reads its missing line as
 						// a sandbox blocker) out of a batch.
 						pendingSandboxLead(t) &&
-						t.stage === "backlog" &&
+						// OTTR-1252: a waiting lead (the todo marker) batches like a backlog
+						// one; a hand-inserted backlog lead keeps working.
+						(t.stage === "backlog" || t.waitsValidation) &&
 						t.cancelledAt === null,
 				);
 			// The user declined the review's validation by cancelling its newest card;
@@ -10326,9 +10339,10 @@ export function createTurnLoop(
 	 *   a later tick routes it;
 	 * - commits beyond its base (or an unreadable branch): park needs_you with
 	 *   LEAD_COMMITS_REASON, never moved;
-	 * - else return to the backlog and file the review's batch with the lead first, in one
-	 *   transaction: a refused filing rolls the move back, so the start waits for a later
-	 *   tick instead of stranding the lead in the backlog.
+	 * - else return to the waiting form (todo, queued, the OTTR-1252 marker) and file
+	 *   the review's batch with the lead first, in one transaction: a refused filing
+	 *   rolls the move back, so the start waits for a later tick instead of stranding
+	 *   the lead.
 	 * Every write rechecks the live row, so a cancel, a claim or a validation result that
 	 * landed during the git read owns the card. No card is deleted. */
 	async function routeStartedLeads(e: TurnProject): Promise<void> {
@@ -10343,7 +10357,9 @@ export function createTurnLoop(
 					(t.state === "needs_you" &&
 						t.needsReason !== LEAD_COMMITS_REASON &&
 						t.needsReason !== LEAD_NO_REVIEW_REASON)) &&
-				pendingSandboxLead(t),
+				// OTTR-1252: a waiting lead already sits where the pass would put it.
+				pendingSandboxLead(t) &&
+				!t.waitsValidation,
 		);
 		if (started.length === 0) return;
 		const runOpen = tasks.some(
@@ -10398,13 +10414,16 @@ export function createTurnLoop(
 					for (const t of leads) {
 						const live = await e.store.getTask(t.id);
 						if (!unchanged(t, live)) continue;
+						// OTTR-1252: the move-back writes the waiting form (todo, queued,
+						// the marker), so the start is held, not stranded in the backlog.
 						await e.store.updateTask(t.id, {
-							stage: "backlog",
-							state: "idle",
-							queuedAt: null,
+							stage: "todo",
+							state: "queued",
+							queuedAt: Date.now(),
+							waitsValidation: true,
 							needsReason: null,
 							asked: null,
-							details: `${live.details ?? ""}\nMoved back to the backlog on ${date}: a Needs validation lead runs in its review's batch validation run, never in a work turn.`,
+							details: `${live.details ?? ""}\nReturned to its review's validation batch on ${date}: a Needs validation lead runs in its review's batch validation run, never in a work turn.`,
 						});
 						moved.add(t.id);
 					}
@@ -11160,7 +11179,7 @@ export function createTurnLoop(
 		if (st.reviewFindings.length === 0) return false;
 		const checkOn = (await ops.reviewCheck?.()) ?? true;
 		// Leads (the prompt's "Needs validation" tag) never enter the selection or the cap:
-		// they file as unverified backlog cards without a second-model opinion.
+		// they file as unverified waiting cards without a second-model opinion.
 		const confirmed = st.reviewFindings.filter(
 			(f) => !f.prompt.startsWith("Needs validation"),
 		);
@@ -11756,13 +11775,18 @@ export function createTurnLoop(
 							match !== null
 								? ` The same fingerprint was already on done card #${match.card.id}; the lead came back.`
 								: "";
+						// OTTR-1252: the lead files in the waiting form (todo, queued, the
+						// marker) so the scheduler holds it until a confirmed result or the
+						// operator's answer clears the marker.
 						await st.store.updateTask(child.id, {
 							followUpOf: st.id,
 							promptAuthor: "board",
 							model: lead.model,
-							stage: "backlog",
-							state: "idle",
-							queuedAt: null,
+							stage: "todo",
+							state: "queued",
+							queuedAt: Date.now(),
+							waitsValidation: true,
+							needsReason: null,
 							details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}${
 								blocker.kind === "sandbox"
 									? " Waits for a validation sandbox."
@@ -11784,7 +11808,7 @@ export function createTurnLoop(
 							}
 						}
 						await st.log(
-							`- filed lead as backlog card #${child.id} (${
+							`- filed lead as todo card #${child.id} (${
 								blocker.kind === "sandbox"
 									? "unverified, waits for a validation sandbox"
 									: "unverified, asked the user"

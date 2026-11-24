@@ -462,7 +462,7 @@ let validateLeadsImpl:
 			e: Entry,
 			reviewId: string,
 			strictReview?: boolean,
-			again?: { before: number },
+			again?: { before: number; lead?: string },
 			first?: ReadonlySet<string>,
 			park?: string,
 	  ) => Promise<
@@ -481,7 +481,7 @@ const loopStubs = () => ({
 		e: Entry,
 		reviewId: string,
 		strictReview?: boolean,
-		again?: { before: number },
+		again?: { before: number; lead?: string },
 		first?: ReadonlySet<string>,
 		park?: string,
 	) => {
@@ -2562,9 +2562,10 @@ describe("task routes", () => {
 		for (const lead of leads)
 			await store.updateTask(lead.id, {
 				followUpOf: review.id,
-				stage: "backlog",
-				state: "idle",
-				queuedAt: null,
+				stage: "todo",
+				state: "queued",
+				queuedAt: Date.now(),
+				waitsValidation: true,
 			});
 		const ask = await store.createTask(
 			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
@@ -2602,9 +2603,10 @@ describe("task routes", () => {
 		for (const lead of leads)
 			await store.updateTask(lead.id, {
 				followUpOf: review.id,
-				stage: "backlog",
-				state: "idle",
-				queuedAt: null,
+				stage: "todo",
+				state: "queued",
+				queuedAt: Date.now(),
+				waitsValidation: true,
 			});
 		const ask = await store.createTask(
 			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
@@ -2755,16 +2757,16 @@ describe("task routes", () => {
 		});
 		expect(res.status).toBe(200);
 		const one = (await store.getTask(lead1.id))!;
-		expect(one.stage).toBe("backlog");
-		expect(one.state).toBe("idle");
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
 			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
 		// The question without an answer line touches nothing.
 		const two = (await store.getTask(lead2.id))!;
-		expect(two.stage).toBe("backlog");
-		expect(two.state).toBe("idle");
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
 		expect(two.cancelledAt).toBeNull();
 		expect(two.details).toBeNull();
 		// A partial reply keeps the card at needs_you with only the unanswered question.
@@ -2789,9 +2791,10 @@ describe("task routes", () => {
 		);
 		await store.updateTask(lead.id, {
 			followUpOf: review.id,
-			stage: "backlog",
-			state: "idle",
-			queuedAt: null,
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			waitsValidation: true,
 		});
 		const ask = await store.createTask(
 			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
@@ -2848,8 +2851,8 @@ describe("task routes", () => {
 		});
 		expect(res.status).toBe(200);
 		const one = (await store.getTask(lead1.id))!;
-		expect(one.stage).toBe("backlog");
-		expect(one.state).toBe("idle");
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
 			"\n\nThe user answered the review's question: only behind our staging proxy",
@@ -2864,7 +2867,7 @@ describe("task routes", () => {
 		});
 		expect(res.status).toBe(200);
 		const one = (await store.getTask(lead1.id))!;
-		expect(one.stage).toBe("backlog");
+		expect(one.stage).toBe("todo");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
 			"\n\nThe user answered the review's question: Approve",
@@ -2883,8 +2886,8 @@ describe("task routes", () => {
 		);
 		for (const id of [lead1.id, lead2.id]) {
 			const lead = (await store.getTask(id))!;
-			expect(lead.stage).toBe("backlog");
-			expect(lead.state).toBe("idle");
+			expect(lead.stage).toBe("todo");
+			expect(lead.state).toBe("queued");
 			expect(lead.cancelledAt).toBeNull();
 			expect(lead.details).toBeNull();
 		}
@@ -2911,8 +2914,8 @@ describe("task routes", () => {
 			expect(one.state).toBe("queued");
 			expect(one.queuedAt).not.toBeNull();
 			const two = (await store.getTask(lead2.id))!;
-			expect(two.stage).toBe("backlog");
-			expect(two.state).toBe("idle");
+			expect(two.stage).toBe("todo");
+			expect(two.state).toBe("queued");
 			expect(two.details).toBeNull();
 			const card = (await store.getTask(ask.id))!;
 			expect(card.state).toBe("needs_you");
@@ -3004,8 +3007,8 @@ describe("task routes", () => {
 		expect(two.stage).toBe("todo");
 		expect(two.state).toBe("queued");
 		const three = (await store.getTask(lead3.id))!;
-		expect(three.stage).toBe("backlog");
-		expect(three.state).toBe("idle");
+		expect(three.stage).toBe("todo");
+		expect(three.state).toBe("queued");
 		expect(three.details).toBeNull();
 		expect((await store.getTask(ask.id))!.asked).toEqual([
 			expect.objectContaining({ question: `Q three? (card #${lead3.id})` }),
@@ -3029,8 +3032,8 @@ describe("task routes", () => {
 		);
 		for (const id of [lead2.id, lead3.id]) {
 			const lead = (await store.getTask(id))!;
-			expect(lead.stage).toBe("backlog");
-			expect(lead.state).toBe("idle");
+			expect(lead.stage).toBe("todo");
+			expect(lead.state).toBe("queued");
 			expect(lead.cancelledAt).toBeNull();
 			expect(lead.details).toBeNull();
 		}
@@ -3067,8 +3070,8 @@ describe("task routes", () => {
 			`answer line "Q2" names no question: the card asks 1 question, numbered Q1. Answer with one line per question, as: ${askAnswerLine(`Q two? (card #${lead2.id})`, "<answer>")}`,
 		);
 		const two = (await store.getTask(lead2.id))!;
-		expect(two.stage).toBe("backlog");
-		expect(two.state).toBe("idle");
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
 		expect(two.cancelledAt).toBeNull();
 		expect(two.details).toBeNull();
 		const card = (await store.getTask(ask.id))!;
@@ -3087,8 +3090,8 @@ describe("task routes", () => {
 			`answer line "Q2" names no question: the card asks 1 question, numbered Q1. Answer with one line per question, as: ${askAnswerLine(`Q one? (card #${lead1.id})`, "<answer>")}`,
 		);
 		const one = (await store.getTask(lead1.id))!;
-		expect(one.stage).toBe("backlog");
-		expect(one.state).toBe("idle");
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
 		expect(one.details).toBeNull();
 		expect((await store.getTask(ask.id))!.state).toBe("needs_you");
 	});
@@ -3096,10 +3099,12 @@ describe("task routes", () => {
 	test("a started lead cancels through the sanctioned cancel", async () => {
 		const { lead1, ask } = await seedLeadAskOne();
 		// The user kicked the lead by hand before answering: the bare cancel patch
-		// would leave a live agent behind a cancelled card.
+		// would leave a live agent behind a cancelled card. A hand start rides a
+		// confirmed validation, so the marker is gone.
 		await store.updateTask(lead1.id, {
 			stage: "in_progress",
 			state: "running",
+			waitsValidation: false,
 		});
 		const cancels: Array<[string, boolean]> = [];
 		const previous = cancelImpl;
@@ -3132,9 +3137,11 @@ describe("task routes", () => {
 		"a started lead retains its answer after a concurrent %s",
 		async (change) => {
 			const { lead1, lead2, ask } = await seedLeadAsk();
+			// A hand start rides a confirmed validation, so the marker is gone.
 			await store.updateTask(lead1.id, {
 				stage: "in_progress",
 				state: "running",
+				waitsValidation: false,
 			});
 			const entered = Promise.withResolvers<void>();
 			const release = Promise.withResolvers<void>();
@@ -3175,21 +3182,14 @@ describe("task routes", () => {
 				expect(await store.getTask(lead2.id)).toMatchObject({
 					stage: "todo",
 					state: "queued",
+					// The applies answer clears the wait marker on the promoted lead.
+					waitsValidation: false,
 				});
 				expect(await store.getTask(ask.id)).toMatchObject({
 					stage: "done",
 					state: "idle",
 					asked: null,
 				});
-				expect(
-					(await store.events()).filter(
-						(event) =>
-							event.taskId === lead2.id &&
-							event.kind === "stage" &&
-							event.from === "backlog" &&
-							event.to === "todo",
-					),
-				).toHaveLength(1);
 			} finally {
 				release.resolve();
 				await reply;
@@ -3200,7 +3200,12 @@ describe("task routes", () => {
 
 	test("an applies answer on a started lead only records it", async () => {
 		const { lead1, ask } = await seedLeadAskOne();
-		await store.updateTask(lead1.id, { stage: "todo", state: "running" });
+		// A hand start rides a confirmed validation, so the marker is gone.
+		await store.updateTask(lead1.id, {
+			stage: "todo",
+			state: "running",
+			waitsValidation: false,
+		});
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
 		});
@@ -3244,8 +3249,8 @@ describe("task routes", () => {
 		// Without the question-card prompt prefix nothing applies to the lead cards,
 		// and the question card itself keeps waiting.
 		const one = (await store.getTask(lead1.id))!;
-		expect(one.stage).toBe("backlog");
-		expect(one.state).toBe("idle");
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
 		expect(one.cancelledAt).toBeNull();
 		const askRow = (await store.getTask(ask.id))!;
 		expect(askRow.stage).toBe("backlog");
@@ -13084,6 +13089,11 @@ describe("manual validation start route (OTTR-1047)", () => {
 			expect(calls).toBe(before + 1);
 		} finally {
 			validateLeadsImpl = null;
+			// The lead path's open-run pre-check refuses while a card stays open:
+			// cancel the filed run like the tests below do.
+			for (const t of await store.listTasks())
+				if (t.kind === "validation" && t.followUpOf === review.id)
+					await store.updateTask(t.id, { cancelledAt: Date.now() });
 			await store.updateTask(review.id, { cancelledAt: Date.now() });
 			await store.updateTask(lead.id, { cancelledAt: Date.now() });
 		}
@@ -13409,6 +13419,11 @@ describe("manual validation start route (OTTR-1047)", () => {
 			expect(card.followUpOf).toBe(review.id);
 		} finally {
 			validateLeadsImpl = null;
+			// The lead path's open-run pre-check refuses while a card stays open:
+			// cancel the filed run like the OTTR-1047 tests do.
+			for (const t of await store.listTasks())
+				if (t.kind === "validation" && t.followUpOf === review.id)
+					await store.updateTask(t.id, { cancelledAt: Date.now() });
 			await store.updateTask(review.id, { cancelledAt: Date.now() });
 			await store.updateTask(lead.id, { cancelledAt: Date.now() });
 		}
@@ -13461,6 +13476,257 @@ describe("manual validation start route (OTTR-1047)", () => {
 			},
 		);
 		fc.assert(props);
+	});
+});
+
+// OTTR-1252: a waiting lead's validate-now route and the guards around the wait
+// marker. The filing itself stays the stubbed validateLeads seam, as in the
+// OTTR-1047 block above.
+describe("waiting lead validate route and guards (OTTR-1252)", () => {
+	/** A done review with one waiting lead in todo, the route's happy-path input. */
+	const doneReviewWithWaitingLead = async () => {
+		const review = await store.createTask(
+			"done review for waiting lead",
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, { stage: "done", state: "idle" });
+		const lead = await store.createTask(
+			"Needs validation: confirm the proxy allowlist",
+		);
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			waitsValidation: true,
+		});
+		return { review, lead };
+	};
+
+	test("validate on a waiting lead files with the lead first and returns the run's view", async () => {
+		const { review, lead } = await doneReviewWithWaitingLead();
+		const seen: Array<{
+			reviewId: string;
+			strictReview?: boolean;
+			again?: { before: number; lead?: string };
+			first?: ReadonlySet<string>;
+		}> = [];
+		validateLeadsImpl = async (e, reviewId, strictReview, again, first) => {
+			seen.push({ reviewId, strictReview, again, first });
+			// The seam mimics the loop's filing: createTask lands the card queued.
+			const card = await e.store.createTask(
+				"Batch validation of 1 lead(s) of review.",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, {
+				followUpOf: reviewId,
+				promptAuthor: "board",
+			});
+			return { id: card.id, reset: [lead.id] };
+		};
+		try {
+			const at = Date.now();
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string; reset: string[] };
+			expect(seen).toHaveLength(1);
+			// The lead path files the lead's review, strict like the review start.
+			expect(seen[0]!.reviewId).toBe(review.id);
+			expect(seen[0]!.strictReview).toBe(true);
+			expect(seen[0]!.again).toEqual({
+				before: expect.any(Number),
+				lead: lead.id,
+			});
+			expect(seen[0]!.again!.before).toBeGreaterThan(at);
+			expect(seen[0]!.first).toEqual(new Set([lead.id]));
+			// The response wraps the filed run's view with the seam's reset list.
+			expect(b.reset).toEqual([lead.id]);
+			const card = (await store.listTasks()).find((t) => t.id === b.id)!;
+			expect(card.kind).toBe("validation");
+			expect(card.followUpOf).toBe(review.id);
+		} finally {
+			validateLeadsImpl = null;
+			for (const t of await store.listTasks())
+				if (t.kind === "validation" && t.followUpOf === review.id)
+					await store.updateTask(t.id, { cancelledAt: Date.now() });
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a waiting lead with an open validation card answers 409 with its id", async () => {
+		const { review, lead } = await doneReviewWithWaitingLead();
+		const run = await store.createTask(
+			"Batch validation of 1 lead(s) of review.",
+			null,
+			"validation",
+		);
+		await store.updateTask(run.id, { followUpOf: review.id });
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(409);
+			const b = (await res.json()) as { error: string; id: string };
+			expect(b.error).toBe("a validation run is already open");
+			expect(b.id).toBe(run.id);
+			// The open-run pre-check refuses before the filing seam runs.
+			expect(filed).toBe(0);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(run.id, { cancelledAt: Date.now() });
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a waiting lead whose review is still running is refused before the filing", async () => {
+		const review = await store.createTask(
+			"running review for waiting lead",
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, {
+			stage: "in_progress",
+			state: "running",
+		});
+		const lead = await store.createTask(
+			"Needs validation: confirm the proxy allowlist",
+		);
+		await store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			waitsValidation: true,
+		});
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"only a done review or a review waiting at merging for its findings can start a validation run",
+			);
+			expect(filed).toBe(0);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("steer, backlog and prompt edit refuse a waiting lead", async () => {
+		const { review, lead } = await doneReviewWithWaitingLead();
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		const refusal =
+			"this Needs validation lead waits for its review's validation run";
+		try {
+			const steer = await post(`/api/projects/p1/tasks/${lead.id}/steer`, {
+				text: "hello",
+			});
+			expect(steer.status).toBe(409);
+			expect(await errorOf(steer)).toBe(refusal);
+			const toTodo = await post(`/api/projects/p1/tasks/${lead.id}/backlog`, {
+				to: "todo",
+			});
+			expect(toTodo.status).toBe(409);
+			expect(await errorOf(toTodo)).toBe(refusal);
+			const toBacklog = await post(
+				`/api/projects/p1/tasks/${lead.id}/backlog`,
+				{ to: "backlog" },
+			);
+			expect(toBacklog.status).toBe(409);
+			expect(await errorOf(toBacklog)).toBe(refusal);
+			const edit = await post(`/api/projects/p1/tasks/${lead.id}/edit`, {
+				prompt: "Needs validation: edited prompt",
+			});
+			expect(edit.status).toBe(409);
+			expect(await errorOf(edit)).toBe(refusal);
+			// The guards refuse before anything files or moves.
+			expect(filed).toBe(0);
+			const after = (await store.getTask(lead.id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.waitsValidation).toBe(true);
+			expect(after.prompt.startsWith("Needs validation")).toBe(true);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	/** Seeds a done review, one waiting lead of it, and its question card with one
+	 * question, as the review check files them (no review run needed). */
+	const seedWaitingLeadAsk = async () => {
+		const { review, lead } = await doneReviewWithWaitingLead();
+		const ask = await store.createTask(
+			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+		);
+		await store.updateTask(ask.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "needs_you",
+			queuedAt: null,
+			needsReason:
+				"Wants your answer: 1 question about the review's needs-validation leads",
+			asked: [
+				{
+					question: `Q one? (card #${lead.id})`,
+					options: [
+						{ label: LEAD_APPLIES_OPTION },
+						{ label: LEAD_NOT_APPLY_OPTION },
+					],
+					multi: false,
+					recommended: null,
+					text: false,
+				},
+			],
+		});
+		return { review, lead, ask };
+	};
+
+	test("the applies answer clears the marker and queues the waiting lead", async () => {
+		const { lead, ask } = await seedWaitingLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(res.status).toBe(200);
+		const one = (await store.getTask(lead.id))!;
+		expect(one.waitsValidation).toBe(false);
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		expect(one.queuedAt).not.toBeNull();
+		expect(
+			one.prompt.endsWith(
+				`The user answered the review's question: ${LEAD_APPLIES_OPTION}`,
+			),
+		).toBe(true);
+	});
+
+	test("the does-not-apply answer cancels the waiting lead", async () => {
+		const { lead, ask } = await seedWaitingLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead.id})`, LEAD_NOT_APPLY_OPTION),
+		});
+		expect(res.status).toBe(200);
+		const one = (await store.getTask(lead.id))!;
+		expect(one.cancelledAt).not.toBeNull();
+		expect(one.needsReason).toBe(
+			`Cancelled by the user's answer to the review's question: ${LEAD_NOT_APPLY_OPTION}`,
+		);
 	});
 });
 

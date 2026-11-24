@@ -276,6 +276,23 @@ export const projectMigrations: readonly PostgresMigration[] = [
 			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
 		);
 	},
+	// OTTR-1252: the lead wait marker — the same convergence the SQLite open runs
+	// (docs/specs/lead-waits-validation.md). Step 1 keeps the column on fresh
+	// databases; this step adds it to schemas from before waiting leads existed
+	// and moves their backlog leads into the waiting form. Idempotent: only
+	// stage-backlog rows match, so a converged lead (now todo) and every done or
+	// cancelled row never match again, and queued_at is never restamped. The
+	// 'Needs-validation lead questions' prefix does not match (the hyphen), so
+	// the question cards stay untouched.
+	async (db) => {
+		await db.exec(
+			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
+		);
+		await db.run(`UPDATE tasks SET stage = 'todo', state = 'queued',
+			waits_validation = 1, queued_at = updated_at
+		WHERE stage = 'backlog' AND cancelled_at IS NULL
+			AND prompt LIKE 'Needs validation%'`);
+	},
 ];
 
 /** How many versioned steps the store's own project migrations carry. The PG
@@ -392,6 +409,7 @@ export const projectStepOne: readonly string[] = [
 		merge_head text, follow_up_of_project text, context_tokens bigint,
 		uncommitted_files text NOT NULL DEFAULT '[]', proposal_summary text,
 		findings_checked_at bigint, lead_at_done bigint, validated_at bigint,
+		waits_validation bigint NOT NULL DEFAULT 0,
 		ci_pr_answered_key text, ci_pr_answered_info text
 	)`,
 	`CREATE TABLE trending_verdict (

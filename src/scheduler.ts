@@ -898,7 +898,10 @@ function workSlotReady(
 	if (t.kind === "trending") return false;
 	// Work slots only: todo and in_progress (replies). Needs a rules file before a fresh todo starts.
 	// A lead that waits for a sandbox never runs as a work turn (OTTR-1128): it has no sandbox_run.
-	if (pendingSandboxLead(t)) return false;
+	// A lead waiting for its review's validation run never runs as a work turn, also when
+	// validatedAt is set (OTTR-1252): a "still blocked" result keeps the wait. pendingSandboxLead
+	// stays for legacy backlog leads.
+	if (pendingSandboxLead(t) || t.waitsValidation) return false;
 	if (t.stage === "todo" && !o.hasRules && t.kind !== "interview") return false;
 	// A queued card waits until every dependency is done (a cancelled dependency counts as
 	// done, waitingOn); merging cards wait in the merge slot above.

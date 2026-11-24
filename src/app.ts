@@ -697,12 +697,13 @@ interface AppDeps {
 	cancel(e: Entry, id: string, force: boolean): Promise<CancelOutcome>;
 	/** OTTR-1047: files at most one batch validation card for a done review's sandbox
 	 * leads (the turn loop's filePendingValidationRun); the manual start route calls it.
-	 * Optional only so narrow route-test mounts that never call the route stay type-valid. */
+	 * Optional only so narrow route-test mounts that never call the route stay type-valid.
+	 * OTTR-1252: the lead path passes the lead in `again` and its id set in `first`. */
 	validateLeads?(
 		e: Entry,
 		reviewId: string,
 		strictReview?: boolean,
-		again?: { before: number },
+		again?: { before: number; lead?: string },
 		first?: ReadonlySet<string>,
 		/** OTTR-1247: one queued pending sandbox lead of the review the filing parks
 		 * into the batch inside its transaction (the drawer's Start validation run). */
@@ -7099,6 +7100,17 @@ export async function createApp(deps: AppDeps) {
 							c.followUpOfProject === null,
 					);
 		const proposal = await e.store.trendingVerdictByProposal(t.id);
+		// A waiting lead's drawer disables Validate now while the project has an open
+		// validation run; one listTasks read only in this case (OTTR-1252).
+		const openValidationRun =
+			t.waitsValidation === true
+				? (await e.store.listTasks()).find(
+						(c) =>
+							c.kind === "validation" &&
+							c.cancelledAt === null &&
+							c.stage !== "done",
+					)?.id
+				: undefined;
 		return {
 			...task,
 			steps: viewSteps(t),
@@ -7106,6 +7118,7 @@ export async function createApp(deps: AppDeps) {
 				({ prompt: _prompt, ...turn }) => turn,
 			),
 			sessionTitle: await e.store.frozenTitle(t),
+			...(openValidationRun !== undefined ? { openValidationRun } : {}),
 			...(proposal?.verdict === "filed" ? { trendingRepo: proposal.repo } : {}),
 			...(pr !== null && e.github !== null
 				? {
@@ -12598,6 +12611,14 @@ export async function createApp(deps: AppDeps) {
 		task: Task,
 		body: Record<string, unknown>,
 	): Promise<Response> {
+		if (task.waitsValidation === true)
+			return json(
+				{
+					error:
+						"this Needs validation lead waits for its review's validation run",
+				},
+				409,
+			);
 		if (task.stage !== "backlog")
 			return json({ error: "only a backlog task can move to todo" }, 409);
 		if (task.state !== "idle")
@@ -12637,6 +12658,14 @@ export async function createApp(deps: AppDeps) {
 	}
 	/** Parks a todo task back into the backlog. */
 	async function backlogToPark(e: Entry, task: Task): Promise<Response> {
+		if (task.waitsValidation === true)
+			return json(
+				{
+					error:
+						"this Needs validation lead waits for its review's validation run",
+				},
+				409,
+			);
 		if (task.stage !== "todo")
 			return json({ error: "only a todo task can be parked" }, 409);
 		if (task.state !== "queued")
@@ -13047,6 +13076,48 @@ export async function createApp(deps: AppDeps) {
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
 			return json({ error: "task is cancelled" }, 404);
+		// OTTR-1252: a waiting lead files its review's run with this lead first. The
+		// review must be validatable (the review path's refusal text), and an open
+		// validation run in the project refuses before the filing.
+		if (isLead(task) && task.waitsValidation === true) {
+			if (task.followUpOf === null)
+				return json({ error: "the lead does not name a review" }, 409);
+			const review = await e.store.getTask(task.followUpOf);
+			if (review === null || !validatableReview(review))
+				return json(
+					{
+						error:
+							"only a done review or a review waiting at merging for its findings can start a validation run",
+					},
+					409,
+				);
+			const open = (await e.store.listTasks()).find(
+				(c) =>
+					c.kind === "validation" &&
+					c.cancelledAt === null &&
+					c.stage !== "done",
+			);
+			if (open !== undefined)
+				return json(
+					{ error: "a validation run is already open", id: open.id },
+					409,
+				);
+			const fileRun = deps.validateLeads;
+			if (fileRun === undefined)
+				return json({ error: "validation filing is not wired" }, 500);
+			const filed = await fileRun(
+				e,
+				review.id,
+				true,
+				{ before: Date.now() + 1, lead: task.id },
+				new Set([task.id]),
+			);
+			if ("error" in filed) return json({ error: filed.error }, filed.status);
+			await deps.schedule();
+			const t = await e.store.getTask(filed.id);
+			if (t === null) return json({ error: "unknown task" }, 404);
+			return json({ ...(await taskView(e, t)), reset: filed.reset });
+		}
 		if (!isReview(task))
 			return json({ error: "only a review card can be validated" }, 409);
 		if (!validatableReview(task))
@@ -13138,6 +13209,15 @@ export async function createApp(deps: AppDeps) {
 
 	/** The steering refusal for a card not in flight; null lets the steer queue. */
 	function steerStateRefusal(task: Task): Response | null {
+		// A waiting lead must not start a work turn: the steer stays refused.
+		if (task.waitsValidation === true)
+			return json(
+				{
+					error:
+						"this Needs validation lead waits for its review's validation run",
+				},
+				409,
+			);
 		if (
 			task.state !== "running" &&
 			task.state !== "preparing" &&
@@ -14205,11 +14285,15 @@ export async function createApp(deps: AppDeps) {
 								? ("not-apply" as const)
 								: null;
 					if (verdict === "applies") {
-						if (live.stage === "backlog" && live.state === "idle")
+						if (
+							live.waitsValidation === true ||
+							(live.stage === "backlog" && live.state === "idle")
+						)
 							await e.store.updateTask(lead.id, {
 								stage: "todo",
 								state: "queued",
 								queuedAt: Date.now(),
+								waitsValidation: false,
 								prompt: `${live.prompt}\n\nThe user answered the review's question: ${m.answer}`,
 							});
 						else await appendDetails(lead.id, m.answer);
@@ -14224,7 +14308,11 @@ export async function createApp(deps: AppDeps) {
 						)?.[1];
 						const reason = `Cancelled by the user's answer to the review's question: ${m.answer}${runId === undefined ? "" : ` (validation run #${runId})`}`;
 						answered.add(lead.id);
-						if (live.stage !== "backlog" || live.state !== "idle")
+						// A waiting lead cancels like the old backlog+idle shape.
+						if (
+							live.waitsValidation !== true &&
+							(live.stage !== "backlog" || live.state !== "idle")
+						)
 							return { id: lead.id, reason, answer: m.answer };
 						await e.store.updateTask(lead.id, {
 							cancelledAt: Date.now(),
@@ -14649,6 +14737,15 @@ export async function createApp(deps: AppDeps) {
 		// 409 with the current card instead of a bare precondition error.
 		const stale = await staleEditResponse(e, task, r.body);
 		if (stale !== null) return stale;
+		// An edit that drops the tag would strand the wait marker (OTTR-1252).
+		if (task.waitsValidation === true)
+			return json(
+				{
+					error:
+						"this Needs validation lead waits for its review's validation run",
+				},
+				409,
+			);
 		const result = await withTask(e, task, async () => {
 			const edit = await editPromptRefusal(e, task, r.body.prompt);
 			if (edit instanceof Response) return edit;

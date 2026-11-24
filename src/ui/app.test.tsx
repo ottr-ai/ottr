@@ -4916,6 +4916,134 @@ describe("Drawer prompt loading", () => {
 	});
 });
 
+describe("Waiting lead drawer actions", () => {
+	// OTTR-1252: a lead that waits for its review's validation run shows exactly
+	// Cancel task and Validate now, the hint with the review link, and no
+	// affordance that would start it. The mounted drawer fetches the detail, so
+	// the hint's last-result line and the open-run id ride that response.
+	installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
+	const base = drawerBase;
+	const leadCard = (over: Record<string, unknown> = {}): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			id: "L-1",
+			title: "Needs validation lead",
+			sessionTitle: "Needs validation lead",
+			stage: "todo",
+			state: "queued",
+			followUpOf: "R-7",
+			waitsValidation: true,
+			validatedAt: 1_764_000_000_000,
+			prompt: "Needs validation: fix the flaky sandbox",
+			details:
+				"\nValidated by validation run #12 on 2026-11-20: still blocked.",
+			...over,
+		}) as unknown as TaskCard;
+	/** Mounts the drawer for the lead; the detail route serves the same card
+	 * back loaded (OTTR-965), everything else 404s. */
+	const mountLead = async (card: TaskCard) => {
+		const { restore } = stubFetch(async (url) => {
+			const u = String(url);
+			if (u.endsWith(`/api/projects/proj/tasks/${card.id}`)) {
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, unmount } = await mount(
+			<Drawer {...base} task={card} />,
+		);
+		await act(async () => {});
+		return {
+			container,
+			close: async () => {
+				await unmount();
+				restore();
+			},
+		};
+	};
+
+	test("the actions row holds exactly Cancel task and Validate now with the hint", async () => {
+		const { container, close } = await mountLead(leadCard());
+		try {
+			const names = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].map((b) => b.textContent?.trim());
+			expect(names).toEqual(["Cancel task", "Validate now"]);
+			const validate = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].find((b) => b.textContent?.trim() === "Validate now");
+			expect(validate?.getAttribute("title")).toBe(
+				"Files this review's batch validation run with this lead first",
+			);
+			expect(validate?.disabled ?? true).toBe(false);
+			// The hint line links the review card and names both runners.
+			const link = container.querySelector<HTMLAnchorElement>(
+				'a[href="/projects/proj/tasks/R-7"]',
+			);
+			expect(link?.textContent).toBe("#R-7");
+			expect(container.textContent).toContain(
+				"starts this lead's validation run by itself. Validate now starts it at once.",
+			);
+			// The newest Validated-by segment shows as the last result.
+			expect(container.textContent).toContain(
+				"Last result: still blocked — 2026-11-20",
+			);
+			// The prompt stays readable, but nothing may start or edit the lead.
+			expect(container.textContent).toContain(
+				"Needs validation: fix the flaky sandbox",
+			);
+			// The steer composer never renders (the closed Follow-up dialog keeps
+			// its textarea mounted for every drawer, so a blanket textarea probe
+			// would misfire; the steer form is the composer that starts work).
+			expect(
+				container.querySelectorAll("form.steer-form"),
+			).toHaveLength(0);
+			expect(container.textContent).not.toContain("Enter steers");
+			expect(container.textContent).not.toContain(
+				"Not ready — park in backlog",
+			);
+			expect(container.textContent).not.toContain("Merge anyway");
+			expect(container.textContent).not.toContain("Edit task");
+		} finally {
+			await close();
+		}
+	});
+
+	test("with a validation run open, Validate now names it and stays disabled", async () => {
+		const { container, close } = await mountLead(
+			leadCard({ openValidationRun: "V-3" }),
+		);
+		try {
+			const validate = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].find((b) => b.textContent?.trim() === "Validate now");
+			expect(validate?.getAttribute("title")).toBe(
+				"Validation run #V-3 is open in this project",
+			);
+			expect(validate?.disabled).toBe(true);
+		} finally {
+			await close();
+		}
+	});
+});
+
 describe("Drawer file-section loading placeholders", () => {
 	// OTTR-473: while the drawer fetches the detail, the file sections hold their space with a
 	// loading line, gated by what the board row predicts (a worktree for worktree files; a

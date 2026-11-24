@@ -234,6 +234,7 @@ function task(p: Partial<Task> = {}): Task {
 		findingsCheckedAt: null,
 		validatedAt: null,
 		leadAtDone: false,
+		waitsValidation: false,
 		research: false,
 		steps: "unknown",
 		starred: false,
@@ -3465,5 +3466,100 @@ describe("leadBlocker", () => {
 				project === "p" && id === created.id ? ["P-1"] : undefined,
 			),
 		).toEqual([]);
+	});
+});
+
+describe("OTTR-1252: a lead waiting for its review's validation never runs and never holds", () => {
+	// The deployment-fact blocker keeps pendingSandboxLead false, so the waitsValidation
+	// marker alone must stop the pick; a sandbox-blocker lead is already caught by
+	// OTTR-1128's guard.
+	const waitingLead = (p: Partial<Task> = {}) =>
+		task({
+			followUpOf: "rev0",
+			prompt:
+				"Needs validation: proxy\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
+			stage: "todo",
+			state: "queued",
+			queuedAt: 700,
+			waitsValidation: true,
+			...p,
+		});
+
+	test("pickRunnable never returns a lead waiting for validation, also with validatedAt set (OTTR-1252)", () => {
+		const many = { ...opts, maxParallel: 10 };
+		const unvalidated = waitingLead();
+		// A "still blocked" result keeps the marker: validatedAt set alone never makes
+		// the lead runnable.
+		const blocked = waitingLead({
+			validatedAt: 800,
+			details:
+				"\nValidated by validation run #id9000 on 2026-11-24: still blocked — no proxy.",
+		});
+		expect(pickRunnable([unvalidated, blocked], many)).toEqual([]);
+		// The confirmed form: the marker cleared, the lead is normal queued work.
+		const confirmed = waitingLead({ validatedAt: 800, waitsValidation: false });
+		expect(pickRunnable([confirmed], many)).toEqual([confirmed]);
+	});
+
+	test("a waiting lead takes neither the grill slot nor a work slot (OTTR-1252)", () => {
+		// A todo lead is never stage backlog, so grillSlot ignores it; the kicked
+		// backlog card keeps the grill slot and the waiting lead stays unpicked.
+		const kicked = task({ stage: "backlog" });
+		expect(
+			pickRunnable([waitingLead(), kicked], { ...opts, maxParallel: 10 }),
+		).toEqual([kicked]);
+	});
+
+	test("a done release review with a waiting lead holds no merge and no findings (OTTR-1252)", () => {
+		const review = task({
+			kind: "review",
+			releaseVersion: "v0.4.0",
+			base: "abc",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		const lead = waitingLead({
+			followUpOf: review.id,
+			createdAt: 310,
+			leadAtDone: false,
+		});
+		const other = task({ stage: "merging", queuedAt: 100 });
+		expect(mergeHold([review, lead, other], other)).toBeNull();
+		expect(findingsHold([review, lead], review)).toBeNull();
+	});
+
+	test("a committed finding in the same shape still holds, a confirmed lead never does (OTTR-1252)", () => {
+		// Control for the exemption above: a committed non-lead finding in todo holds
+		// the merge. A confirmed lead keeps its "Needs validation" prompt tag, so isLead
+		// still exempts it in any stage (OTTR-1128) — the cleared marker is not what
+		// frees it, the lead tag is.
+		const review = task({
+			kind: "review",
+			releaseVersion: "v0.4.0",
+			base: "abc",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		const committed = task({
+			followUpOf: review.id,
+			createdAt: 310,
+			stage: "todo",
+			queuedAt: 700,
+			waitsValidation: false,
+		});
+		const confirmedLead = waitingLead({
+			followUpOf: review.id,
+			createdAt: 310,
+			validatedAt: 800,
+			waitsValidation: false,
+			leadAtDone: false,
+		});
+		const other = task({ stage: "merging", queuedAt: 100 });
+		expect(mergeHold([review, committed, other], other)).toBe(FINDINGS_HOLD);
+		expect(mergeHold([review, confirmedLead, other], other)).toBeNull();
 	});
 });

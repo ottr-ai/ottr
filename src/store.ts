@@ -429,6 +429,7 @@ interface TaskRow {
 	findings_checked_at: number | null;
 	validated_at: number | null;
 	lead_at_done: number | null;
+	waits_validation: number | null;
 	kind: string;
 }
 
@@ -768,6 +769,7 @@ function toListedTask(
 		findingsCheckedAt: r.findings_checked_at,
 		validatedAt: r.validated_at,
 		leadAtDone: r.lead_at_done === 1,
+		waitsValidation: r.waits_validation === 1,
 	};
 }
 
@@ -1203,6 +1205,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	proposalSummary: "proposal_summary",
 	findingsCheckedAt: "findings_checked_at",
 	validatedAt: "validated_at",
+	waitsValidation: "waits_validation",
 };
 
 // Wide text columns the list read never selects (OTTR-866): diff_text alone is up to
@@ -2784,6 +2787,40 @@ export class ProjectStore {
 					"validated_at",
 					"ALTER TABLE tasks ADD COLUMN validated_at INTEGER",
 				);
+				// OTTR-1252: the wait marker on a review lead — 1 while the scheduler
+				// must never start the card as a work turn. ALTER-only after every
+				// rebuild, like the columns above; update patches write it through
+				// TaskPatch.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"waits_validation",
+					"ALTER TABLE tasks ADD COLUMN waits_validation INTEGER NOT NULL DEFAULT 0",
+				);
+				// OTTR-1252: the pre-marker backlog leads converge to the waiting form
+				// (todo/queued, queued_at = updated_at, marker set) on every open.
+				// Guarded like the backfills above: a tasks table old enough to miss
+				// cancelled_at predates review findings entirely, so it holds no leads.
+				// Idempotent: only stage-backlog rows match, so a converged lead (now
+				// todo) and every done or cancelled row never match again, and queued_at
+				// is never restamped. The 'Needs-validation lead questions' prefix does
+				// not match (the hyphen), so the question cards stay untouched.
+				if (
+					[
+						"stage",
+						"state",
+						"cancelled_at",
+						"prompt",
+						"queued_at",
+						"updated_at",
+					].every((c) => cols.includes(c))
+				)
+					await db.run(`
+						UPDATE tasks SET stage = 'todo', state = 'queued',
+							waits_validation = 1, queued_at = updated_at
+						WHERE stage = 'backlog' AND cancelled_at IS NULL
+							AND prompt LIKE 'Needs validation%'
+					`);
 				// OTTR-1056: the answered PR-head CI failure. The key is
 				// `<pushSha>:<runId>#<attempt>[,...]`; a matching key keeps ciPrHeadReply from
 				// replying again to the same head and run, also after the same head ships

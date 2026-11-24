@@ -66,6 +66,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		findingsCheckedAt: null,
 		validatedAt: null,
 		leadAtDone: false,
+		waitsValidation: false,
 		research: false,
 		steps: "unknown",
 		starred: false,

@@ -1,0 +1,138 @@
+# Leads wait for validation in todo
+
+A needs-validation lead is a card whose prompt carries the "Needs validation" tag
+(`isLead`, src/scheduler.ts). Today a review files each lead in stage `backlog`; an
+operator move to todo starts it as a plain work turn once `validatedAt` is set.
+This change files every new lead in `todo` under a wait marker the scheduler reads
+as "waits for validation". Only a confirmed validation result or the operator's
+"applies" answer makes the lead a normal work card.
+
+## The waiting form
+
+A lead waits when `waitsValidation` is true. The full form:
+
+- stage `todo`, state `queued`, `queuedAt` set, `needsReason` null
+- `waitsValidation: true` (store column `waits_validation`, INTEGER/BIGINT NOT NULL DEFAULT 0)
+- `prompt` still starts with "Needs validation", `followUpOf` names the review
+
+The marker never depends on `validatedAt`: a lead with a "still blocked" result
+keeps waiting. `pendingSandboxLead` (validatedAt null, sandbox blocker) keeps its
+meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
+
+## Store (src/types.ts, src/store.ts, src/postgresSchema.ts)
+
+1. `Task.waitsValidation: boolean` next to `leadAtDone`. Caller-settable: join
+   `TASK_COLUMNS` as `waits_validation` so list rows carry it (the `lead_at_done`
+   precedent keeps `leadAtDone` out; this one must be writable by update patches).
+2. SQLite: `ProjectStore.open` adds the column with the additive `addCol` pattern
+   (`ALTER TABLE tasks ADD COLUMN waits_validation INTEGER NOT NULL DEFAULT 0`),
+   then converges in plain SQL, idempotent on every open:
+
+   ```sql
+   UPDATE tasks SET stage = 'todo', state = 'queued',
+     waits_validation = 1, queued_at = updated_at
+   WHERE stage = 'backlog' AND cancelled_at IS NULL
+     AND prompt LIKE 'Needs validation%'
+   ```
+
+   (`Needs-validation lead questions...` does not match the pattern: the hyphen.)
+3. PostgreSQL: fresh databases get `waits_validation bigint NOT NULL DEFAULT 0`
+   in `projectStepOne`; a new numbered step runs the same ALTER and the same
+   UPDATE, so old schemas converge. Versioned step, atomic with its version
+   record (the `applyPostgresMigrations` shape).
+4. No new enum value: the stage and state CHECK lists stay untouched, so no
+   table rebuild happens.
+5. The shared fresh-SQLite vs fresh-PostgreSQL schema comparison test stays green.
+
+## Turn loop (src/turn.ts)
+
+- Filing (the review settle's lead child): the existing update patch gains
+  `waitsValidation: true`, `stage: "todo"`, `state: "queued"`, `queuedAt: now`,
+  `needsReason: null`. The `createTask` call stays default (todo/queued), so the
+  create-to-update window shows a runnable card for milliseconds at worst; the
+  OTTR-1128 routing pass stays the safety net.
+- `batchableOf` in `filePendingValidationRun`: a lead is batchable when
+  `pendingSandboxLead(t)` and (`stage === "backlog"` or `waitsValidation`) and
+  not cancelled. `again` widens to `{ before: number; lead?: string }`;
+  `resetValidatedLeads` restricts to that lead when set. Its stage gate becomes
+  (`stage === "backlog"` or `waitsValidation`).
+- `settleValidationResults`: the started-lead branch (details-only recording)
+  fires only for a lead that is NOT waiting and sits beyond backlog/idle. A
+  waiting lead takes the normal branches; confirmed additionally clears
+  `waitsValidation` (false). Refuted and "does not apply" still cancel (the
+  OTTR-1227 shapes). Blocked and deployment outcomes keep the marker.
+- `routeStartedLeads`: the started filter excludes marker leads; the move-back
+  writes the waiting form (todo/queued/queuedAt/marker) instead of backlog, one
+  patch, with the same details line and the same file-with-lead-first call.
+
+## Scheduler (src/scheduler.ts)
+
+- `workSlotReady` returns false for `t.waitsValidation` (next to the
+  `pendingSandboxLead` check). This guards `pickRunnable` and `pickLowPriority`.
+- Leads never hold a review's Done or a release merge: `findingOpen` already
+  exempts every lead in any stage (`!isLead`, OTTR-1128) and `reviewHoldFor`
+  builds on it. Pin both with tests for the todo form; no production change
+  there unless a test shows a gap.
+
+## Routes (src/app.ts, src/server.ts)
+
+- `POST /api/projects/:project/tasks/:id/validate` gains a lead path: the id
+  resolves to a waiting lead, `followUpOf` names a validatable review, and the
+  call files with `first = {lead id}` and `again = { before: now + 1, lead: id }`
+  (resets only this lead, only a blocked outcome). An open validation run in the
+  project answers 409 with `{ error, id: <open run id> }`. Response: the filed
+  run's view plus `reset`.
+- `deps.validateLeads` (app.ts) and the server.ts wiring gain the widened
+  `again` and an optional `first` parameter, passed to `filePendingValidationRun`.
+- The backlog route refuses a waiting lead in both directions (409).
+- The steer route refuses a waiting lead (409): a reply must not start a work turn.
+- The prompt-edit route refuses a waiting lead (409): an edit that drops the tag
+  would strand the marker.
+- The lead answer flow: "applies" clears `waitsValidation` and queues the lead
+  (todo/queued/queuedAt, answer appended to the prompt); "does not apply"
+  cancels it. The old backlog+idle shape keeps working where it still exists.
+- `taskView` adds optional `openValidationRun?: string | null`: the id of the
+  project's one open validation card, set only for a waiting lead's detail view.
+
+## UI (src/ui/app.tsx)
+
+For a waiting lead the drawer renders:
+
+- exactly two actions: "Cancel task" (existing) and "Validate now" (new,
+  posts the lead validate route). "Validate now" is disabled with the open
+  run's card id in its title while `openValidationRun` is set;
+- one hint line under the actions linking the review card: "The review
+  #<id> starts this lead's validation run by itself. Validate now starts it at
+  once.", plus the last validation result and date when `validatedAt` is set
+  (the newest "Validated by " segment of the fetched details);
+- no Move-to-backlog/park button, no Merge anyway, no prompt edit, no reply or
+  steer composer, no Start. Gated on `task.waitsValidation`.
+
+## Board report (.agents/skills/check-ottr-board/scripts/board-report.ts)
+
+`Card` gains `waitsValidation?: boolean`; the queued branch returns
+`{ verdict: "waits", note: "waits for validation (review #<followUpOf>)" }` for a
+waiting lead instead of "queued with no hold found".
+
+## Acceptance (each fails before the fix)
+
+1. A review files its lead in todo with the marker; `pickRunnable` returns it
+   neither with `validatedAt` null nor with a blocked result.
+2. A confirmed result clears the marker; `pickRunnable` returns the lead.
+3. An old-schema database with an open backlog lead converges to the waiting
+   form on open, on SQLite and PostgreSQL; the shared schema comparison stays green.
+4. The validate-now route files with the lead first, answers 409 with the open
+   run's id when a run is open, and resets only this lead's `validatedAt` when
+   its newest outcome was blocked.
+5. The lead drawer renders exactly Cancel and Validate now with accessible
+   names, plus the hint with the review link; a screenshot is attached.
+6. A done release review with a waiting lead in todo does not hold the release
+   (mergeHold null) and does not hold its review's Done (findingsOpen false).
+7. The board report shows the waiting lead as "waits for validation".
+
+## Non-goals
+
+No change to the validation run itself, its prompt text, the batch size, the
+confirmed/refuted/blocked/deployment outcomes, or review cards that are not
+leads. No change to OTTR-1247's moved-lead work; leads moved before this change
+keep the routing pass's net.

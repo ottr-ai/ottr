@@ -29358,7 +29358,7 @@ describe("stored review findings", () => {
 		expect(checkRuns).toHaveLength(1);
 	});
 
-	test("lead findings file as unverified backlog cards and never enter the check or the cap", async () => {
+	test("lead findings file as waiting todo cards and never enter the check or the cap", async () => {
 		const record = baseRecord();
 		const confirmed = Array.from({ length: 12 }, (_, i) =>
 			mkFinding(`Bug ${i + 1}`, i + 1),
@@ -29398,16 +29398,19 @@ describe("stored review findings", () => {
 			Array.from({ length: 10 }, (_, i) => `Bug ${i + 1}`),
 		);
 
-		// Each lead filed as a backlog card marked unverified, linked to the review.
+		// Each lead files as a waiting todo card marked unverified, linked to the
+		// review (OTTR-1252: the marker holds it out of the scheduler's picks).
 		const kids = await kidsOf(store, review.id);
 		const leadKids = kids.filter((k) =>
 			k.prompt.startsWith("Needs validation:"),
 		);
 		expect(leadKids).toHaveLength(3);
 		for (const k of leadKids) {
-			expect(k.stage).toBe("backlog");
-			expect(k.state).toBe("idle");
-			expect(k.queuedAt).toBeNull();
+			expect(k.stage).toBe("todo");
+			expect(k.state).toBe("queued");
+			expect(k.queuedAt).toBeGreaterThan(0);
+			expect(k.waitsValidation).toBe(true);
+			expect(k.needsReason).toBeNull();
 			expect(k.followUpOf).toBe(review.id);
 			expect(k.details).toContain("Unverified lead from review");
 			// The board wrote this prompt: the card's turn skips the gate model.
@@ -29436,7 +29439,14 @@ describe("stored review findings", () => {
 		const doneAfter = (await store.getTask(review.id))!;
 		expect(doneAfter.stage).toBe("done");
 		expect(doneAfter.needsReason).toBeNull();
-		expect(leadKids.every((k) => k.stage === "backlog")).toBe(true);
+		// Re-read the rows: the waiting leads keep their form while the review
+		// lands Done (the routing tick never catches a marker lead, OTTR-1252).
+		const leadKidsAfter = (await kidsOf(store, review.id)).filter((k) =>
+			k.prompt.startsWith("Needs validation:"),
+		);
+		expect(
+			leadKidsAfter.every((k) => k.stage === "todo" && k.waitsValidation),
+		).toBe(true);
 	});
 
 	test("a lead whose fingerprint is on an open card is not filed again; the card learns it was seen again", async () => {
@@ -29556,7 +29566,8 @@ describe("stored review findings", () => {
 		expect(kids).toHaveLength(1);
 		const refiled = kids[0]!;
 		expect(refiled.prompt).toBe(lead.prompt);
-		expect(refiled.stage).toBe("backlog");
+		expect(refiled.stage).toBe("todo");
+		expect(refiled.waitsValidation).toBe(true);
 		expect(refiled.followUpOf).toBe(review.id);
 		expect(refiled.details).toContain("Unverified lead from review");
 		expect(refiled.details).toContain(
@@ -29888,16 +29899,18 @@ describe("stored review findings", () => {
 		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
-		// All three leads file as unverified backlog cards linked to the review.
+		// All three leads file as unverified waiting todo cards linked to the review
+		// (OTTR-1252: the marker holds them out of the scheduler's picks).
 		const kids = await kidsOf(store, review.id);
 		const leadKids = kids.filter((k) =>
 			k.prompt.startsWith("Needs validation:"),
 		);
 		expect(leadKids).toHaveLength(3);
 		for (const k of leadKids) {
-			expect(k.stage).toBe("backlog");
-			expect(k.state).toBe("idle");
-			expect(k.queuedAt).toBeNull();
+			expect(k.stage).toBe("todo");
+			expect(k.state).toBe("queued");
+			expect(k.queuedAt).toBeGreaterThan(0);
+			expect(k.waitsValidation).toBe(true);
 			expect(k.followUpOf).toBe(review.id);
 			expect(k.details).toContain("Unverified lead from review");
 		}
@@ -29975,8 +29988,9 @@ describe("stored review findings", () => {
 		const kids = await kidsOf(store, review.id);
 		expect(kids).toHaveLength(2);
 		for (const k of kids) {
-			expect(k.stage).toBe("backlog");
-			expect(k.state).toBe("idle");
+			expect(k.stage).toBe("todo");
+			expect(k.state).toBe("queued");
+			expect(k.waitsValidation).toBe(true);
 			expect(k.details).toContain("Waits for a validation sandbox");
 			expect(k.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)).toBe(false);
 		}
@@ -31345,6 +31359,208 @@ describe("stored review findings", () => {
 		expect(fresh.prompt).not.toContain(`#${lg.id}`);
 	});
 
+	// ---- OTTR-1252: a lead waits for its validation in todo ----
+
+	/** The waiting form a filed lead carries (OTTR-1252): the leadCard fixture's
+	 * backlog shape moved to todo/queued with the marker. */
+	const waitingLead = async (
+		store: ProjectStore,
+		reviewId: string,
+		prompt: string,
+	) => {
+		const lead = await leadCard(store, reviewId, prompt);
+		await store.updateTask(lead.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			waitsValidation: true,
+		});
+		return lead;
+	};
+
+	test("a waiting lead joins the batch; a blocked marker lead stays out (OTTR-1252)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await validationCase(record);
+		const review = await doneReview(store, "waiting batches");
+		const af = mkFinding(
+			"Needs validation: waiting A\nBlocker: sandbox run: ca",
+			1,
+		);
+		const bf = mkFinding(
+			"Needs validation: blocked B\nBlocker: sandbox run: cb",
+			2,
+		);
+		for (const f of [af, bf]) await store.appendReviewFinding(review.id, f);
+		const la = await waitingLead(store, review.id, af.prompt);
+		const lb = await waitingLead(store, review.id, bf.prompt);
+		// B's blocked result stamped its marker; the marker alone never batches
+		// (pendingSandboxLead reads the stamp, not the wait flag).
+		await store.updateTask(lb.id, { validatedAt: Date.now() });
+
+		const filed = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in filed).toBe(true);
+		if (!("id" in filed)) throw new Error("no validation run filed");
+		const card = (await store.getTask(filed.id))!;
+		expect(card.prompt).toContain(`#${la.id}`);
+		expect(card.prompt).not.toContain(`#${lb.id}`);
+		// The waiting lead keeps its form: filing touches no lead.
+		const afterA = (await store.getTask(la.id))!;
+		expect(afterA.stage).toBe("todo");
+		expect(afterA.waitsValidation).toBe(true);
+		expect(afterA.validatedAt).toBeNull();
+	});
+
+	test("validate-again scoped to one lead resets only that lead (OTTR-1252)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await validationCase(record);
+		const review = await doneReview(store, "scoped again");
+		const af = mkFinding(
+			"Needs validation: scoped A\nBlocker: sandbox run: ca",
+			1,
+		);
+		const bf = mkFinding(
+			"Needs validation: scoped B\nBlocker: sandbox run: cb",
+			2,
+		);
+		for (const f of [af, bf]) await store.appendReviewFinding(review.id, f);
+		const la = await waitingLead(store, review.id, af.prompt);
+		const lb = await waitingLead(store, review.id, bf.prompt);
+		// A finished validation run recorded both leads "blocked": the reset's
+		// newest-outcome map reads validation cards only (OTTR-1129).
+		const run = await store.createTask(
+			"Batch validation of 2 lead(s) of review.",
+			null,
+			"validation",
+		);
+		await store.updateTask(run.id, {
+			followUpOf: review.id,
+			stage: "done",
+			state: "idle",
+		});
+		await store.appendReviewFinding(
+			run.id,
+			mkFinding(`Validation: #${la.id} blocked\nstill fails`),
+		);
+		await store.appendReviewFinding(
+			run.id,
+			mkFinding(`Validation: #${lb.id} blocked\nstill fails`),
+		);
+		// Both leads carry a blocked result's stamp; the cutoff sits between them.
+		await store.updateTask(la.id, { validatedAt: 1000 });
+		await store.updateTask(lb.id, { validatedAt: 2000 });
+
+		const again = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: 1500, lead: la.id },
+		);
+		expect("id" in again).toBe(true);
+		if (!("id" in again)) throw new Error("no validation run filed");
+		expect(again.reset).toEqual([la.id]);
+		// Only A's stamp cleared; B keeps its marker and stays out of the batch.
+		expect((await store.getTask(la.id))!.validatedAt).toBeNull();
+		expect((await store.getTask(lb.id))!.validatedAt).toBe(2000);
+		const card = (await store.getTask(again.id))!;
+		expect(card.prompt).toContain(`#${la.id}`);
+		expect(card.prompt).not.toContain(`#${lb.id}`);
+	});
+
+	test("a validation run's settle unlocks a waiting lead per result (OTTR-1252)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "waiting settle");
+		const cf = mkFinding(
+			"Needs validation: confirmed wait\nBlocker: sandbox run: cc",
+			1,
+		);
+		const bf = mkFinding(
+			"Needs validation: blocked wait\nBlocker: sandbox run: cb",
+			2,
+		);
+		const rf = mkFinding(
+			"Needs validation: refuted wait\nBlocker: sandbox run: cr",
+			3,
+		);
+		for (const f of [cf, bf, rf])
+			await store.appendReviewFinding(review.id, f);
+		const confirmed = await waitingLead(store, review.id, cf.prompt);
+		const blocked = await waitingLead(store, review.id, bf.prompt);
+		const refuted = await waitingLead(store, review.id, rf.prompt);
+
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		// The waiting leads all entered the batch despite their todo stages.
+		expect((await store.getTask(v1.id))!.prompt).toContain(`#${confirmed.id}`);
+		batches.push([
+			mkFinding(`Validation: #${confirmed.id} confirmed\nthe job reproduces it`),
+			mkFinding(`Validation: #${blocked.id} blocked\nstill lacks the control`),
+			mkFinding(
+				`Validation: #${refuted.id} refuted\nthe job passes without it`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		await settled(store, v1.id);
+
+		// confirmed: the marker clears and the lead stays todo/queued — the
+		// scheduler's own pick can now run it.
+		const afterConfirmed = (await store.getTask(confirmed.id))!;
+		expect(afterConfirmed.waitsValidation).toBe(false);
+		expect(afterConfirmed.stage).toBe("todo");
+		expect(afterConfirmed.state).toBe("queued");
+		expect(afterConfirmed.validatedAt).toBeGreaterThan(0);
+		const picked = pickRunnable(await store.listTasks(), {
+			maxParallel: 4,
+			hasRules: true,
+			mainUnpushed: false,
+		}).map((t) => t.id);
+		expect(picked).toContain(confirmed.id);
+
+		// blocked: the marker keeps the hold, so the pick still skips it.
+		const afterBlocked = (await store.getTask(blocked.id))!;
+		expect(afterBlocked.waitsValidation).toBe(true);
+		expect(afterBlocked.stage).toBe("todo");
+		expect(afterBlocked.validatedAt).toBeGreaterThan(0);
+		expect(picked).not.toContain(blocked.id);
+
+		// refuted: the waiting lead cancels like a backlog one did.
+		const afterRefuted = (await store.getTask(refuted.id))!;
+		expect(afterRefuted.cancelledAt).toBeGreaterThan(0);
+		expect(afterRefuted.needsReason).toContain(
+			`Refuted by validation run #${v1.id}`,
+		);
+	});
+
+	test("a waiting lead is never caught by the routing tick (OTTR-1252)", async () => {
+		const record = baseRecord();
+		const { store, loop } = await validationCase(record);
+		const review = await doneReview(store, "waiting parked");
+		const af = mkFinding(
+			"Needs validation: waiting parked\nBlocker: sandbox run: ca",
+			1,
+		);
+		await store.appendReviewFinding(review.id, af);
+		const waiting = await waitingLead(store, review.id, af.prompt);
+
+		await loop.schedule();
+		await flushPromises();
+
+		// No move, no details line, no batch, no turn: the marker lead is not a
+		// started lead, and the review's batch waits for its trigger.
+		const after = (await store.getTask(waiting.id))!;
+		expect(after.stage).toBe("todo");
+		expect(after.state).toBe("queued");
+		expect(after.waitsValidation).toBe(true);
+		expect(after.details ?? "").not.toContain(
+			"Returned to its review's validation batch",
+		);
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toHaveLength(0);
+		expect(await store.listTurns(waiting.id)).toHaveLength(0);
+	});
+
 	// ---- OTTR-1128: a lead never runs as a work turn and never holds its review ----
 
 	test("a started lead of a held release goes to the release's batch validation, never a work turn (OTTR-1128)", async () => {
@@ -31392,12 +31608,13 @@ describe("stored review findings", () => {
 
 		await loop.schedule();
 
-		// The same tick routes the lead back to the backlog and files the
-		// release's batch validation card with the lead in it.
+		// The same tick routes the lead to the waiting form and files the
+		// release's batch validation card with the lead in it (OTTR-1252).
 		const back = (await store.getTask(lead.id))!;
-		expect(back.stage).toBe("backlog");
-		expect(back.state).toBe("idle");
-		expect(back.queuedAt).toBeNull();
+		expect(back.stage).toBe("todo");
+		expect(back.state).toBe("queued");
+		expect(back.queuedAt).toBeGreaterThan(0);
+		expect(back.waitsValidation).toBe(true);
 		expect(back.validatedAt).toBeNull();
 		expect(back.details).toContain(
 			"a Needs validation lead runs in its review's batch validation run, never in a work turn.",
@@ -31426,7 +31643,7 @@ describe("stored review findings", () => {
 		expect(await store.listTurns(lead.id)).toHaveLength(0);
 		expect(await store.listTurns(card.id)).toHaveLength(1);
 		expect(record.runs).toHaveLength(1);
-		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+		expect((await store.getTask(lead.id))!.stage).toBe("todo");
 		expect(
 			(await store.listTasks()).filter((t) => t.kind === "validation"),
 		).toHaveLength(1);
@@ -31521,7 +31738,11 @@ describe("stored review findings", () => {
 			}),
 		);
 		expect(card.prompt).not.toContain(`#${lBest.id}`);
-		expect((await store.getTask(lWorse.id))!.stage).toBe("backlog");
+		// The started lead sits in the waiting form after the move (OTTR-1252);
+		// the never-started fixture lead keeps its backlog shape.
+		const movedWorse = (await store.getTask(lWorse.id))!;
+		expect(movedWorse.stage).toBe("todo");
+		expect(movedWorse.waitsValidation).toBe(true);
 		expect((await store.getTask(lBest.id))!.stage).toBe("backlog");
 	});
 
@@ -31579,9 +31800,15 @@ describe("stored review findings", () => {
 		expect(afterConfirmed.details ?? "").not.toContain(
 			"Moved back to the backlog",
 		);
-		// The pending lead went to the batch instead of a work turn.
+		expect(afterConfirmed.details ?? "").not.toContain(
+			"Returned to its review's validation batch",
+		);
+		// The pending lead went to the batch instead of a work turn, into the
+		// waiting form (OTTR-1252).
 		expect(await store.listTurns(pending.id)).toHaveLength(0);
-		expect((await store.getTask(pending.id))!.stage).toBe("backlog");
+		const afterPending = (await store.getTask(pending.id))!;
+		expect(afterPending.stage).toBe("todo");
+		expect(afterPending.waitsValidation).toBe(true);
 	});
 
 	test("a lead validated during the routing tick's git read stays started, never moved (OTTR-1128)", async () => {
@@ -31671,7 +31898,7 @@ describe("stored review findings", () => {
 		);
 		expect(runs).toHaveLength(1);
 		expect((await store.getTask(runs[0]!.id))!.prompt).toContain(`#${lead.id}`);
-		expect((await store.getTask(lead.id))!.stage).toBe("backlog");
+		expect((await store.getTask(lead.id))!.stage).toBe("todo");
 	});
 
 	test("a started lead with no live review parks needs_you with an actionable reason (OTTR-1128)", async () => {

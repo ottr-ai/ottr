@@ -6758,6 +6758,68 @@ describe("review findings storage", () => {
 		await store.close();
 	});
 
+	// OTTR-1252: a database from before waiting leads existed — the pre-lead-flag
+	// shape above plus validated_at, which landed in between. Only waits_validation
+	// is missing; the single open below must add it and converge the backlog leads
+	// in the same pass. Like the OTTR-963 budget, the upgrade open can pass the
+	// 5 s default under a full parallel suite run, so this test carries its own.
+	const PRE_WAITS_TASKS_DDL = `${PRE_LEAD_FLAG_TASKS_DDL.replace(
+		/\)\s*$/,
+		`,
+		validated_at INTEGER
+	)`,
+	)}`;
+	test("open adds waits_validation and converges backlog leads to the waiting form (OTTR-1252)", async () => {
+		const dir = join(root, "waits-validation-upgrade");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.exec(PRE_WAITS_TASKS_DDL);
+		raw.exec(EVENTS_DDL);
+		raw.exec(`INSERT INTO tasks
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at)
+			VALUES
+				('lead1', 'lead card', 'Needs validation: suspicious retry loop', 'backlog', 'idle', 'work', 100, 500, 'rev1', NULL),
+				('plain1', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 200, 600, NULL, NULL),
+				('gone1', 'cancelled lead', 'Needs validation: lost report', 'backlog', 'idle', 'work', 300, 700, 'rev1', 400)`);
+		raw.close();
+
+		const store = await open(dir);
+		// The lead took the waiting form: todo/queued, the marker set, queued_at
+		// stamped from the row's updated_at.
+		const lead = (await store.getTask("lead1"))!;
+		expect(lead.stage).toBe("todo");
+		expect(lead.state).toBe("queued");
+		expect(lead.waitsValidation).toBe(true);
+		expect(lead.queuedAt).toBe(500);
+		// A plain backlog card keeps its stage and reads no marker.
+		const plain = (await store.getTask("plain1"))!;
+		expect(plain.stage).toBe("backlog");
+		expect(plain.waitsValidation).toBe(false);
+		// A cancelled lead never moves and reads no marker.
+		const gone = (await store.getTask("gone1"))!;
+		expect(gone.stage).toBe("backlog");
+		expect(gone.waitsValidation).toBe(false);
+
+		// The marker is caller-settable (unlike lead_at_done): the patch round-trips
+		// on getTask and on the list rows.
+		await store.updateTask("lead1", { waitsValidation: false });
+		expect((await store.getTask("lead1"))?.waitsValidation).toBe(false);
+		expect(
+			(await store.listTasks()).find((t) => t.id === "lead1")!.waitsValidation,
+		).toBe(false);
+		await store.updateTask("lead1", { waitsValidation: true });
+		await store.close();
+
+		// A second open is a no-op: the lead is todo now, so the convergence never
+		// matches it again and queued_at keeps its stamp.
+		const again = await open(dir);
+		const relead = (await again.getTask("lead1"))!;
+		expect(relead.stage).toBe("todo");
+		expect(relead.state).toBe("queued");
+		expect(relead.waitsValidation).toBe(true);
+		expect(relead.queuedAt).toBe(500);
+	}, 15_000);
+
 	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", async () => {
 		const dir = join(root, "review-findings-roundtrip");
 		const store = await open(dir);
