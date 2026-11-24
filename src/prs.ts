@@ -1093,8 +1093,12 @@ interface PrWatcherCtx {
 	gh: GhFn;
 	now: () => number;
 	review: ReviewFn;
-	/** Starts the PR's run record when none is active; an active record keeps its start. A new record writes the card's start log line. */
-	prRunStart: (project: string, number: number, taskId?: string | null) => void;
+	/** Starts the PR's run record when none is active; an active record keeps its start. A new record writes the card's start log line. Returns true when it started the record, false when one is already in flight: the board's re-review route claims with this synchronously before its fire-and-forget run, so concurrent requests cannot both pass. */
+	prRunStart: (
+		project: string,
+		number: number,
+		taskId?: string | null,
+	) => boolean;
 	/** Ends the active run record and writes its card-log end line; a later end is a no-op and returns null. */
 	prRunEnd: (
 		project: string,
@@ -1631,16 +1635,23 @@ async function reviewOnce(
 				`prs: ${project.name}: #${row.number} perf lens failed: ${(e as Error).message}`,
 			);
 		}
-		earlier = await fetchReReviewContext({
-			repo,
-			number: row.number,
-			gh: ctx.gh,
-			postedHead: row.postedHead,
-			postedUrl: row.postedUrl,
-			postedLogin: row.postedLogin,
-			reviewedHead: row.reviewedHead,
-			head: row.head,
-		});
+		// OTTR-1248: the Re-review now request (note "") promises a fresh full
+		// review, so with the head already reviewed no earlier review enters the
+		// prompt: the posted review's paragraph must not narrow the findings.
+		// A reply (note text) and watcher runs (note undefined) keep the context.
+		earlier =
+			note === "" && row.reviewedHead === row.head
+				? null
+				: await fetchReReviewContext({
+						repo,
+						number: row.number,
+						gh: ctx.gh,
+						postedHead: row.postedHead,
+						postedUrl: row.postedUrl,
+						postedLogin: row.postedLogin,
+						reviewedHead: row.reviewedHead,
+						head: row.head,
+					});
 		user = reviewUserMessage({
 			repo,
 			number: row.number,
@@ -2101,6 +2112,8 @@ export function createPrWatcher(deps: {
 	skipNotices(): string[];
 	/** The PR's last draft run in memory, or null when none ran since the watcher started. */
 	prRun(project: string, number: number): PrRunState | null;
+	/** Synchronous run-record reservation for the explicit-request routes: true when it started the record, false when one is already in flight. */
+	prRunStart(project: string, number: number, taskId?: string | null): boolean;
 } {
 	const gh = deps.gh ?? runGh;
 	const log = deps.log;
@@ -2142,10 +2155,10 @@ export function createPrWatcher(deps: {
 		project: string,
 		number: number,
 		taskId?: string | null,
-	): void => {
+	): boolean => {
 		const key = `${project}/${number}`;
 		const active = prRuns.get(key);
-		if (active !== undefined && active.endedAt === null) return;
+		if (active !== undefined && active.endedAt === null) return false;
 		const startedAt = now();
 		prRuns.set(key, {
 			startedAt,
@@ -2160,6 +2173,7 @@ export function createPrWatcher(deps: {
 			`== pr review draft ${new Date(startedAt).toISOString()} (model ${model})`,
 		);
 		deps.runEdge?.();
+		return true;
 	};
 	const prRunEnd = (
 		project: string,
@@ -2316,5 +2330,6 @@ export function createPrWatcher(deps: {
 		/** The bell's notice lines for skipped PR reviews, oldest first. */
 		skipNotices: () => skipNotices.map((n) => n.text),
 		prRun,
+		prRunStart,
 	};
 }

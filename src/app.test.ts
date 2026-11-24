@@ -21597,6 +21597,10 @@ describe(
 		// --- Re-review route (OTTR-1248): the same canned world as the reply suite, in
 		// its own store. The reply suite's tests spend that store's 24 h cap window (the
 		// cap reads real Date.now), so a successful re-review needs a fresh window.
+		// The window holds 5 runs, so the tests lean on declaration order: the quiet
+		// test checks 0, the concurrency test checks 1, the in-flight test checks 2,
+		// the already-reviewed test checks 3, the posted-head test checks 4, and the
+		// cap test's fill closes the window.
 		const rereviewSuite = await (async () => {
 			const rrDir = join(root, "p-pr-rereview");
 			mkdirSync(rrDir, { recursive: true });
@@ -21653,6 +21657,31 @@ describe(
 						path,
 					);
 				if (empty) return { code: 0, stdout: "[]", stderr: "" };
+				// The posted review of PR 43 (OTTR-1248 send-back): the re-review
+				// context fetch reads the reviews list and the posted review's inline
+				// comment pages with per_page/page query strings.
+				if (path === "repos/acme/widget/pulls/43/reviews?per_page=100")
+					return {
+						code: 0,
+						stdout: JSON.stringify([
+							{
+								id: 99,
+								body: "Earlier review: the retry loop swallows the second failure.",
+								submitted_at: "2026-11-20T10:00:00Z",
+								user: { login: "ottr[bot]" },
+								commit_id: H1,
+								html_url:
+									"https://github.com/acme/widget/pull/43#pullrequestreview-99",
+							},
+						]),
+						stderr: "",
+					};
+				if (
+					/^repos\/acme\/widget\/pulls\/\d+\/reviews\/\d+\/comments\?per_page=100&page=\d+$/.test(
+						path,
+					)
+				)
+					return { code: 0, stdout: "[]", stderr: "" };
 				if (
 					/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
 						path,
@@ -21761,6 +21790,26 @@ describe(
 					);
 				});
 
+				test("two concurrent re-reviews start one run", async () => {
+					// The reservation is prRunStart: synchronous, before the awaited
+					// cap read's successor — of two concurrent requests exactly one
+					// reserves, the other refuses instead of consuming a second slot.
+					const t = await rrReviewed(44, H1, Date.now() - 25 * 3_600_000);
+					const before = await rrStore.prReviewRunsSince(0);
+					const promptsBefore = rrPrompts.length;
+					rrSlowGateway = true;
+					const [a, b] = await Promise.all([rereview(t.id), rereview(t.id)]);
+					const statuses = [a.status, b.status].sort();
+					expect(statuses).toEqual([200, 409]);
+					const refused = a.status === 409 ? a : b;
+					expect(await errorOf(refused)).toBe("a draft is already running");
+					rrSlowGateway = false;
+					await rm.app.prReviewIdle();
+					// One reservation, one model call, one cap slot.
+					expect(await rrStore.prReviewRunsSince(0)).toBe(before + 1);
+					expect(rrPrompts).toHaveLength(promptsBefore + 1);
+				});
+
 				test("a re-review refuses while a draft is already running", async () => {
 					const t = await rrReviewed(38, H1, Date.now() - 25 * 3_600_000);
 					const before = await rrStore.prReviewRunsSince(0);
@@ -21832,6 +21881,35 @@ describe(
 							.slice(promptsBefore)
 							.every((p) => !p.includes("MAINTAINER NOTE")),
 					).toBe(true);
+				});
+
+				test("a posted same-head review still gets a fresh full review", async () => {
+					// The board posted its review of H1, so the re-review context fetch
+					// finds it on GitHub — the path the watcher and reply runs take, and
+					// the one that writes the re-review paragraph (covered positive in
+					// prs.test.ts's posted-review runs). The button's empty note promises
+					// a full review: no paragraph, no EARLIER REVIEW block.
+					const t = await rrReviewed(43, H1, Date.now() - 25 * 3_600_000);
+					await rrStore.savePrReview({
+						...(await rrRow(43)),
+						postedHead: H1,
+						postedUrl:
+							"https://github.com/acme/widget/pull/43#pullrequestreview-99",
+						postedLogin: "ottr[bot]",
+					});
+					const promptsBefore = rrPrompts.length;
+					const res = await rereview(t.id);
+					expect(res.status).toBe(200);
+					await rm.app.prReviewIdle();
+					expect(rrPrompts).toHaveLength(promptsBefore + 1);
+					expect(rrPrompts[promptsBefore]!).not.toContain(
+						"already reviewed at an earlier head",
+					);
+					expect(rrPrompts[promptsBefore]!).not.toContain("EARLIER REVIEW");
+					// The posted row still names its review: only the prompt changed.
+					const row = await rrRow(43);
+					expect(row.postedHead).toBe(H1);
+					expect(row.reviewedHead).toBe(H1);
 				});
 
 				test("a re-review respects the daily cap", async () => {

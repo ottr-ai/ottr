@@ -13036,8 +13036,6 @@ export async function createApp(deps: AppDeps) {
 		if (row === null || e.github === null)
 			return json({ error: "not a PR review card" }, 409);
 		if (row.state !== "open") return json({ error: `PR is ${row.state}` }, 409);
-		if (prWatcher.prRun(e.name, row.number)?.endedAt === null)
-			return json({ error: "a draft is already running" }, 409);
 		if (
 			(await e.store.prReviewRunsSince(Date.now() - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
@@ -13048,6 +13046,11 @@ export async function createApp(deps: AppDeps) {
 				},
 				429,
 			);
+		// Reserve the card's run record before the fire-and-forget run: prRunStart is
+		// synchronous, so of two concurrent requests exactly one reserves and the
+		// other refuses instead of both consuming a review slot.
+		if (!prWatcher.prRunStart(e.name, row.number, row.taskId))
+			return json({ error: "a draft is already running" }, 409);
 		// Track the detached review so app shutdown waits for its final writes.
 		void trackWork(
 			"PR review re-review",
