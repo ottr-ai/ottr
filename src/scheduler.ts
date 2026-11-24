@@ -1411,6 +1411,63 @@ export function leadValidationHold(
 		: `Waits for a validation run of review ${t.followUpOf}; a work turn has no sandbox_run.`;
 }
 
+/** OTTR-1247: the coarse refusal of the manual validate start for one lead and its
+ * review, or null when the start may file. One predicate for every side: the route
+ * maps it to its exact 409s (unchanged texts), the filing transaction gates the park
+ * with it, and the drawer renders the action disabled with the reason as its title.
+ * Pure. */
+export type LeadStartRefusal =
+	/** The lead row is cancelled (the route answers 404 before this). */
+	| "unknown"
+	/** The lead links another card than the review being filed. */
+	| "mismatch"
+	/** The prompt carries no pending sandbox lead (wrong tag or a deployment fact
+	 * answered as normal work). */
+	| "not-lead"
+	/** The lead is not a queued todo/in_progress card without a worktree and
+	 * without a queued reply. */
+	| "state";
+
+export function leadValidationStartRefusal(
+	lead: Pick<
+		Task,
+		| "cancelledAt"
+		| "followUpOf"
+		| "stage"
+		| "state"
+		| "pendingPrompt"
+		| "worktree"
+		| "validatedAt"
+	> & {
+		/** Store rows carry the prompt tag; wire rows ship no prompt and carry the
+		 * `sandboxLead` stamp instead. */
+		prompt?: string;
+		sandboxLead?: true;
+	},
+	reviewId: string,
+): LeadStartRefusal | null {
+	if (lead.cancelledAt !== null) return "unknown";
+	if (lead.followUpOf !== reviewId) return "mismatch";
+	if (
+		lead.sandboxLead !== true &&
+		!pendingSandboxLead({
+			prompt: lead.prompt ?? "",
+			validatedAt: lead.validatedAt,
+		})
+	)
+		return "not-lead";
+	if (
+		!(
+			(lead.stage === "todo" || lead.stage === "in_progress") &&
+			lead.state === "queued"
+		) ||
+		lead.pendingPrompt !== null ||
+		lead.worktree !== null
+	)
+		return "state";
+	return null;
+}
+
 /** True for a review whose leads a batch validation run may take: a done review, or one
  * held at merging for its findings (OTTR-1128), so a release validates before it ships. */
 export function validatableReview(

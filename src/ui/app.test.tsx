@@ -13471,13 +13471,39 @@ describe("Drawer start validation run on a queued lead", () => {
 		);
 	});
 
-	test("a started lead with a worktree renders no validate control", async () => {
+	test("a started lead with a worktree renders the button disabled", async () => {
 		await withLeadDrawer(
 			leadCard({ worktree: "/tmp/lead-worktree" }),
 			reviewCard(),
 			[],
 			async ({ container }) => {
-				expect(container.textContent).not.toContain("Start validation run");
+				const button = startButton(container) as HTMLButtonElement;
+				expect(button.disabled).toBe(true);
+				expect(button.getAttribute("title")).toBe(
+					"Only a queued lead without a worktree and without a queued reply can join a batch. Reply to settle the steer first, or cancel.",
+				);
+			},
+		);
+	});
+
+	test("a steered lead renders the button disabled with the reason", async () => {
+		// A queued reply (Steer) makes the filing refuse; the drawer must show
+		// that as a disabled action, never one that cannot work (send-back 3).
+		await withLeadDrawer(
+			leadCard({ pendingPrompt: "please merge" }),
+			reviewCard(),
+			[],
+			async ({ posts, container }) => {
+				const button = startButton(container) as HTMLButtonElement;
+				expect(button.disabled).toBe(true);
+				expect(button.getAttribute("title")).toBe(
+					"Only a queued lead without a worktree and without a queued reply can join a batch. Reply to settle the steer first, or cancel.",
+				);
+				await act(async () => {
+					onClickOf(startButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(0);
 			},
 		);
 	});
@@ -13515,13 +13541,19 @@ describe("Drawer start validation run on a queued lead", () => {
 		);
 	});
 
-	test("a lead whose review still runs renders no validate control", async () => {
+	test("a lead whose review still runs renders the button disabled", async () => {
+		// The review cannot take a batch yet — the drawer names that instead of
+		// offering an action that answers 409.
 		await withLeadDrawer(
 			leadCard(),
 			reviewCard({ stage: "in_progress", state: "running" }),
 			[],
 			async ({ container }) => {
-				expect(container.textContent).not.toContain("Start validation run");
+				const button = startButton(container) as HTMLButtonElement;
+				expect(button.disabled).toBe(true);
+				expect(button.getAttribute("title")).toBe(
+					"Review r9 must finish (or hold at merging for its findings) before a batch validation can start.",
+				);
 			},
 		);
 	});

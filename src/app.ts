@@ -338,6 +338,7 @@ import {
 	LEAD_NOT_APPLY_OPTION_LEGACY,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
+	leadValidationStartRefusal,
 	liveCardOf,
 	mergeAnywayPatch,
 	openWorkBlockers,
@@ -12478,7 +12479,8 @@ export async function createApp(deps: AppDeps) {
 		// this review into the batch inside the filing's transaction, so a refusal
 		// leaves the lead untouched and the drawer keeps showing the hold and the
 		// error. The gates run here for good status codes and again inside the
-		// transaction against the fresh rows (routeStartedLeads' recheck pattern).
+		// transaction against the fresh rows; `leadValidationStartRefusal` is the
+		// one predicate the drawer's disabled button reads too.
 		let park: string | undefined;
 		if (body.lead !== undefined) {
 			if (typeof body.lead !== "string" || body.lead.length === 0)
@@ -12486,21 +12488,15 @@ export async function createApp(deps: AppDeps) {
 			const lead = await e.store.getTask(body.lead);
 			if (lead === null || lead.cancelledAt !== null)
 				return json({ error: "unknown lead" }, 404);
-			if (lead.followUpOf !== task.id)
+			const refusal = leadValidationStartRefusal(lead, task.id);
+			if (refusal === "mismatch")
 				return json({ error: "the lead does not belong to this review" }, 409);
-			if (!pendingSandboxLead(lead))
+			if (refusal === "not-lead")
 				return json(
 					{ error: "only a pending sandbox lead can join a batch" },
 					409,
 				);
-			if (
-				!(
-					(lead.stage === "todo" || lead.stage === "in_progress") &&
-					lead.state === "queued"
-				) ||
-				lead.pendingPrompt !== null ||
-				lead.worktree !== null
-			)
+			if (refusal === "state")
 				return json(
 					{
 						error: "only a queued lead without a worktree can join a batch",

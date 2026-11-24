@@ -154,6 +154,7 @@ import {
 	LEAD_UNSURE_OPTION,
 	lastReviewBase,
 	leadBlocker,
+	leadValidationStartRefusal,
 	mergeHold,
 	openWorkBlockers,
 	parseCheckVerdicts,
@@ -10027,22 +10028,15 @@ export function createTurnLoop(
 			// OTTR-1247: the manual start may name one queued lead of this review
 			// (the drawer's Start validation run). The park happens inside this
 			// transaction, so a refusal leaves the lead exactly where it was and the
-			// batchable gate below sees it in the backlog. The gates mirror
-			// routeStartedLeads: a started lead with a worktree or a queued reply
-			// never moves; the route checks them for good status codes, these are
-			// the binding ones against the fresh rows.
+			// batchable gate below sees it in the backlog. The shared predicate
+			// (`leadValidationStartRefusal`) gates it — the same one the route's
+			// status codes and the drawer's disabled button read.
 			const parkLead =
 				park !== undefined ? (tasks.find((t) => t.id === park) ?? null) : null;
-			const parkOk =
-				park !== undefined &&
-				reviewId !== undefined &&
+			const parkFits = (candidate: ListedTask): boolean =>
 				parkLead !== null &&
-				parkLead.cancelledAt === null &&
-				parkLead.followUpOf === reviewId &&
-				pendingSandboxLead(parkLead) &&
-				(parkLead.stage === "todo" || parkLead.stage === "in_progress") &&
-				parkLead.state === "queued" &&
-				parkLead.pendingPrompt === null;
+				park !== undefined &&
+				leadValidationStartRefusal(parkLead, candidate.id) === null;
 			const batchableOf = (review: ListedTask): ListedTask[] =>
 				tasks.filter(
 					(t) =>
@@ -10079,7 +10073,7 @@ export function createTurnLoop(
 						(t.id === reviewId || !declined(t)) &&
 						// A review with only a parked-now lead qualifies through the park
 						// gate: without it the strict start would 409 before the park.
-						(batchableOf(t).length > 0 || (t.id === reviewId && parkOk)),
+						(batchableOf(t).length > 0 || (t.id === reviewId && parkFits(t))),
 				)
 				.sort((a, b) => {
 					if (a.id === reviewId) return -1;
@@ -10100,7 +10094,7 @@ export function createTurnLoop(
 					status: 409,
 				};
 			if (park !== undefined) {
-				if (!parkOk || parkLead === null)
+				if (parkLead === null || !parkFits(review))
 					return {
 						error:
 							"the lead to park must be a queued pending sandbox lead of this review",

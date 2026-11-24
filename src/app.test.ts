@@ -12412,6 +12412,20 @@ describe("manual validation start route (OTTR-1047)", () => {
 				expect(await errorOf(running)).toBe(
 					"only a queued lead without a worktree can join a batch",
 				);
+				// A queued reply (Steer) refuses too — the same state the drawer's
+				// disabled button names (OTTR-1247 send-back 3).
+				await store.updateTask(lead.id, {
+					state: "queued",
+					pendingPrompt: "please merge",
+				});
+				const steered = await post(
+					`/api/projects/p1/tasks/${review.id}/validate`,
+					{ lead: lead.id },
+				);
+				expect(steered.status).toBe(409);
+				expect(await errorOf(steered)).toBe(
+					"only a queued lead without a worktree can join a batch",
+				);
 				// An unknown id answers 404 and a wrong type answers 400.
 				const unknown = await post(
 					`/api/projects/p1/tasks/${review.id}/validate`,

@@ -37,6 +37,7 @@ import {
 	lastReviewBase,
 	leadBlocker,
 	leadValidationHold,
+	leadValidationStartRefusal,
 	liveCard,
 	liveCardOf,
 	mergeAnywayPatch,
@@ -1622,6 +1623,55 @@ describe("OTTR-1128: a lead never runs as a work turn and never holds its review
 			),
 		).toBeNull();
 		expect(leadValidationHold(task())).toBeNull();
+	});
+
+	test("leadValidationStartRefusal mirrors the start's gates on both sides", () => {
+		const lead = task({
+			prompt: "Needs validation: parked\nBlocker: sandbox run: sx",
+			followUpOf: "id00001",
+		});
+		expect(leadValidationStartRefusal(lead, "id00001")).toBeNull();
+		expect(leadValidationStartRefusal(lead, "other")).toBe("mismatch");
+		expect(
+			leadValidationStartRefusal({ ...lead, cancelledAt: 1 }, "id00001"),
+		).toBe("unknown");
+		// A store row without the lead tag, and a deployment-fact lead, are no batch.
+		expect(
+			leadValidationStartRefusal({ ...lead, prompt: "plain work" }, "id00001"),
+		).toBe("not-lead");
+		expect(
+			leadValidationStartRefusal(
+				task({
+					prompt:
+						"Needs validation: proxy\nBlocker: deployment fact: Which proxy?",
+					followUpOf: "id00001",
+				}),
+				"id00001",
+			),
+		).toBe("not-lead");
+		// A wire row carries the stamp instead of the prompt.
+		expect(
+			leadValidationStartRefusal(
+				{ ...lead, prompt: undefined, sandboxLead: true },
+				"id00001",
+			),
+		).toBeNull();
+		// The state gates: a steer's queued reply, a started lead, a backlog lead.
+		expect(
+			leadValidationStartRefusal(
+				{ ...lead, pendingPrompt: "steer" },
+				"id00001",
+			),
+		).toBe("state");
+		expect(
+			leadValidationStartRefusal({ ...lead, worktree: "/w" }, "id00001"),
+		).toBe("state");
+		expect(
+			leadValidationStartRefusal({ ...lead, stage: "backlog" }, "id00001"),
+		).toBe("state");
+		expect(
+			leadValidationStartRefusal({ ...lead, state: "idle" }, "id00001"),
+		).toBe("state");
 	});
 
 	test("validatableReview: a done review, or one idle at merging", () => {

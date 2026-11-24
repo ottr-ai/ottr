@@ -41,7 +41,9 @@ import {
 	type DepProject,
 	findDep,
 	isReview,
+	type LeadStartRefusal,
 	leadValidationHold,
+	leadValidationStartRefusal,
 	liveCardOf,
 	queueOrder,
 	validatableReview,
@@ -13164,6 +13166,26 @@ function DrawerComposer(p: {
 }
 
 /** Drawer Actions section: extracted verbatim from the drawer body. */
+/** OTTR-1247: the disabled Start validation run button's reason, one per shared
+ * predicate refusal plus the filing's own review precondition. */
+function leadStartDisabledTitle(
+	refusal: LeadStartRefusal | "review",
+	reviewId: string,
+): string {
+	switch (refusal) {
+		case "unknown":
+			return "This card's lead row is stale; close and reopen the drawer.";
+		case "mismatch":
+			return `This lead does not link review ${reviewId}; the filing would refuse it.`;
+		case "not-lead":
+			return "Only a Needs validation lead with a sandbox blocker can join a batch.";
+		case "state":
+			return "Only a queued lead without a worktree and without a queued reply can join a batch. Reply to settle the steer first, or cancel.";
+		case "review":
+			return `Review ${reviewId} must finish (or hold at merging for its findings) before a batch validation can start.`;
+	}
+}
+
 function DrawerActions(p: {
 	task: TaskView;
 	cancelled: boolean;
@@ -13191,10 +13213,16 @@ function DrawerActions(p: {
 	runValidateAgain: () => Promise<boolean>;
 	validateAgainError: string | null;
 	validateAgainDone: boolean;
-	/** OTTR-1247: the queued lead's validation group — the start button for its
+	/** OTTR-1247: the queued lead's validation action — the start button for its
 	 * review's batch run and its inline lines; null hides the group (the lead has
-	 * no live review that can take a batch now). */
-	leadValidate: { id: string; project: string } | null;
+	 * no live review link). `refusal` is the shared predicate's answer (or
+	 * "review" when the review cannot take a batch): non-null disables the button
+	 * with the reason as its title. */
+	leadValidate: {
+		id: string;
+		project: string;
+		refusal: LeadStartRefusal | "review" | null;
+	} | null;
 	runLeadValidate: () => Promise<boolean>;
 	leadValidateError: string | null;
 	leadValidateDone: boolean;
@@ -13351,14 +13379,25 @@ function DrawerActions(p: {
 			</div>
 			{/* OTTR-1247: a queued pending sandbox lead offers the manual start of its
 				    review's batch validation run; the lead's status line already names the
-				    wait. Like the group below, the group and its inline lines render full
-				    width under the actions row. */}
+				    wait. The shared predicate (the route's own gate) disables the button
+				    with the refusal as its title whenever the filing would refuse — a
+				    steer's queued reply, a started lead, or a review that cannot take a
+				    batch yet. Like the group below, the group and its inline lines render
+				    full width under the actions row. */}
 			{leadValidate !== null && (
 				<div className="reply-form">
 					<label htmlFor="lead-validate">Start validation run</label>
 					<div className="reply-actions">
 						<BusyButton
-							title={`Files a batch validation run of review ${leadValidate.id}; the filing parks this lead in the review's backlog and takes it first`}
+							title={
+								leadValidate.refusal !== null
+									? leadStartDisabledTitle(
+											leadValidate.refusal,
+											leadValidate.id,
+										)
+									: `Files a batch validation run of review ${leadValidate.id}; the filing parks this lead in the review's backlog and takes it first`
+							}
+							disabled={leadValidate.refusal !== null}
 							run={runLeadValidate}
 						>
 							Start validation run
@@ -14521,15 +14560,20 @@ export function Drawer({
 	// backlog inside its own transaction, so a refusal leaves the lead — and this
 	// drawer's hold and error — untouched. The parent resolves through the lineage
 	// fetch too: the Done window can drop the review from the board's task list.
-	// A new card's drawer starts without the last card's result.
+	// The button renders whenever the hold does and a review exists; the shared
+	// `leadValidationStartRefusal` predicate (the route's own gate) disables it
+	// with the refusal as its title whenever the route would refuse.
 	const leadValidate =
-		!cancelled &&
-		task.state === "queued" &&
-		task.worktree === null &&
-		leadValidationHold(task) !== null &&
-		parentCard !== null &&
-		validatableReview(parentCard)
-			? { id: parentCard.id, project: parentCard.project }
+		!cancelled && leadValidationHold(task) !== null && parentCard !== null
+			? {
+					id: parentCard.id,
+					project: parentCard.project,
+					refusal:
+						leadValidationStartRefusal(task, parentCard.id) ??
+						// The filing's other precondition: the review can take a batch
+						// (done, or held at merging for its findings).
+						(validatableReview(parentCard) ? null : ("review" as const)),
+				}
 			: null;
 	const [leadValidateError, setLeadValidateError] = useState<string | null>(
 		null,
@@ -14540,7 +14584,7 @@ export function Drawer({
 		setLeadValidateDone(false);
 	}, [rerunTaskId]);
 	const runLeadValidate = async (): Promise<boolean> => {
-		if (leadValidate === null) return false;
+		if (leadValidate === null || leadValidate.refusal !== null) return false;
 		setLeadValidateError(null);
 		try {
 			await post(
