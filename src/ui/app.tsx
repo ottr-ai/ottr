@@ -10573,8 +10573,10 @@ function DrawerLineage(p: {
 	parent: TaskCard | null;
 	retroSource: (LineageRef & { card: TaskCard | null }) | null;
 	kids: TaskCard[];
-	/** The board's cards: the descendant tree walks them once per render. */
-	tasks: TaskCard[];
+	/** Every loaded card, any project: the descendant tree's source (Drawer's
+	 * boardTasks). The drawer's context `tasks` list is project-scoped and would
+	 * drop a grandchild filed into another project. */
+	boardTasks: TaskCard[];
 	onOpenTask: (id: string) => void;
 	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
 	 * dropped; null when the card sits in the state and nothing fetches. */
@@ -10590,7 +10592,7 @@ function DrawerLineage(p: {
 		parent,
 		retroSource,
 		kids,
-		tasks,
+		boardTasks,
 		onOpenTask,
 		parentFetch,
 		retroFetch,
@@ -10662,14 +10664,19 @@ function DrawerLineage(p: {
 				);
 		}
 	};
-	// Per-node fold state: card id → override. The default folds a quiet subtree:
-	// no open card below it and more than three rows.
+	// Per-node fold state: `${project}/${id}` → override. The id alone collides
+	// across projects (real stores reuse ids), and one disclosure must not move
+	// both branches. The default folds a quiet subtree: no open card in it — the
+	// node's own state included — and more than three rows.
 	const [folded, setFolded] = useState<Record<string, boolean>>({});
-	const tree = lineageTree(row, childMap(tasks));
+	const tree = lineageTree(row, childMap(boardTasks));
 	/** One descendant row: the card link with its live state and its open count,
 	 * then — unless folded — its children one indent deeper, oldest first. */
 	const renderNode = (n: LineageNode, depth: number): ReactNode => {
-		const isFolded = folded[n.card.id] ?? (n.open === 0 && n.rows > 3);
+		const foldKey = `${n.card.project}/${n.card.id}`;
+		const selfOpen = n.card.cancelledAt === null && n.card.stage !== "done";
+		const isFolded =
+			folded[foldKey] ?? (n.open === 0 && !selfOpen && n.rows > 3);
 		// Past the cap a node renders no children; its whole subtree collapses
 		// into one "+N more" row that opens this node, the deepest shown card.
 		const hasKids = depth < LINEAGE_DEPTH && n.kids.length > 0;
@@ -10719,9 +10726,7 @@ function DrawerLineage(p: {
 							aria-expanded={!isFolded}
 							aria-label={isFolded ? "Show sub-tasks" : "Hide sub-tasks"}
 							title={isFolded ? "Show sub-tasks" : "Hide sub-tasks"}
-							onClick={() =>
-								setFolded((m) => ({ ...m, [n.card.id]: !isFolded }))
-							}
+							onClick={() => setFolded((m) => ({ ...m, [foldKey]: !isFolded }))}
 						>
 							<Icon name="chevron-right" size={12} />
 						</button>
@@ -14256,6 +14261,7 @@ export function Drawer({
 	onMarkSeen,
 	delta,
 	tasks,
+	boardTasks,
 	onOpenTask,
 	draining,
 	usedTotal,
@@ -14278,6 +14284,12 @@ export function Drawer({
 	onMarkSeen: () => void;
 	delta?: number;
 	tasks: TaskCard[];
+	/** Every loaded card, any project: the descendant tree's source. The context
+	 * list in `tasks` is project-scoped (AppDrawer), so a grandchild filed into
+	 * another project sits only here (OTTR-1258); no second fetch runs for it.
+	 * Optional only for direct fixtures, which hold one list; AppDrawer always
+	 * passes the full loaded board. */
+	boardTasks?: TaskCard[];
 	onOpenTask: (id: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
@@ -14362,8 +14374,9 @@ export function Drawer({
 	}, [lineageWant]);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
 	// The whole descendant tree hangs below, one level in per card; childMap walks the
-	// board once, so the rail never scans it once per level.
-	const kids = childMap(tasks).get(`${row.project}/${row.id}`) ?? [];
+	// loaded board once, so the rail never scans it once per level.
+	const treeTasks = boardTasks ?? tasks;
+	const kids = childMap(treeTasks).get(`${row.project}/${row.id}`) ?? [];
 	/** The live state span a lineage row shows after its tags, as the meta line shows
 	 * it. Follow-up rows and fetched parent rows share it. */
 	const lineageState = (k: TaskCard): ReactNode => (
@@ -14415,13 +14428,19 @@ export function Drawer({
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
 	// The banner names every card the holds park, deduped by card: the dependency
-	// list, this review's own open findings, and the cards another review's hold parks.
+	// list, and — at merging, the only stage mergeHold applies to (holdFor) — the
+	// review holds' cards: another review's hold, or this parked review's own
+	// findings hold riding its needsReason.
 	const waitSources = [
 		...waiting,
-		...(row.needsReason === FINDINGS_HOLD
-			? reviewOpenFindings(reviewFindings(tasks, row), row)
+		...(row.stage === "merging"
+			? [
+					...(row.needsReason === FINDINGS_HOLD
+						? reviewOpenFindings(reviewFindings(tasks, row), row)
+						: []),
+					...holdWaitCards(tasks, row),
+				]
 			: []),
-		...holdWaitCards(tasks, row),
 	];
 	const waitAll = waitSources.filter(
 		(t, i, all) =>
@@ -15242,7 +15261,7 @@ export function Drawer({
 						parent={parentCard}
 						retroSource={retroCard}
 						kids={kids}
-						tasks={tasks}
+						boardTasks={treeTasks}
 						onOpenTask={onOpenTask}
 						parentFetch={parentFetch}
 						retroFetch={retroFetch}
@@ -17828,7 +17847,7 @@ function AppMainContent(p: {
 
 /** The task drawer and its frozen exit sheet: mounted only while a card and its
  * project are selected. */
-function AppDrawer(p: {
+export function AppDrawer(p: {
 	selected: TaskCard | null;
 	selectedProject: ProjectView | null;
 	sheet: { task: TaskCard; project: ProjectView } | null;
@@ -17937,6 +17956,9 @@ function AppDrawer(p: {
 			projects={projects}
 			delta={deltas.get(drawerTask.id)}
 			tasks={drawerTasks}
+			// The tree's source stays unfiltered: a descendant the project-scoped
+			// context drops (a grandchild filed into another project) still renders.
+			boardTasks={tasks}
 			onOpenTask={openTask}
 			draining={draining}
 			usedTotal={usedTotal}

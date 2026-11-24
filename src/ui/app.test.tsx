@@ -223,6 +223,7 @@ const {
 	reportHtml,
 	shortNoticeText,
 	Drawer,
+	AppDrawer,
 	LogView,
 	ProjectBoard,
 	RailRows,
@@ -3774,6 +3775,248 @@ describe("Drawer parent chip", () => {
 		expect(foldButton(open)).toContain('aria-label="Hide sub-tasks"');
 		expect(railHtml(open)).toContain(">G-1<");
 		expect(railHtml(open)).toContain("lineage-holds");
+	});
+
+	test("an open child keeps its subtree expanded", () => {
+		// The fold predicate counts the node itself: a running child with three
+		// done children has no open descendant but is open work, so it must not
+		// fold away its own unfinished state.
+		const kid = (
+			id: string,
+			followUpOf: string,
+			createdAt: number,
+			stage: TaskCard["stage"],
+		) => cardFixture({ id, followUpOf, createdAt, stage });
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={[
+					kid("Q-1", "S-1", 1000, "in_progress"),
+					kid("G-1", "Q-1", 2000, "done"),
+					kid("G-2", "Q-1", 3000, "done"),
+					kid("G-3", "Q-1", 4000, "done"),
+				]}
+			/>,
+		);
+		expect(foldButton(html)).toContain('aria-expanded="true"');
+		expect(railHtml(html)).toContain(">G-1<");
+	});
+
+	test("a card outside merging names no review's cards", () => {
+		// mergeHold applies at merging only (holdFor): a queued todo card and a
+		// done card list no running review's findings under Waiting for.
+		const runningReview = cardFixture({
+			id: "R-9",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			createdAt: 100,
+		});
+		const finding = cardFixture({
+			id: "F-9",
+			followUpOf: "R-9",
+			createdAt: 200,
+			stage: "todo",
+		});
+		const todo = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={cardFixture({ id: "T-1", stage: "todo", createdAt: 300 })}
+				tasks={[runningReview, finding]}
+			/>,
+		);
+		expect(todo).not.toContain('id="drawer-waiting"');
+		const landed = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={cardFixture({
+					id: "D-9",
+					stage: "done",
+					state: "idle",
+					createdAt: 300,
+				})}
+				tasks={[runningReview, finding]}
+			/>,
+		);
+		expect(landed).not.toContain('id="drawer-waiting"');
+	});
+
+	test("a queued merge names the review that holds it", () => {
+		// The run hold (a review still running) names the review card itself,
+		// and only the held merge lists it — no other stage does.
+		const held = cardFixture({
+			id: "M-1",
+			stage: "merging",
+			state: "queued",
+			createdAt: 300,
+		});
+		const running = cardFixture({
+			id: "R-1",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			createdAt: 100,
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={held} tasks={[running]} />,
+		);
+		const waiting = html.slice(html.indexOf('id="drawer-waiting"'));
+		expect(waiting).toContain('href="/projects/proj/tasks/R-1"');
+		const bystander = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={cardFixture({ id: "T-2", stage: "todo", createdAt: 300 })}
+				tasks={[running, held]}
+			/>,
+		);
+		expect(bystander).not.toContain('id="drawer-waiting"');
+	});
+
+	test("the fold state keys by project and id", async () => {
+		// Real stores reuse ids across projects (src/app.test.ts documents them):
+		// opening one D-1's folded branch must not open the other project's D-1.
+		const d = (project: string, createdAt: number): TaskCard =>
+			cardFixture({
+				id: "D-1",
+				project,
+				followUpOf: "S-1",
+				followUpOfProject: "proj",
+				createdAt,
+				stage: "done",
+				state: "idle",
+			});
+		const kid = (project: string, prefix: string, n: number): TaskCard =>
+			cardFixture({
+				id: `${prefix}-${n}`,
+				project,
+				followUpOf: "D-1",
+				followUpOfProject: project,
+				createdAt: 1000 + n,
+				stage: "done",
+				state: "idle",
+			});
+		const tasks = [
+			d("proj", 1000),
+			d("other", 2000),
+			kid("proj", "P", 1),
+			kid("proj", "P", 2),
+			kid("proj", "P", 3),
+			kid("other", "O", 1),
+			kid("other", "O", 2),
+			kid("other", "O", 3),
+		];
+		const { container, close } = await mountDrawer(
+			treeSelf,
+			tasks,
+			() => new Response("{}", { status: 404 }),
+		);
+		try {
+			// Both D-1 subtrees start folded (quiet, four rows each).
+			const before = railHtml(container.innerHTML);
+			expect(before).not.toContain(">P-1<");
+			expect(before).not.toContain(">O-1<");
+			const folds = container.querySelectorAll("button.lineage-fold");
+			expect(folds).toHaveLength(2);
+			await act(async () => onClickOf(folds[0] as unknown as Element)({}));
+			const after = railHtml(container.innerHTML);
+			expect(after).toContain(">P-1<");
+			expect(after).not.toContain(">O-1<");
+		} finally {
+			await close();
+		}
+	});
+
+	test("a followUpOf cycle renders each card once and stops", () => {
+		// Caller-controlled links (OTTR-1009) can name a descendant as a parent:
+		// S-1 -> K-1 -> S-1. The walk roots at the drawer card, so the seen set
+		// stops the return edge instead of recursing forever.
+		const self = childCard({
+			id: "S-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "K-1",
+		});
+		const k = cardFixture({
+			id: "K-1",
+			followUpOf: "S-1",
+			createdAt: 1000,
+			stage: "done",
+			state: "idle",
+		});
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={self} tasks={[k]} />,
+		);
+		const rail = railHtml(html);
+		// K-1 renders twice: the parent chip row above this card's node, and its
+		// tree row below. The self row never repeats inside its own tree.
+		expect(rail.match(/>S-1</g)).toHaveLength(1);
+		expect(rail.match(/>K-1</g)).toHaveLength(2);
+	});
+
+	test("the tree keeps cross-project grandchildren the context list drops", async () => {
+		// A/R -> A/C -> B/G, C no retro: AppDrawer's project-scoped context filter
+		// drops G, so the tree reads it from the unfiltered loaded board list.
+		const review = cardFixture({
+			id: "R-1",
+			kind: "review",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 900,
+		});
+		const child = cardFixture({
+			id: "C-1",
+			followUpOf: "R-1",
+			createdAt: 200,
+			stage: "done",
+			state: "idle",
+		});
+		const grand = cardFixture({
+			id: "G-1",
+			project: "other",
+			followUpOf: "C-1",
+			followUpOfProject: "proj",
+			createdAt: 300,
+			stage: "in_progress",
+			state: "running",
+		});
+		const { restore } = stubFetch(
+			async () => new Response("{}", { status: 404 }),
+		);
+		const { container, unmount } = await mount(
+			<AppDrawer
+				selected={review}
+				selectedProject={listProject}
+				sheet={null}
+				pendingDrawer={null}
+				retryPending={() => {}}
+				state={null}
+				projects={[listProject]}
+				tasks={[review, child, grand]}
+				deltas={new Map()}
+				draining={false}
+				usedTotal={0}
+				seenAnswers={new Set()}
+				origin={{ current: null }}
+				act={async () => true}
+				openTask={() => {}}
+				markRead={() => {}}
+				markUnread={() => {}}
+				closeDrawer={() => {}}
+				seenDoneSince={0}
+			/>,
+		);
+		try {
+			const rail = railHtml(container.innerHTML);
+			expect(rail).toContain('href="/projects/other/tasks/G-1"');
+			// C's row carries the open count for its foreign grandchild.
+			const cRow = rail.slice(rail.indexOf(">C-1<"));
+			expect(cRow).toContain("1 open below");
+		} finally {
+			await unmount();
+			restore();
+		}
 	});
 });
 
