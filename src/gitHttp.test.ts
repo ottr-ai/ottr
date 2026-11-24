@@ -1,5 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
@@ -83,6 +89,8 @@ let worktree = "";
 let token = "";
 let base = "";
 let secretSha = "";
+let secretABlob = "";
+let secretBBlob = "";
 
 beforeAll(async () => {
 	const root = dir();
@@ -99,7 +107,17 @@ beforeAll(async () => {
 	writeFileSync(join(main, "secret.txt"), "TOPSECRET-MARKER\n");
 	await must(main, "add", "secret.txt");
 	await must(main, "commit", "-q", "-m", "hidden commit");
+	// Two more hidden blobs: B is a prefix of A, so a copy delta against A can rebuild B
+	// without sending B's bytes.
+	writeFileSync(join(main, "big.txt"), "TOPSECRET-MARKER-TAIL-CONTENTS\n");
+	await must(main, "add", "big.txt");
+	await must(main, "commit", "-q", "-m", "hidden big");
+	writeFileSync(join(main, "prefix.txt"), "TOPSECRET-MARKER");
+	await must(main, "add", "prefix.txt");
+	await must(main, "commit", "-q", "-m", "hidden prefix");
 	secretSha = await must(main, "rev-parse", "refs/heads/secret");
+	secretABlob = await must(main, "rev-parse", "secret:big.txt");
+	secretBBlob = await must(main, "rev-parse", "secret:prefix.txt");
 	await must(main, "checkout", "-q", "main");
 	worktree = join(main, ".worktrees", "ALP-1");
 	await must(main, "worktree", "add", "-q", "-b", BRANCH, worktree);
@@ -659,16 +677,43 @@ describe("packSupplyRefusal", () => {
 		return out;
 	}
 
-	/** A REF_DELTA entry: the 20-byte base oid rides uncompressed in front of the compressed delta. */
+	/** A REF_DELTA entry: the raw base oid rides uncompressed in front of the compressed delta. */
 	function refDeltaEntry(baseOid: string, delta: Uint8Array): Uint8Array {
 		const head = entryHead(7, delta.length);
 		const oid = Buffer.from(baseOid, "hex");
 		const body = deflateSync(delta);
-		const out = new Uint8Array(head.length + 20 + body.length);
+		const out = new Uint8Array(head.length + oid.length + body.length);
 		out.set(head);
 		out.set(oid, head.length);
-		out.set(body, head.length + 20);
+		out.set(body, head.length + oid.length);
 		return out;
+	}
+
+	/** A copy-only delta body: base size, result size, one copy run from the base. */
+	function copyDelta(
+		baseSize: number,
+		from: number,
+		length: number,
+	): Uint8Array {
+		const size = (n: number): number[] => {
+			const out: number[] = [n & 0x7f];
+			for (n >>= 7; n > 0; n >>= 7) {
+				const last = out.length - 1;
+				out[last] = (out[last] ?? 0) | 0x80;
+				out.push(n & 0x7f);
+			}
+			return out;
+		};
+		const offsetBytes = from < 256 ? 1 : 2;
+		const opcode = 0x80 | (offsetBytes << 4) | 1;
+		const offset = [from & 0xff, ...(offsetBytes === 2 ? [from >> 8] : [])];
+		return Uint8Array.from([
+			...size(baseSize),
+			...size(length),
+			opcode,
+			...offset,
+			length,
+		]);
 	}
 
 	/** A literal-only delta body: base size, result size, one literal run. */
@@ -693,9 +738,10 @@ describe("packSupplyRefusal", () => {
 	/** A tree object naming one blob by its oid. */
 	function treeBytes(blobOid: string, name: string): Uint8Array {
 		const head = new TextEncoder().encode(`100644 ${name}\0`);
-		const out = new Uint8Array(head.length + 20);
+		const oid = Buffer.from(blobOid, "hex");
+		const out = new Uint8Array(head.length + oid.length);
 		out.set(head);
-		out.set(Buffer.from(blobOid, "hex"), head.length);
+		out.set(oid, head.length);
 		return out;
 	}
 
@@ -707,18 +753,25 @@ describe("packSupplyRefusal", () => {
 	}
 
 	/** The store sha of one object body. */
-	async function objectSha(type: string, body: Uint8Array): Promise<string> {
+	async function objectSha(
+		type: string,
+		body: Uint8Array,
+		algo: "SHA-1" | "SHA-256" = "SHA-1",
+	): Promise<string> {
 		const head = new TextEncoder().encode(`${type} ${body.length}\0`);
 		const all = new Uint8Array(head.length + body.length);
 		all.set(head);
 		all.set(body, head.length);
-		return [...new Uint8Array(await crypto.subtle.digest("SHA-1", all))]
+		return [...new Uint8Array(await crypto.subtle.digest(algo, all))]
 			.map((b) => b.toString(16).padStart(2, "0"))
 			.join("");
 	}
 
-	/** A packfile over the entries, with the object count and the sha1 trailer. */
-	async function assemblePack(entries: Uint8Array[]): Promise<Uint8Array> {
+	/** A packfile over the entries, with the object count and the hash trailer. */
+	async function assemblePack(
+		entries: Uint8Array[],
+		algo: "SHA-1" | "SHA-256" = "SHA-1",
+	): Promise<Uint8Array> {
 		const parts: Uint8Array[] = [
 			new TextEncoder().encode("PACK"),
 			new Uint8Array(new DataView(new ArrayBuffer(8)).buffer),
@@ -732,12 +785,10 @@ describe("packSupplyRefusal", () => {
 			body.set(p, at);
 			at += p.length;
 		}
-		const out = new Uint8Array(body.length + 20);
+		const sum = new Uint8Array(await crypto.subtle.digest(algo, body));
+		const out = new Uint8Array(body.length + sum.length);
 		out.set(body);
-		out.set(
-			new Uint8Array(await crypto.subtle.digest("SHA-1", body)),
-			body.length,
-		);
+		out.set(sum, body.length);
 		return out;
 	}
 
@@ -784,6 +835,80 @@ describe("packSupplyRefusal", () => {
 			pack,
 		);
 		expect(r).toBeNull();
+	}, 60_000);
+
+	test("a copy delta cannot rebuild a hidden blob from another hidden base", async () => {
+		// The blocker's case: B is a prefix of the hidden blob A. A copy delta names A as
+		// base and copies A's first bytes, so git rebuilds B in the guest's own pack region
+		// without the guest ever sending B. The external base A must be a visible object.
+		const branchTip = await must(main, "rev-parse", `refs/heads/${BRANCH}`);
+		const aSize = Number(await must(main, "cat-file", "-s", secretABlob));
+		const bSize = Number(await must(main, "cat-file", "-s", secretBBlob));
+		const tree = treeBytes(secretBBlob, "prefix.txt");
+		const commit = commitBytes(await objectSha("tree", tree), branchTip);
+		const commitSha = await objectSha("commit", commit);
+		const pack = await assemblePack([
+			packEntry(1, commit),
+			packEntry(2, tree),
+			refDeltaEntry(secretABlob, copyDelta(aSize, 0, bSize)),
+		]);
+		const r = await packSupplyRefusal(
+			[{ old: branchTip, new: commitSha, ref: `refs/heads/${BRANCH}` }],
+			grant("main"),
+			pack,
+		);
+		expect(r).toContain(secretABlob);
+		expect(r).toContain("delta base");
+	}, 60_000);
+
+	test("a sha256 pack cannot smuggle a hidden base past the guest boundary", async () => {
+		// SHA-256 trailers are 32 bytes: the appended base starts at pack.length - 32, so a
+		// fixed 20-byte boundary would count it as guest data.
+		const shaRepo = join(dir(), "sha256");
+		mkdirSync(shaRepo, { recursive: true });
+		await must(shaRepo, "init", "-q", "--object-format=sha256", "-b", "main");
+		writeFileSync(join(shaRepo, "a.txt"), "one\n");
+		await must(shaRepo, "add", ".");
+		await must(shaRepo, "commit", "-q", "-m", "init");
+		await must(shaRepo, "branch", BRANCH);
+		await must(shaRepo, "branch", "secret");
+		await must(shaRepo, "checkout", "-q", "secret");
+		writeFileSync(join(shaRepo, "secret.txt"), "TOPSECRET-MARKER\n");
+		await must(shaRepo, "add", "secret.txt");
+		await must(shaRepo, "commit", "-q", "-m", "hidden commit");
+		await must(shaRepo, "checkout", "-q", "main");
+		const branchTip = await must(shaRepo, "rev-parse", `refs/heads/${BRANCH}`);
+		const secretBlob = await must(shaRepo, "rev-parse", "secret:secret.txt");
+		const blobSize = Number(await must(shaRepo, "cat-file", "-s", secretBlob));
+		const tree = treeBytes(secretBlob, "secret.txt");
+		const commit = commitBytes(
+			await objectSha("tree", tree, "SHA-256"),
+			branchTip,
+		);
+		const commitSha = await objectSha("commit", commit, "SHA-256");
+		const pack = await assemblePack(
+			[
+				packEntry(1, commit),
+				packEntry(2, tree),
+				refDeltaEntry(secretBlob, literalDelta(blobSize, "abc")),
+			],
+			"SHA-256",
+		);
+		const shaGrant: VmGrant = {
+			project: "alpha",
+			taskId: "ALP-1",
+			branch: BRANCH,
+			repoPath: shaRepo,
+			worktree: shaRepo,
+			base: "main",
+		};
+		const r = await packSupplyRefusal(
+			[{ old: branchTip, new: commitSha, ref: `refs/heads/${BRANCH}` }],
+			shaGrant,
+			pack,
+		);
+		expect(r).toContain(secretBlob);
+		expect(r).toContain("not supplied");
 	}, 60_000);
 });
 
