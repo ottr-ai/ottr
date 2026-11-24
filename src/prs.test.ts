@@ -1691,6 +1691,44 @@ describe("createPrWatcher", () => {
 			s.logs.filter((m) => m.includes("re-review over budget")),
 		).toHaveLength(1);
 	});
+	test("the re-review-now request gives a reverted head a fresh full review", async () => {
+		const s = await setup();
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The board posts its review of a; a later push drafts b, and the author
+		// reverts to a. reviewedHead and head now disagree, but the posted review
+		// sits on the head the button promises to re-review in full.
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(22))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 22)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(22, sha("b"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect((await s.store.getPrReview(22))!.reviewedHead).toBe(sha("b"));
+		s.setReviews([
+			ghReview(
+				1,
+				sha("a"),
+				"Earlier: the error panel leaks state",
+				"2026-01-01T00:00:00Z",
+			),
+		]);
+		s.setOpen([pr(22, sha("a"))]);
+		await s.watcher.reviewNow({ project: "p", number: 22, note: "" });
+		const msg = s.prompts.at(-1)!;
+		// The posted review of a sits on GitHub; the prompt still runs like a
+		// first review: no earlier-review block, no re-review paragraph.
+		expect(msg).not.toContain("EARLIER REVIEW");
+		expect(msg).not.toContain("already reviewed at an earlier head");
+		// The run saved a fresh draft on the restored head.
+		expect((await s.store.getPrReview(22))!.reviewedHead).toBe(sha("a"));
+	});
 	test("a retried over-budget re-review logs the dropped block once", async () => {
 		const s = await setup();
 		s.setOpen([pr(22, sha("a"))]);

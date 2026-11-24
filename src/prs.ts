@@ -21,7 +21,12 @@ import {
 } from "./prInline.ts";
 import { ownerRepo, runGh } from "./release.ts";
 import { singleFlightTick } from "./singleFlight.ts";
-import type { OpenPrsView, PrReviewRow, PrRunState } from "./types.ts";
+import {
+	type OpenPrsView,
+	type PrReviewRow,
+	type PrRunState,
+	prHeadHasReview,
+} from "./types.ts";
 
 export type ReviewFn = (
 	messages: Array<{ role: "system" | "user"; content: string }>,
@@ -1638,9 +1643,11 @@ async function reviewOnce(
 		// OTTR-1248: the Re-review now request (note "") promises a fresh full
 		// review, so with the head already reviewed no earlier review enters the
 		// prompt: the posted review's paragraph must not narrow the findings.
-		// A reply (note text) and watcher runs (note undefined) keep the context.
+		// prHeadHasReview also names the reverted head whose posted review sits on
+		// it while a later draft holds reviewedHead. A reply (note text) and
+		// watcher runs (note undefined) keep the context.
 		earlier =
-			note === "" && row.reviewedHead === row.head
+			note === "" && prHeadHasReview(row.head, row.reviewedHead, row.postedHead)
 				? null
 				: await fetchReReviewContext({
 						repo,
@@ -2114,6 +2121,16 @@ export function createPrWatcher(deps: {
 	prRun(project: string, number: number): PrRunState | null;
 	/** Synchronous run-record reservation for the explicit-request routes: true when it started the record, false when one is already in flight. */
 	prRunStart(project: string, number: number, taskId?: string | null): boolean;
+	/** Ends the PR's active run record and writes its card-log end line; a later end is a no-op. The re-review route releases its reservation with this when the cap refuses the request. */
+	prRunEnd(
+		project: string,
+		number: number,
+		outcome: {
+			kind: "saved" | "skipped" | "failed" | "cap";
+			text: string | null;
+		},
+		taskId?: string | null,
+	): PrRunState | null;
 } {
 	const gh = deps.gh ?? runGh;
 	const log = deps.log;
@@ -2331,5 +2348,6 @@ export function createPrWatcher(deps: {
 		skipNotices: () => skipNotices.map((n) => n.text),
 		prRun,
 		prRunStart,
+		prRunEnd,
 	};
 }

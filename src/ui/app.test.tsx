@@ -6813,6 +6813,17 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(reButton(html)).toContain("fresh full review");
 	});
 
+	test("the re-review tooltip names a fresh review for a reverted head too", () => {
+		// A later draft holds reviewedHead, but the posted review sits on the
+		// current head (the H1 -> H2 -> H1 revert): the promise still shows.
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			reviewedHead: "c".repeat(40),
+			postedHead: "d".repeat(40),
+		});
+		expect(reButton(html)).toContain("fresh full review");
+	});
+
 	test("the re-review button is disabled while a draft runs", () => {
 		const html = section(waitingReview(), "## Summary\nreview", {
 			...prView("open"),

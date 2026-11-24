@@ -2005,6 +2005,17 @@ export const PR_REVIEW_WAITING =
 export const PR_REVIEW_POSTED =
 	"Review posted; waits for the author or the merge.";
 
+/** True when `head` already has a review: the latest draft or the board's posted
+ * review sits on it (a push followed by a revert included). The Re-review now
+ * request and its drawer tooltip share this one rule. */
+export function prHeadHasReview(
+	head: string,
+	reviewedHead: string | null,
+	postedHead: string | null,
+): boolean {
+	return reviewedHead === head || postedHead === head;
+}
+
 /** Time ranges the performance dashboard can filter by. */
 export const PERF_RANGES = ["1h", "24h", "7d", "30d", "90d", "all"] as const;
 export type PerfRange = (typeof PERF_RANGES)[number];

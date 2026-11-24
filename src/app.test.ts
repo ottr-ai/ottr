@@ -21598,9 +21598,10 @@ describe(
 		// its own store. The reply suite's tests spend that store's 24 h cap window (the
 		// cap reads real Date.now), so a successful re-review needs a fresh window.
 		// The window holds 5 runs, so the tests lean on declaration order: the quiet
-		// test checks 0, the concurrency test checks 1, the in-flight test checks 2,
-		// the already-reviewed test checks 3, the posted-head test checks 4, and the
-		// cap test's fill closes the window.
+		// test checks 0, the in-flight test checks 1, the already-reviewed test
+		// checks 2, the posted-head test checks 3, the concurrency test's winner
+		// claims the fifth slot (its loser crosses the full window at the
+		// reservation), and the cap test's fill closes it.
 		const rereviewSuite = await (async () => {
 			const rrDir = join(root, "p-pr-rereview");
 			mkdirSync(rrDir, { recursive: true });
@@ -21790,26 +21791,6 @@ describe(
 					);
 				});
 
-				test("two concurrent re-reviews start one run", async () => {
-					// The reservation is prRunStart: synchronous, before the awaited
-					// cap read's successor — of two concurrent requests exactly one
-					// reserves, the other refuses instead of consuming a second slot.
-					const t = await rrReviewed(44, H1, Date.now() - 25 * 3_600_000);
-					const before = await rrStore.prReviewRunsSince(0);
-					const promptsBefore = rrPrompts.length;
-					rrSlowGateway = true;
-					const [a, b] = await Promise.all([rereview(t.id), rereview(t.id)]);
-					const statuses = [a.status, b.status].sort();
-					expect(statuses).toEqual([200, 409]);
-					const refused = a.status === 409 ? a : b;
-					expect(await errorOf(refused)).toBe("a draft is already running");
-					rrSlowGateway = false;
-					await rm.app.prReviewIdle();
-					// One reservation, one model call, one cap slot.
-					expect(await rrStore.prReviewRunsSince(0)).toBe(before + 1);
-					expect(rrPrompts).toHaveLength(promptsBefore + 1);
-				});
-
 				test("a re-review refuses while a draft is already running", async () => {
 					const t = await rrReviewed(38, H1, Date.now() - 25 * 3_600_000);
 					const before = await rrStore.prReviewRunsSince(0);
@@ -21910,6 +21891,26 @@ describe(
 					const row = await rrRow(43);
 					expect(row.postedHead).toBe(H1);
 					expect(row.reviewedHead).toBe(H1);
+				});
+
+				test("two concurrent re-reviews at the full window start one run", async () => {
+					// The winner claims the fifth slot, so the loser crosses a full
+					// window: the reservation-first order answers 409 (a draft is
+					// already running), never the cap's 429, and one run starts.
+					const t = await rrReviewed(44, H1, Date.now() - 25 * 3_600_000);
+					const before = await rrStore.prReviewRunsSince(0);
+					const promptsBefore = rrPrompts.length;
+					rrSlowGateway = true;
+					const [a, b] = await Promise.all([rereview(t.id), rereview(t.id)]);
+					const statuses = [a.status, b.status].sort();
+					expect(statuses).toEqual([200, 409]);
+					const refused = a.status === 409 ? a : b;
+					expect(await errorOf(refused)).toBe("a draft is already running");
+					rrSlowGateway = false;
+					await rm.app.prReviewIdle();
+					// One reservation, one model call, one cap slot.
+					expect(await rrStore.prReviewRunsSince(0)).toBe(before + 1);
+					expect(rrPrompts).toHaveLength(promptsBefore + 1);
 				});
 
 				test("a re-review respects the daily cap", async () => {

@@ -13036,21 +13036,34 @@ export async function createApp(deps: AppDeps) {
 		if (row === null || e.github === null)
 			return json({ error: "not a PR review card" }, 409);
 		if (row.state !== "open") return json({ error: `PR is ${row.state}` }, 409);
+		// Reserve before the cap read: while a draft runs, the request must answer
+		// 409 (a draft is already running) even when that draft's own claim filled
+		// the daily window. prRunStart is synchronous, so of two concurrent
+		// requests exactly one reserves and the other refuses.
+		if (!prWatcher.prRunStart(e.name, row.number, row.taskId))
+			return json({ error: "a draft is already running" }, 409);
 		if (
 			(await e.store.prReviewRunsSince(Date.now() - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
-		)
+		) {
+			// No run follows the refusal, so the reservation ends here; the card
+			// log names the cap like the watcher's own cap skip does.
+			prWatcher.prRunEnd(
+				e.name,
+				row.number,
+				{
+					kind: "cap",
+					text: `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+				},
+				row.taskId,
+			);
 			return json(
 				{
 					error: `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
 				},
 				429,
 			);
-		// Reserve the card's run record before the fire-and-forget run: prRunStart is
-		// synchronous, so of two concurrent requests exactly one reserves and the
-		// other refuses instead of both consuming a review slot.
-		if (!prWatcher.prRunStart(e.name, row.number, row.taskId))
-			return json({ error: "a draft is already running" }, 409);
+		}
 		// Track the detached review so app shutdown waits for its final writes.
 		void trackWork(
 			"PR review re-review",
