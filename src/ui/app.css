@@ -3998,6 +3998,35 @@ a.pr-link:hover {
 	font-variant-numeric: tabular-nums;
 	color: var(--dim);
 }
+/* Done lane's Inbox head row (OTTR-1259): the label and the Sweep inbox trigger share
+   one line; the button steps down to the lane's quiet scale so the label stays first. */
+.inbox-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.sweep-inbox {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 2px 8px;
+	font-size: 11px;
+	font-weight: 600;
+	color: var(--dim);
+	background: transparent;
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	cursor: pointer;
+}
+.sweep-inbox:hover:not(:disabled) {
+	color: var(--text);
+	border-color: var(--line);
+}
+.sweep-inbox:disabled {
+	color: var(--dim);
+	opacity: 0.6;
+	cursor: default;
+}
 /* Done lane "Show more": a quiet full-width button under the last page of cards. */
 .lane-more {
 	display: flex;
@@ -8438,6 +8467,94 @@ button.log-mode[aria-pressed="true"] {
 }
 .work-checks li > ul {
 	margin: 2px 0;
+}
+/* Inbox sweep drawer (OTTR-1259): one row per swept research card — check, verdict
+   chip, title — then the proposed action, the evidence readout and the draft count.
+   Verdict chips stay in the neutral grammar (a verdict is a fact, not an alarm);
+   only the Stale chip and the failed-apply line carry alarm colours. */
+.sweep-rows {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.sweep-row {
+	padding: 10px 0;
+	border-top: 1px solid var(--line-soft);
+}
+.sweep-row:first-child {
+	padding-top: 2px;
+	border-top: 0;
+}
+.sweep-row-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
+}
+.sweep-row-head input {
+	margin: 0;
+	flex: none;
+	accent-color: var(--accent);
+}
+.sweep-verdict {
+	flex: none;
+	padding: 0 5px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 16px;
+	color: var(--dim);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.sweep-title {
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.sweep-stale-tag {
+	flex: none;
+	padding: 0 5px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 16px;
+	color: var(--alarm);
+	border: 1px solid var(--alarm-line);
+	border-radius: 3px;
+}
+.sweep-row.stale .sweep-title,
+.sweep-row.stale .sweep-action,
+.sweep-row.stale .sweep-evidence,
+.sweep-row.stale .sweep-drafts {
+	color: var(--dim);
+}
+.sweep-action {
+	margin: 4px 0 0 24px;
+	font-size: 12px;
+	color: var(--text);
+}
+.sweep-evidence {
+	margin: 4px 0 0 24px;
+	padding: 6px 8px;
+	overflow-wrap: anywhere;
+	white-space: pre-wrap;
+	font-family: var(--mono);
+	font-size: 12px;
+	color: var(--text);
+	background: var(--well);
+	border-radius: 4px;
+}
+.sweep-drafts,
+.sweep-pending {
+	margin: 4px 0 0 24px;
+	font-size: 12px;
+	color: var(--dim);
+}
+.sweep-pending {
+	margin-left: 0;
+}
+.sweep-error {
+	margin: 8px 0 0;
+	font-size: 12.5px;
+	color: var(--crit-text);
 }
 /* Work steps: one rail, one node per turn; shape carries state, not boxes. */
 .turns {

@@ -76,6 +76,7 @@ import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
+import { SWEEP_DRAFT_SEP } from "./inboxSweep.ts";
 import { acquireLayerUse } from "./layers.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
 import type { MemoryHealth } from "./memory.ts";
@@ -469,6 +470,10 @@ let validateLeadsImpl:
 			{ id: string; reset: string[] } | { error: string; status: number }
 	  >)
 	| null = null;
+// OTTR-1259: the sweep start route's filing seam, same shape as validateLeads.
+let sweepInboxImpl:
+	| ((e: Entry) => Promise<{ id: string } | { error: string; status: number }>)
+	| null = null;
 const loopStubs = () => ({
 	cancel: (e: Entry, id: string, force: boolean) => cancelImpl(e, id, force),
 	finishKept: (e: Entry, id: string, choices: unknown) =>
@@ -488,6 +493,11 @@ const loopStubs = () => ({
 		if (!validateLeadsImpl)
 			return Promise.reject(new Error("validateLeads not stubbed"));
 		return validateLeadsImpl(e, reviewId, strictReview, again, first, park);
+	},
+	sweepInbox: (e: Entry) => {
+		if (!sweepInboxImpl)
+			return Promise.reject(new Error("sweepInbox not stubbed"));
+		return sweepInboxImpl(e);
 	},
 });
 // Deepen seam: the route tests swap deepenImpl per test; unstubbed calls fail loudly.
@@ -594,7 +604,10 @@ projects.set("p2", {
 });
 const projectDir3 = join(root, "p3");
 const store3 = await ProjectStore.open(projectDir3);
-projects.set("p3", {
+/** The p3 entry: one object the module registers here and the sweep-routes
+ * describe re-registers in beforeAll (a mid-file describe owns the name in
+ * between and deletes it in its afterAll). */
+const p3Entry = {
 	path: projectDir3,
 	name: "p3",
 	store: store3,
@@ -609,7 +622,8 @@ projects.set("p3", {
 	latestRelease: null,
 	latestImage: null,
 	archReview: null,
-});
+};
+projects.set("p3", p3Entry);
 
 const post = async (
 	path: string,
@@ -13952,6 +13966,340 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		expect(one.needsReason).toBe(
 			`Cancelled by the user's answer to the review's question: ${LEAD_NOT_APPLY_OPTION}`,
 		);
+	});
+});
+
+// OTTR-1259: the inbox sweep routes. The start route's filing is the stubbed
+// sweepInbox seam (the loop's filePendingSweepRun); the apply route drives the
+// real store path (verdict parsing, the stale rule, the seen writes, the
+// proposal filing).
+describe("inbox sweep routes (OTTR-1259)", () => {
+	// The p3 store keeps the sweep fixtures off p1's accumulated done-lane cards,
+	// so the view's pending count stays exact. A mid-file describe owns the "p3"
+	// name in between and deletes it, so this describe re-registers the entry.
+	const p3 = "p3";
+	beforeAll(() => {
+		projects.set("p3", p3Entry);
+	});
+	afterAll(() => {
+		projects.delete("p3");
+	});
+
+	/** A done pinned research card (the sweep's target). */
+	const pinnedResearch = async (
+		prompt: string,
+		report: string,
+		steps: "yes" | "no" = "yes",
+	) => {
+		const t = await store3.createTask(prompt);
+		await store3.updateTask(t.id, {
+			research: true,
+			report,
+			steps,
+			stage: "done",
+			state: "idle",
+		});
+		return t;
+	};
+
+	/** A done sweep run card with one recorded verdict per given prompt. */
+	const doneSweep = async (findings: { cardId: string; record: string }[]) => {
+		const run = await store3.createTask(
+			`Inbox sweep route run ${findings.length}`,
+			null,
+			"sweep",
+		);
+		await store3.updateTask(run.id, {
+			stage: "done",
+			state: "idle",
+			promptAuthor: "board",
+		});
+		for (const f of findings)
+			await store3.appendReviewFinding(run.id, {
+				prompt: f.record.replace("<CARD>", f.cardId),
+				model: null,
+				rank: null,
+				security: null,
+			});
+		return run;
+	};
+
+	test("the start route files one queued sweep card and schedules", async () => {
+		sweepInboxImpl = async (e) => {
+			expect(e.store).toBe(store3);
+			const card = await e.store.createTask(
+				`Inbox sweep for ${p3}`,
+				null,
+				"sweep",
+			);
+			await e.store.updateTask(card.id, { promptAuthor: "board" });
+			return { id: card.id };
+		};
+		const before = calls;
+		try {
+			const res = await post(`/api/projects/${p3}/inbox/sweep`, {});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as { id: string; kind: string };
+			const card = (await store3.getTask(b.id))!;
+			expect(card.kind).toBe("sweep");
+			expect(card.promptAuthor).toBe("board");
+			expect(card.state).toBe("queued");
+			expect(calls).toBe(before + 1);
+		} finally {
+			sweepInboxImpl = null;
+		}
+	});
+
+	test("an unknown project answers 404 and a filing 409 passes through", async () => {
+		sweepInboxImpl = async () => ({
+			error: "a sweep run is already open",
+			status: 409,
+		});
+		try {
+			expect((await post("/api/projects/nope/inbox/sweep", {})).status).toBe(
+				404,
+			);
+			const res = await post(`/api/projects/${p3}/inbox/sweep`, {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe("a sweep run is already open");
+		} finally {
+			sweepInboxImpl = null;
+		}
+	});
+
+	test("the apply route clears, implements and marks seen", async () => {
+		const clear = await pinnedResearch(
+			"pinned clear card",
+			"# R\n## Recommended steps\n- done already",
+		);
+		const implement = await pinnedResearch(
+			"pinned implement card",
+			"# R\n## Recommended steps\n- step two open",
+		);
+		const info = await pinnedResearch(
+			"pinned info card",
+			"# R\nno steps at all",
+			"no",
+		);
+		const draft = "Add the retry\n\nCheck: the retry test passes";
+		const run = await doneSweep([
+			{ cardId: clear.id, record: "Sweep: #<CARD> done\ncard #x did it" },
+			{
+				cardId: implement.id,
+				record: `Sweep: #<CARD> partial\nstep two open\n${SWEEP_DRAFT_SEP}\n${draft}`,
+			},
+			{
+				cardId: info.id,
+				record: "Sweep: #<CARD> info\nno steps in the report",
+			},
+		]);
+		const res = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows: [
+				{ card: clear.id, action: "clear" },
+				{ card: implement.id, action: "implement" },
+				{ card: info.id, action: "clear" },
+			],
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			results: { card: string; applied: boolean; skipped?: string }[];
+		};
+		expect(b.results).toEqual([
+			{ card: clear.id, applied: true },
+			{ card: implement.id, applied: true },
+			{ card: info.id, applied: true },
+		]);
+		// clear marks seen; implement files one held proposal card and marks seen.
+		const seen = (await gstore.get<unknown>("seen_answers")) as string[];
+		for (const id of [clear.id, implement.id, info.id])
+			expect(seen.includes(id)).toBe(true);
+		const proposals = (await store3.listTasks()).filter(
+			(t) => t.followUpOf === run.id,
+		);
+		expect(proposals).toHaveLength(1);
+		const proposal = proposals[0]!;
+		expect(proposal.prompt).toBe(draft);
+		expect(proposal.stage).toBe("backlog");
+		expect(proposal.state).toBe("needs_you");
+		expect(proposal.queuedAt).toBeNull();
+		expect(proposal.promptAuthor).toBe("board");
+		expect(proposal.needsReason).toBe(
+			`Inbox sweep proposal from #${run.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
+		);
+	});
+
+	test("a stale row, a no-verdict row and a cancelled run apply nothing", async () => {
+		const fresh = await pinnedResearch(
+			"stale target card",
+			"# R\n## Recommended steps\n- x",
+		);
+		const noVerdict = await pinnedResearch(
+			"uncovered card",
+			"# R\n## Recommended steps\n- y",
+		);
+		const run = await doneSweep([
+			{ cardId: fresh.id, record: "Sweep: #<CARD> done\nevidence" },
+		]);
+		// A reply-style write bumps the target after the sweep read it: stale.
+		await store3.updateTask(fresh.id, { summary: "edited after the sweep" });
+		const res = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows: [
+				{ card: fresh.id, action: "clear" },
+				{ card: noVerdict.id, action: "clear" },
+			],
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			results: { card: string; applied: boolean; skipped?: string }[];
+		};
+		expect(b.results).toEqual([
+			{ card: fresh.id, applied: false, skipped: "stale" },
+			{ card: noVerdict.id, applied: false, skipped: "no verdict" },
+		]);
+		const seen = (await gstore.get<unknown>("seen_answers")) as string[];
+		expect(seen.includes(fresh.id)).toBe(false);
+		expect(seen.includes(noVerdict.id)).toBe(false);
+
+		// A cancelled run's verdicts apply nowhere, whatever they recorded.
+		await store3.updateTask(run.id, { cancelledAt: Date.now() });
+		const dead = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows: [{ card: fresh.id, action: "clear" }],
+		});
+		expect((await dead.json()) as { results: unknown[] }).toEqual({
+			results: [{ card: fresh.id, applied: false, skipped: "no verdict" }],
+		});
+		// The two skipped cards stay pinned; cancel them so the later drawer
+		// test's pending count stays exact.
+		await store3.updateTask(fresh.id, { cancelledAt: Date.now() });
+		await store3.updateTask(noVerdict.id, { cancelledAt: Date.now() });
+	});
+
+	test("an unknown run or card answers 404 and a malformed body 400s", async () => {
+		const run = await doneSweep([{ cardId: "x", record: "Sweep: #x done" }]);
+		const card = await store.createTask("plain card for apply 404");
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: "P3-99999",
+					rows: [{ card: card.id, action: "clear" }],
+				})
+			).status,
+		).toBe(404);
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: run.id,
+					rows: [{ card: "P3-99998", action: "clear" }],
+				})
+			).status,
+		).toBe(404);
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: card.id,
+					rows: [{ card: card.id, action: "clear" }],
+				})
+			).status,
+		).toBe(404);
+		for (const body of [
+			{ run: run.id },
+			{ run: run.id, rows: [] },
+			{ run: run.id, rows: [{ card: card.id, action: "file" }] },
+			{ run: "bad id", rows: [{ card: card.id, action: "clear" }] },
+		]) {
+			const res = await post(`/api/projects/p3/inbox/sweep/apply`, body);
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).not.toBe("");
+		}
+	});
+
+	test("the drawer view carries the sweep rows and the chain remainder", async () => {
+		const a = await pinnedResearch(
+			"view card a",
+			"# R\n## Recommended steps\n- a",
+		);
+		const b = await pinnedResearch(
+			"view card b",
+			"# R\n## Recommended steps\n- b",
+		);
+		const info = await pinnedResearch("view card c", "# R\nno steps", "no");
+		const run = await doneSweep([
+			{ cardId: a.id, record: "Sweep: #<CARD> done\ncard #x did it" },
+			{
+				cardId: b.id,
+				record: `Sweep: #<CARD> none\neverything open\n${SWEEP_DRAFT_SEP}\ndraft one`,
+			},
+			{ cardId: info.id, record: "Sweep: #<CARD> info\ninfo only" },
+		]);
+		// b changed after the run: its row shows stale; a uncovered pinned card
+		// d counts into pending.
+		const d = await pinnedResearch(
+			"view card d",
+			"# R\n## Recommended steps\n- d",
+		);
+		await store3.updateTask(b.id, { summary: "changed after the sweep" });
+		const res = await get(`/api/projects/p3/tasks/${run.id}`);
+		expect(res.status).toBe(200);
+		const v = (await res.json()) as {
+			sweep: {
+				rows: {
+					card: string;
+					title: string;
+					verdict: string;
+					evidence: string;
+					proposed: string;
+					stale: boolean;
+					drafts: string[];
+					stage: string;
+					state: string;
+					cancelled: boolean;
+				}[];
+				pending: number;
+			};
+		};
+		expect(v.sweep.rows).toEqual([
+			{
+				card: a.id,
+				title: a.title,
+				verdict: "done",
+				evidence: "card #x did it",
+				proposed: "clear",
+				stale: false,
+				drafts: [],
+				stage: "done",
+				state: "idle",
+				cancelled: false,
+			},
+			{
+				card: b.id,
+				title: b.title,
+				verdict: "none",
+				evidence: "everything open",
+				proposed: "implement",
+				stale: true,
+				drafts: ["draft one"],
+				stage: "done",
+				state: "idle",
+				cancelled: false,
+			},
+			{
+				card: info.id,
+				title: info.title,
+				verdict: "info",
+				evidence: "info only",
+				proposed: "clear",
+				stale: false,
+				drafts: [],
+				stage: "done",
+				state: "idle",
+				cancelled: false,
+			},
+		]);
+		expect(v.sweep.pending).toBe(1);
+		expect(d.cancelledAt).toBeNull();
 	});
 });
 

@@ -1,5 +1,11 @@
 import { queueOrder } from "../scheduler.ts";
-import type { RunState, Stage, Task, TaskCard } from "../types.ts";
+import type {
+	RunState,
+	Stage,
+	SweepRowView,
+	Task,
+	TaskCard,
+} from "../types.ts";
 import { doneReadKey, recommendsSteps } from "../types.ts";
 
 /** Card facts the lane counts and the search filter read. */
@@ -87,6 +93,29 @@ export function autoMarkOnOpen(
 	>,
 ): boolean {
 	return seenable(t) && researchSteps(t) !== "yes";
+}
+
+/** OTTR-1259: the drawer's verdict label for one sweep row; one wording for the table and its tests. */
+export function sweepVerdictLabel(v: {
+	verdict: SweepRowView["verdict"];
+}): string {
+	switch (v.verdict) {
+		case "done":
+			return "All steps done";
+		case "partial":
+			return "Some steps open";
+		case "none":
+			return "Nothing done";
+		case "info":
+			return "Info only";
+	}
+}
+
+/** OTTR-1259: the action text one sweep row proposes — what a checked row runs on apply. */
+export function sweepRowAction(v: {
+	proposed: SweepRowView["proposed"];
+}): "No further steps" | "Implement steps" {
+	return v.proposed === "implement" ? "Implement steps" : "No further steps";
 }
 
 /** OTTR-566: whether a card's completion key carries the read mark for the unread rule (the

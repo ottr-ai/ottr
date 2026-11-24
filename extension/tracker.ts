@@ -1027,19 +1027,25 @@ export default function (pi: Pi) {
 	// Proposal tools the runner reads from the event stream and files as cards when the run
 	// ends. Retro (OTTR_RETRO=1): ONE proposal, filed as a held card. Review (OTTR_REVIEW=1):
 	// one call per finding with a rank and an optional confirmed security severity; Ottr checks
-	// the best ones with a second model and files the kept ones. Both run without board env, so
-	// they are local-only. The description texts must match src/prompts.ts
-	// (PROPOSE_TOOL_DESCRIPTION / REVIEW_PROPOSE_TOOL_DESCRIPTION); the extension loads
-	// standalone, so they are inlined here.
+	// the best ones with a second model and files the kept ones. Sweep (OTTR_SWEEP=1, OTTR-1259):
+	// one call per pinned research card recording a verdict; nothing files — the run's card
+	// table offers the verdicts to the operator. All run without board env, so they are
+	// local-only. The description texts must match src/prompts.ts
+	// (PROPOSE_TOOL_DESCRIPTION / REVIEW_PROPOSE_TOOL_DESCRIPTION /
+	// SWEEP_PROPOSE_TOOL_DESCRIPTION); the extension loads standalone, so they are
+	// inlined here.
 	const retroMode = process.env.OTTR_RETRO === "1";
 	const reviewMode = process.env.OTTR_REVIEW === "1";
-	if (retroMode || reviewMode) {
+	const sweepMode = process.env.OTTR_SWEEP === "1";
+	if (retroMode || reviewMode || sweepMode) {
 		pi.registerTool({
 			name: "propose_task",
 			label: "Propose task",
 			description: retroMode
 				? "Propose ONE improvement task from this retro. Ottr files it as a card when the retro ends: it starts after the user accepts it, or at once when the project starts proposals without asking. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified. decision: optional; the question the user must answer before this task can start, for example a choice between two designs or a scope call. Leave it out when the task needs no decision. A proposal with a decision always waits for the user."
-				: 'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out. End the prompt with a section headed \'Acceptance\' that holds at least one observable check; the tool refuses a prompt without one.',
+				: sweepMode
+					? 'Record ONE verdict for one pinned research card of the inbox sweep; call it once per card, as many times as you need. prompt: the verdict record. The first line must be exactly "Sweep: #<card id> <verdict>" with verdict one of done, partial, none, info. After it, the evidence, then one "--- card draft ---" block per open step when the verdict is partial or none.'
+					: 'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out. End the prompt with a section headed \'Acceptance\' that holds at least one observable check; the tool refuses a prompt without one.',
 			parameters: z.object(
 				retroMode
 					? {
@@ -1091,46 +1097,57 @@ export default function (pi: Pi) {
 									"The question the user must answer before the task can start; omit when none (1-400 characters)",
 								),
 						}
-					: {
-							prompt: z
-								.string()
-								.describe(
-									"Self-contained finding text: what is wrong, the evidence, the effect, the fix (1-20000 characters)",
-								),
-							model: z
-								.string()
-								.optional()
-								.describe(
-									"Model id (provider/model) for the finding's card — never an omp agent type such as sonic, scout or task; omit to use the board default",
-								),
-							rank: z
-								.number()
-								.optional()
-								.describe("The finding's importance, 1 = most important"),
-							security: z
-								.enum(["critical", "high"])
-								.optional()
-								.describe(
-									"Set only for a confirmed security finding of that severity",
-								),
-						},
+					: sweepMode
+						? {
+								prompt: z
+									.string()
+									.describe(
+										"The verdict record: the Sweep: first line, the evidence, then one draft block per open step (1-20000 characters)",
+									),
+							}
+						: {
+								prompt: z
+									.string()
+									.describe(
+										"Self-contained finding text: what is wrong, the evidence, the effect, the fix (1-20000 characters)",
+									),
+								model: z
+									.string()
+									.optional()
+									.describe(
+										"Model id (provider/model) for the finding's card — never an omp agent type such as sonic, scout or task; omit to use the board default",
+									),
+								rank: z
+									.number()
+									.optional()
+									.describe("The finding's importance, 1 = most important"),
+								security: z
+									.enum(["critical", "high"])
+									.optional()
+									.describe(
+										"Set only for a confirmed security finding of that severity",
+									),
+							},
 			),
 			loadMode: "essential",
 			approval: "read",
 			async execute(toolCallId: string, params: CreateTaskParams) {
 				const refusal = proposeRefusal(toolCallId, retroMode);
 				if (refusal !== null) return textResult(refusal);
-				const error = proposeValidationError(
-					params,
-					reviewMode,
-					retroKnownProjects(),
-				);
+				// A sweep verdict record is not a task prompt: no Acceptance section
+				// applies, only the prompt shape (the drafts inside are data the
+				// operator's apply step files, never automatic cards).
+				const error = sweepMode
+					? promptValidationError(params)
+					: proposeValidationError(params, reviewMode, retroKnownProjects());
 				if (error !== null) return textResult(error);
 				if (retroMode) proposed = true;
 				return textResult(
 					retroMode
 						? "Recorded. Ottr files it as a held card when this retro ends."
-						: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+						: sweepMode
+							? "Recorded. The run's card lists this verdict, and the operator applies it from the table."
+							: "Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
 				);
 			},
 		});

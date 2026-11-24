@@ -55,6 +55,20 @@ import {
 	sniffImage,
 	visuallyIdentical,
 } from "./images.ts";
+import {
+	collectDescendants,
+	descendantLines,
+	relatedByTokens,
+	relatedLines,
+	reportPathTokens,
+	SWEEP_BATCH_SIZE,
+	type SweepRecord,
+	stepsEvidence,
+	sweepCandidateRows,
+	sweepCoveredCards,
+	sweepResult,
+	sweepSteps,
+} from "./inboxSweep.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
 import { modelFallbacks, modelList, modelRoles } from "./models.ts";
 import type { GateCheck } from "./promptGate.ts";
@@ -83,6 +97,7 @@ import {
 	followUpPrompt,
 	grillPrompt,
 	handoffMarkdown,
+	inboxSweepPrompt,
 	isRetroProposalReason,
 	mergePrompt,
 	proposedReason,
@@ -92,6 +107,7 @@ import {
 	restartResumePrompt,
 	retroReplyPrompt,
 	reviewCheckPrompt,
+	type SweepCardBlock,
 	validationRunPrompt,
 	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
@@ -322,6 +338,9 @@ export function microVmTurn(o: {
 		!o.boardCheck &&
 		o.task.kind !== "interview" &&
 		o.task.kind !== "trending" &&
+		// OTTR-1259: an inbox sweep runs worktree-less in the main checkout, which
+		// no VM holds — the claim gate must not count it against the VM pool.
+		o.task.kind !== "sweep" &&
 		o.task.stage !== "backlog"
 	);
 }
@@ -968,6 +987,10 @@ export interface TurnOps {
 	commitMeta?: typeof commitMeta;
 	/** True while an update holds new turns (POST /api/drain): running turns finish, nothing new starts. */
 	drained(): boolean;
+	/** OTTR-1259: the board's sorted seen ids (app.ts loadSeen), read per filing so the
+	 * inbox sweep's candidates and the settle's chain skip already-read cards. Absent in
+	 * narrow test fakes: the seen set then reads as empty. */
+	seenIds?: () => Promise<string[]>;
 	stopping?: () => boolean;
 	/** OTTR-454: true while a per-runner hold covers this runner id (a worker hostname or "local"). */
 	drainedRunner(id: string): boolean;
@@ -1691,6 +1714,15 @@ export interface TurnLoop {
 	 * the filing, a 409 from the one-open-run rule) still gets its batch run. A
 	 * refusal ({ error, status }) logs nothing; a thrown error logs one line. */
 	validationSweep(): Promise<void>;
+	/** OTTR-1259: files at most one inbox sweep card ({ id }), or { error, status }
+	 * when nothing files — "a sweep run is already open" (one open sweep per
+	 * project) or "no pinned research cards". The manual start route and the done
+	 * sweep's chain trigger share this one implementation; `seen` overrides the
+	 * ops.seenIds read (the start route's test seam). */
+	filePendingSweepRun(
+		e: TurnProject,
+		seen?: ReadonlySet<string>,
+	): Promise<{ id: string } | { error: string; status: number }>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
 	stopTurn(e: TurnProject, id: string): Promise<StopOutcome>;
 	/** Hosted mode: sets the credit hold and stops every turn in flight (work or merge runs like
@@ -1748,6 +1780,9 @@ type TurnIdentityFlags = {
 	grill: boolean;
 	scout: boolean;
 	validation: boolean;
+	/** OTTR-1259: the inbox sweep batch run — read-only in the main checkout, one
+	 * propose_task verdict per pinned research card. */
+	sweep: boolean;
 };
 
 /** The flags plus the session name resolveTurnIdentity fixed before the run. */
@@ -4476,6 +4511,7 @@ export function createTurnLoop(
 			flags.interview ||
 			flags.grill ||
 			flags.scout ||
+			flags.sweep ||
 			flags.retroCard ||
 			flags.reviewCard ||
 			flags.releaseCard ||
@@ -4816,6 +4852,10 @@ export function createTurnLoop(
 			// Not a review: no review hold, no review check, no reviewBlocked delay; isWorkCard
 			// excludes it, so no work check runs either.
 			validation: task.kind === "validation",
+			// OTTR-1259: the inbox sweep batch run of a project's pinned research cards.
+			// Read-only like the scout: worktree-less, no checkout guard, no report read,
+			// no quarantine, never a work card; its verdicts are propose_task records.
+			sweep: task.kind === "sweep",
 		};
 	}
 
@@ -5412,7 +5452,10 @@ export function createTurnLoop(
 		flags: TurnIdentity,
 		log: (line: string) => void | Promise<void>,
 	): Promise<RunLocation | null> {
-		const special = flags.interview || flags.grill || flags.scout;
+		// OTTR-1259: a sweep joins the special set — read-only in the main checkout,
+		// no worktree, no branch, like an interview, grill or scout card.
+		const special =
+			flags.interview || flags.grill || flags.scout || flags.sweep;
 		// A card run always holds a branch name here: task.branch, or the one the
 		// worktree step below creates. Worktree-less cards (interview, grill, scout)
 		// never read it — every branch read below sits behind a !special or
@@ -6625,7 +6668,7 @@ export function createTurnLoop(
 				// pushes non-GitHub merges itself after the turn.
 			},
 			stripBoard: idn.retroCard,
-			stripGithubToken: idn.scout,
+			stripGithubToken: idn.scout || idn.sweep,
 			// OTTR-994: the identity key survives stripBoard on the worker request.
 			project: store.name,
 			...turnRunTools(idn),
@@ -6635,10 +6678,11 @@ export function createTurnLoop(
 			onProgress: (text) => dispatchProgressEntry(mx, ops, text),
 			onSession: async (sid) =>
 				await dispatchSessionEntry(store, id, kind, sid),
-			// A review or validation run stores each finding the moment the runner parses it
-			// (the spec's arrival persistence; a validation card's findings are its per-lead
-			// results, read back by the settle); other cards store nothing.
-			...((idn.reviewCard || idn.validation) && {
+			// A review, validation or sweep run stores each finding the moment the
+			// runner parses it (the spec's arrival persistence; a validation card's
+			// findings are its per-lead results, a sweep card's are its per-card
+			// verdicts; both are read back by the settle); other cards store nothing.
+			...((idn.reviewCard || idn.validation || idn.sweep) && {
 				onRecorded: async (finding: RecordedFinding) => {
 					await store.appendReviewFinding(id, finding);
 				},
@@ -6658,7 +6702,10 @@ export function createTurnLoop(
 			!idn.retroCard &&
 			!idn.boardCheck &&
 			!idn.grill &&
-			!idn.scout
+			!idn.scout &&
+			// A sweep reads the project's own main checkout and files verdicts only:
+			// the cross-project snapshot says nothing about its work (OTTR-1259).
+			!idn.sweep
 		);
 	}
 
@@ -6737,7 +6784,11 @@ export function createTurnLoop(
 		// OTTR_MODELS: its proposal files past the card-filing routes' catalog check,
 		// so propose_task must check at record time).
 		const marks =
-			idn.retroCard || idn.reviewCard || idn.validation || idn.scout
+			idn.retroCard ||
+			idn.reviewCard ||
+			idn.validation ||
+			idn.scout ||
+			idn.sweep
 				? await retroEnvMarks(idn)
 				: {};
 
@@ -6947,6 +6998,11 @@ export function createTurnLoop(
 		// propose_task and sandbox_run, and the model catalog rides for record-time checks.
 		if (idn.validation)
 			return { OTTR_REVIEW: "1", ...(await retroModelsEnv()) };
+		// OTTR-1259: a sweep run gets OTTR_SWEEP=1 — the extension registers the
+		// sweep-mode propose_task (prompt-only verdict records). No model catalog:
+		// nothing files at record time, and the run carries no GitHub token (the
+		// scout's strip below).
+		if (idn.sweep) return { OTTR_SWEEP: "1" };
 		if (idn.scout) return { OTTR_TRENDING: "1" };
 		return {};
 	}
@@ -6979,6 +7035,10 @@ export function createTurnLoop(
 				tools: "read,grep,glob,report_outcome,propose_repo,judge_repo",
 				config: join(dirname(ops.extensionPath), "trending.yml"),
 			};
+		// OTTR-1259: the sweep's read-only toolset — the extension's OTTR_SWEEP mode
+		// registers propose_task (prompt-only verdict records).
+		if (idn.sweep)
+			return { tools: "read,grep,glob,report_outcome,propose_task" };
 		return {};
 	}
 
@@ -7107,6 +7167,12 @@ export function createTurnLoop(
 					e,
 					st.task.followUpOf ?? undefined,
 				).catch((err) => logStoreError(e.store.name, err));
+			// OTTR-1259: a done sweep files the next sweep for the pinned cards it did
+			// not cover (the chain), on the same quiet-refusal terms.
+			if (st.idn.sweep)
+				await filePendingSweepRun(e).catch((err) =>
+					logStoreError(e.store.name, err),
+				);
 		}
 		return false;
 	}
@@ -7242,7 +7308,11 @@ export function createTurnLoop(
 				st.kind === "work" &&
 				!st.idn.interview &&
 				!st.idn.grill &&
-				!st.idn.scout
+				!st.idn.scout &&
+				// A sweep runs in the main checkout and writes no report file: reading
+				// the user's own tree would store their file as the card's report
+				// (OTTR-1259).
+				!st.idn.sweep
 			)
 		)
 			return { text: null, error: null };
@@ -7298,7 +7368,7 @@ export function createTurnLoop(
 	 * "integrated" is provable from the main repo alone. */
 	async function analyzeTurnTree(st: TurnSettle): Promise<void> {
 		const husk =
-			st.idn.interview || st.idn.grill || st.idn.scout
+			st.idn.interview || st.idn.grill || st.idn.scout || st.idn.sweep
 				? false
 				: await ops.worktreeHusk(st.loc.wt).catch(() => false);
 		// A deregistered worktree can lose its `.git` file while keeping the checkout: then neither
@@ -7309,6 +7379,7 @@ export function createTurnLoop(
 			!st.idn.interview &&
 			!st.idn.grill &&
 			!st.idn.scout &&
+			!st.idn.sweep &&
 			!husk &&
 			!(await ops.worktreeLinked(st.loc.wt).catch(() => false));
 		st.fromMain = husk || unlinked;
@@ -7407,6 +7478,7 @@ export function createTurnLoop(
 			!st.idn.interview &&
 			!st.idn.grill &&
 			!st.idn.scout &&
+			!st.idn.sweep &&
 			!st.wasResearch &&
 			!st.idn.releaseCard &&
 			existsSync(join(st.loc.wt, "shots"))
@@ -7516,6 +7588,9 @@ export function createTurnLoop(
 				!st.idn.interview &&
 				!st.idn.grill &&
 				!st.idn.scout &&
+				// A sweep runs in the main checkout: the untracked files there are the
+				// user's, never the card's leftovers (OTTR-1259).
+				!st.idn.sweep &&
 				!st.wasResearch &&
 				!st.idn.releaseCard &&
 				st.finishedCleanly &&
@@ -9165,10 +9240,15 @@ export function createTurnLoop(
 			// An interview card runs in the main checkout with no base branch: the commits-ahead
 			// gate would count its own AGENTS.md commit and trap the card, so it stays exempt.
 			// A trending scout runs there too: the checkout's own commits are never its work.
+			// The inbox sweep joins them (OTTR-1259): it runs read-only in the main checkout.
 			// A husk or unlinked dir would make git speak for the enclosing checkout instead,
 			// so the main-repo proof stands in for all three facts there.
 			commitsAhead:
-				st.idn.interview || st.idn.grill || st.idn.scout || st.fromMain
+				st.idn.interview ||
+				st.idn.grill ||
+				st.idn.scout ||
+				st.idn.sweep ||
+				st.fromMain
 					? 0
 					: await ops.commitsAhead(st.loc.wt, st.header.base).catch(() => 0),
 			// A microVM's tree is gone with the VM: its end-of-run status report decides,
@@ -9762,10 +9842,21 @@ export function createTurnLoop(
 				needsReason:
 					"A validation run must not commit. Cancel this card, or reply to continue.",
 			};
+		if (st.idn.sweep && next.stage === "merging")
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason:
+					"A sweep run must not commit. Cancel this card, or reply to continue.",
+			};
 		if (st.idn.reviewCard && next.stage === "done")
 			return await parkReviewDone(st, next);
 		if (st.idn.validation && next.stage === "done")
 			return await settleValidationResults(st, next);
+		// OTTR-1259: a done sweep writes no target card — its verdicts are records
+		// on the run card, and the apply route applies them per operator click.
+		if (st.idn.sweep && next.stage === "done")
+			return await settleSweepResults(st, next);
 		return next;
 	}
 
@@ -10046,6 +10137,45 @@ export function createTurnLoop(
 		return next;
 	}
 
+	/** A sweep card classified done (OTTR-1259): parse the run's per-card verdicts —
+	 * the card's stored findings unioned with this run's recorded set, dedupe by
+	 * prompt, stored first (the review check's union rule) — and log one line per
+	 * card, first result per card id winning (the validation settle's rule). The
+	 * settle writes no target card: verdicts are records on the sweep card, the
+	 * drawer and the apply route parse them from the stored findings, and the chain
+	 * trigger below files the remainder. Zero parsed results park the card
+	 * needs_you; otherwise the done Next passes through unchanged. */
+	async function settleSweepResults(st: TurnSettle, next: Next): Promise<Next> {
+		const stored = await st.store.listReviewFindings(st.id);
+		const seen = new Set(stored.map((f) => f.prompt));
+		const all = [...stored];
+		for (const finding of st.result.recorded) {
+			if (seen.has(finding.prompt)) continue;
+			seen.add(finding.prompt);
+			all.push(finding);
+		}
+		const results = all
+			.map((finding) => sweepResult(finding.prompt))
+			.filter((r) => r !== null);
+		if (results.length === 0)
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: "The sweep recorded no per-card verdicts",
+			};
+		const first = new Map<string, SweepRecord>();
+		for (const result of results)
+			if (!first.has(result.cardId)) first.set(result.cardId, result);
+		for (const [cardId, result] of first)
+			await st.log(
+				`- sweep verdict for #${cardId}: ${result.verdict}${result.drafts.length > 0 ? ` (${result.drafts.length} draft(s))` : ""}`,
+			);
+		await st.log(
+			`- sweep results: ${first.size} card(s) recorded, the table and the apply route read them from this card`,
+		);
+		return next;
+	}
+
 	/** OTTR-1129 validate-again: clears validatedAt on the review's sandbox leads whose
 	 * newest recorded outcome was "blocked" and whose validatedAt predates `before` (the
 	 * broken-sandbox window). With `lead` set, only that lead id is considered
@@ -10321,6 +10451,121 @@ export function createTurnLoop(
 		});
 	}
 
+	/** OTTR-1259: files at most one inbox sweep card per call, in one store
+	 * transaction. The manual start route (deps.sweepInbox) and the done sweep's
+	 * chain share this one implementation. Candidates: the project's pinned
+	 * research cards — `research`, stage done, not cancelled, the resolved steps
+	 * value not "unknown" (both steps reports and pure-info cards count), the id
+	 * not in the seen set (the ops seen ids unioned with the explicit `seen`
+	 * override), and no live sweep card already records a verdict for it. Order:
+	 * oldest createdAt first, id
+	 * tiebreak. Cap: SWEEP_BATCH_SIZE cards per run. No pinned cards: 409 "no
+	 * pinned research cards"; an open sweep: 409 "a sweep run is already open".
+	 * Evidence is gathered server-side at filing time (reports, descendants,
+	 * token-matching related cards, the git log since the card landed — skipped on
+	 * a gitless project or git failure), all escaped into the prompt's labelled
+	 * blocks. The card runs on the board's cheap model role (modelRoles().plan)
+	 * with promptAuthor "board". */
+	async function filePendingSweepRun(
+		e: TurnProject,
+		seen?: ReadonlySet<string>,
+	): Promise<{ id: string } | { error: string; status: number }> {
+		return await e.store.transaction(async () => {
+			const tasks = await e.store.listTasks();
+			// One open sweep per project: the manual route's 409 and the chain's
+			// quiet no-op come from this single check.
+			if (
+				tasks.some(
+					(t) =>
+						t.kind === "sweep" && t.cancelledAt === null && t.stage !== "done",
+				)
+			)
+				return { error: "a sweep run is already open", status: 409 };
+			const covered = await sweepCoveredCards(tasks, (id) =>
+				e.store.listReviewFindings(id),
+			);
+			const seenSet = new Set([
+				...((await ops.seenIds?.().catch(() => [])) ?? []),
+				...(seen ?? []),
+			]);
+			// The list rows lack the wide report column, so the steps resolution
+			// (and every evidence read below) reads the full card, like the seen
+			// set's own resolution does.
+			const fulls: Task[] = [];
+			for (const row of tasks) {
+				if (!row.research || row.stage !== "done" || row.cancelledAt !== null)
+					continue;
+				const full = await e.store.getTask(row.id);
+				if (full !== null && sweepSteps(full) !== "unknown") fulls.push(full);
+			}
+			const candidates = sweepCandidateRows(fulls, seenSet, covered);
+			if (candidates.length === 0)
+				return { error: "no pinned research cards", status: 409 };
+			const batch = candidates.slice(0, SWEEP_BATCH_SIZE);
+			const blocks: SweepCardBlock[] = [];
+			for (const card of batch) {
+				const report = card.report ?? "";
+				const tokens = reportPathTokens(report);
+				const descendants = collectDescendants(tasks, card.id);
+				const related = await relatedByTokens(
+					tasks,
+					tokens,
+					card.id,
+					async (id) => (await e.store.getTask(id))?.details ?? null,
+				);
+				// The named paths' history since the card landed, in the project's main
+				// checkout, capped at 30 lines; a gitless project or a git failure
+				// sweeps without the commits evidence. Tokens lead with a word
+				// character, so none can parse as a git flag, and `--` keeps them
+				// pathspecs.
+				const commits: string[] = [];
+				if (!e.gitless && tokens.length > 0) {
+					const log = await git(
+						[
+							"log",
+							`--since=${new Date(card.createdAt).toISOString()}`,
+							"--name-only",
+							"--format=%h %s",
+							"--",
+							...tokens,
+						],
+						e.path,
+						30_000,
+					).catch(() => null);
+					if (log !== null && log.code === 0)
+						commits.push(
+							...log.stdout
+								.split("\n")
+								.filter((l) => l !== "")
+								.slice(0, 30),
+						);
+				}
+				blocks.push({
+					id: card.id,
+					title: card.title,
+					created: new Date(card.createdAt).toISOString(),
+					steps: stepsEvidence(report),
+					descendants: descendantLines(descendants),
+					related: relatedLines(related),
+					commits,
+				});
+			}
+			// The board's cheap model role: the selector under modelRoles().plan; null
+			// runs the default role.
+			const planModel = (ops.modelRoles ?? modelRoles)().plan ?? null;
+			const run = await e.store.createTask(
+				inboxSweepPrompt({ project: e.name, cards: blocks }),
+				planModel,
+				"sweep",
+			);
+			await e.store.updateTask(run.id, {
+				promptAuthor: "board",
+				details: `Inbox sweep of ${batch.length} pinned research card(s).`,
+			});
+			return { id: run.id };
+		});
+	}
+
 	/** OTTR-1139: the periodic catch-up sweep. The filing rules live entirely in
 	 * filePendingValidationRun: same one-open-run-per-project rule, same declined
 	 * rule, same batch cap. A refusal ({ error, status }) logs nothing — the same
@@ -10462,6 +10707,7 @@ export function createTurnLoop(
 				!st.idn.interview &&
 				!st.idn.grill &&
 				!st.idn.scout &&
+				!st.idn.sweep &&
 				!st.research &&
 				!st.idn.releaseCard &&
 				// This turn's copies count, and so do shots an earlier turn on this card attached:
@@ -10529,6 +10775,7 @@ export function createTurnLoop(
 			!st.idn.reviewCard &&
 			!st.idn.interview &&
 			!st.idn.scout &&
+			!st.idn.sweep &&
 			!st.research
 				? await ops.unsavedWork(st.loc.wt, st.header.target, {
 						// A superseded close discards the branch's unmerged commits by
@@ -10775,7 +11022,8 @@ export function createTurnLoop(
 			!st.idn.grill &&
 			!st.idn.scout &&
 			!st.idn.retroCard &&
-			!st.idn.validation
+			!st.idn.validation &&
+			!st.idn.sweep
 		);
 	}
 
@@ -12772,13 +13020,14 @@ export function createTurnLoop(
 		});
 	}
 
-	/** An interview, grill or trending scout card runs in the main checkout: its worktree must
-	 * never be removed. A done work card's worktree goes away. */
+	/** An interview, grill, trending scout or inbox sweep card runs in the main checkout: its
+	 * worktree must never be removed. A done work card's worktree goes away. */
 	async function removeDoneWorktree(
 		st: TurnSettle,
 		branch: string,
 	): Promise<void> {
-		if (st.idn.interview || st.idn.grill || st.idn.scout) return;
+		if (st.idn.interview || st.idn.grill || st.idn.scout || st.idn.sweep)
+			return;
 		// The done drawer keeps naming what the run left uncommitted after the
 		// worktree is gone: capture the list before removeWorktree deletes it.
 		// statusFiles never rejects (an unreadable tree reads as []).
@@ -13444,6 +13693,7 @@ export function createTurnLoop(
 		cancel,
 		filePendingValidationRun,
 		validationSweep,
+		filePendingSweepRun,
 		stopTurn,
 		creditStop,
 		creditRelease,

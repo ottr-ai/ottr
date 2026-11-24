@@ -235,6 +235,8 @@ import {
 	type SlotCounts,
 	seenable,
 	slotUse,
+	sweepRowAction,
+	sweepVerdictLabel,
 } from "./queue.ts";
 import {
 	historyTask,
@@ -5084,6 +5086,21 @@ export function ProjectBoard({
 			await post(`/api/projects/${encodeURIComponent(project.name)}/init`, {});
 			refreshState();
 		});
+	/** One inbox sweep start (OTTR-1259): act's success path refreshes the board so
+	 *  the new sweep card lands, and a refusal's server reason (one sweep already
+	 *  open, no pinned research cards) goes to the board's notice line. */
+	const startSweep = useCallback(
+		(): Promise<boolean> =>
+			act(
+				() =>
+					post(
+						`/api/projects/${encodeURIComponent(project.name)}/inbox/sweep`,
+						{},
+					),
+				onNotice,
+			),
+		[act, onNotice, project.name],
+	);
 	// The live rules interview card, if any: the no-rules advisory then offers opening it
 	// instead of a second "Discuss rules" that would only answer "queued".
 	const rulesTask = liveCardOf(tasks, "interview");
@@ -5565,6 +5582,8 @@ export function ProjectBoard({
 								}
 								starredCollapsed={starredCollapsed}
 								onStarredToggle={() => setStarredCollapsed((c) => !c)}
+								// Only the done lane pins research reports, so only it sweeps.
+								onSweepInbox={c.key === "done" ? startSweep : undefined}
 								// Idle backlog cards park under the todo lane, below a divider; started ones
 								// joined the lane's own list and the search filter already applied.
 								parked={
@@ -6825,6 +6844,8 @@ function LaneCards(p: {
 	onSearchRetry?: () => void;
 	/** LaneCol's useId value: names the Starred body for aria-controls. */
 	uid: string;
+	/** Done lane only: starts the inbox sweep run (OTTR-1259); the button sits beside the Inbox label. */
+	onSweepInbox?: () => Promise<boolean>;
 	starredCollapsed: boolean;
 	onStarredToggle: (() => void) | undefined;
 	showMore: (e: ReactMouseEvent<HTMLButtonElement>, go: () => void) => void;
@@ -6853,7 +6874,20 @@ function LaneCards(p: {
 					{filtering ? "No matches." : EMPTY_STAGE[stage]}
 				</p>
 			)}
-			{p.fresh.length > 0 && <p className="lane-label">Inbox</p>}
+			{p.fresh.length > 0 && (
+				<p className="lane-label inbox-head">
+					Inbox
+					{p.onSweepInbox !== undefined && (
+						<BusyButton
+							className="sweep-inbox"
+							run={p.onSweepInbox}
+							title="One batch run proposes one decision per pinned research card"
+						>
+							Sweep inbox
+						</BusyButton>
+					)}
+				</p>
+			)}
 			{p.fresh.map(p.card)}
 			{p.fresh.length > 0 && p.fresh.length + p.starred.length < p.total && (
 				<hr className="lane-divider" />
@@ -7031,6 +7065,8 @@ export function LaneCol({
 	starredCollapsed = false,
 	onStarredToggle,
 	onRerelease,
+	/** Done lane only: starts the inbox sweep run (OTTR-1259); absent on the other lanes. */
+	onSweepInbox,
 	tick,
 	pendingCards,
 }: {
@@ -7059,6 +7095,8 @@ export function LaneCol({
 	starredCollapsed?: boolean;
 	/** Done lane only: flips the Starred section's collapse state. */
 	onStarredToggle?: () => void;
+	/** Done lane only: starts the inbox sweep run (OTTR-1259); the button shows beside the Inbox label. */
+	onSweepInbox?: () => Promise<boolean>;
 	/** Every lane's cards: a dependency hold must find a dependency that sits in another lane. */
 	projectTasks: TaskCard[];
 	/** The index-shaped whole-project list (OTTR-1255): the hold and release gates read
@@ -7382,6 +7420,7 @@ export function LaneCol({
 				unread={unread}
 				fresh={fresh}
 				starred={starred}
+				onSweepInbox={stage === "done" ? onSweepInbox : undefined}
 				view={view}
 				more={more}
 				onMore={onMore}
@@ -11889,6 +11928,120 @@ function DrawerPrSec(p: {
 	);
 }
 
+/** Drawer Sweep section (OTTR-1259): the sweep run card's one table — one row per
+ * swept card, its verdict, its evidence and its proposed action; the operator
+ * checks rows and applies. The section rides the drawer detail (task.sweep). */
+function DrawerSweep(p: {
+	task: TaskView;
+	act: Act;
+	setDetail: React.Dispatch<React.SetStateAction<TaskView | null>>;
+}) {
+	const { task, act, setDetail } = p;
+	const sweep = task.sweep;
+	// Checked rows, keyed by the target card id. Stale rows never join: their
+	// checkbox is disabled, so an apply cannot carry them either.
+	const [checked, setChecked] = useState<ReadonlySet<string>>(
+		() =>
+			new Set((sweep?.rows ?? []).filter((r) => !r.stale).map((r) => r.card)),
+	);
+	const [error, setError] = useState<string | null>(null);
+	// An apply refetches the detail (and the state refresh re-renders the drawer):
+	// the fresh rows reset the checks to their defaults, like PrReviewSection's
+	// draft reset. Render-phase guard on the rows array identity.
+	const lastRows = useRef(sweep?.rows);
+	if (sweep !== undefined && sweep.rows !== lastRows.current) {
+		lastRows.current = sweep.rows;
+		setChecked(new Set(sweep.rows.filter((r) => !r.stale).map((r) => r.card)));
+	}
+	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
+	return (
+		<>
+			{" "}
+			{task.kind === "sweep" && sweep !== undefined && (
+				<DrawerSec id="drawer-sweep" label="Sweep results">
+					<div className="sweep-results">
+						<ul className="sweep-rows">
+							{sweep.rows.map((row) => (
+								<li
+									key={row.card}
+									className={row.stale ? "sweep-row stale" : "sweep-row"}
+								>
+									<label className="sweep-row-head">
+										<input
+											type="checkbox"
+											name={`sweep-row-${row.card}`}
+											aria-label={`${sweepVerdictLabel(row)}: ${row.title}`}
+											checked={!row.stale && checked.has(row.card)}
+											disabled={row.stale}
+											onChange={() => {
+												const next = new Set(checked);
+												if (next.has(row.card)) next.delete(row.card);
+												else next.add(row.card);
+												setChecked(next);
+											}}
+										/>
+										<span className="sweep-verdict" data-verdict={row.verdict}>
+											{sweepVerdictLabel(row)}
+										</span>
+										<span className="sweep-title">{row.title}</span>
+										{row.stale && (
+											<span className="sweep-stale-tag">Stale</span>
+										)}
+									</label>
+									<p className="sweep-action">{sweepRowAction(row)}</p>
+									<pre className="sweep-evidence">{row.evidence}</pre>
+									{row.drafts.length > 0 && (
+										<p className="sweep-drafts">
+											{row.drafts.length} draft
+											{row.drafts.length === 1 ? "" : "s"} to file on apply.
+										</p>
+									)}
+								</li>
+							))}
+						</ul>
+						{sweep.pending > 0 && (
+							<p className="sweep-pending" role="status">
+								{sweep.pending} more cards continue in the next sweep run.
+							</p>
+						)}
+						{error !== null && (
+							<p className="sweep-error" role="alert">
+								{error}
+							</p>
+						)}
+						<div className="reply-actions">
+							<BusyButton
+								className="primary"
+								disabled={checked.size === 0}
+								run={() =>
+									act(async () => {
+										setError(null);
+										// Each checked row applies its own proposed action; stale
+										// rows cannot join (their checkbox is disabled) and the
+										// server refuses them too.
+										const rows = sweep.rows
+											.filter((r) => !r.stale && checked.has(r.card))
+											.map((r) => ({ card: r.card, action: r.proposed }));
+										await post(`${taskUrl}/inbox/sweep/apply`, {
+											run: task.id,
+											rows,
+										});
+										// The applied rows changed seen marks and filed drafts:
+										// refetch this card's detail, act refreshes the board state.
+										setDetail(await readDetail(taskUrl));
+									}, setError)
+								}
+							>
+								Apply selected
+							</BusyButton>
+						</div>
+					</div>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
 /** Drawer WorkCheck section: extracted verbatim from the drawer body. */
 function DrawerWorkCheck(p: {
 	task: TaskView;
@@ -16139,6 +16292,7 @@ export function Drawer({
 						act={act}
 						setDetail={setDetail}
 					/>
+					<DrawerSweep task={task} act={act} setDetail={setDetail} />
 					<DrawerWorkCheck task={task} catalog={catalog} />
 					<DrawerMergeModal
 						mergeOpen={mergeOpen}

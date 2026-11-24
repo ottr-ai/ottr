@@ -1365,6 +1365,8 @@ const app = await createApp({
 			first,
 			park,
 		),
+	// OTTR-1259: the inbox sweep's start files through the same loop seam.
+	sweepInbox: (e) => loop.filePendingSweepRun(e),
 	stopTurn: loop.stopTurn,
 	// OTTR-1261: the reply route's stale-ask responder intercepts only while the
 	// card's unsuffixed turn entry is live.

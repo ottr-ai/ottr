@@ -394,7 +394,8 @@ export type TaskKind =
 	| "interview"
 	| "pr_review"
 	| "trending"
-	| "validation";
+	| "validation"
+	| "sweep";
 
 /** A trending scout's judgement of one repo for one project: filed and no_fit are final; deferred is offered again next scan. */
 export type TrendingVerdictKind = "filed" | "no_fit" | "deferred";
@@ -1337,6 +1338,38 @@ export interface TaskView extends Omit<Task, "diffText"> {
 		| "blocked"
 		| "deployment"
 		| null;
+	/** Set only for kind "sweep" (OTTR-1259): the run's per-card verdict rows and the
+	 * pinned cards the run does not cover (the chain's remainder). */
+	sweep?: SweepView;
+}
+
+/** One verdict row of an inbox sweep run (OTTR-1259): one pinned research card the run
+ * judged, with the evidence it recorded and the drawer action the row proposes. */
+export interface SweepRowView {
+	/** The pinned research card the verdict names. */
+	card: string;
+	/** The target card's sessionTitle. */
+	title: string;
+	verdict: "done" | "partial" | "none" | "info";
+	/** The recorded evidence text (everything between the verdict line and the first draft). */
+	evidence: string;
+	/** The recorded draft card prompts, one per open step. */
+	drafts: string[];
+	/** The drawer action the row proposes: done and info clear, partial and none implement. */
+	proposed: "clear" | "implement";
+	/** True when the target changed after the sweep read it (a new child, a reply, a cancel). */
+	stale: boolean;
+	/** The target card's live row fields. */
+	stage: Stage;
+	state: RunState;
+	cancelled: boolean;
+}
+
+/** The sweep section a kind "sweep" card's drawer shows. */
+export interface SweepView {
+	rows: SweepRowView[];
+	/** Pinned research cards of the project this run does not cover (the chain's remainder). */
+	pending: number;
 }
 
 /** A retro card as its source card's drawer shows it: the facts its Work steps entry reads. */

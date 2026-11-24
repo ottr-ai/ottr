@@ -19,6 +19,8 @@ import type {
 	ServiceQuotaMetric,
 	ServiceQuotaSourceState,
 	StateResponse,
+	SweepRowView,
+	SweepView,
 	Task,
 	TaskCard,
 	TaskView,
@@ -1498,6 +1500,218 @@ describe("done lane star section", () => {
 			<LaneCol {...base} stage="done" tasks={[normal]} />,
 		);
 		expect(html).not.toContain(">Starred</span>");
+	});
+});
+
+describe("Inbox sweep (OTTR-1259)", () => {
+	const base = laneColBase;
+
+	// LaneCol props every test here passes on top of the shared laneColBase.
+	const lane = (
+		tasks: TaskCard[],
+		over: Partial<Parameters<typeof LaneCol>[0]> = {},
+	): string =>
+		renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={tasks}
+				unread={(t) => t.id === "r1"}
+				{...over}
+			/>,
+		);
+	const onSweepInbox = async (): Promise<boolean> => true;
+
+	test("the done lane's Inbox head offers the sweep run only when the pinned group is non-empty", () => {
+		// A done research steps card the unread callback names pins in the Inbox group;
+		// the plain done card rides below the divider, read.
+		const pinnedResearch = cardFixture({
+			id: "r1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			steps: "yes",
+			report: "## Recommended steps\n\n1. Buy the rack",
+		});
+		const readWork = cardFixture({ id: "w1", stage: "done", state: "idle" });
+		const withPin = lane([pinnedResearch, readWork], { onSweepInbox });
+		expect(withPin).toContain("Sweep inbox");
+		// Nothing pinned: the label itself is gone, so no sweep trigger rides it.
+		const empty = lane([readWork], { onSweepInbox });
+		expect(empty).not.toContain("Sweep inbox");
+		// A lane without the handler (todo) never renders the trigger either.
+		const todo = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="todo"
+				tasks={[cardFixture({ id: "t1", stage: "todo", state: "queued" })]}
+				onSweepInbox={onSweepInbox}
+			/>,
+		);
+		expect(todo).not.toContain("Sweep inbox");
+	});
+
+	// --- the sweep card's drawer table ---
+
+	// One sweep view: r1 done (clear), r2 partial with drafts (implement), r3 stale.
+	const sweepRows = (): SweepRowView[] => [
+		{
+			card: "r1",
+			title: "Fix the login bug",
+			verdict: "done",
+			evidence: "The fix landed in card w7; git log names 1a2b3c4.",
+			drafts: [],
+			proposed: "clear",
+			stale: false,
+			stage: "done",
+			state: "idle",
+			cancelled: false,
+		},
+		{
+			card: "r2",
+			title: "Research the queue rewrite",
+			verdict: "partial",
+			evidence: "Step 2 has no child card.",
+			drafts: ["Rewrite the queue page"],
+			proposed: "implement",
+			stale: false,
+			stage: "done",
+			state: "idle",
+			cancelled: false,
+		},
+		{
+			card: "r3",
+			title: "Research the stale plan",
+			verdict: "none",
+			evidence: "No step is done.",
+			drafts: ["Draft the first step"],
+			proposed: "implement",
+			stale: true,
+			stage: "done",
+			state: "idle",
+			cancelled: false,
+		},
+	];
+	// The sweep run card fixture: kind "sweep" and the sweep view ride the same
+	// short cast drawerFields uses (the server's TaskKind gain lands in parallel).
+	const sweepCard = (sweep: SweepView): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			id: "S-1",
+			kind: "sweep",
+			stage: "done",
+			state: "idle",
+			sweep,
+		} as unknown as Parameters<typeof cardFixture>[0]);
+	const sweepView = (rows: SweepRowView[], pending = 0): SweepView => ({
+		rows,
+		pending,
+	});
+
+	/** The rendered drawer's sweep checkbox for one target card id. */
+	const rowInput = (
+		html: string,
+		card: string,
+	): { checked: boolean; disabled: boolean } => {
+		const el = parseMarkup(html).querySelector(
+			`input[name="sweep-row-${card}"]`,
+		);
+		// happy-dom nodes: check the tag, not the global class (bun defines no
+		// HTMLInputElement global and its element types differ from the DOM lib).
+		if (el?.tagName !== "INPUT")
+			throw new Error(`no sweep checkbox for ${card}`);
+		return el as unknown as { checked: boolean; disabled: boolean };
+	};
+	/** The drawer's Apply selected button. */
+	const applyButton = (html: string): { disabled: boolean } => {
+		const doc = parseMarkup(html);
+		const el = [...doc.querySelectorAll("button")].find((b) =>
+			b.textContent?.includes("Apply selected"),
+		);
+		if (el?.tagName !== "BUTTON") throw new Error("no Apply selected button");
+		return el as unknown as { disabled: boolean };
+	};
+
+	test("the sweep drawer renders one named checkbox per row, preselected to its proposed action", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...drawerBase} task={sweepCard(sweepView(sweepRows()))} />,
+		);
+		// One checkbox per row, named sweep-row-<cardId>, under the Sweep results section.
+		expect(html).toContain("Sweep results");
+		expect(html).toContain('name="sweep-row-r1"');
+		expect(html).toContain('name="sweep-row-r2"');
+		expect(html).toContain('name="sweep-row-r3"');
+		// The non-stale rows are preselected; the stale one is not.
+		expect(rowInput(html, "r1").checked).toBe(true);
+		expect(rowInput(html, "r2").checked).toBe(true);
+		expect(rowInput(html, "r3").checked).toBe(false);
+		// Each row names its verdict and its proposed action.
+		expect(html).toContain('aria-label="All steps done: Fix the login bug"');
+		expect(html).toContain(
+			'aria-label="Some steps open: Research the queue rewrite"',
+		);
+		expect(html).toContain("No further steps");
+		expect(html).toContain("Implement steps");
+		// Evidence reads pre-wrapped; the partial row names its draft count.
+		expect(html).toContain("sweep-evidence");
+		expect(html).toContain("The fix landed in card w7; git log names 1a2b3c4.");
+		expect(html).toContain("1 draft to file on apply.");
+	});
+
+	test("the stale row's checkbox is disabled, tagged Stale, and never preselected", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...drawerBase} task={sweepCard(sweepView(sweepRows()))} />,
+		);
+		const stale = rowInput(html, "r3");
+		expect(stale.disabled).toBe(true);
+		expect(stale.checked).toBe(false);
+		expect(html).toContain(">Stale</span>");
+		// The fresh rows stay enabled.
+		expect(rowInput(html, "r1").disabled).toBe(false);
+	});
+
+	test("Apply selected disables with nothing checked and enables with rows checked", () => {
+		// The fixture's rows: one checked state is the default (fresh rows preselect),
+		// the other has only the stale row, so nothing is checked.
+		const enabled = applyButton(
+			renderToStaticMarkup(
+				<Drawer {...drawerBase} task={sweepCard(sweepView(sweepRows()))} />,
+			),
+		);
+		expect(enabled.disabled).toBe(false);
+		const allStale = sweepRows().map((r) => ({ ...r, stale: true }));
+		const disabled = applyButton(
+			renderToStaticMarkup(
+				<Drawer {...drawerBase} task={sweepCard(sweepView(allStale))} />,
+			),
+		);
+		expect(disabled.disabled).toBe(true);
+	});
+
+	test("the pending line renders only when cards continue in the next run", () => {
+		const withPending = renderToStaticMarkup(
+			<Drawer
+				{...drawerBase}
+				task={sweepCard(sweepView(sweepRows().slice(0, 1), 2))}
+			/>,
+		);
+		expect(withPending).toContain(
+			"2 more cards continue in the next sweep run.",
+		);
+		const withoutPending = renderToStaticMarkup(
+			<Drawer
+				{...drawerBase}
+				task={sweepCard(sweepView(sweepRows().slice(0, 1), 0))}
+			/>,
+		);
+		expect(withoutPending).not.toContain("more cards continue");
+	});
+
+	test("a non-sweep drawer renders no Sweep results section", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...drawerBase} task={cardFixture({ ...drawerFields })} />,
+		);
+		expect(html).not.toContain("Sweep results");
 	});
 });
 

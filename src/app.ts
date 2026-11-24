@@ -162,6 +162,14 @@ import {
 	saveImages,
 	sniffImage,
 } from "./images.ts";
+import {
+	collectDescendants,
+	type SweepRecord,
+	sweepCandidateRows,
+	sweepCoveredCards,
+	sweepResult,
+	sweepRowStale,
+} from "./inboxSweep.ts";
 import { createIssueWatcher } from "./issues.ts";
 import { assertAllowedHost, JiraError, type JiraNet } from "./jira.ts";
 import { createJiraRoutes } from "./jiraRoutes.ts";
@@ -280,6 +288,7 @@ import {
 	releasePrompt,
 	reviewPrompt,
 	rulesInterviewPrompt,
+	sweepProposedReason,
 	WORK_CHECK_MAX_SENDBACKS,
 	workCheckSendBack,
 	workCheckSendBackDirection,
@@ -472,6 +481,7 @@ import {
 	type SeedPartialView,
 	type ServerMessage,
 	type StateResponse,
+	type SweepView,
 	type SystemHolds,
 	type Task,
 	type TaskCard,
@@ -721,6 +731,12 @@ interface AppDeps {
 	 * responder intercepts replies only while it is; absent in narrow mounts, where
 	 * every reply takes the normal path. */
 	turnLive?: (project: string, id: string) => boolean;
+	/** OTTR-1259: files at most one inbox sweep card for the project (the turn
+	 * loop's filePendingSweepRun); the start route calls it. Optional only so
+	 * narrow route-test mounts that never call the route stay type-valid. */
+	sweepInbox?(
+		e: Entry,
+	): Promise<{ id: string } | { error: string; status: number }>;
 	finishKept(
 		e: Entry,
 		id: string,
@@ -7086,6 +7102,79 @@ export async function createApp(deps: AppDeps) {
 		return null;
 	}
 
+	/** A sweep run's parsed verdicts: the card's stored findings parsed with
+	 * `sweepResult`, first result per card id winning (the settle's rule).
+	 * `applicable` is the spec's live-and-done gate — a cancelled or unfinished
+	 * sweep's records apply nowhere. */
+	async function sweepVerdicts(
+		store: ProjectStore,
+		runId: string,
+		applicable: boolean,
+	): Promise<Map<string, SweepRecord>> {
+		const verdicts = new Map<string, SweepRecord>();
+		if (!applicable) return verdicts;
+		for (const finding of await store.listReviewFindings(runId)) {
+			const parsed = sweepResult(finding.prompt);
+			if (parsed !== null && !verdicts.has(parsed.cardId))
+				verdicts.set(parsed.cardId, parsed);
+		}
+		return verdicts;
+	}
+
+	/** The sweep section a kind "sweep" card's drawer shows (OTTR-1259): one row
+	 * per recorded verdict, stale computed live against the run card's updatedAt
+	 * stamp, plus the pinned cards no live sweep covers (the chain's remainder). */
+	async function sweepView(e: Entry, run: Task): Promise<SweepView> {
+		const tasks = await e.store.listTasks();
+		const verdicts = await sweepVerdicts(
+			e.store,
+			run.id,
+			run.cancelledAt === null,
+		);
+		const stamp = run.updatedAt;
+		const rows = (
+			await Promise.all(
+				[...verdicts.values()].map(async (v) => {
+					const target = tasks.find((t) => t.id === v.cardId);
+					if (target === undefined) return null;
+					return {
+						card: v.cardId,
+						title: await e.store.frozenTitle(target),
+						verdict: v.verdict,
+						evidence: v.evidence,
+						drafts: v.drafts,
+						proposed:
+							v.verdict === "done" || v.verdict === "info"
+								? ("clear" as const)
+								: ("implement" as const),
+						stale: sweepRowStale(
+							target,
+							collectDescendants(tasks, v.cardId),
+							stamp,
+						),
+						stage: target.stage,
+						state: target.state,
+						cancelled: target.cancelledAt !== null,
+					};
+				}),
+			)
+		).filter((r) => r !== null);
+		// The chain's remainder: the pinned cards no live sweep covers, counted
+		// with the same resolution the filing runs.
+		const seen = new Set(await loadSeen());
+		const covered = await sweepCoveredCards(tasks, (id) =>
+			e.store.listReviewFindings(id),
+		);
+		const fulls: Task[] = [];
+		for (const row of tasks) {
+			if (!row.research || row.stage !== "done" || row.cancelledAt !== null)
+				continue;
+			const full = await e.store.getTask(row.id);
+			if (full !== null && viewSteps(full) !== "unknown") fulls.push(full);
+		}
+		return { rows, pending: sweepCandidateRows(fulls, seen, covered).length };
+	}
+
 	/** One task with its turns for the drawer; turns ship without the prompt text and the raw
 	 * diff ships only from its own endpoint, so opening a drawer never carries the cap-sized text. */
 	async function taskView(e: Entry, t: Task): Promise<TaskView> {
@@ -7176,6 +7265,7 @@ export async function createApp(deps: AppDeps) {
 						),
 					}
 				: {}),
+			...(t.kind === "sweep" ? { sweep: await sweepView(e, t) } : {}),
 		};
 	}
 
@@ -13234,6 +13324,131 @@ export async function createApp(deps: AppDeps) {
 		return json({ ...(await taskView(e, t)), reset: filed.reset });
 	}
 
+	/** OTTR-1259: the inbox sweep's start — files the sweep card (one open per
+	 * project, the loop's filePendingSweepRun via deps.sweepInbox), schedules, and
+	 * returns the card's view. A gitless project sweeps too: the git-log evidence
+	 * just stays empty. 404 unknown project; the filing's 409s pass through. */
+	async function handlePOSTInboxSweepStart(
+		req: BunRequest<"/api/projects/:project/inbox/sweep">,
+	): Promise<Response> {
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		const fileRun = deps.sweepInbox;
+		if (fileRun === undefined)
+			return json({ error: "sweep filing is not wired" }, 500);
+		const filed = await fileRun(e);
+		if ("error" in filed) return json({ error: filed.error }, filed.status);
+		await deps.schedule();
+		const t = await e.store.getTask(filed.id);
+		if (t === null) return json({ error: "unknown task" }, 404);
+		return json(await taskView(e, t));
+	}
+
+	/** One apply row the request body parsed into. */
+	type SweepApplyRow = { card: string; action: "clear" | "implement" };
+
+	/** Parses the apply body's rows; a Response is the 400. */
+	function parseSweepApplyRows(rows: unknown): SweepApplyRow[] | Response {
+		if (!Array.isArray(rows) || rows.length === 0 || rows.length > 200)
+			return json({ error: "rows must be a non-empty array" }, 400);
+		const parsed: SweepApplyRow[] = [];
+		for (const row of rows) {
+			if (typeof row !== "object" || row === null)
+				return json({ error: "each row must be an object" }, 400);
+			const { card, action } = row as Record<string, unknown>;
+			if (typeof card !== "string" || card === "" || !TASK_ID_RE.test(card))
+				return json({ error: "card must be a task id" }, 400);
+			if (action !== "clear" && action !== "implement")
+				return json({ error: 'action must be "clear" or "implement"' }, 400);
+			parsed.push({ card, action });
+		}
+		return parsed;
+	}
+
+	/** OTTR-1259: the inbox sweep's apply — the drawer's per-row actions, in one
+	 * pass. Per row: the run card must be kind "sweep", live (not cancelled) and
+	 * done, and carry a parsed verdict for the card, else `skipped: "no verdict"`;
+	 * a stale row (the live stale rule against the run card's updatedAt stamp)
+	 * never applies, whatever the body asks; `clear` adds the target to the seen
+	 * set (the shared /api/seen path: seenable-gated, decayed); `implement` files
+	 * each recorded draft as a held proposal card (backlog, needs_you, board
+	 * authorship, the sweep proposal reason) and marks the target seen — an
+	 * implement row with no drafts only marks seen. Unknown run or card: 404. */
+	async function handlePOSTInboxSweepApply(
+		req: BunRequest<"/api/projects/:project/inbox/sweep/apply">,
+	): Promise<Response> {
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const b = r.body as Record<string, unknown>;
+		if (typeof b.run !== "string" || b.run === "" || !TASK_ID_RE.test(b.run))
+			return json({ error: "run must be a task id" }, 400);
+		const rows = parseSweepApplyRows(b.rows);
+		if (rows instanceof Response) return rows;
+		const run = await e.store.getTask(b.run);
+		if (run === null || run.kind !== "sweep")
+			return json({ error: "unknown task" }, 404);
+		for (const row of rows)
+			if ((await e.store.getTask(row.card)) === null)
+				return json({ error: "unknown task" }, 404);
+		// "The run must be live and done": a cancelled or unfinished sweep's
+		// verdicts apply nowhere, whatever they recorded.
+		const verdicts = await sweepVerdicts(
+			e.store,
+			run.id,
+			run.cancelledAt === null && run.stage === "done",
+		);
+		const tasks = await e.store.listTasks();
+		const stamp = run.updatedAt;
+		const results: { card: string; applied: boolean; skipped?: string }[] = [];
+		const markSeen: string[] = [];
+		for (const row of rows) {
+			const verdict = verdicts.get(row.card);
+			if (verdict === undefined) {
+				results.push({ card: row.card, applied: false, skipped: "no verdict" });
+				continue;
+			}
+			const target = tasks.find((t) => t.id === row.card);
+			if (
+				target === undefined ||
+				sweepRowStale(target, collectDescendants(tasks, row.card), stamp)
+			) {
+				results.push({ card: row.card, applied: false, skipped: "stale" });
+				continue;
+			}
+			if (row.action === "implement")
+				for (const draft of verdict.drafts) {
+					const proposal = await e.store.createTask(draft);
+					await e.store.updateTask(proposal.id, {
+						followUpOf: run.id,
+						promptAuthor: "board",
+						stage: "backlog",
+						state: "needs_you",
+						queuedAt: null,
+						needsReason: sweepProposedReason({ id: run.id }),
+					});
+					await appendLog(
+						e.store,
+						run.id,
+						`- filed proposal ${proposal.id} for #${row.card}`,
+					);
+				}
+			// `clear` marks seen; `implement` marks seen after the drafts filed. The
+			// seenable-gated write decays a card that stopped being seenable (the
+			// shared /api/seen rule), it never re-pins.
+			markSeen.push(row.card);
+			results.push({ card: row.card, applied: true });
+		}
+		if (markSeen.length > 0) {
+			const live = await seenableIds();
+			await updateSeen((current) =>
+				[...current, ...markSeen].filter((id) => live.has(id)),
+			);
+		}
+		return json({ results });
+	}
+
 	/** The steering refusal for a card not in flight; null lets the steer queue. */
 	function steerStateRefusal(task: Task): Response | null {
 		// A waiting lead must not start a work turn: the steer stays refused.
@@ -17417,6 +17632,19 @@ export async function createApp(deps: AppDeps) {
 					},
 				),
 		},
+		// OTTR-1259: the inbox sweep's start and apply.
+		"/api/projects/:project/inbox/sweep": {
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTInboxSweepStart(req), {
+					costly: true,
+				}),
+		},
+		"/api/projects/:project/inbox/sweep/apply": {
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTInboxSweepApply(req), {
+					costly: true,
+				}),
+		},
 		"/api/projects/:project/tasks/:id/cancel": {
 			POST: async (req) =>
 				await api(
@@ -17713,6 +17941,9 @@ export async function createApp(deps: AppDeps) {
 		// OTTR-876: the read-only GitHub token a turn may hold, or null — the served rule
 		// (docs/specs/turn-read-token.md); the turn loop asks it at every turn start.
 		turnReadToken,
+		// OTTR-1259: the board's sorted seen ids; the turn loop reads them per inbox
+		// sweep filing (candidates skip already-read cards).
+		seenIds: loadSeen,
 		// OTTR-882: the release identity (the configured GitHub app's contents-write token,
 		// else the GH_TOKEN user token with a warning); the turn loop asks it at publish.
 		releaseIdentity,

@@ -16,6 +16,8 @@ import {
 	seenable,
 	slotUse,
 	spliceColumn,
+	sweepRowAction,
+	sweepVerdictLabel,
 } from "./queue.ts";
 
 const t = (
@@ -211,6 +213,18 @@ test("researchSteps resolves the stored steps value first, then falls back to th
 	// Cards may omit report: no report, nothing to pin.
 	expect(researchSteps({ steps: "unknown" })).toBe("quiet");
 	expect(researchSteps({ steps: "unknown", report: null })).toBe("quiet");
+});
+
+test("sweepVerdictLabel names the four verdicts with the drawer's fixed wording", () => {
+	expect(sweepVerdictLabel({ verdict: "done" })).toBe("All steps done");
+	expect(sweepVerdictLabel({ verdict: "partial" })).toBe("Some steps open");
+	expect(sweepVerdictLabel({ verdict: "none" })).toBe("Nothing done");
+	expect(sweepVerdictLabel({ verdict: "info" })).toBe("Info only");
+});
+
+test("sweepRowAction maps a row's proposed action to the two drawer action texts", () => {
+	expect(sweepRowAction({ proposed: "clear" })).toBe("No further steps");
+	expect(sweepRowAction({ proposed: "implement" })).toBe("Implement steps");
 });
 
 test("autoMarkOnOpen clears everything on open except a steps report", () => {
