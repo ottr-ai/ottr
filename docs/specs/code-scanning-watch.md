@@ -144,6 +144,15 @@ largest tier that fits, in order:
   copied untracked files). The file stays outside git: `git status` in the
   worktree stays clean, and the tracker's uncommitted-files checks never see
   it. A card whose prompt fits in tier 1 or 2 gets no file.
+- A microVM guest clones the branch fresh, so the excluded file never crosses
+  with the checkout. The turn dispatch carries the file text to vm-runner as
+  `cloneFiles` on the VM spec (`{ path, text }`, every path inside the run's
+  cwd, at most 4 files of at most 1 MB each); vm-runner validates the paths
+  against the run's cwd and forwards the list, and the guest writes the files
+  into its clone right after cloning, before the agent starts, then adds their
+  relative paths to the clone's own `.git/info/exclude`, so the guest's
+  `git status` stays clean too. Docker workers need no delivery: they see the
+  host worktree through the workspace bind mount.
 
 ### Convergence of old part cards (OTTR-1256)
 

@@ -93,6 +93,25 @@ writeFileSync(
 	`process.stdout.write(JSON.stringify(process.env) + "\\n");`,
 );
 
+// Fake omp: prints the clone file the board wrote into the cwd; missing means omp never saw it.
+const cloneFileOmp = join(dir, "clone-file-omp.js");
+writeFileSync(
+	cloneFileOmp,
+	`const fs = require("node:fs");
+try {
+	process.stdout.write(JSON.stringify({ type: "cloneFile", text: fs.readFileSync("code-scan-alerts.md", "utf8") }) + "\\n");
+} catch {
+	process.stdout.write('{"type":"missing"}\\n');
+}`,
+);
+
+// Fake omp: drops a marker file; its absence proves omp never ran.
+const markerOmp = join(dir, "marker-omp.js");
+writeFileSync(
+	markerOmp,
+	`require("node:fs").writeFileSync("marker.txt", "ran\\n");`,
+);
+
 // Fake omp: one event, then alive until killed.
 const sleepPath = join(dir, "sleep-omp.js");
 writeFileSync(
@@ -164,13 +183,16 @@ interface RunOpts {
 	hindsight?: boolean;
 	boardUrl?: string;
 	project?: string;
+	/** Board clone files; each path sits inside the run's cwd, named relative to it. */
+	cloneFiles?: { path: string; text: string }[];
 }
 
 function runBody(o: RunOpts): string {
+	const cwd = join(fresh("ws"), "proj", ".worktrees", "T-1");
 	return JSON.stringify({
 		argv: o.argv,
 		// The clone target's parents do not exist yet, like /workspace in a fresh VM.
-		cwd: join(fresh("ws"), "proj", ".worktrees", "T-1"),
+		cwd,
 		env: o.env ?? {},
 		stdin: "",
 		vm: {
@@ -182,6 +204,14 @@ function runBody(o: RunOpts): string {
 			providers: o.providers ?? [],
 			hindsight: o.hindsight ?? false,
 			project: o.project ?? "proj",
+			...(o.cloneFiles === undefined
+				? {}
+				: {
+						cloneFiles: o.cloneFiles.map((file) => ({
+							path: join(cwd, file.path),
+							text: file.text,
+						})),
+					}),
 		},
 	});
 }
@@ -368,6 +398,89 @@ describe("POST /run", () => {
 		expect(done.vm.head).toBeNull();
 		expect(done.vm.pushError).toContain("board says no");
 		expect(done.vm.dirty).toEqual([]);
+	}, 30_000);
+
+	test("clone files land in the fresh clone and stay invisible to git status", async () => {
+		const branch = "ott/t-clone-files";
+		const bare = makeRemote(branch);
+		const url = start();
+		const { lines, done, cwd } = await runTurn(url, {
+			gitUrl: bare,
+			branch,
+			argv: [cloneFileOmp],
+			cloneFiles: [{ path: "code-scan-alerts.md", text: "alert list" }],
+		});
+		// omp saw the file the board wrote into its clone before omp started.
+		expect(JSON.parse(lines[0] ?? "{}")).toEqual({
+			type: "cloneFile",
+			text: "alert list",
+		});
+		expect(done.exitCode).toBe(0);
+		expect(readFileSync(join(cwd, "code-scan-alerts.md"), "utf8")).toBe(
+			"alert list",
+		);
+		// The exclude keeps the board's own file out of the dirty report.
+		expect(git(cwd, "status", "--porcelain", "--untracked-files=all")).toBe("");
+		expect(done.vm.dirty).toEqual([]);
+		const exclude = readFileSync(join(cwd, ".git", "info", "exclude"), "utf8");
+		expect(
+			exclude.split("\n").filter((l) => l === "/code-scan-alerts.md"),
+		).toHaveLength(1);
+	}, 30_000);
+
+	test("a clone file path outside the cwd refuses the run", async () => {
+		const branch = "ott/t-clone-file-escape";
+		const bare = makeRemote(branch);
+		const url = start();
+		const { done, cwd } = await runTurn(url, {
+			gitUrl: bare,
+			branch,
+			argv: [markerOmp],
+			cloneFiles: [{ path: "../escape.md", text: "escape" }],
+		});
+		expect(done.exitCode).toBe(1);
+		expect(done.stderrTail).toContain("outside");
+		// The refusal ends the run like a failed clone: no omp, no escaped file, no head,
+		// and no dirty report.
+		expect(existsSync(join(cwd, "marker.txt"))).toBe(false);
+		expect(existsSync(join(dirname(cwd), "escape.md"))).toBe(false);
+		expect(done.vm.head).toBeNull();
+		expect(done.vm.dirty).toBeNull();
+	}, 30_000);
+
+	test("a malformed cloneFiles answers 400", async () => {
+		const branch = "ott/t-clone-file-bad";
+		const bare = makeRemote(branch);
+		const url = start();
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { ...AUTH, "content-type": "application/json" },
+			body: JSON.stringify({
+				argv: [markerOmp],
+				cwd: join(fresh("ws"), "proj", ".worktrees", "T-1"),
+				env: {},
+				stdin: "",
+				vm: {
+					gitUrl: bare,
+					branch,
+					base: "main",
+					token: "vm-turn-token",
+					boardUrl: "http://ottr:8080",
+					providers: [],
+					hindsight: false,
+					cloneFiles: "nope",
+				},
+			}),
+		});
+		expect(res.status).toBe(400);
+		expect(await res.text()).toBe("bad request");
+		// A second run starts on the same guest, so the bad request never held the slot.
+		const { done } = await runTurn(url, {
+			gitUrl: bare,
+			branch: "ott/absent",
+			argv: [markerOmp],
+		});
+		expect(done.exitCode).toBe(1);
 	}, 30_000);
 
 	test("models.yml keeps unrelated keys and routes the turn's providers through /llm", async () => {

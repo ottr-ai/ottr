@@ -654,6 +654,71 @@ describe("vm-runner /run", () => {
 		expect(r.recs).toHaveLength(0);
 	});
 
+	test("forwards cloneFiles unchanged into the guest body's vm object", async () => {
+		const r = startRunner();
+		const cloneFiles = [
+			{
+				path: "/workspace/proj/.worktrees/P-1/code-scan-alerts.md",
+				text: "alert list",
+			},
+		];
+		const res = await post(r.url, "/run", request({ cloneFiles }));
+		expect(res.status).toBe(200);
+		await res.text();
+		const body = r.recs[0]!.runBody as { vm: Record<string, unknown> };
+		expect(body.vm.cloneFiles).toEqual(cloneFiles);
+	});
+
+	test("a clone file path outside the cwd answers 400 before any VM boots", async () => {
+		const r = startRunner();
+		for (const p of [
+			"/workspace/other/x.md",
+			// Strictly inside means not the cwd itself.
+			"/workspace/proj/.worktrees/P-1",
+			// Not join()/resolve(): the ".." must stay visible to the check.
+			"/workspace/proj/.worktrees/P-1/../other/x.md",
+		]) {
+			const res = await post(
+				r.url,
+				"/run",
+				request({ cloneFiles: [{ path: p, text: "x" }] }),
+			);
+			expect(res.status).toBe(400);
+			expect(await res.text()).toContain(p.replace(/\/\.\.\/.*/, ""));
+		}
+		expect(r.recs).toHaveLength(0);
+	});
+
+	test("a cloneFiles shape violation answers 400", async () => {
+		const r = startRunner();
+		const res = await post(
+			r.url,
+			"/run",
+			request({ cloneFiles: "nope" as never }),
+		);
+		expect(res.status).toBe(400);
+		expect(await res.text()).toContain("vm.cloneFiles");
+		expect(r.recs).toHaveLength(0);
+	});
+
+	test("an oversized clone file answers 400", async () => {
+		const r = startRunner();
+		const res = await post(
+			r.url,
+			"/run",
+			request({
+				cloneFiles: [
+					{
+						path: "/workspace/proj/.worktrees/P-1/code-scan-alerts.md",
+						text: "x".repeat(1_000_001),
+					},
+				],
+			}),
+		);
+		expect(res.status).toBe(400);
+		expect(r.recs).toHaveLength(0);
+	});
+
 	test("sends the agent layer without credentials, links as links, and the copyIn files", async () => {
 		const r = startRunner();
 		const layer = join(r.homeRoot, ".alate", "layers", "L1");

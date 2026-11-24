@@ -1800,6 +1800,8 @@ interface StartOptions {
 		providers?: string[];
 		/** Tests only; default: the deployment's memory backend is hindsight. */
 		hindsight?: boolean;
+		/** Board-written card files (e.g. the code scanning alert list) written into the guest's fresh clone after the clone and before omp starts; every path sits inside the run's cwd. Rides the spec to the guest. The /run validation caps the list at 4 entries of at most 1 MB each. */
+		cloneFiles?: { path: string; text: string }[];
 	} | null;
 	/** The board's per-run token store (OTTR-1006, docs/specs/hindsight-bank-binding.md).
 	 *  Set on every production dispatch: a classic worker or local run whose project is
@@ -2324,6 +2326,8 @@ function startVmRun(
 			...(pluginSkillsConfig ? [pluginSkillsConfig] : []),
 		],
 		copyOut: [o.sessionDir],
+		// Absent stays absent: no card files, no empty array on the wire.
+		...(vm.cloneFiles === undefined ? {} : { cloneFiles: vm.cloneFiles }),
 		// The bake reads the dispatch's trusted texts, never the shared home
 		// (docs/specs/vm-list-isolation.md); the read resolves the board home's
 		// current layer, like the board's own provisioning reads.

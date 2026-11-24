@@ -158,6 +158,8 @@ export interface VmSpec {
 	copyIn: string[];
 	/** Absolute dirs under /data/<project>/ whose new/changed files sync back. */
 	copyOut: string[];
+	/** Board-written card files (e.g. the code scanning alert list) written into the guest's fresh clone after the clone and before omp starts; every path sits inside the run's cwd. The /run validation caps the list at 4 entries of at most 1 MB each. */
+	cloneFiles?: { path: string; text: string }[];
 	/** The board's trusted provisioning lists (docs/specs/vm-list-isolation.md): the bake
 	 * installs exactly these texts; the shared home is never a provisioning input. */
 	lists?: ProvisionLists;

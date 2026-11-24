@@ -31,7 +31,7 @@ import {
 	writeSync,
 } from "node:fs";
 import { hostname } from "node:os";
-import { dirname, isAbsolute, join, posix, relative } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { childDatabaseEnv } from "./childEnv.ts";
 import { type Dir, openDir, withDir } from "./confine.ts";
 import { readCgroup } from "./systemStats.ts";
@@ -900,6 +900,42 @@ function checkLists(lists: unknown, what: string): string | null {
 	return null;
 }
 
+/** The 400 reason for vm.cloneFiles, null when it is absent or a list of at most 4
+ * files, each an absolute non-empty path plus a text of at most a million characters. */
+function checkCloneFiles(files: unknown): string | null {
+	if (files === undefined) return null;
+	if (!Array.isArray(files)) return "vm.cloneFiles is not a list";
+	if (files.length > 4) return "vm.cloneFiles holds more than 4 files";
+	for (const f of files) {
+		if (typeof f !== "object" || f === null)
+			return "vm.cloneFiles holds a non-object entry";
+		const { path, text } = f as Record<string, unknown>;
+		if (typeof path !== "string" || path === "" || !isAbsolute(path))
+			return "vm.cloneFiles holds a path that is not an absolute non-empty string";
+		if (typeof text !== "string")
+			return "vm.cloneFiles holds a text that is not a string";
+		if (text.length > 1_000_000)
+			return "vm.cloneFiles holds a text over 1000000 characters";
+	}
+	return null;
+}
+
+/** The 400 reason for the spec's cloneFiles paths, null when each resolves strictly
+ * inside the run's cwd (the guest worktree): a clone file must land there before omp runs. */
+function checkCloneFilesCwd(
+	files: readonly { path: string }[] | undefined,
+	cwd: string,
+): string | null {
+	if (files === undefined) return null;
+	const root = resolve(cwd);
+	for (const f of files) {
+		const p = resolve(f.path);
+		if (p !== root && p.startsWith(`${root}/`)) continue;
+		return `clone file ${f.path} is outside ${cwd}/: refused`;
+	}
+	return null;
+}
+
 /** Null when `vm` is a well-formed spec this runner may act on, else the 400 reason. */
 function checkVmSpec(
 	vm: unknown,
@@ -918,6 +954,7 @@ function checkVmSpec(
 	return (
 		checkLists(s.lists, "vm.lists") ??
 		checkLayerDir(s, o.homeRoot) ??
+		checkCloneFiles(s.cloneFiles) ??
 		checkCopyPaths([...s.copyIn, ...s.copyOut], join(o.dataRoot, project))
 	);
 }
@@ -1779,6 +1816,9 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 						providers: spec.providers,
 						hindsight: spec.hindsight,
 						project: spec.project,
+						...(spec.cloneFiles === undefined
+							? {}
+							: { cloneFiles: spec.cloneFiles }),
 					},
 				}),
 				signal,
@@ -2353,6 +2393,9 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 		const refusal = checkVmSpec(body.vm, { dataRoot, homeRoot });
 		if (refusal !== null) return new Response(refusal, { status: 400 });
 		const spec = body.vm as VmSpec;
+		const cloneRefusal = checkCloneFilesCwd(spec.cloneFiles, body.cwd);
+		if (cloneRefusal !== null)
+			return new Response(cloneRefusal, { status: 400 });
 		// Not the busy answer: a host that cannot boot VMs is down, which the board's
 		// health probe already shows.
 		const health = vmRunnerHealth(opts, exists);

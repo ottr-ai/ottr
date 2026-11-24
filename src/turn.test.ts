@@ -27154,6 +27154,89 @@ describe("microVM dispatch (OTTR-532)", () => {
 		expect(card.pendingPrompt).toBe(".");
 	});
 
+	// OTTR-1256: a fallback code scanning card's microVM dispatch carries the alert
+	// file the prep wrote; a plain card's dispatch carries no clone files.
+	test("a fallback code scanning card's microVM dispatch carries the alert file", async () => {
+		const { store, loop, calls } = await vmSetup();
+		// The prep write's ensureGitExclude runs real git: the project path is a repo
+		// with one commit (the rig's fake createWorktree only mkdirs the worktree).
+		const git = (...args: string[]): void => {
+			execSync(`git ${args.join(" ")}`, {
+				cwd: store.path,
+				stdio: "ignore",
+				env: fixtureGitEnv(),
+			});
+		};
+		git("init", "-q", "-b", "main");
+		git("config", "user.email", "t@t");
+		git("config", "user.name", "t");
+		writeFileSync(join(store.path, "seed.txt"), "seed\n");
+		git("add", ".");
+		git("commit", "-qm", "seed");
+
+		const prompt = [
+			"Code scanning: js/x (2 alerts)",
+			"",
+			`The messages and URLs did not fit the prompt. Read the full alert list from ${CODE_SCAN_FALLBACK_MARKER} (the board writes the file there when the turn starts).`,
+			"",
+			"#{11} high src/a.ts:10 - secret in source",
+			"#{12} medium src/b.ts:20 - another secret",
+		].join("\n");
+		const [card] = await store.fileCodeScanCards({
+			items: [
+				{
+					rule: "js/x",
+					title: "Code scanning: js/x (2 alerts)",
+					prompt,
+					alerts: [
+						{
+							number: 11,
+							rule: "js/x",
+							severity: "high",
+							path: "src/a.ts",
+							line: 10,
+							url: "https://github.test/acme/widget/alert/11",
+							message: "secret in source",
+						},
+						{
+							number: 12,
+							rule: "js/x",
+							severity: "medium",
+							path: "src/b.ts",
+							line: 20,
+							url: "https://github.test/acme/widget/alert/12",
+							message: "another secret",
+						},
+					],
+				},
+			],
+			now: Date.now(),
+			start: true,
+		});
+		await loop.runTurn(store.name, card!.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm).not.toBeNull();
+		const wt = (await store.getTask(card!.id))!.worktree!;
+		expect(calls[0]!.vm!.cloneFiles).toEqual([
+			{
+				path: join(wt, CODE_SCAN_ALERTS_FILE),
+				text: expect.any(String),
+			},
+		]);
+		// The real prep write rode the dispatch: the text names both alert numbers.
+		expect(calls[0]!.vm!.cloneFiles![0]!.text).toContain("#11");
+		expect(calls[0]!.vm!.cloneFiles![0]!.text).toContain("#12");
+	});
+
+	test("a plain card's microVM dispatch carries no clone files", async () => {
+		const { store, loop, calls } = await vmSetup();
+		const task = await store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.vm).not.toBeNull();
+		expect(calls[0]!.vm!.cloneFiles).toBeUndefined();
+	});
+
 	describe("token revoke at the restart settle", () => {
 		const WT = "/srv/wt-vm";
 		async function seeded(store: ProjectStore) {

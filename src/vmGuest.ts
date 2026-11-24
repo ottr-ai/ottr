@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { aptListPath, ensureProjectPackages, parseAptTxt } from "./apt.ts";
 import { childDatabaseEnv } from "./childEnv.ts";
 import { memoryTurnEnv } from "./memory.ts";
@@ -59,6 +59,11 @@ export interface GuestRunRequest {
 		hindsight: boolean;
 		/** The run's project: names the memory bank the VM token may reach. */
 		project: string;
+		/**
+		 * Board-written card files (e.g. the code scanning alert list) written into the fresh
+		 * clone after the clone and before omp starts; each path sits inside the run's cwd.
+		 */
+		cloneFiles?: { path: string; text: string }[];
 	};
 }
 
@@ -133,6 +138,25 @@ const isMapping = (v: unknown): v is Record<string, unknown> =>
 const isStrings = (v: unknown): v is string[] =>
 	Array.isArray(v) && v.every((s) => typeof s === "string");
 
+/** Caps for vm.cloneFiles, matching vm-runner's guard on the sending side. */
+const CLONE_FILES_MAX = 4;
+const CLONE_FILE_TEXT_MAX = 1_000_000;
+
+const isCloneFiles = (
+	v: unknown,
+): v is NonNullable<GuestRunRequest["vm"]["cloneFiles"]> =>
+	v === undefined ||
+	(Array.isArray(v) &&
+		v.length <= CLONE_FILES_MAX &&
+		v.every(
+			(file) =>
+				isMapping(file) &&
+				typeof file.path === "string" &&
+				isAbsolute(file.path) &&
+				typeof file.text === "string" &&
+				file.text.length <= CLONE_FILE_TEXT_MAX,
+		));
+
 type Loose<T> = { [K in keyof T]?: unknown };
 
 function parseRun(raw: unknown): GuestRunRequest | null {
@@ -158,7 +182,8 @@ function parseRun(raw: unknown): GuestRunRequest | null {
 		!isStrings(vm.providers) ||
 		typeof vm.hindsight !== "boolean" ||
 		typeof vm.project !== "string" ||
-		vm.project === ""
+		vm.project === "" ||
+		!isCloneFiles(vm.cloneFiles)
 	)
 		return null;
 	return raw as GuestRunRequest;
@@ -432,6 +457,50 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 			}
 			return cloned.out.trim();
 		};
+		// The board ships card files (e.g. the code scanning alert list) straight into the
+		// fresh clone, before omp runs. Bodies arrive over the guest token, so the path
+		// check only guards against sending bugs: a path outside the cwd or a failed write
+		// ends the run like a failed clone. Each written file joins the clone's local
+		// exclude, so the dirty report stays empty for files the board itself put there.
+		const writeCloneFiles = (push: (text: string) => void): boolean => {
+			if (vm.cloneFiles === undefined || vm.cloneFiles.length === 0)
+				return true;
+			try {
+				const root = resolve(cwd);
+				for (const file of vm.cloneFiles) {
+					const path = resolve(file.path);
+					const rel = relative(root, path);
+					if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`)) {
+						finish(push, 1, `clone file path outside ${cwd}: ${file.path}\n`);
+						return false;
+					}
+					mkdirSync(dirname(path), { recursive: true });
+					writeFileSync(path, file.text);
+				}
+				const excludePath = join(cwd, ".git", "info", "exclude");
+				let text = existsSync(excludePath)
+					? readFileSync(excludePath, "utf8")
+					: "";
+				mkdirSync(dirname(excludePath), { recursive: true });
+				const seen = new Set(text.split("\n"));
+				for (const file of vm.cloneFiles) {
+					const line = `/${relative(root, resolve(file.path))}`;
+					if (seen.has(line)) continue;
+					seen.add(line);
+					if (text !== "" && !text.endsWith("\n")) text += "\n";
+					text += `${line}\n`;
+				}
+				writeFileSync(excludePath, text);
+				return true;
+			} catch (err) {
+				finish(
+					push,
+					1,
+					`${err instanceof Error ? err.message : String(err)}\n`,
+				);
+				return false;
+			}
+		};
 		// The guest's own env stays out of the turn (its token above all); omp gets a
 		// working PATH, locale and home, then exactly what the board sent.
 		const turnEnv = (): Record<string, string> => {
@@ -575,6 +644,7 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		const pump = async (push: (text: string) => void): Promise<void> => {
 			const cloneHead = await cloneTurn(push);
 			if (cloneHead === null) return;
+			if (!writeCloneFiles(push)) return;
 			const env = turnEnv();
 			if (!(await addProviders(push, env))) return;
 			// Memory through the board's proxy, bound to this VM's own project bank

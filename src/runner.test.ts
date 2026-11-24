@@ -6717,6 +6717,36 @@ describe("startRun microVM dispatch", () => {
 		}
 	});
 
+	test("the /run dispatch carries vm.cloneFiles on the spec; absent stays absent", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-clone-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "run");
+		const cloneFiles = [
+			{
+				path: "/workspace/p/.worktrees/P-1/code-scan-alerts.md",
+				text: "alert list",
+			},
+		];
+		try {
+			const opts = vmOpts(dir, tokens, url);
+			const run = await startRun({
+				...opts,
+				vm: { ...opts.vm!, cloneFiles },
+			});
+			expect(run.url).toBe(url);
+			const r = await run.done;
+			expect(r.exitCode).toBe(0);
+			// The board-written card files ride the spec verbatim.
+			expect(seen[0]!.body.vm!.cloneFiles).toEqual(cloneFiles);
+			// A dispatch without card files sends no list, never an empty array.
+			await (await startRun(vmOpts(dir, tokens, url))).done;
+			expect(seen[1]!.body.vm!.cloneFiles).toBeUndefined();
+		} finally {
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("VM requests exclude inherited, project and secondary production URLs", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-database-"));
 		const tokens = new VmTokens({ file: null });

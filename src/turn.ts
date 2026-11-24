@@ -1371,6 +1371,9 @@ const TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
 // OTTR-1014: the newest shots one turn adopts; each candidate past the cap costs a
 // full synchronous PNG decode, so the candidate list is sliced before the loop.
 const MAX_SHOT_CANDIDATES = 8;
+// The vm-runner refuses a clone file text over this many characters, so the
+// dispatch reads at most that much: a bigger file would fail the dispatch 400.
+const CLONE_FILES_MAX_CHARS = 1_000_000;
 /** The park reason of a stopped turn (the board's Esc). */
 const TURN_STOPPED_REASON =
 	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
@@ -5475,6 +5478,33 @@ export function createTurnLoop(
 		);
 	}
 
+	/** OTTR-1256: the clone files a microVM dispatch carries into the guest: the
+	 * fallback alert file, read back from the worktree after the prep write.
+	 * Undefined when the prompt carries no fallback marker, the run is a special
+	 * one (no worktree file), or the file is missing or over the cap; another
+	 * refusal (a planted symlink) still fails the turn loudly, like the prep write. */
+	async function cloneFilesFor(
+		e: TurnProject,
+		loc: RunLocation,
+		prompt: string,
+	): Promise<{ path: string; text: string }[] | undefined> {
+		if (!prompt.includes(CODE_SCAN_FALLBACK_MARKER)) return undefined;
+		if (loc.special) return undefined;
+		try {
+			const text = readBelow(
+				worktreeAnchor(e.path, loc.wt),
+				join(loc.wt, CODE_SCAN_ALERTS_FILE),
+				CLONE_FILES_MAX_CHARS,
+			)?.toString("utf8");
+			return text === undefined
+				? undefined
+				: [{ path: join(loc.wt, CODE_SCAN_ALERTS_FILE), text }];
+		} catch (err) {
+			if (!isSizeRefusal(err)) throw err;
+			return undefined;
+		}
+	}
+
 	/** Creates the card worktree and stamps the card row with it. Null: a cancel landed
 	 * during the create; the fresh worktree is removed again (the agent never ran, so there
 	 * is nothing to lose) and the turn stops. */
@@ -6508,6 +6538,11 @@ export function createTurnLoop(
 		// OTTR-1028: a scout reads third-party repository text, so it gets no served token
 		// at all — its GitHub reads are the unauthenticated public ones the prompt names.
 		const turnRead = idn.scout ? null : ((await ops.turnReadToken?.()) ?? null);
+		// OTTR-1256: a fallback code scanning card's microVM dispatch carries the
+		// alert file into the guest; every other run carries none.
+		const vm = vmGrantFor(name, e, id, header, loc, route);
+		const vmCloneFiles =
+			vm === null ? undefined : await cloneFilesFor(e, loc, input.prompt);
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
@@ -6542,7 +6577,15 @@ export function createTurnLoop(
 			model: route.runModel,
 			sessionName: idn.sessionName,
 			worker: route.vmTurn ? null : route.liveWorker,
-			vm: vmGrantFor(name, e, id, header, loc, route),
+			vm:
+				vm === null
+					? null
+					: {
+							...vm,
+							...(vmCloneFiles === undefined
+								? {}
+								: { cloneFiles: vmCloneFiles }),
+						},
 			secrets:
 				turnRead === null
 					? route.turnEnv.secrets
