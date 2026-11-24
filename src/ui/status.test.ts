@@ -33,6 +33,8 @@ const t = (
 	doneAt: null,
 	prNumber: null,
 	pushSha: null,
+	validatedAt: null,
+	followUpOf: null,
 	...overrides,
 });
 
@@ -41,6 +43,32 @@ test("statusLine queued precedence: needsReason beats everything", () => {
 	expect(
 		statusLine(t({ needsReason: "exit 1", pendingPrompt: "hi" }), false),
 	).toBe("resuming");
+});
+
+test("statusLine: a pending sandbox lead's validation wait beats a queued reply", () => {
+	// Steer on a pending lead queues a reply, but the lead never runs as a work
+	// turn, so the reply-queued words would be false (OTTR-1247 send-back).
+	const lead = t({
+		sandboxLead: true,
+		validatedAt: null,
+		followUpOf: "r1",
+		pendingPrompt: "please merge",
+	});
+	expect(statusLine(lead, true, undefined, false, [])).toBe(
+		"Waits for a validation run of review r1; a work turn has no sandbox_run.",
+	);
+});
+
+test("statusLine: a pending sandbox lead's validation wait beats a tracker reason", () => {
+	const lead = t({
+		sandboxLead: true,
+		validatedAt: null,
+		followUpOf: "r1",
+		needsReason: "exit 1",
+	});
+	expect(statusLine(lead, true)).toBe(
+		"Waits for a validation run of review r1; a work turn has no sandbox_run.",
+	);
 });
 
 test("statusLine queued with pendingPrompt waits for a slot", () => {

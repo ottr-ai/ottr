@@ -129,8 +129,10 @@ function queuedHoldLine(holdUntil: number | null, reason: string): string {
 	return "resuming";
 }
 
-/** The statusLine words for a queued card: a re-queued card counts its hold down or names
- *  the tracker's reason, a pending reply waits for a slot (for the restart while draining),
+/** The statusLine words for a queued card: a pending sandbox lead waits for its review's
+ *  validation run — no work turn can ever take it, so that hold outranks a queued reply
+ *  and the tracker's reason — a re-queued card counts its hold down or names the
+ *  tracker's reason, a pending reply waits for a slot (for the restart while draining),
  *  and the rest wait for rules, their merge hold, or a free slot. */
 function queuedLine(
 	t: Pick<
@@ -142,7 +144,12 @@ function queuedLine(
 		| "pendingPrompt"
 		| "holdUntil"
 		| "id"
-	>,
+		| "validatedAt"
+		| "followUpOf"
+	> & {
+		/** The wire stamp (taskView); store rows read the prompt tag instead. */
+		sandboxLead?: true;
+	},
 	hasRules: boolean,
 	hold: string | null | undefined,
 	drain: boolean,
@@ -151,6 +158,8 @@ function queuedLine(
 		| undefined,
 ): string {
 	if (t.stage === "backlog") return "grill queued";
+	const leadHold = leadValidationHold(t);
+	if (leadHold !== null) return leadHold;
 	if (t.needsReason !== null) return queuedHoldLine(t.holdUntil, t.needsReason);
 	if (t.pendingPrompt !== null)
 		return drain
@@ -204,7 +213,12 @@ export function statusLine(
 		| "id"
 		| "prNumber"
 		| "pushSha"
-	>,
+		| "validatedAt"
+		| "followUpOf"
+	> & {
+		/** The wire stamp (taskView); store rows read the prompt tag instead. */
+		sandboxLead?: true;
+	},
 	hasRules: boolean,
 	hold?: string | null,
 	/** True while an update holds new turns (POST /api/drain): every queued card waits for the restart. */

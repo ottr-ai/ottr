@@ -13329,8 +13329,10 @@ describe("Drawer validate blocked leads again action", () => {
 
 describe("Drawer start validation run on a queued lead", () => {
 	// OTTR-1247: a queued pending sandbox lead's drawer offers the manual start of
-	// its review's batch validation run when the review can take a batch; the
-	// POST targets the review's validate route, not the lead's.
+	// its review's batch validation run. The filing only takes backlog leads, so
+	// the action parks the lead in the review's backlog first and then files the
+	// run on the review's validate route. The review resolves through the lineage
+	// fetch too, because the Done window can drop it from the board's task list.
 	installBrowserGlobals([
 		"Event",
 		"HTMLElement",
@@ -13362,19 +13364,51 @@ describe("Drawer start validation run on a queued lead", () => {
 			...over,
 		}) as TaskCard;
 
-	const withRoot = (
+	/** Renders the lead's drawer with the review out of the board's task list;
+	 * the drawer loads it through the lineage route. `handlers` answer the
+	 * action POSTs and record them. */
+	const withLeadDrawer = async (
 		lead: TaskCard,
-		review: TaskCard,
-		respond: { status: number; body: unknown },
+		review: TaskCard | null,
+		handlers: { suffix: string; status: number; body: unknown }[],
 		run: (args: DrawerRunArgs) => Promise<void>,
-	): Promise<void> =>
-		withDrawerRoute(
-			{ ...drawerBase, tasks: [lead, review] },
-			lead,
-			"/tasks/r9/validate",
-			respond,
-			run,
+	): Promise<void> => {
+		const posts: { url: string; body: unknown }[] = [];
+		const { restore } = stubFetch(async (url, init) => {
+			const u = String(url);
+			const hit = handlers.find((h) => u.endsWith(h.suffix));
+			if (hit) {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				return new Response(JSON.stringify(hit.body), { status: hit.status });
+			}
+			if (u.endsWith(`/tasks/${lead.id}`))
+				return new Response(JSON.stringify({ ...lead, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			if (review !== null && u.endsWith(`/tasks/${review.id}`))
+				return new Response(JSON.stringify({ ...review, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			return new Response("{}", { status: 404 });
+		});
+		const { container, root, unmount } = await mount(
+			<Drawer {...drawerBase} task={lead} tasks={[lead]} />,
 		);
+		try {
+			// One act for the lead detail, one for the lineage fetch of the review.
+			await act(async () => {});
+			await act(async () => {});
+			await run({ posts, container, root });
+		} finally {
+			await unmount();
+			restore();
+		}
+	};
 
 	const startButton = (container: HTMLDivElement): Element => {
 		for (const node of container.querySelectorAll("button"))
@@ -13382,19 +13416,28 @@ describe("Drawer start validation run on a queued lead", () => {
 		throw new Error("no Start validation run button");
 	};
 
-	test("renders the button and POSTs to the review's validate route", async () => {
-		await withRoot(
+	test("parks the lead, then POSTs to the review's validate route", async () => {
+		await withLeadDrawer(
 			leadCard(),
 			reviewCard(),
-			{ status: 200, body: { id: "v1", reset: [] } },
+			[
+				{ suffix: "/tasks/t1/backlog", status: 200, body: { id: "t1" } },
+				{
+					suffix: "/tasks/r9/validate",
+					status: 200,
+					body: { id: "v1", reset: [] },
+				},
+			],
 			async ({ posts, container }) => {
 				await act(async () => {
 					onClickOf(startButton(container))({});
 				});
 				await act(async () => {});
-				expect(posts).toHaveLength(1);
-				expect(posts[0]?.url.endsWith("/tasks/r9/validate")).toBe(true);
-				expect(posts[0]?.body).toEqual({});
+				expect(posts).toHaveLength(2);
+				expect(posts[0]?.url.endsWith("/tasks/t1/backlog")).toBe(true);
+				expect(posts[0]?.body).toEqual({ to: "backlog" });
+				expect(posts[1]?.url.endsWith("/tasks/r9/validate")).toBe(true);
+				expect(posts[1]?.body).toEqual({});
 				const statuses = [...container.querySelectorAll('p[role="status"]')];
 				expect(
 					statuses.some((s) =>
@@ -13406,10 +13449,10 @@ describe("Drawer start validation run on a queued lead", () => {
 	});
 
 	test("a lead whose review still runs renders no validate control", async () => {
-		await withRoot(
+		await withLeadDrawer(
 			leadCard(),
 			reviewCard({ stage: "in_progress", state: "running" }),
-			{ status: 200, body: { id: "v1", reset: [] } },
+			[],
 			async ({ container }) => {
 				expect(container.textContent).not.toContain("Start validation run");
 			},
@@ -13417,21 +13460,27 @@ describe("Drawer start validation run on a queued lead", () => {
 	});
 
 	test("a validated lead renders no validate control", async () => {
-		await withRoot(
+		await withLeadDrawer(
 			leadCard({ validatedAt: 5 }),
 			reviewCard(),
-			{ status: 200, body: { id: "v1", reset: [] } },
+			[],
 			async ({ container }) => {
 				expect(container.textContent).not.toContain("Start validation run");
 			},
 		);
 	});
 
-	test("a failed POST surfaces the message as an inline alert", async () => {
-		await withRoot(
+	test("a failed park surfaces the message as an inline alert", async () => {
+		await withLeadDrawer(
 			leadCard(),
 			reviewCard(),
-			{ status: 409, body: { error: "a validation run is already in flight" } },
+			[
+				{
+					suffix: "/tasks/t1/backlog",
+					status: 409,
+					body: { error: "a reply or steer is still queued" },
+				},
+			],
 			async ({ posts, container }) => {
 				await act(async () => {
 					onClickOf(startButton(container))({});
@@ -13441,7 +13490,7 @@ describe("Drawer start validation run on a queued lead", () => {
 				const alerts = [...container.querySelectorAll('p[role="alert"]')];
 				expect(
 					alerts.some((a) =>
-						a.textContent?.includes("a validation run is already in flight"),
+						a.textContent?.includes("a reply or steer is still queued"),
 					),
 				).toBe(true);
 				expect(container.textContent).not.toContain("Validation run filed.");

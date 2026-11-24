@@ -41,8 +41,8 @@ import {
 	type DepProject,
 	findDep,
 	isReview,
+	leadValidationHold,
 	liveCardOf,
-	pendingSandboxLead,
 	queueOrder,
 	validatableReview,
 	waitingOn,
@@ -13358,7 +13358,7 @@ function DrawerActions(p: {
 					<label htmlFor="lead-validate">Start validation run</label>
 					<div className="reply-actions">
 						<BusyButton
-							title={`Files a batch validation run of review ${leadValidate.id}; the run takes this lead back into its batch`}
+							title={`Parks this lead in its review's backlog and files a batch validation run of review ${leadValidate.id} that takes it`}
 							run={runLeadValidate}
 						>
 							Start validation run
@@ -14516,16 +14516,19 @@ export function Drawer({
 	};
 	// OTTR-1247: a queued pending sandbox lead never runs as a work turn (its status
 	// line names the wait), and its review's batch validation run is the only way
-	// forward. When the linked review can take a batch (done, or held at merging for
-	// its findings), the drawer offers the manual start on the review's validate
-	// route. A new card's drawer starts without the last card's result.
-	const { parent: leadParent } = followUpParent(row, tasks);
+	// forward. The filing only takes backlog leads, so the action first parks the
+	// lead in its review's backlog — the same move the routing tick makes for a
+	// started lead — and then files the run on the review's validate route. The
+	// parent resolves through the lineage fetch too: the Done window can drop the
+	// review from the board's task list while its card stays linkable. A new card's
+	// drawer starts without the last card's result.
 	const leadValidate =
 		!cancelled &&
-		pendingSandboxLead(task) &&
-		leadParent !== null &&
-		validatableReview(leadParent)
-			? { id: leadParent.id, project: leadParent.project }
+		task.state === "queued" &&
+		leadValidationHold(task) !== null &&
+		parentCard !== null &&
+		validatableReview(parentCard)
+			? { id: parentCard.id, project: parentCard.project }
 			: null;
 	const [leadValidateError, setLeadValidateError] = useState<string | null>(
 		null,
@@ -14539,6 +14542,10 @@ export function Drawer({
 		if (leadValidate === null) return false;
 		setLeadValidateError(null);
 		try {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/backlog`,
+				{ to: "backlog" },
+			);
 			await post(
 				`/api/projects/${encodeURIComponent(leadValidate.project)}/tasks/${encodeURIComponent(leadValidate.id)}/validate`,
 				{},
