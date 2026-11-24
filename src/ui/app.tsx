@@ -9567,6 +9567,10 @@ export function PrReviewSection({
 		/** The run record the ask started from: its startedAt, or -1 with none. Only a newer record's end can be this ask's result. */
 		runAt: number;
 	} | null>(null);
+	// The re-review click bridges the same gap: `reFor` holds the run record this
+	// re-review started from (its startedAt, or -1 with none), so the shared
+	// waiting line lives until this re-review's own run record arrives.
+	const [reFor, setReFor] = useState<number | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
 	const { postedLabel, blocked } = prPostState(
 		pr,
@@ -9592,7 +9596,8 @@ export function PrReviewSection({
 		(run !== null && run.endedAt === null) ||
 		(noteFor !== null &&
 			note === noteFor.text &&
-			(run === null || run.startedAt <= noteFor.runAt));
+			(run === null || run.startedAt <= noteFor.runAt)) ||
+		(reFor !== null && (run === null || run.startedAt <= reFor));
 	const freshDraft =
 		!waiting && run !== null && run.endedAt !== null && run.error === null;
 	const runError =
@@ -9607,6 +9612,8 @@ export function PrReviewSection({
 				</a>
 				{" · "}
 				{pr.state === "closed" ? "closed without merge" : pr.state}
+				{" · "}
+				{`head ${pr.head.slice(0, 7)}`}
 			</p>
 			<div className="reply-form">
 				<label htmlFor="pr-review-text">Review comment</label>
@@ -9690,6 +9697,27 @@ export function PrReviewSection({
 								{runError}
 							</span>
 						)}
+						<BusyButton
+							// Plain, not primary: a done drawer keeps exactly one primary (Post review).
+							disabled={waiting}
+							title={
+								pr.reviewedHead !== null && pr.reviewedHead === pr.head
+									? "The current head already has a review; this starts a fresh full review"
+									: "Skips the quiet wait and starts a new draft for the current head"
+							}
+							run={() =>
+								act(async () => {
+									setError(null);
+									await post(`${taskUrl}/re-review`, {});
+									// runAt mirrors noteFor: the record this re-review started
+									// from, so a stale ended record never masks the wait.
+									setReFor(run?.startedAt ?? -1);
+								}, setError)
+							}
+						>
+							<Icon name="send" />
+							Re-review now
+						</BusyButton>
 						<BusyButton
 							// Plain, not primary: a done drawer keeps exactly one primary (Post review).
 							disabled={note.trim() === ""}

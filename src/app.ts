@@ -6863,6 +6863,7 @@ export async function createApp(deps: AppDeps) {
 								pr.number,
 							),
 							state: pr.state,
+							head: pr.head,
 							reviewedHead: pr.reviewedHead,
 							postedHead: pr.postedHead,
 							postedUrl: pr.postedUrl,
@@ -13025,6 +13026,42 @@ export async function createApp(deps: AppDeps) {
 		);
 		return await taskResponse(e, task.id);
 	}
+	/** The "Re-review now" button: a fresh full draft for the current head with no maintainer note.
+	 * An explicit request: no task-state gate (a posted card sits done/idle) and no quiet gate
+	 * (only watcher runs wait it out), so it starts at once. */
+	async function prReviewRereview(e: Entry, task: Task): Promise<Response> {
+		if (task.cancelledAt !== null)
+			return json({ error: "task is cancelled" }, 404);
+		const row = await e.store.getPrReviewByTask(task.id);
+		if (row === null || e.github === null)
+			return json({ error: "not a PR review card" }, 409);
+		if (row.state !== "open") return json({ error: `PR is ${row.state}` }, 409);
+		if (prWatcher.prRun(e.name, row.number)?.endedAt === null)
+			return json({ error: "a draft is already running" }, 409);
+		if (
+			(await e.store.prReviewRunsSince(Date.now() - PR_GATES.DAY_MS)) >=
+			PR_GATES.PROJECT_DAILY_RUNS
+		)
+			return json(
+				{
+					error: `daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+				},
+				429,
+			);
+		// Track the detached review so app shutdown waits for its final writes.
+		void trackWork(
+			"PR review re-review",
+			prWatcher.reviewNow({ project: e.name, number: row.number, note: "" }),
+		);
+		return await taskResponse(e, task.id);
+	}
+	async function handlePOSTProjectsTasksReReviewByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/re-review">,
+	): Promise<Response> {
+		const found = await resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		return await prReviewRereview(found.e, found.task);
+	}
 	/** Queues the work-check send-back under any pending steer. A null direction
 	 * is a plain send-back; on a diverging park, any other text is the user's new
 	 * direction and goes out with it. On a diverging park a click without text
@@ -16551,6 +16588,16 @@ export async function createApp(deps: AppDeps) {
 				await api(
 					req,
 					async () => await handlePOSTProjectsTasksPrPostByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
+		},
+		"/api/projects/:project/tasks/:id/re-review": {
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksReReviewByProjectAndId(req),
 					{
 						costly: true,
 					},

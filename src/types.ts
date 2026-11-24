@@ -523,6 +523,8 @@ export interface PrReviewView {
 	number: number;
 	url: string;
 	state: PrState;
+	/** The PR's current head: the head the next draft reviews. */
+	head: string;
 	reviewedHead: string | null;
 	postedHead: string | null;
 	/** html_url of the posted review; null until a Post succeeds. */

@@ -21594,6 +21594,268 @@ describe(
 				});
 			};
 		})();
+		// --- Re-review route (OTTR-1248): the same canned world as the reply suite, in
+		// its own store. The reply suite's tests spend that store's 24 h cap window (the
+		// cap reads real Date.now), so a successful re-review needs a fresh window.
+		const rereviewSuite = await (async () => {
+			const rrDir = join(root, "p-pr-rereview");
+			mkdirSync(rrDir, { recursive: true });
+			const rrStore = await ProjectStore.open(rrDir);
+			const rrProjects = new Map<string, Entry>();
+			rrProjects.set("rr", {
+				path: rrDir,
+				name: "rr",
+				store: rrStore,
+				target: null,
+				gitless: false,
+				github: "acme/widget",
+				protectedTarget: false,
+				remote: null,
+				dirty: false,
+				mainUnpushed: false,
+				mainBranch: null,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			});
+			const rrPrompts: string[] = [];
+			/** Armed by the in-flight test; the canned gateway then answers after ~300 ms. */
+			let rrSlowGateway = false;
+			/** A short real wait between poll rounds: the run start is fire-and-forget
+			 * inside the app with no exposed signal to await, so deterministic time
+			 * control cannot replace it (the appcheck test above uses the same form). */
+			const settle = (ms: number) => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, ms);
+				return promise;
+			};
+			/** Same canned read-only GETs as replyApiStub, but against the fresh store. */
+			const rrApiStub = async (
+				args: string[],
+			): Promise<{ code: number; stdout: string; stderr: string } | null> => {
+				if (args.length !== 2 || args[0] !== "api") return null;
+				const path = args[1]!;
+				const pull = path.match(/^repos\/acme\/widget\/pulls\/(\d+)$/);
+				if (pull !== null) {
+					const r = await rrStore.getPrReview(Number(pull[1]));
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							head: { sha: r?.head ?? H1 },
+							body: "Please merge.",
+							title: r?.title ?? "Fix it",
+						}),
+						stderr: "",
+					};
+				}
+				const empty =
+					/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)$/.test(
+						path,
+					);
+				if (empty) return { code: 0, stdout: "[]", stderr: "" };
+				if (
+					/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
+						path,
+					)
+				)
+					return {
+						code: 0,
+						stdout: JSON.stringify({ commits: [], files: [] }),
+						stderr: "",
+					};
+				return null;
+			};
+			const rm = await mount({
+				projects: rrProjects,
+				gh: async (args) =>
+					(await rrApiStub(args)) ?? { code: 0, stdout: "{}", stderr: "" },
+				prReviewSpawn: async (_argv, o) => {
+					if (rrSlowGateway) await settle(300);
+					rrPrompts.push(String(o.stdin));
+					return {
+						code: 0,
+						stdout: [
+							JSON.stringify({ ready: true }),
+							JSON.stringify({
+								id: 1,
+								status: 200,
+								body: {
+									choices: [
+										{ message: { content: "## Re-review\nfresh look" } },
+									],
+								},
+							}),
+						].join("\n"),
+						stderr: "",
+					};
+				},
+			});
+			const rrRow = async (n: number): Promise<PrReviewRow> => {
+				const r = await rrStore.getPrReview(n);
+				if (r === null) throw new Error(`no pr_review row ${n}`);
+				return r;
+			};
+			const rrReviewed = async (
+				n: number,
+				head: string,
+				runAt: number = Date.now(),
+			): Promise<Task> => {
+				const prev = await rrStore.getPrReview(n);
+				await rrStore.savePrReview({
+					number: n,
+					taskId: prev?.taskId ?? null,
+					head,
+					firstSeenAt: 0,
+					reviewedHead: prev?.reviewedHead ?? null,
+					postedHead: prev?.postedHead ?? null,
+					postedUrl: prev?.postedUrl ?? null,
+					postedLogin: prev?.postedLogin ?? null,
+					postedEvent: prev?.postedEvent ?? null,
+					postedVia: prev?.postedVia ?? null,
+					state: "open",
+					draft: false,
+					title: "Fix it",
+					postError: null,
+					commentsAt: null,
+					commentsUnseen: false,
+				});
+				return await rrStore.savePrDraft({
+					run: await rrStore.startPrRun(n, head, runAt),
+					number: n,
+					head,
+					draft: "draft",
+					prompt: "review",
+					blocking: true,
+				});
+			};
+			const rereview = (id: string) =>
+				rm.call(`/api/projects/rr/tasks/${id}/re-review`, {});
+			return () => {
+				afterAll(async () => {
+					await closeTestStore(rrStore);
+				});
+
+				test("a re-review inside the quiet period runs a full draft with no note", async () => {
+					const t = await rrReviewed(37, H1, Date.now() - 25 * 3_600_000);
+					// A push moved the head to H2; the row was first seen just now, so a
+					// watcher run would wait out the quiet gate. The explicit request starts.
+					await rrStore.savePrReview({
+						...(await rrRow(37)),
+						head: H2,
+						firstSeenAt: Date.now(),
+					});
+					const before = await rrStore.prReviewRunsSince(0);
+					const res = await rereview(t.id);
+					expect(res.status).toBe(200);
+					await rm.app.prReviewIdle();
+					expect(await rrStore.prReviewRunsSince(0)).toBe(before + 1);
+					expect((await rrStore.getTask(t.id))!.details).toBe(
+						"## Re-review\nfresh look",
+					);
+					expect((await rrStore.getTask(t.id))!.prompt).toContain(
+						`at head ${H2.slice(0, 7)}`,
+					);
+					// An empty note adds no MAINTAINER NOTE block to the model's user message.
+					expect(rrPrompts.every((p) => !p.includes("MAINTAINER NOTE"))).toBe(
+						true,
+					);
+				});
+
+				test("a re-review refuses while a draft is already running", async () => {
+					const t = await rrReviewed(38, H1, Date.now() - 25 * 3_600_000);
+					const before = await rrStore.prReviewRunsSince(0);
+					rrSlowGateway = true;
+					const first = await rereview(t.id);
+					expect(first.status).toBe(200);
+					// The run start is fire-and-forget inside the app, so the test polls
+					// the task view until the run record is in flight (endedAt null)
+					// instead of guessing a fixed delay.
+					for (let i = 0; i < 50; i++) {
+						const flight = (await (
+							await rm.call(`/api/projects/rr/tasks/${t.id}`)
+						).json()) as { prReview?: { run?: { endedAt: number | null } } };
+						if (flight.prReview?.run?.endedAt === null) break;
+						await settle(5);
+					}
+					const second = await rereview(t.id);
+					expect(second.status).toBe(409);
+					expect(await errorOf(second)).toBe("a draft is already running");
+					rrSlowGateway = false;
+					await rm.app.prReviewIdle();
+					// Run #1 completed once the gateway was released.
+					expect(await rrStore.prReviewRunsSince(0)).toBe(before + 1);
+					const view = (await (
+						await rm.call(`/api/projects/rr/tasks/${t.id}`)
+					).json()) as {
+						prReview?: {
+							head?: string;
+							run?: { endedAt: number | null; error: string | null };
+						};
+					};
+					expect(view.prReview!.run!.endedAt).not.toBeNull();
+					expect(view.prReview!.run!.error).toBeNull();
+					// The view carries the row's current head: the head the next draft reviews.
+					expect(view.prReview!.head).toBe(H1);
+				});
+
+				test("a re-review refuses a closed or merged PR", async () => {
+					const closedT = await rrReviewed(39, H1, Date.now() - 25 * 3_600_000);
+					await rrStore.savePrReview({
+						...(await rrRow(39)),
+						state: "closed",
+					});
+					const closed = await rereview(closedT.id);
+					expect(closed.status).toBe(409);
+					expect(await errorOf(closed)).toBe("PR is closed");
+					const mergedT = await rrReviewed(40, H1, Date.now() - 25 * 3_600_000);
+					await rrStore.savePrReview({
+						...(await rrRow(40)),
+						state: "merged",
+					});
+					const merged = await rereview(mergedT.id);
+					expect(merged.status).toBe(409);
+					expect(await errorOf(merged)).toBe("PR is merged");
+				});
+
+				test("a re-review runs a fresh full review for an already-reviewed head", async () => {
+					const t = await rrReviewed(41, H1, Date.now() - 25 * 3_600_000);
+					const before = await rrStore.prReviewRunsSince(0);
+					const promptsBefore = rrPrompts.length;
+					const res = await rereview(t.id);
+					expect(res.status).toBe(200);
+					await rm.app.prReviewIdle();
+					// The one-draft-per-head skip applies to watcher runs only: the empty
+					// note is a defined note, so the explicit request re-reviews in full.
+					expect(await rrStore.prReviewRunsSince(0)).toBe(before + 1);
+					expect(
+						rrPrompts
+							.slice(promptsBefore)
+							.every((p) => !p.includes("MAINTAINER NOTE")),
+					).toBe(true);
+				});
+
+				test("a re-review respects the daily cap", async () => {
+					const t = await rrReviewed(42, H1, Date.now() - 25 * 3_600_000);
+					const promptsBefore = rrPrompts.length;
+					for (let i = 0; i < PR_GATES.PROJECT_DAILY_RUNS; i++)
+						await rrStore.startPrRun(42, H1, Date.now());
+					const res = await rereview(t.id);
+					expect(res.status).toBe(429);
+					expect(await errorOf(res)).toBe(
+						`daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+					);
+					await rm.app.prReviewIdle();
+					expect(rrPrompts.length).toBe(promptsBefore);
+				});
+
+				test("a re-review refuses a plain work card", async () => {
+					const work = await rrStore.createTask("plain card");
+					const res = await rereview(work.id);
+					expect(res.status).toBe(409);
+					expect(await errorOf(res)).toBe("not a PR review card");
+				});
+			};
+		})();
 		return () => {
 			afterAll(async () => {
 				await closeTestStore(prStore);
@@ -22185,6 +22447,7 @@ describe(
 					number: 8,
 					url: "https://github.com/acme/widget/pull/8",
 					state: "open",
+					head: H1,
 					reviewedHead: H1,
 					postedHead: null,
 					postedUrl: null,
@@ -22629,6 +22892,10 @@ describe(
 			// the watcher runs above would otherwise exhaust the 24h budget and make these
 			// tests order-dependent.
 			describe("PR review reply routes", replySuite);
+
+			// --- Re-review route (OTTR-1248): the drawer button's POST runs the same
+			// draft path with an empty note, with no quiet gate and no per-head skip.
+			describe("PR review re-review routes", rereviewSuite);
 
 			test("a failed app check leaves checkingApp clear, so the next tick re-runs it", async () => {
 				// The install lookup answers 404: the check fails but settles, so saveApp

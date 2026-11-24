@@ -5482,6 +5482,7 @@ describe("Drawer approve button", () => {
 				url: "https://github.com/acme/repo/pull/7",
 				number: 7,
 				state: "open",
+				head: "dddddddddddddddddddddddddddddddddddddddd",
 				reviewedHead: "sha-1",
 				postedHead: null,
 				postedLogin: null,
@@ -6690,6 +6691,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		url: "https://github.com/acme/widget/pull/7",
 		state,
 		reviewedHead: "c".repeat(40),
+		head: "d".repeat(40),
 		postedHead: null,
 		postedUrl: null,
 		postedLogin: null,
@@ -6710,6 +6712,10 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain("Ask for a new draft");
 		expect(html).toContain('id="pr-review-note"');
+		// OTTR-1248: the header names the head the next draft reviews, and the
+		// composer row carries the re-review button.
+		expect(html).toContain("head ddddddd");
+		expect(html).toContain("Re-review now");
 	});
 
 	test("a closed pr_review drawer hides the ask-for-draft composer", () => {
@@ -6784,6 +6790,36 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		if (m === null) throw new Error("no Post review button");
 		return m[0];
 	};
+	const reButton = (html: string): string => {
+		const m = /<button(?:(?!<button)[\s\S])*?Re-review now<\/button>/.exec(
+			html,
+		);
+		if (m === null) throw new Error("no Re-review now button");
+		return m[0];
+	};
+
+	// OTTR-1248: the Re-review now button's state mirrors the head and the run.
+	test("the re-review button is enabled with the quiet-skip tooltip for a new head", () => {
+		const html = section(waitingReview(), "## Summary\nreview");
+		expect(reButton(html)).not.toContain("disabled");
+		expect(reButton(html)).toContain("quiet wait");
+	});
+
+	test("the re-review tooltip names a fresh review when the head already has one", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			head: "c".repeat(40),
+		});
+		expect(reButton(html)).toContain("fresh full review");
+	});
+
+	test("the re-review button is disabled while a draft runs", () => {
+		const html = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			run: { startedAt: 1, endedAt: null, error: null, model: "@plan" },
+		});
+		expect(reButton(html)).toContain("disabled");
+	});
 
 	test("a needs_you pr_review drawer shows the PR section and no generic reply composer", () => {
 		const html = renderToStaticMarkup(
@@ -6981,6 +7017,7 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 		url: "https://github.com/acme/widget/pull/7",
 		state: "open",
 		reviewedHead: "c".repeat(40),
+		head: "d".repeat(40),
 		postedHead: null,
 		postedUrl: null,
 		postedLogin: null,
@@ -7116,6 +7153,65 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 			expect(container.textContent).not.toContain("Writing a new draft...");
 			const alert = container.querySelector('[role="alert"]');
 			expect(alert?.textContent).toBe("gateway down");
+		} finally {
+			await unmount();
+			restore();
+		}
+	});
+
+	// OTTR-1248: the re-review click skips the note entirely — one POST with an
+	// empty body, the shared spinner line while the run record is still missing.
+	test("a re-review click POSTs and shows Writing a new draft, then the ended run clears it", async () => {
+		const posts: { url: string; body: string }[] = [];
+		const { restore } = stubFetch(async (url, init) => {
+			if (url.endsWith("/tasks/P-5/re-review") && init?.method === "POST") {
+				posts.push({ url, body: String(init.body) });
+				return new Response(JSON.stringify({ ok: true }));
+			}
+			return new Response("{}", { status: 404 });
+		});
+		const { container, root, unmount } = await mount(
+			<PrReviewSection
+				task={view(card())}
+				pr={prView(null)}
+				draft={draft}
+				act={actProp}
+				onLoaded={() => {}}
+			/>,
+		);
+		try {
+			const re = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent === "Re-review now",
+			);
+			expect(re).toBeDefined();
+			await act(async () => {
+				propOf(re as unknown as Element, "onClick")({});
+			});
+			// The POST answered and no run record reached the view yet: the spinner
+			// line shows with no note typed — the ask went out as the empty body.
+			expect(container.textContent).toContain("Writing a new draft...");
+			expect(posts).toHaveLength(1);
+			expect(posts[0]!.url.endsWith("/tasks/P-5/re-review")).toBe(true);
+			expect(JSON.parse(posts[0]!.body)).toEqual({});
+			// The run record arrives ended with an error: the spinner gives way.
+			await act(async () => {
+				root.render(
+					<PrReviewSection
+						task={view(card())}
+						pr={prView({
+							startedAt: 1_000,
+							endedAt: 1_500,
+							error: "gateway down",
+							model: "@plan",
+						})}
+						draft={draft}
+						act={actProp}
+						onLoaded={() => {}}
+					/>,
+				);
+			});
+			expect(container.textContent).toContain("gateway down");
+			expect(container.textContent).not.toContain("Writing a new draft...");
 		} finally {
 			await unmount();
 			restore();
