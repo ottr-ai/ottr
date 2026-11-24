@@ -60,9 +60,8 @@ shots were already written).
 - Bounds every wait: an overall 90 s watchdog plus a deadline on each CDP
   call, the Chrome endpoint line, the readiness poll, and each page load.
 - Gives Chrome its own writable HOME: its caches and crash database die on a
-  read-only one before any endpoint line. When a Chrome boot dies before it
-  prints the DevTools endpoint, the script boots once without the sandbox —
-  containers without unprivileged user namespaces kill the sandboxed zygote.
+  read-only one before any endpoint line. The sandbox stays on: only a root
+  run drops it, and a boot that dies before the endpoint line fails the run.
 - Verifies every PNG (signature `89 50 4e 47 0d 0a 1a 0a` and the 1440x900
   IHDR size) after the children are stopped, then calls `process.exit` so the
   script cannot hang after success.

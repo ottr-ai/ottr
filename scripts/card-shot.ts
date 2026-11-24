@@ -305,38 +305,30 @@ const board = Bun.spawn(["bun", "src/server.ts"], {
 // Chrome writes its caches and the crash database under HOME; a read-only HOME (a
 // service account's) kills the boot before any endpoint line. Give chrome its own.
 const chromeHome = mkdtempSync(join(tmpdir(), "ottr-card-shot-chrome-home-"));
-const bootChrome = (sandbox: boolean) => {
-	// A fresh profile dir per boot: a dead boot's Singleton lock must not block the
-	// sandbox retry below.
-	const userDir = mkdtempSync(join(tmpdir(), "ottr-card-shot-chrome-"));
-	return Bun.spawn(
-		[
-			chromePath,
-			"--headless=new",
-			"--remote-debugging-port=0",
-			`--user-data-dir=${userDir}`,
-			"--no-first-run",
-			"--no-default-browser-check",
-			"--disable-gpu",
-			"--disable-dev-shm-usage",
-			"--hide-scrollbars",
-			`--window-size=${WIDTH},${HEIGHT}`,
-			// Root keeps no sandbox (the zygote refuses it there); the retry below
-			// drops it only where unprivileged user namespaces are missing.
-			...(!sandbox ||
-			(typeof process.getuid === "function" && process.getuid() === 0)
-				? ["--no-sandbox"]
-				: []),
-			"about:blank",
-		],
-		{
-			stdout: "ignore",
-			stderr: "pipe",
-			env: { ...process.env, HOME: chromeHome },
-		},
-	);
-};
-let chrome = bootChrome(true);
+const userDir = mkdtempSync(join(tmpdir(), "ottr-card-shot-chrome-"));
+const chrome = Bun.spawn(
+	[
+		chromePath,
+		"--headless=new",
+		"--remote-debugging-port=0",
+		`--user-data-dir=${userDir}`,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-gpu",
+		"--disable-dev-shm-usage",
+		"--hide-scrollbars",
+		`--window-size=${WIDTH},${HEIGHT}`,
+		...(typeof process.getuid === "function" && process.getuid() === 0
+			? ["--no-sandbox"]
+			: []),
+		"about:blank",
+	],
+	{
+		stdout: "ignore",
+		stderr: "pipe",
+		env: { ...process.env, HOME: chromeHome },
+	},
+);
 
 /** Waits for chrome's CDP endpoint line on stderr; null when the deadline wins. */
 async function waitEndpoint(
@@ -546,18 +538,7 @@ async function captureView(
 /** One capture run; every await below carries its own deadline. */
 async function capture(): Promise<void> {
 	// The endpoint line arrives on stderr: "DevTools listening on ws://...".
-	let endpoint = await waitEndpoint(chrome, 15_000);
-	if (endpoint === null) {
-		// Chrome died before any endpoint line: on hosts without unprivileged user
-		// namespaces the sandbox zygote kills the boot ("No usable sandbox"). Confirm
-		// the exit, then boot once without the sandbox (the board's readiness retry
-		// is the pattern; this harness visits only its own demo board).
-		const exit = await Promise.race([chrome.exited, Bun.sleep(250)]);
-		if (exit !== undefined) {
-			chrome = bootChrome(false);
-			endpoint = await waitEndpoint(chrome, 15_000);
-		}
-	}
+	const endpoint = await waitEndpoint(chrome, 15_000);
 	if (endpoint === null) throw new Error("chrome printed no DevTools endpoint");
 
 	const client = new Cdp(new WebSocket(endpoint));
