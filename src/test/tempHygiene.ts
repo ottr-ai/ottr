@@ -22,7 +22,13 @@
  * redirects into a nested root of its own and removes it at its own end.
  */
 import { afterAll, expect } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,6 +45,13 @@ const FIXTURE_PREFIXES = [
 ];
 
 const runRoot = mkdtempSync(join(tmpdir(), "ottr-suite-"));
+// mkdtempSync ignores its mode option in bun (probe-measured: always 0700). The root must
+// carry /tmp's own semantics instead: the suite spawns setpriv children that drop to
+// per-project uids (src/turnUid.test.ts, src/workers.test.ts) and their env spreads inherit
+// this TMPDIR, so they must be able to traverse into and mkdtemp inside the root. 01777 is
+// sticky world-rwx, exactly like the OS temp dir itself; every entry created inside keeps
+// its own mkdtemp 0700, and the sticky bit keeps other uids from deleting each other's.
+chmodSync(runRoot, 0o1777);
 process.env.TMPDIR = runRoot;
 
 afterAll(() => {
