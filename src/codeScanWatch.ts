@@ -499,9 +499,13 @@ export function createCodeScanWatcher(deps: {
 				const open = byRule.get(rule);
 				// ruleOrder lists byRule's own keys, so the lookup always hits.
 				if (open === undefined) continue;
+				// The rule's card tasks come from this tick's row scan, taken before the
+				// removal pass: a card whose rows all died this tick still holds the
+				// rule's in-flight turn, so the tracking cannot key on surviving rows.
+				const cardTasks = tasksByRule.get(rule) ?? [];
 				const cards = await store.codeScanRuleCards(rule);
 				let refile = false;
-				if (cards.length === 0) {
+				if (cards.length === 0 && cardTasks.length === 0) {
 					// A cancelled card is the user's "do not file" for its rows. With no
 					// open card left, a new number re-files the whole rule: unskip, drop
 					// the dead rows, and every still-open alert files into one fresh card.
@@ -517,7 +521,7 @@ export function createCodeScanWatcher(deps: {
 				}
 				const fresh = open.filter((a) => !known.has(a.number));
 				if (fresh.length === 0) continue;
-				if (refile || cards.length === 0) {
+				if (refile) {
 					// One card for the whole rule, however many alerts: one daily-cap slot.
 					await fileOne({
 						rule,
@@ -533,22 +537,23 @@ export function createCodeScanWatcher(deps: {
 					continue;
 				}
 				// The append target is the rule's single unstarted card (convergence
-				// keeps at most one). Started cards keep their prompt; their fresh
-				// alerts wait while a started card is still in flight (open, not
-				// unstarted, not yet done): an early follow-up runs two agents on
-				// one rule at once. When every started card landed (stage done),
-				// the fresh alerts file a follow-up card on a slot.
+				// keeps at most one; removal cancels an unstarted card whose rows all
+				// died). Started cards keep their prompt; their fresh alerts wait while
+				// a started card is still in flight (open, not unstarted, not yet
+				// done): an early follow-up runs two agents on one rule at once. When
+				// every started card landed (stage done), the fresh alerts file a
+				// follow-up card on a slot.
 				let target: string | null = null;
 				let inFlight: string | null = null;
-				for (const card of cards) {
-					const task = await store.getTask(card.taskId);
+				for (const taskId of cardTasks) {
+					const task = await store.getTask(taskId);
 					if (task === null) continue;
 					if (unstarted(task)) {
-						target = card.taskId;
+						target = taskId;
 						break;
 					}
 					if (task.cancelledAt === null && task.stage !== "done")
-						inFlight = card.taskId;
+						inFlight = taskId;
 				}
 				if (target === null && inFlight !== null) {
 					deps.log(

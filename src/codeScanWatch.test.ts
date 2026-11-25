@@ -14,6 +14,7 @@ import {
 } from "./codeScanWatch.ts";
 import type { GhFn } from "./forks.ts";
 import { CODE_SCAN_MAX_ALERTS } from "./githubAlerts.ts";
+import { pickRunnable } from "./scheduler.ts";
 import {
 	type CodeScanAlertRow,
 	type NewCodeScanAlert,
@@ -627,6 +628,57 @@ describe("createCodeScanWatcher", () => {
 		// The appended card's title count updates with its rows.
 		expect(task!.title).toBe("Code scanning: js/a (3 alerts)");
 		expect((await s.store.codeScanCardRows(cards[0]!.id)).length).toBe(3);
+	});
+
+	test("a running card that loses its last alert holds the rule until it lands", async () => {
+		const s = await setup();
+		await s.store.setSettings({ codeScanAutoStart: true });
+		s.open([alert(1)]);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		await s.store.updateTask(card.id, {
+			stage: "in_progress",
+			state: "running",
+		});
+		s.advance(60_000);
+		// #1 closes and #2 opens while the card runs: its rows die in the removal
+		// pass, but the running card still holds the rule, so no follow-up files.
+		s.open([alert(2)]);
+		await s.watcher.tick();
+		expect((await s.cards()).length).toBe(1);
+		const still = await s.store.getTask(card.id);
+		expect(still!.cancelledAt).toBeNull();
+		expect(still!.stage).toBe("in_progress");
+		expect((await s.store.codeScanCardRows(card.id)).length).toBe(0);
+		expect(s.logs).toContain(
+			`code scanning: p: js/a waits for its open card ${card.id} to land (1 new alert(s))`,
+		);
+		// The blocker's probe: with two slots nothing is pickable while the card
+		// runs — the waiting alert files no second todo/queued card.
+		expect(
+			pickRunnable(await s.store.listTasks(), {
+				maxParallel: 2,
+				hasRules: true,
+				now: Date.now(),
+			}).map((picked) => picked.id),
+		).toEqual([]);
+		// After the card lands, the waiting alert files a follow-up on a slot.
+		await s.store.updateTask(card.id, { stage: "done" });
+		s.advance(60_000);
+		await s.watcher.tick();
+		const followUp = (await s.cards()).find((c) => c.id !== card.id)!;
+		expect(followUp.stage).toBe("todo");
+		expect(followUp.state).toBe("queued");
+		expect(
+			(await s.store.codeScanCardRows(followUp.id)).map((r) => r.number),
+		).toEqual([2]);
+		expect(
+			pickRunnable(await s.store.listTasks(), {
+				maxParallel: 2,
+				hasRules: true,
+				now: Date.now(),
+			}).map((picked) => picked.id),
+		).toEqual([followUp.id]);
 	});
 
 	test("a follow-up waits while the started card is in flight and files after it lands", async () => {
