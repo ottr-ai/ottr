@@ -32179,6 +32179,37 @@ describe("prompt gate", () => {
 		expect((await store.getTask(task.id))!.gate?.parked).toBe(false);
 	});
 
+	test("a Start anyway with a still-queued note skips the gate and runs the agent (OTTR-1281)", async () => {
+		let calls = 0;
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = await store.createTask("approved with note");
+		// The Start anyway reply's write: the note is queued, folded into seen, and
+		// the hash covers prompt + note once. The run has not consumed the note yet.
+		await store.updateTask(task.id, {
+			pendingPrompt: "use SQLite",
+			pendingBy: "user",
+			gate: {
+				hash: gateFingerprint(gateCompareText(task.prompt, "use SQLite", null)),
+				seen: "use SQLite",
+				fails: 0,
+				sig: null,
+				parked: false,
+			},
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(calls).toBe(0);
+		expect(record.runs).toHaveLength(1);
+		expect((await store.getTask(task.id))!.gate?.parked).toBe(false);
+	});
+
 	test("the third identical park carries only the Start-anyway question", async () => {
 		let calls = 0;
 		const check: GateCheck = {

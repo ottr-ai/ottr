@@ -5020,10 +5020,19 @@ export function createTurnLoop(
 		for (const reason of handoff.reasons)
 			await log(`! prompt gate: handoff not judged: ${reason}`);
 		const judged = gateJudgedPrompt(live.prompt, handoff);
-		// Skip rule: the gate passed for exactly this compared text.
+		// Skip rule: the gate passed for exactly this compared text. A Start anyway
+		// reply that queued the user's note (OTTR-1281) already folded that queued text
+		// into seen, so the approval compares it once, not twice, until the run consumes it.
+		const folded =
+			pending !== null &&
+			seen !== null &&
+			(seen === pending || seen.endsWith(`\n\n${pending}`));
 		if (
 			live.gate?.hash ===
-			gateFingerprint(gateCompareText(judged, pending, seen))
+				gateFingerprint(gateCompareText(judged, pending, seen)) ||
+			(folded &&
+				live.gate?.hash ===
+					gateFingerprint(gateCompareText(judged, null, seen)))
 		) {
 			await log("+ prompt gate: passed earlier for this text");
 			return true;
