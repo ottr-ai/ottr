@@ -20,7 +20,11 @@ import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
 import type { KillExpect } from "./staleTurn.ts";
 import { SWEEP_CLOCK_SKEW_MS, sweepTmpDirs } from "./tmpsweep.ts";
-import { projectTurnUid } from "./turnUid.ts";
+import {
+	projectTurnUid,
+	STORE_MOUNT_BLOCKED,
+	type TurnIdentity,
+} from "./turnUid.ts";
 import {
 	detachedRuns,
 	killDetached,
@@ -3310,6 +3314,185 @@ describe("serveWorker turn identity", () => {
 			// The daemon-owned gitconfig pins the project identity.
 			const gitconfigText = readFileSync(gitconfig, "utf8");
 			expect(gitconfigText).toContain("[user]");
+		},
+		30_000,
+	);
+
+	// The pinned-layer fixture both store tests share: passwd/group snapshots,
+	// one git repo, a pinned layer whose db link targets the flat shared home,
+	// and an omp stub that plays the store access omp does (OTTR-1291).
+	function storeFixture(project: string): {
+		workerHome: string;
+		homesRoot: string;
+		ws: string;
+		repo: string;
+		layerDir: string;
+		dbTarget: string;
+	} {
+		const workerHome = freshWorkerHome();
+		const homesRoot = freshWorkerHome();
+		const ws = freshWorkerHome();
+		const passwd = join(homesRoot, "passwd");
+		const group = join(homesRoot, "group");
+		writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+		writeFileSync(group, "root:x:0:\n");
+		const repo = join(ws, project);
+		mkdirSync(repo, { recursive: true });
+		Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		const layerDir = join(workerHome, ".alate", "layers", "l1");
+		mkdirSync(join(layerDir, ".omp", "agent"), { recursive: true });
+		mkdirSync(join(workerHome, ".omp", "agent"), { recursive: true });
+		const dbTarget = join(workerHome, ".omp", "agent", "agent.db");
+		writeFileSync(dbTarget, "store");
+		symlinkSync(dbTarget, join(layerDir, ".omp", "agent", "agent.db"));
+		// The stub dir gets a plain world-readable mode, because mkdtemp dirs
+		// are 0700 root-only and the real omp binary lives in the image's
+		// world-executable PATH instead.
+		chmodSync(workerHome, 0o755);
+		return { workerHome, homesRoot, ws, repo, layerDir, dbTarget };
+	}
+
+	rootTest(
+		"a root omp reset of the store modes is restored before each turn",
+		async () => {
+			const project = "store-restore-proj";
+			const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
+				storeFixture(project);
+			// Store stub: opens the store through PI_CODING_AGENT_DIR the way omp
+			// does, and prints the result with the uid the turn ran under.
+			const stubPath = join(workerHome, "store-omp.js");
+			writeFileSync(
+				stubPath,
+				`#!${process.execPath}
+const fs = require("node:fs");
+let opened = "ok";
+try {
+	fs.closeSync(fs.openSync(process.env.PI_CODING_AGENT_DIR + "/agent.db", "r+"));
+} catch (err) {
+	opened = String(err);
+}
+process.stdout.write(JSON.stringify({ uid: process.getuid(), opened }) + "\\n");
+`,
+			);
+			chmodSync(stubPath, 0o755);
+			// The between-turns root omp reset: agent dir 0700, db and wal 0600.
+			chmodSync(join(workerHome, ".omp", "agent"), 0o700);
+			chmodSync(dbTarget, 0o600);
+			writeFileSync(`${dbTarget}-wal`, "wal");
+			chmodSync(`${dbTarget}-wal`, 0o600);
+
+			const url = start({
+				ompPath: stubPath,
+				home: workerHome,
+				turnUid: {
+					homesRoot,
+					workerHome,
+					dataRoots: [],
+					workspaceRoot: ws,
+					provisionPaths: {
+						passwd: join(homesRoot, "passwd"),
+						group: join(homesRoot, "group"),
+					},
+				},
+			});
+			const res = await post(url, {
+				id: "ti-store-restore",
+				argv: ["-p"],
+				cwd: repo,
+				stdin: "",
+				env: {
+					OTTR_PROJECT: project,
+					HOME: layerDir,
+					PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
+				},
+			});
+			expect(res.status).toBe(200);
+			const lines = await readLines(res);
+			// The turn uid opened the store: the modes were restored before spawn.
+			const stubLine = lines.find((l) => l.includes('"opened"'));
+			expect(stubLine).toBeDefined();
+			const dumped = JSON.parse(stubLine!) as {
+				uid: number;
+				opened: string;
+			};
+			expect(dumped.opened).toBe("ok");
+			expect(dumped.uid).toBe(projectTurnUid(project).uid);
+			// Exactly one drift line rode the stream.
+			const driftLines = lines.filter((l) => l.startsWith("turn-uid:"));
+			expect(driftLines.length).toBe(1);
+			expect(driftLines[0]).toContain("shared store modes drifted");
+			// The shared home carries the boot modes again.
+			expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+				0o1777,
+			);
+			expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+			expect(statSync(`${dbTarget}-wal`).mode & 0o777).toBe(0o666);
+		},
+		30_000,
+	);
+
+	rootTest(
+		"a mounted drifted store refuses the run instead of chmodding through the mount",
+		async () => {
+			const project = "store-mounted-proj";
+			const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
+				storeFixture(project);
+			// Store stub: writes a marker first thing, so an assertion on the
+			// marker proves omp never started.
+			const marker = join(homesRoot, "mounted-marker");
+			const stubPath = join(workerHome, "mounted-omp.js");
+			writeFileSync(
+				stubPath,
+				`#!${process.execPath}
+require("node:fs").writeFileSync(process.env.STORE_MARKER, "started\\n");
+`,
+			);
+			chmodSync(stubPath, 0o755);
+			chmodSync(join(workerHome, ".omp", "agent"), 0o700);
+			chmodSync(dbTarget, 0o600);
+
+			const url = start({
+				ompPath: stubPath,
+				home: workerHome,
+				turnUid: {
+					homesRoot,
+					workerHome,
+					dataRoots: [],
+					workspaceRoot: ws,
+					provisionPaths: {
+						passwd: join(homesRoot, "passwd"),
+						group: join(homesRoot, "group"),
+					},
+					isMounted: (p) => p === dbTarget,
+				},
+			});
+			const res = await post(url, {
+				id: "ti-store-mounted",
+				argv: ["-p"],
+				cwd: repo,
+				stdin: "",
+				env: {
+					OTTR_PROJECT: project,
+					HOME: layerDir,
+					PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
+					STORE_MARKER: marker,
+				},
+			});
+			expect(res.status).toBe(500);
+			const body = await res.text();
+			expect(body).toContain(STORE_MOUNT_BLOCKED);
+			expect(body).toContain(dbTarget);
+			expect(body).toContain("host");
+			// omp never started.
+			expect(existsSync(marker)).toBe(false);
+			// Nothing was chmodded through the mount: the drift stays as it was.
+			expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+				0o700,
+			);
+			expect(statSync(dbTarget).mode & 0o777).toBe(0o600);
 		},
 		30_000,
 	);

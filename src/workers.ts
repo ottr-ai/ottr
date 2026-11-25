@@ -70,6 +70,7 @@ import {
 	applyTurnHomeEnv,
 	closeProjectDir,
 	ensureProjectIdentity,
+	ensureTurnStoreAccess,
 	newLayerToken,
 	type ProvisionPaths,
 	prepareRunWorkspace,
@@ -281,6 +282,8 @@ export function serveWorker(opts: {
 		workspaceRoot: string;
 		/** Provisioning paths the boot/test can point at temp files (OTTR-1184). */
 		provisionPaths?: ProvisionPaths;
+		/** Only for tests: replaces the mount check of the per-turn store-access check. */
+		isMounted?: (path: string) => boolean;
 	} | null;
 	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
 	readSignIns?: () => SignIn[];
@@ -689,6 +692,22 @@ export function serveWorker(opts: {
 								basename(home.home),
 								copyToken,
 							);
+					// Per-turn store access (OTTR-1291): a root omp run between turns
+					// resets the shared store modes, so every turn restores them before
+					// it spawns. A mounted drifted store refuses the run instead of
+					// chmodding through the mount.
+					const agentDir =
+						typeof env.PI_CODING_AGENT_DIR === "string" &&
+						env.PI_CODING_AGENT_DIR !== ""
+							? env.PI_CODING_AGENT_DIR
+							: join(env.HOME ?? "", ".omp", "agent");
+					const drift = ensureTurnStoreAccess(
+						turnUid.workerHome,
+						join(agentDir, "agent.db"),
+						ids,
+						{ isMounted: turnUid.isMounted },
+					);
+					if (drift !== null) runNotes += `${drift}\n`;
 					ensureProjectIdentity(project, ids, turnHome, turnUid.provisionPaths);
 					applyTurnGitEnv(env, project, turnHome);
 					for (const root of turnUid.dataRoots)

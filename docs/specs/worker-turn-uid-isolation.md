@@ -184,12 +184,25 @@ daemon prepares it once per boot, root-only:
   another uid's entries by path, and a sticky dir keeps each uid to its own
   files.
 - `.omp/agent/agent.db` gets `a+rw`, but only when it is not a mount point
-  (the daemon reads `/proc/self/mountinfo`). The compose store is a host
+  (the daemon reads `/proc/self/mountinfo`). The boot also gives `a+rw` to
+  the existing `agent.db-wal` and `agent.db-shm` siblings, under the same
+  mounted-skip rule. The compose store is a host
   bind mount, and a chmod through it would change the host file's mode; the
   boot logs a note instead and leaves the mode to the host. The residual:
   a turn-side store write (a credential refresh of a non-lent provider)
   fails on such a deployment with the cause omp reports; lent providers and
   env keys are unaffected.
+- Before each turn spawns as the turn uid, the daemon restores the
+  shared-store modes (`src/turnUid.ts`). It walks the store path chain
+  through the layer links and checks the uid access bits on each entry.
+  The chain holds the worker home traversal bit, the `.omp/agent` dir, and
+  the `agent.db` file with its `agent.db-wal` and `agent.db-shm`
+  siblings. A drifted entry gets the boot table's mode (home `0711`,
+  agent dir `1777`, store files `0666`), and the run logs one `turn-uid:`
+  drift line. The daemon never chmods a mounted entry that blocks the uid,
+  because a chmod through the mount would change the host file. The run
+  refuses to start, and the board parks the card `needs_you` with a reason
+  that names the file and the host fix.
 - BuildKit client material (`/certs/buildkit/client/*`, the CA) is root-only
   `0400` in the image ("workers run as root"); the boot gives the turn uids
   a read (`0644`), because a build turn needs the client key when the build
@@ -199,6 +212,36 @@ daemon prepares it once per boot, root-only:
 - At boot, when root, the daemon raises its soft RLIMIT_NPROC toward the
   hard cap (floor 4096) so turn uids can fork (OTTR-1184); it logs a
   `turn-uid:` note. An unavailable setrlimit degrades to that note.
+
+### Root cause: root omp re-enforces owner-private modes
+
+The omp binary (`/usr/local/bin/omp`, package
+`@oh-my-pi/pi-coding-agent`) enforces owner-private agent dirs. Its bundle
+(`/usr/local/bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js`)
+holds the evidence. Two greps show it:
+
+- `rg -o ".{200}Owner-private dir chmod failed.{80}" <bundle>`: omp runs
+  `mkdirSync(dir, {recursive:true, mode:448})` (`448` = `0o700`), fstats
+  the dir, and runs `fchmodSync(r,448)` when `(i.mode&511)!==448`. So omp
+  chmods an existing dir to `0700` again, and the error log names
+  "Owner-private dir chmod failed".
+- `rg -o "mkdirSync\(.{0,120}" <bundle> | rg agent`: the store open path
+  runs `mkdirSync(NVr.dirname(e),{recursive:!0,mode:448})` directly before
+  the sqlite `agent-storage` open. omp writes store-side files there with
+  `mode:384` (`0o600`).
+
+So any omp process that opens the agent storage sets `0700` on
+`.omp/agent` again, and it creates new files there with `0600`-class
+modes. The board's root-side omp calls (a gate run, `omp models list`, the
+omp watch probe) run against the shared home. They reset the modes that
+bootTurnIsolation set for the turn uids.
+
+The 2026-11-25 outage matches this: `.omp/agent` showed `0700` root, and
+`agent.db` plus `agent.db-wal` showed `0600`. `/root/.omp/agent/models.db`
+had mtime `15:56:18 UTC`, right after the first failing turns at `15:51`.
+This is the same class as the 2026-11-21 outage (OTTR-1179). Hardening at
+boot time only cannot survive the next root omp call, so the design adds
+the per-turn restore.
 
 ### Spawn
 
@@ -234,6 +277,9 @@ their repo's owner and need nothing.
 - Layer copy source missing: the run fails with the layer id in the message.
 - Chown or copy failure: the run fails with the cause; the temp copy is
   removed on the next run's stale sweep.
+- A mounted store whose mode blocks the turn uid: the run refuses to
+  start. The daemon chmods nothing through the mount. The card parks
+  `needs_you` with the file name and the host fix in the reason.
 - A run cwd outside the workspace root, or a project dir without a git dir:
   the run fails with the cause.
 - Uid collision between two project names: logged per run; both projects
@@ -286,6 +332,10 @@ their repo's owner and need nothing.
   identity, and a configured turn-home `.gitconfig` identity wins over the
   project fallback.
 - A child under the project uid forks twelve parallel processes.
+- A fixture with a `0700` agent folder and a `0600` store file starts a
+  turn, and the turn opens the store. Before the fix, this check fails.
+- A mounted store that the uid cannot open refuses the run. The reason
+  names the file and the host fix, and omp does not start.
 - `bun run check` and `bun test` pass.
 
 ## Alternatives considered

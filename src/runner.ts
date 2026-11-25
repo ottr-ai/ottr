@@ -57,6 +57,7 @@ import { formatBytes } from "./tmpsweep.ts";
 import { CARD_ENV_NOTE_NAME } from "./tokens.ts";
 import { toolsListPath } from "./tools.ts";
 import { projectTrustedLists } from "./trustedLists.ts";
+import { STORE_MOUNT_BLOCKED } from "./turnUid.ts";
 import type {
 	AskQuestion,
 	GitFacts,
@@ -659,6 +660,17 @@ const workerLostRule: ClassifyRule = (o, stage) => {
 			};
 };
 
+/** The worker refused to start the turn: the shared omp store is a bind mount whose mode blocks
+ * the turn uid (OTTR-1291). No retry can fix a host file mode; the operator fixes it. */
+const storeMountRule: ClassifyRule = (o, stage) => {
+	if (!o.result.stderrTail.includes(STORE_MOUNT_BLOCKED)) return null;
+	const file = /cannot open: (\S+)/.exec(o.result.stderrTail)?.[1];
+	return needsAt(
+		stage,
+		`The worker refused to start the turn: ${STORE_MOUNT_BLOCKED}${file ? ` (${file})` : ""}. Fix the store's mode on the host: chmod a+rw on the store file and a+rwx on its folder, then reply.`,
+	);
+};
+
 /** The turn's death context: stderr, then the provider's structured error. */
 function deathContext(o: ClassifyInput): string | null | undefined {
 	return deathLine(o.result.stderrTail) ?? o.result.providerError;
@@ -953,6 +965,7 @@ const CLASSIFY_RULES: ClassifyRule[] = [
 	provisionRule,
 	killedRule,
 	backgroundWaitRule,
+	storeMountRule,
 	workerLostRule,
 	deathRule,
 	approvalRefusedRule,

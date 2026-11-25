@@ -19,6 +19,7 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
@@ -753,6 +754,18 @@ function linkIfMissing(
 }
 
 /**
+ * Shared-home store access modes (OTTR-1291): the flat worker home stays
+ * traversable for turn uids, the store's dir stays sticky-writable so sqlite
+ * can create its journal beside the store, and the store file stays writable
+ * by every uid. bootTurnIsolation sets these once at boot;
+ * ensureTurnStoreAccess restores them before each turn, because a root omp
+ * run between turns resets them (dir 0700, db 0600).
+ */
+const WORKER_HOME_MODE = 0o711;
+const AGENT_DIR_MODE = 0o1777;
+const STORE_FILE_MODE = 0o666;
+
+/**
  * Boot preparation, root-only: the shared home becomes traversable-but-not-
  * listable for turn uids, the flat state dirs omp writes through the pin's
  * links become sticky write-only-for-others (each uid keeps its entries
@@ -772,14 +785,14 @@ export function bootTurnIsolation(
 		];
 	const notes: string[] = [];
 	try {
-		chmodSync(workerHome, 0o711);
+		chmodSync(workerHome, WORKER_HOME_MODE);
 	} catch (err) {
 		notes.push(`home chmod failed: ${String(err)}`);
 	}
 	// 1733: write-and-traverse for every uid, no listing of others' entries,
 	// sticky so a uid cannot remove another uid's files.
 	for (const [rel, mode] of [
-		[".omp/agent", 0o1777],
+		[".omp/agent", AGENT_DIR_MODE],
 		[".omp/agent/sessions", 0o1733],
 		[".omp/logs", 0o1733],
 	] as const) {
@@ -800,7 +813,11 @@ export function bootTurnIsolation(
 				// to the cause omp reports (docs/specs/worker-turn-uid-isolation.md).
 				notes.push("agent.db is a mount; store mode left to the host");
 			} else {
-				chmodSync(db, 0o666);
+				// The store and the journal siblings sqlite creates beside it all
+				// need the turn uids' write bit; one mount check covers them all.
+				for (const file of [db, `${db}-wal`, `${db}-shm`]) {
+					if (existsSync(file)) chmodSync(file, STORE_FILE_MODE);
+				}
 			}
 		} catch (err) {
 			notes.push(`agent.db chmod failed: ${String(err)}`);
@@ -841,6 +858,111 @@ function pathIsMounted(path: string): boolean {
 		if (fields[4] === escaped) return true;
 	}
 	return false;
+}
+
+/** Refusal head for a drifted store entry that sits on a mount (OTTR-1291). */
+export const STORE_MOUNT_BLOCKED =
+	"the shared omp store is a mount the turn uid cannot open";
+
+/**
+ * Per-turn store access (OTTR-1291): a root omp run between turns resets the
+ * shared-home store modes (dir 0700, db 0600), and the next turn-uid turn
+ * then dies opening the store. Before every spawn, stat the entries the turn
+ * opens through its store path — the layer copy's state link resolves into
+ * the flat shared home — and restore the boot modes. Mode bits only: the db
+ * is never opened, so the check stays fast enough to sit before each spawn.
+ *
+ * A drifted entry that sits on a mount is refused instead of chmodded: a
+ * chmod through the mount would change the host file's mode, so the host
+ * fixes the mode first. The refusal throws before any chmod, so a refused
+ * turn never changes a mode. Returns the one-line drift note, or null on a
+ * clean tree.
+ */
+export function ensureTurnStoreAccess(
+	workerHome: string,
+	storePath: string,
+	ids: TurnIdentity,
+	deps: { isMounted?: (path: string) => boolean } = {},
+): string | null {
+	let dbFile: string;
+	try {
+		dbFile = realpathSync(storePath);
+	} catch {
+		// The store link dangles (no db yet): check beside the resolved parent
+		// dir instead. When even that parent is missing, boot creates it and
+		// there is nothing to check yet.
+		try {
+			dbFile = join(realpathSync(dirname(storePath)), basename(storePath));
+		} catch {
+			return null;
+		}
+	}
+	const mounted = deps.isMounted ?? pathIsMounted;
+	// One entry per path the turn opens: the worker home itself (every uid
+	// traverses it), the store's dir (every uid creates the journal beside
+	// the store), and the store with its sqlite siblings (every uid reads
+	// and writes them). Names ride the drift note; the store files keep
+	// their sqlite names.
+	const entries: {
+		path: string;
+		name: string;
+		need: number;
+		mode: number;
+	}[] = [
+		{ path: workerHome, name: ".", need: 0o001, mode: WORKER_HOME_MODE },
+		{
+			path: dirname(dbFile),
+			name: relative(workerHome, dirname(dbFile)) || ".",
+			need: 0o003,
+			mode: AGENT_DIR_MODE,
+		},
+	];
+	for (const suffix of ["", "-wal", "-shm"] as const) {
+		const file = dbFile + suffix;
+		entries.push({
+			path: file,
+			name: basename(file),
+			need: 0o006,
+			mode: STORE_FILE_MODE,
+		});
+	}
+	const blocked: { path: string; mode: number }[] = [];
+	const drifted: { path: string; name: string; mode: number; from: number }[] =
+		[];
+	for (const entry of entries) {
+		let st: Stats;
+		try {
+			st = statSync(entry.path);
+		} catch {
+			continue; // A missing entry (no db yet) carries no mode bits.
+		}
+		if ((st.mode & entry.need) === entry.need) continue; // Healthy.
+		if (mounted(entry.path)) {
+			blocked.push({ path: entry.path, mode: st.mode });
+			continue;
+		}
+		drifted.push({
+			path: entry.path,
+			name: entry.name,
+			mode: entry.mode,
+			from: st.mode & 0o7777,
+		});
+	}
+	if (blocked.length > 0) {
+		const first = blocked[0]!;
+		throw new Error(
+			`${STORE_MOUNT_BLOCKED}: ${first.path} (mode ${(first.mode & 0o777).toString(8)}); chmod through the mount would change the host file - fix the mode on the host (a+rw on the store file, a+rwx on its folder), then reply`,
+		);
+	}
+	if (drifted.length === 0) return null;
+	for (const entry of drifted) chmodSync(entry.path, entry.mode);
+	const restored = drifted
+		.map(
+			(entry) =>
+				`${entry.name} ${entry.from.toString(8)}->${entry.mode.toString(8)}`,
+		)
+		.join(", ");
+	return `turn-uid: shared store modes drifted for uid ${ids.uid}; restored ${restored}`;
 }
 
 /** chown+close every project dir directly under one shared root; per-entry failures note. */

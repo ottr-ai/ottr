@@ -54,6 +54,7 @@ import {
 } from "./runner.ts";
 import fc from "./test/properties.ts";
 import { CARD_ENV_NOTE } from "./tokens.ts";
+import { STORE_MOUNT_BLOCKED } from "./turnUid.ts";
 import type {
 	GitFacts,
 	Next,
@@ -4845,6 +4846,62 @@ describe("classify workerLost", () => {
 		});
 		expect(next.state).toBe("needs_you");
 		expect(next.needsReason).toContain(WORKER_LOST);
+	});
+});
+
+describe("classify store mount refusal", () => {
+	const mountStderr = `worker dispatch failed: worker http://worker:8080 responded 500: turn-uid: Error: ${STORE_MOUNT_BLOCKED}: /root/.omp/agent/agent.db (mode 600); chmod through the mount would change the host file - fix the mode on the host (a+rw on the store file, a+rwx on its folder), then reply`;
+
+	test("the refusal parks needs_you naming the file and the fix", () => {
+		const next = classify({
+			kind: "work",
+			result: result({
+				workerLost: true,
+				exitCode: null,
+				stderrTail: mountStderr,
+			}),
+			git: git(),
+			target: null,
+			previousError: `${WORKER_LOST} - resuming automatically. Cancel to stop it instead.`,
+		});
+		expect(next.state).toBe("needs_you");
+		expect(next.needsReason).toContain(STORE_MOUNT_BLOCKED);
+		expect(next.needsReason).toContain("/root/.omp/agent/agent.db");
+		expect(next.needsReason).toContain("chmod a+rw");
+	});
+
+	test("the first refusal parks needs_you without an automatic requeue", () => {
+		const next = classify({
+			kind: "work",
+			result: result({
+				workerLost: true,
+				exitCode: null,
+				stderrTail: mountStderr,
+			}),
+			git: git(),
+			target: null,
+			previousError: null,
+		});
+		expect(next.state).toBe("needs_you");
+		expect(next.needsReason).toContain(STORE_MOUNT_BLOCKED);
+		expect(next.needsReason).toContain("/root/.omp/agent/agent.db");
+	});
+
+	test("a plain lost-worker result without the marker still queues", () => {
+		const next = classify({
+			kind: "work",
+			result: result({
+				workerLost: true,
+				exitCode: null,
+				stderrTail:
+					"worker dispatch failed: worker http://worker:8080 connect ECONNREFUSED",
+			}),
+			git: git(),
+			target: null,
+			previousError: null,
+		});
+		expect(next.state).toBe("queued");
+		expect(next.pendingPrompt).toBe(".");
 	});
 });
 

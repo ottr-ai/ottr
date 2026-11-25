@@ -20,7 +20,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import fc from "fast-check";
 import { holdLock } from "./layerLeaseLock.ts";
 import {
@@ -34,6 +34,7 @@ import {
 	ensureForkCapacity,
 	ensureLayerCopy,
 	ensureProjectIdentity,
+	ensureTurnStoreAccess,
 	isolationEnabled,
 	newLayerToken,
 	openPinned,
@@ -43,6 +44,7 @@ import {
 	releaseLayerCopyUse,
 	resolvePinnedLayer,
 	retargetCacheLinks,
+	STORE_MOUNT_BLOCKED,
 	type TurnHome,
 	type TurnIdentity,
 	uidCollisionNote,
@@ -945,6 +947,168 @@ test("isolationEnabled matches the process uid", () => {
 	expect(isolationEnabled()).toBe(
 		typeof process.getuid === "function" && process.getuid() === 0,
 	);
+});
+
+// Per-turn store access (OTTR-1291): stats and chmods only files the test
+// owns, so every case runs on every gate, root or not.
+describe("ensureTurnStoreAccess", () => {
+	/** A layer-copy-shaped store: the copy's agent dir holds a db link into
+	 * the flat shared home, like ensureLayerCopy builds for a pinned turn. */
+	function freshStore(): {
+		workerHome: string;
+		storePath: string;
+		dbTarget: string;
+	} {
+		const workerHome = freshDir("store-flat");
+		const copyHome = freshDir("store-copy");
+		mkdirSync(join(copyHome, ".omp", "agent"), { recursive: true });
+		mkdirSync(join(workerHome, ".omp", "agent"), { recursive: true });
+		const dbTarget = join(workerHome, ".omp", "agent", "agent.db");
+		writeFileSync(dbTarget, "store");
+		const storePath = join(copyHome, ".omp", "agent", "agent.db");
+		symlinkSync(dbTarget, storePath);
+		return { workerHome, storePath, dbTarget };
+	}
+
+	/** The healthy boot state: home 0711, agent dir 01777, store 0666. */
+	function healthy(workerHome: string, dbTarget: string): void {
+		chmodSync(workerHome, 0o711);
+		chmodSync(join(workerHome, ".omp", "agent"), 0o1777);
+		chmodSync(dbTarget, 0o666);
+	}
+
+	test("a clean tree returns null and leaves the modes untouched", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		const ids = projectTurnUid("store-clean-proj");
+		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBeNull();
+		expect(statSync(workerHome).mode & 0o777).toBe(0o711);
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o1777,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+	});
+
+	test("drift through the copy's link restores the flat home and names each entry", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		writeFileSync(`${dbTarget}-wal`, "wal");
+		// The root omp reset between turns: dir 0700, db and wal 0600.
+		chmodSync(join(workerHome, ".omp", "agent"), 0o700);
+		chmodSync(dbTarget, 0o600);
+		chmodSync(`${dbTarget}-wal`, 0o600);
+		const ids = projectTurnUid("store-drift-proj");
+		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBe(
+			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored .omp/agent 700->1777, agent.db 600->666, agent.db-wal 600->666`,
+		);
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o1777,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+		expect(statSync(`${dbTarget}-wal`).mode & 0o777).toBe(0o666);
+	});
+
+	test("a store at 0644 lacks the others' write bit and restores to 0666", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		chmodSync(dbTarget, 0o644);
+		const ids = projectTurnUid("store-644-proj");
+		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBe(
+			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored agent.db 644->666`,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+	});
+
+	test("an agent dir at 0755 lacks the others' write bit and restores to 01777", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		chmodSync(join(workerHome, ".omp", "agent"), 0o755);
+		const ids = projectTurnUid("store-755-proj");
+		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBe(
+			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored .omp/agent 755->1777`,
+		);
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o1777,
+		);
+	});
+
+	test("a worker home at 0700 blocks traversal and restores to 0711", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		chmodSync(workerHome, 0o700);
+		const ids = projectTurnUid("store-home-proj");
+		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBe(
+			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored . 700->711`,
+		);
+		expect(statSync(workerHome).mode & 0o777).toBe(0o711);
+	});
+
+	test("a mounted drifted store refuses and changes no mode", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		chmodSync(workerHome, 0o700);
+		chmodSync(join(workerHome, ".omp", "agent"), 0o700);
+		chmodSync(dbTarget, 0o600);
+		const ids = projectTurnUid("store-mounted-proj");
+		let err: Error | null = null;
+		try {
+			ensureTurnStoreAccess(workerHome, storePath, ids, {
+				isMounted: (p) => p === dbTarget,
+			});
+		} catch (caught) {
+			err = caught as Error;
+		}
+		expect(err).not.toBeNull();
+		expect(err!.message).toContain(STORE_MOUNT_BLOCKED);
+		expect(err!.message).toContain(dbTarget);
+		expect(err!.message).toContain("(mode 600)");
+		expect(err!.message).toContain("host");
+		// The refusal throws before any chmod: nothing was restored.
+		expect(statSync(workerHome).mode & 0o777).toBe(0o700);
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o700,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o600);
+	});
+
+	test("a mounted store with healthy modes does not throw and returns null", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		const ids = projectTurnUid("store-mounted-ok-proj");
+		expect(
+			ensureTurnStoreAccess(workerHome, storePath, ids, {
+				isMounted: () => true,
+			}),
+		).toBeNull();
+	});
+
+	test("a dangling store link checks the resolved dir only; nothing at all returns null", () => {
+		// The db link dangles (the flat db is gone), but the link's agent dir
+		// exists: the fallback resolves through it and checks it — and only
+		// it, since no store file exists beside it.
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		const copyAgentDir = dirname(storePath);
+		chmodSync(copyAgentDir, 0o755);
+		rmSync(dbTarget);
+		const ids = projectTurnUid("store-dangling-proj");
+		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBe(
+			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored ${relative(workerHome, copyAgentDir)} 755->1777`,
+		);
+		expect(statSync(copyAgentDir).mode & 0o7777).toBe(0o1777);
+		expect(existsSync(dbTarget)).toBe(false);
+
+		// Nothing exists yet at all: boot creates the dir later, so null.
+		const emptyHome = freshDir("store-empty");
+		chmodSync(emptyHome, 0o711);
+		expect(
+			ensureTurnStoreAccess(
+				emptyHome,
+				join(emptyHome, ".omp", "agent", "agent.db"),
+				ids,
+			),
+		).toBeNull();
+	});
 });
 
 rootTest("a cwd naming another project fails the run", () => {
