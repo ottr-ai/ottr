@@ -70,8 +70,8 @@ exist only when the profile is on (the `OTTR_VM_RUNNER_URL` pattern).
 
 ## Pins
 
-- `moby/buildkit:v0.34.2-rootless@sha256:c8252268760e1baba80780d63d738ef9f260fb7c7c0973c78494cb9ddd99eda1`
-  (multiarch index digest, checked 2026-11-10).
+- `moby/buildkit:v0.35.0-rootless@sha256:5987568f92dafbfb679879de59c1cd8d26597f5f6635c314e166164e2615870c`
+  (multiarch index digest, checked 2026-11-25).
 - `buildkit-v0.34.2.linux-amd64.tar.gz`, sha256
   `b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13`.
 - `buildkit-v0.34.2.linux-arm64.tar.gz`, sha256
