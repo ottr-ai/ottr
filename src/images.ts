@@ -4,7 +4,7 @@ import { withDir, writeBelow } from "./confine.ts";
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
-type ImageExt = "png" | "jpg" | "gif" | "webp";
+type ImageExt = "png" | "jpg" | "gif" | "webp" | "ico";
 
 export interface DecodedImage {
 	bytes: Buffer;
@@ -19,6 +19,16 @@ export function sniffImage(bytes: Uint8Array): ImageExt | null {
 	if (ascii(0, "\x89PNG\r\n\x1a\n")) return "png";
 	if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "jpg";
 	if (ascii(0, "GIF87a") || ascii(0, "GIF89a")) return "gif";
+	// ICO: reserved 00 00, type 01 (CUR would be 02), and a 16-bit LE image count above 0.
+	if (
+		b.length >= 6 &&
+		b[0] === 0 &&
+		b[1] === 0 &&
+		b[2] === 1 &&
+		b[3] === 0 &&
+		(b[4] !== 0 || b[5] !== 0)
+	)
+		return "ico";
 	if (ascii(0, "RIFF") && ascii(8, "WEBP")) return "webp";
 	return null;
 }
@@ -49,7 +59,7 @@ export function decodeImages(
 		const bytes = Buffer.from(s, "base64");
 		const ext = sniffImage(bytes);
 		if (ext === null)
-			return { error: `image ${n} is not a PNG, JPEG, GIF or WebP file` };
+			return { error: `image ${n} is not a PNG, JPEG, GIF, WebP or ICO file` };
 		images.push({ bytes, ext });
 	}
 	return { images };

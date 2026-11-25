@@ -14268,7 +14268,7 @@ describe("project icon", () => {
 		);
 		expect(res.status).toBe(400);
 		expect(await errorOf(res)).toBe(
-			"icon must be a PNG, JPEG, GIF or WebP file",
+			"icon must be a PNG, JPEG, GIF, WebP or ICO file",
 		);
 	});
 
@@ -14292,6 +14292,36 @@ describe("project icon", () => {
 		const res = await get("/api/projects/p1/icon");
 		expect(res.headers.get("Content-Type")).toBe("image/webp");
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(webp);
+	});
+
+	// ICO header (reserved 0, type 1 icon, one image) plus one 16-byte directory
+	// entry (16x16, 32bpp, 16 bytes of data at offset 22) and the data itself.
+	const ico = new Uint8Array([
+		0, 0, 1, 0, 1, 0, 16, 16, 0, 0, 1, 0, 32, 0, 16, 0, 0, 0, 22, 0, 0, 0, 0xff,
+		0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff,
+	]);
+
+	test("POST an ico replaces the webp; GET serves it back", async () => {
+		const up = await rawPost("/api/projects/p1/icon", ico);
+		expect(up.status).toBe(200);
+		const dir = store.tasksDir;
+		expect(existsSync(join(dir, "icon.webp"))).toBe(false);
+		expect(existsSync(join(dir, "icon.ico"))).toBe(true);
+		const res = await get("/api/projects/p1/icon");
+		expect(res.status).toBe(200);
+		expect(res.headers.get("Content-Type")).toBe("image/x-icon");
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(ico);
+	});
+
+	test("POST rejects a CUR file", async () => {
+		// A cursor is 00 00 02 00 plus a count above 0: near-miss bytes that must stay 400.
+		const cur = new Uint8Array([0, 0, 2, 0, 1, 0]);
+		const res = await rawPost("/api/projects/p1/icon", cur);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			"icon must be a PNG, JPEG, GIF, WebP or ICO file",
+		);
 	});
 
 	test("DELETE clears the icon", async () => {

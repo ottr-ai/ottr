@@ -9811,7 +9811,7 @@ function ProjectIdentitySection({
 						settingKey="icon"
 						name="Project icon"
 						help="An image that replaces the project's letters on the board. Without one, Ottr uses the repo owner's avatar or the host's favicon, and then the letters."
-						shape="PNG, JPEG, WebP or GIF"
+						shape="PNG, JPEG, WebP, GIF or ICO"
 					>
 						<div className="icon-row">
 							<span className="icon-preview">
@@ -9822,7 +9822,7 @@ function ProjectIdentitySection({
 								Upload
 								<input
 									type="file"
-									accept="image/png,image/jpeg,image/webp,image/gif"
+									accept="image/png,image/jpeg,image/webp,image/gif,image/x-icon,image/vnd.microsoft.icon,.ico"
 									onChange={(e) => {
 										const file = e.target.files?.[0];
 										e.target.value = "";

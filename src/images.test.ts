@@ -52,6 +52,16 @@ describe("sniffImage", () => {
 		expect(sniffImage(Buffer.from("RIFF\0\0\0\0WEBPVP8 "))).toBe("webp");
 	});
 
+	test("ico with a count above 0", () => {
+		expect(sniffImage(Buffer.from([0, 0, 1, 0, 1, 0]))).toBe("ico");
+	});
+
+	test("rejects ico variants: count 0, CUR, truncated header", () => {
+		expect(sniffImage(Buffer.from([0, 0, 1, 0, 0, 0]))).toBe(null);
+		expect(sniffImage(Buffer.from([0, 0, 2, 0, 1, 0]))).toBe(null);
+		expect(sniffImage(Buffer.from([0, 0, 1, 0]))).toBe(null);
+	});
+
 	test("rejects short input, text and pdf", () => {
 		expect(sniffImage(PNG_SIG.subarray(0, 7))).toBe(null);
 		expect(sniffImage(Buffer.from("%PDF-1.7 fake"))).toBe(null);
@@ -112,7 +122,7 @@ describe("decodeImages", () => {
 
 	test("rejects non-image bytes with index", () => {
 		expect(err([Buffer.from("hello world").toString("base64")])).toContain(
-			"image 1 is not a PNG, JPEG, GIF or WebP file",
+			"image 1 is not a PNG, JPEG, GIF, WebP or ICO file",
 		);
 		expect(
 			err([Buffer.from("%PDF-1.7 fake pdf").toString("base64")]),

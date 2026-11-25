@@ -527,7 +527,7 @@ function isStringList(v: unknown, max: number): v is string[] {
 	);
 }
 
-const ICON_EXTS = ["png", "jpg", "gif", "webp"] as const;
+const ICON_EXTS = ["png", "jpg", "gif", "webp", "ico"] as const;
 
 /** Path of the stored icon in the project's data dir, or null when none exists. A
  * symlink at an icon name refuses: lstat never follows it, so a worker-planted link
@@ -10321,7 +10321,10 @@ export async function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		const ext = sniffImage(r.bytes);
 		if (ext === null)
-			return json({ error: "icon must be a PNG, JPEG, GIF or WebP file" }, 400);
+			return json(
+				{ error: "icon must be a PNG, JPEG, GIF, WebP or ICO file" },
+				400,
+			);
 		removeIcons(e.store.dataRoot, e.store.tasksDir);
 		writeBelow(
 			e.store.dataRoot,
