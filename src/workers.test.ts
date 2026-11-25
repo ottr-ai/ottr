@@ -3352,21 +3352,34 @@ describe("serveWorker turn identity", () => {
 		// are 0700 root-only and the real omp binary lives in the image's
 		// world-executable PATH instead.
 		chmodSync(workerHome, 0o755);
+		// The turn uid must traverse the homes root to reach its layer copy
+		// (HOME lives under it): the real homes root is a volume mount point,
+		// so give the fixture the same traversable-not-listable mode instead
+		// of mkdtemp's 0700.
+		chmodSync(homesRoot, 0o711);
 		return { workerHome, homesRoot, ws, repo, layerDir, dbTarget };
 	}
 
-	rootTest(
-		"a root omp reset of the store modes is restored before each turn",
-		async () => {
-			const project = "store-restore-proj";
-			const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
-				storeFixture(project);
-			// Store stub: opens the store through PI_CODING_AGENT_DIR the way omp
-			// does, and prints the result with the uid the turn ran under.
-			const stubPath = join(workerHome, "store-omp.js");
-			writeFileSync(
-				stubPath,
-				`#!${process.execPath}
+	// Both store tests run the daemon's identity steps against the test's own
+	// uid (chown-to-self and setuid-to-self need no privilege), so the two
+	// acceptance scenarios execute on every gate. The root-gated test above
+	// covers the real cross-uid drop.
+	const selfIds = (): { uid: number; gid: number } => ({
+		uid: typeof process.getuid === "function" ? process.getuid() : 0,
+		gid: typeof process.getgid === "function" ? process.getgid() : 0,
+	});
+
+	test("a root omp reset of the store modes is restored before each turn", async () => {
+		const project = "store-restore-proj";
+		const ids = selfIds();
+		const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
+			storeFixture(project);
+		// Store stub: opens the store through PI_CODING_AGENT_DIR the way omp
+		// does, and prints the result with the uid the turn ran under.
+		const stubPath = join(workerHome, "store-omp.js");
+		writeFileSync(
+			stubPath,
+			`#!${process.execPath}
 const fs = require("node:fs");
 let opened = "ok";
 try {
@@ -3376,126 +3389,123 @@ try {
 }
 process.stdout.write(JSON.stringify({ uid: process.getuid(), opened }) + "\\n");
 `,
-			);
-			chmodSync(stubPath, 0o755);
-			// The between-turns root omp reset: agent dir 0700, db and wal 0600.
-			chmodSync(join(workerHome, ".omp", "agent"), 0o700);
-			chmodSync(dbTarget, 0o600);
-			writeFileSync(`${dbTarget}-wal`, "wal");
-			chmodSync(`${dbTarget}-wal`, 0o600);
+		);
+		chmodSync(stubPath, 0o755);
+		// The between-turns root omp reset: agent dir 0700, db and wal 0600.
+		chmodSync(join(workerHome, ".omp", "agent"), 0o700);
+		chmodSync(dbTarget, 0o600);
+		writeFileSync(`${dbTarget}-wal`, "wal");
+		chmodSync(`${dbTarget}-wal`, 0o600);
 
-			const url = start({
-				ompPath: stubPath,
-				home: workerHome,
-				turnUid: {
-					homesRoot,
-					workerHome,
-					dataRoots: [],
-					workspaceRoot: ws,
-					provisionPaths: {
-						passwd: join(homesRoot, "passwd"),
-						group: join(homesRoot, "group"),
-					},
+		const url = start({
+			ompPath: stubPath,
+			home: workerHome,
+			turnUid: {
+				homesRoot,
+				workerHome,
+				dataRoots: [],
+				workspaceRoot: ws,
+				ids,
+				provisionPaths: {
+					passwd: join(homesRoot, "passwd"),
+					group: join(homesRoot, "group"),
 				},
-			});
-			const res = await post(url, {
-				id: "ti-store-restore",
-				argv: ["-p"],
-				cwd: repo,
-				stdin: "",
-				env: {
-					OTTR_PROJECT: project,
-					HOME: layerDir,
-					PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
-				},
-			});
-			expect(res.status).toBe(200);
-			const lines = await readLines(res);
-			// The turn uid opened the store: the modes were restored before spawn.
-			const stubLine = lines.find((l) => l.includes('"opened"'));
-			expect(stubLine).toBeDefined();
-			const dumped = JSON.parse(stubLine!) as {
-				uid: number;
-				opened: string;
-			};
-			expect(dumped.opened).toBe("ok");
-			expect(dumped.uid).toBe(projectTurnUid(project).uid);
-			// Exactly one drift line rode the stream.
-			const driftLines = lines.filter((l) => l.startsWith("turn-uid:"));
-			expect(driftLines.length).toBe(1);
-			expect(driftLines[0]).toContain("shared store modes drifted");
-			// The shared home carries the boot modes again.
-			expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
-				0o1777,
-			);
-			expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
-			expect(statSync(`${dbTarget}-wal`).mode & 0o777).toBe(0o666);
-		},
-		30_000,
-	);
+			},
+		});
+		const res = await post(url, {
+			id: "ti-store-restore",
+			argv: ["-p"],
+			cwd: repo,
+			stdin: "",
+			env: {
+				OTTR_PROJECT: project,
+				HOME: layerDir,
+				PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
+			},
+		});
+		expect(res.status).toBe(200);
+		const lines = await readLines(res);
+		// The turn uid opened the store: the modes were restored before spawn.
+		const stubLine = lines.find((l) => l.includes('"opened"'));
+		expect(stubLine).toBeDefined();
+		const dumped = JSON.parse(stubLine!) as {
+			uid: number;
+			opened: string;
+		};
+		expect(dumped.opened).toBe("ok");
+		expect(dumped.uid).toBe(ids.uid);
+		// Exactly one drift line rode the stream.
+		const driftLines = lines.filter((l) => l.startsWith("turn-uid:"));
+		expect(driftLines.length).toBe(1);
+		expect(driftLines[0]).toContain("shared store modes drifted");
+		// The shared home carries the boot modes again.
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o1777,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+		expect(statSync(`${dbTarget}-wal`).mode & 0o777).toBe(0o666);
+	}, 30_000);
 
-	rootTest(
-		"a mounted drifted store refuses the run instead of chmodding through the mount",
-		async () => {
-			const project = "store-mounted-proj";
-			const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
-				storeFixture(project);
-			// Store stub: writes a marker first thing, so an assertion on the
-			// marker proves omp never started.
-			const marker = join(homesRoot, "mounted-marker");
-			const stubPath = join(workerHome, "mounted-omp.js");
-			writeFileSync(
-				stubPath,
-				`#!${process.execPath}
+	test("a mounted drifted store refuses the run instead of chmodding through the mount", async () => {
+		const project = "store-mounted-proj";
+		const ids = selfIds();
+		const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
+			storeFixture(project);
+		// Store stub: writes a marker first thing, so an assertion on the
+		// marker proves omp never started.
+		const marker = join(homesRoot, "mounted-marker");
+		const stubPath = join(workerHome, "mounted-omp.js");
+		writeFileSync(
+			stubPath,
+			`#!${process.execPath}
 require("node:fs").writeFileSync(process.env.STORE_MARKER, "started\\n");
 `,
-			);
-			chmodSync(stubPath, 0o755);
-			chmodSync(join(workerHome, ".omp", "agent"), 0o700);
-			chmodSync(dbTarget, 0o600);
+		);
+		chmodSync(stubPath, 0o755);
+		chmodSync(join(workerHome, ".omp", "agent"), 0o700);
+		chmodSync(dbTarget, 0o600);
 
-			const url = start({
-				ompPath: stubPath,
-				home: workerHome,
-				turnUid: {
-					homesRoot,
-					workerHome,
-					dataRoots: [],
-					workspaceRoot: ws,
-					provisionPaths: {
-						passwd: join(homesRoot, "passwd"),
-						group: join(homesRoot, "group"),
-					},
-					isMounted: (p) => p === dbTarget,
+		const url = start({
+			ompPath: stubPath,
+			home: workerHome,
+			turnUid: {
+				homesRoot,
+				workerHome,
+				dataRoots: [],
+				workspaceRoot: ws,
+				ids,
+				provisionPaths: {
+					passwd: join(homesRoot, "passwd"),
+					group: join(homesRoot, "group"),
 				},
-			});
-			const res = await post(url, {
-				id: "ti-store-mounted",
-				argv: ["-p"],
-				cwd: repo,
-				stdin: "",
-				env: {
-					OTTR_PROJECT: project,
-					HOME: layerDir,
-					PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
-					STORE_MARKER: marker,
-				},
-			});
-			expect(res.status).toBe(500);
-			const body = await res.text();
-			expect(body).toContain(STORE_MOUNT_BLOCKED);
-			expect(body).toContain(dbTarget);
-			expect(body).toContain("host");
-			// omp never started.
-			expect(existsSync(marker)).toBe(false);
-			// Nothing was chmodded through the mount: the drift stays as it was.
-			expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
-				0o700,
-			);
-			expect(statSync(dbTarget).mode & 0o777).toBe(0o600);
-		},
-		30_000,
-	);
+				isMounted: (p) => p === dbTarget,
+			},
+		});
+		const res = await post(url, {
+			id: "ti-store-mounted",
+			argv: ["-p"],
+			cwd: repo,
+			stdin: "",
+			env: {
+				OTTR_PROJECT: project,
+				HOME: layerDir,
+				PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
+				STORE_MARKER: marker,
+			},
+		});
+		expect(res.status).toBe(500);
+		const body = await res.text();
+		expect(body).toContain(STORE_MOUNT_BLOCKED);
+		expect(body).toContain(dbTarget);
+		expect(body).toContain("host");
+		// omp never started.
+		expect(existsSync(marker)).toBe(false);
+		// Nothing was chmodded through the mount: the drift stays as it was.
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o700,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o600);
+	}, 30_000);
 });
 
 describe("stale turn probe and fix (OTTR-1261)", () => {

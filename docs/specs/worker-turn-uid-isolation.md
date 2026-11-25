@@ -186,23 +186,35 @@ daemon prepares it once per boot, root-only:
 - `.omp/agent/agent.db` gets `a+rw`, but only when it is not a mount point
   (the daemon reads `/proc/self/mountinfo`). The boot also gives `a+rw` to
   the existing `agent.db-wal` and `agent.db-shm` siblings, under the same
-  mounted-skip rule. The compose store is a host
+  mounted-skip rule. Each of these chmods runs through a pinned fd: the
+  boot opens the entry with `O_NOFOLLOW` and runs `fchmodSync` through it,
+  so a swap between the check and the chmod cannot redirect the chmod. A
+  store sibling that is not a plain file gets no chmod: the boot logs a
+  note and leaves the mode. The compose store is a host
   bind mount, and a chmod through it would change the host file's mode; the
   boot logs a note instead and leaves the mode to the host. The residual:
   a turn-side store write (a credential refresh of a non-lent provider)
   fails on such a deployment with the cause omp reports; lent providers and
   env keys are unaffected.
 - Before each turn spawns as the turn uid, the daemon restores the
-  shared-store modes (`src/turnUid.ts`). It walks the store path chain
-  through the layer links and checks the uid access bits on each entry.
-  The chain holds the worker home traversal bit, the `.omp/agent` dir, and
-  the `agent.db` file with its `agent.db-wal` and `agent.db-shm`
-  siblings. A drifted entry gets the boot table's mode (home `0711`,
-  agent dir `1777`, store files `0666`), and the run logs one `turn-uid:`
-  drift line. The daemon never chmods a mounted entry that blocks the uid,
-  because a chmod through the mount would change the host file. The run
-  refuses to start, and the board parks the card `needs_you` with a reason
-  that names the file and the host fix.
+  shared-store modes (`src/turnUid.ts`). It resolves the turn's store path
+  through the layer links. A planted pointer whose resolution does not
+  name the trusted shared store `<workerHome>/.omp/agent/agent.db` fails
+  the run. The daemon walks the trusted chain and checks the uid access
+  bits on each entry. The chain holds the worker home traversal bit, the
+  `.omp/agent` dir, and the `agent.db` file with its `agent.db-wal` and
+  `agent.db-shm` siblings. A store entry that is a symlink or not a plain
+  file fails the run: a turn can plant `agent.db-wal` or `agent.db-shm`
+  in the sticky `1777` dir. Before each chmod the daemon pins the entry's
+  inode: it opens the entry with `O_NOFOLLOW` (plus `O_DIRECTORY` for a
+  dir) and runs `fchmodSync` through the fd, so a same-uid swap between
+  the stat and the chmod cannot redirect the chmod. A drifted entry gets
+  the boot table's mode (home `0711`, agent dir `1777`, store files
+  `0666`), and the run logs one `turn-uid:` drift line. The daemon chmods
+  only entries of the trusted chain. It never chmods a mounted entry that
+  blocks the uid, because a chmod through the mount would change the host
+  file. The run refuses to start, and the board parks the card
+  `needs_you` with a reason that names the file and the host fix.
 - BuildKit client material (`/certs/buildkit/client/*`, the CA) is root-only
   `0400` in the image ("workers run as root"); the boot gives the turn uids
   a read (`0644`), because a build turn needs the client key when the build
@@ -230,18 +242,49 @@ holds the evidence. Two greps show it:
   the sqlite `agent-storage` open. omp writes store-side files there with
   `mode:384` (`0o600`).
 
-So any omp process that opens the agent storage sets `0700` on
-`.omp/agent` again, and it creates new files there with `0600`-class
-modes. The board's root-side omp calls (a gate run, `omp models list`, the
-omp watch probe) run against the shared home. They reset the modes that
-bootTurnIsolation set for the turn uids.
+So any omp process that opens an agent storage resets its dir to `0700`
+and writes new files there with `0600`-class modes.
 
-The 2026-11-25 outage matches this: `.omp/agent` showed `0700` root, and
-`agent.db` plus `agent.db-wal` showed `0600`. `/root/.omp/agent/models.db`
-had mtime `15:56:18 UTC`, right after the first failing turns at `15:51`.
+Proved facts about the callers in this repo:
+
+- The shared home volume `home:/root` (docker-compose.yml line 635 defines
+  it) is mounted by the classic workers (line 58), the server (line 178),
+  the home-repair repair service (line 554) and alate (line 596, it
+  provisions the agent layer). One more mount is read-only
+  (`home:/root:ro`, line 498) and cannot change modes.
+- The board's own omp calls do not use the shared home. `boardOmpEnv()`
+  (src/login.ts:385) sets `HOME` to the pinned agent layer or to
+  `boardOmpHome()` (`OTTR_BOARD_OMP_HOME`); docker-compose.yml pins
+  `OTTR_BOARD_OMP_HOME` to `/etc/ottr/home` (line 265) and
+  `PI_CODING_AGENT_DIR` to `/etc/ottr/home/.omp/agent` (line 255), the
+  server-only board store. `omp models`, `omp auth-gateway` and the
+  `omp usage` watch probes all take their env from `boardOmpEnv`
+  (src/models.ts:30, src/forkAnalysis.ts:347, src/quota.ts). Server-side
+  turn spawns use `boardOmpEnv` as their env base too
+  (src/runner.ts:2124-2131). The board's flows never reset the shared
+  store.
+- Turn-side omp runs as the project uid. Its owner-private re-chmod of the
+  root-owned shared dirs fails with `EPERM` and cannot reset the modes.
+- The repo's automated flows hold no root omp call against the shared
+  home. The worker daemon spawns omp only for turns, and each turn spawn
+  drops to the project uid. The entry script `docker/ottr-entry.sh` runs
+  no omp; its repair mode only removes a wrong `agent.db` folder.
+  `GET /signins` reads the store with `bun:sqlite` directly
+  (`signIns`, src/login.ts:482).
+
+Inference (not a proved fact): the outage's
+`/root/.omp/agent/models.db` mtime `15:56:18 UTC` shows that a root omp
+process opened the shared store then. The remaining callers sit outside
+the repo's automated paths: an interactive root session in a worker or
+server container runs omp. It arrives through `docker exec` or a compose
+run with the default `HOME`. Any such run resets the modes, so the per-turn restore
+makes the whole caller class harmless.
+
+The 2026-11-25 outage showed `.omp/agent` at `0700` root, and `agent.db`
+plus `agent.db-wal` at `0600`. The first failing turns started at `15:51`.
 This is the same class as the 2026-11-21 outage (OTTR-1179). Hardening at
-boot time only cannot survive the next root omp call, so the design adds
-the per-turn restore.
+boot time alone cannot survive the next root omp call. The design
+therefore adds the per-turn restore.
 
 ### Spawn
 
@@ -280,6 +323,8 @@ their repo's owner and need nothing.
 - A mounted store whose mode blocks the turn uid: the run refuses to
   start. The daemon chmods nothing through the mount. The card parks
   `needs_you` with the file name and the host fix in the reason.
+- A planted store link, or a store entry that is not a plain file: the run
+  refuses to start. The reason names the entry, and nothing is chmodded.
 - A run cwd outside the workspace root, or a project dir without a git dir:
   the run fails with the cause.
 - Uid collision between two project names: logged per run; both projects
@@ -336,6 +381,9 @@ their repo's owner and need nothing.
   turn, and the turn opens the store. Before the fix, this check fails.
 - A mounted store that the uid cannot open refuses the run. The reason
   names the file and the host fix, and omp does not start.
+- A planted `agent.db-wal` symlink in the shared agent dir (or a
+  turn-retargeted store link) refuses the run, and the link's target keeps
+  its mode.
 - `bun run check` and `bun test` pass.
 
 ## Alternatives considered

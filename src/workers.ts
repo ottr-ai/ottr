@@ -282,6 +282,10 @@ export function serveWorker(opts: {
 		workspaceRoot: string;
 		/** Provisioning paths the boot/test can point at temp files (OTTR-1184). */
 		provisionPaths?: ProvisionPaths;
+		/** Only for tests: the turn identity the run drops to instead of the
+		 * project's hashed uid. Chown-to-self needs no privilege, so identity
+		 * tests run without root (the prune tests use the same selfIds trick). */
+		ids?: TurnIdentity;
 		/** Only for tests: replaces the mount check of the per-turn store-access check. */
 		isMounted?: (path: string) => boolean;
 	} | null;
@@ -621,7 +625,7 @@ export function serveWorker(opts: {
 				turnHome = prepareTurnHome(
 					turnUid.homesRoot,
 					project,
-					projectTurnUid(project),
+					turnUid.ids ?? projectTurnUid(project),
 				);
 			} catch (err) {
 				return new Response(`turn-uid: ${String(err)}`, { status: 500 });
@@ -674,7 +678,7 @@ export function serveWorker(opts: {
 		if (turnUid) {
 			if (typeof project === "string" && project !== "") {
 				try {
-					ids = projectTurnUid(project);
+					ids = turnUid.ids ?? projectTurnUid(project);
 					const collision = uidCollisionNote(project, ids);
 					if (collision !== null) runNotes += `${collision}\n`;
 					const turnHome = prepareTurnHome(turnUid.homesRoot, project, ids);

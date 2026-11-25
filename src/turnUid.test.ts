@@ -20,7 +20,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join } from "node:path";
 import fc from "fast-check";
 import { holdLock } from "./layerLeaseLock.ts";
 import {
@@ -943,6 +943,26 @@ rootTest("bootTurnIsolation skips the chmod on a mounted store", () => {
 	expect(notes.some((n) => n.includes("mount"))).toBe(true);
 });
 
+rootTest("bootTurnIsolation leaves a planted store sibling untouched", () => {
+	// The store dir is sticky-writable: a turn can plant agent.db-wal as a
+	// symlink. Boot refuses the non-plain entry with a note and never chmods
+	// through it, so the link's target keeps its mode.
+	const workerHome = freshDir("boot-home-wal");
+	const agentDir = join(workerHome, ".omp", "agent");
+	mkdirSync(agentDir, { recursive: true });
+	const foreign = join(freshDir("boot-wal-foreign"), "victim");
+	writeFileSync(foreign, "secret");
+	chmodSync(foreign, 0o600);
+	symlinkSync(foreign, join(agentDir, "agent.db-wal"));
+	const db = join(agentDir, "agent.db");
+	writeFileSync(db, "store");
+	chmodSync(db, 0o600);
+	const notes = bootTurnIsolation(workerHome, []);
+	expect(notes.some((n) => n.includes("not a plain file"))).toBe(true);
+	expect(statSync(foreign).mode & 0o777).toBe(0o600);
+	expect(statSync(db).mode & 0o777).toBe(0o666);
+});
+
 test("isolationEnabled matches the process uid", () => {
 	expect(isolationEnabled()).toBe(
 		typeof process.getuid === "function" && process.getuid() === 0,
@@ -1082,32 +1102,99 @@ describe("ensureTurnStoreAccess", () => {
 		).toBeNull();
 	});
 
-	test("a dangling store link checks the resolved dir only; nothing at all returns null", () => {
-		// The db link dangles (the flat db is gone), but the link's agent dir
-		// exists: the fallback resolves through it and checks it — and only
-		// it, since no store file exists beside it.
+	test("a dangling link naming the trusted store checks the trusted dir only", () => {
+		// The db link dangles (the flat db is gone) but names the trusted
+		// store: the check verifies the trusted chain, never the uid-owned
+		// copy's dirs — root must not chmod a dir the turn can rewrite.
 		const { workerHome, storePath, dbTarget } = freshStore();
 		healthy(workerHome, dbTarget);
 		const copyAgentDir = dirname(storePath);
 		chmodSync(copyAgentDir, 0o755);
 		rmSync(dbTarget);
+		chmodSync(join(workerHome, ".omp", "agent"), 0o700);
 		const ids = projectTurnUid("store-dangling-proj");
 		expect(ensureTurnStoreAccess(workerHome, storePath, ids)).toBe(
-			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored ${relative(workerHome, copyAgentDir)} 755->1777`,
+			`turn-uid: shared store modes drifted for uid ${ids.uid}; restored .omp/agent 700->1777`,
 		);
-		expect(statSync(copyAgentDir).mode & 0o7777).toBe(0o1777);
+		expect(statSync(join(workerHome, ".omp", "agent")).mode & 0o7777).toBe(
+			0o1777,
+		);
+		// The copy's own agent dir keeps its uid-owned mode.
+		expect(statSync(copyAgentDir).mode & 0o7777).toBe(0o755);
 		expect(existsSync(dbTarget)).toBe(false);
 
-		// Nothing exists yet at all: boot creates the dir later, so null.
+		// A missing store dir chain fails closed: boot creates `.omp/agent`
+		// before any turn, so a missing dir at turn time is a plant, not a
+		// fresh deployment.
 		const emptyHome = freshDir("store-empty");
-		chmodSync(emptyHome, 0o711);
-		expect(
+		expect(() =>
 			ensureTurnStoreAccess(
 				emptyHome,
 				join(emptyHome, ".omp", "agent", "agent.db"),
 				ids,
 			),
-		).toBeNull();
+		).toThrow(/refusing planted store dir/);
+	});
+
+	test("a retargeted store link refuses the run and leaves every mode", () => {
+		// The copy's agent.db link is uid-owned content: a turn can point it
+		// anywhere. The check resolves it and refuses before any chmod, so
+		// root's chmod never lands on the foreign target.
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		const foreign = join(freshDir("store-foreign"), "shadow");
+		writeFileSync(foreign, "secret");
+		chmodSync(foreign, 0o640);
+		rmSync(storePath);
+		symlinkSync(foreign, storePath);
+		const ids = projectTurnUid("store-retarget-proj");
+		expect(() => ensureTurnStoreAccess(workerHome, storePath, ids)).toThrow(
+			/refusing planted store link .* -> .*shadow/,
+		);
+		expect(statSync(foreign).mode & 0o777).toBe(0o640);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+	});
+
+	test("a dangling link to a foreign target refuses the run", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		rmSync(storePath);
+		symlinkSync(join(freshDir("store-gone"), "gone"), storePath);
+		const ids = projectTurnUid("store-dangling-foreign");
+		expect(() => ensureTurnStoreAccess(workerHome, storePath, ids)).toThrow(
+			/refusing planted store link/,
+		);
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+	});
+
+	test("a planted journal symlink refuses the run and keeps the target's mode", () => {
+		// The store dir is sticky-writable for every uid: a turn can plant its
+		// own agent.db-wal entry as a symlink. The check refuses the entry, so
+		// root's chmod never reaches the link's target.
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		const foreign = join(freshDir("store-wal-foreign"), "victim");
+		writeFileSync(foreign, "secret");
+		chmodSync(foreign, 0o600);
+		symlinkSync(foreign, `${dbTarget}-wal`);
+		const ids = projectTurnUid("store-wal-proj");
+		expect(() => ensureTurnStoreAccess(workerHome, storePath, ids)).toThrow(
+			/refusing planted store entry .*agent\.db-wal .*a symlink/,
+		);
+		expect(statSync(foreign).mode & 0o777).toBe(0o600);
+		// The db itself was never reached: the refusal threw before any chmod.
+		expect(statSync(dbTarget).mode & 0o777).toBe(0o666);
+	});
+
+	test("a planted non-plain store entry refuses the run", () => {
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		rmSync(dbTarget);
+		mkdirSync(dbTarget); // A directory where the store file belongs.
+		const ids = projectTurnUid("store-dir-proj");
+		expect(() => ensureTurnStoreAccess(workerHome, storePath, ids)).toThrow(
+			/refusing planted store entry .*not a plain file/,
+		);
 	});
 });
 

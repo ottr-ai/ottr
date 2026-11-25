@@ -8,6 +8,7 @@ import {
 	constants,
 	cpSync,
 	existsSync,
+	fchmodSync,
 	fstatSync,
 	lchownSync,
 	lstatSync,
@@ -19,7 +20,6 @@ import {
 	realpathSync,
 	renameSync,
 	rmSync,
-	statSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
@@ -814,9 +814,20 @@ export function bootTurnIsolation(
 				notes.push("agent.db is a mount; store mode left to the host");
 			} else {
 				// The store and the journal siblings sqlite creates beside it all
-				// need the turn uids' write bit; one mount check covers them all.
+				// need the turn uids' write bit. The siblings live in the sticky
+				// 1777 store dir, so a turn can plant its own entry there: only a
+				// plain file is chmodded, and through a pinned inode (chmodPinned),
+				// never through a planted link (OTTR-1291 review).
 				for (const file of [db, `${db}-wal`, `${db}-shm`]) {
-					if (existsSync(file)) chmodSync(file, STORE_FILE_MODE);
+					const st = statOf(file);
+					if (st === null) continue;
+					if (!st.isFile()) {
+						notes.push(
+							`${basename(file)} is not a plain file; store mode left as it is`,
+						);
+						continue;
+					}
+					chmodPinned(file, STORE_FILE_MODE, false);
 				}
 			}
 		} catch (err) {
@@ -865,12 +876,80 @@ export const STORE_MOUNT_BLOCKED =
 	"the shared omp store is a mount the turn uid cannot open";
 
 /**
+ * chmod a store inode through a pinned descriptor. A path chmod reads the
+ * directory entry again, and the store dir is sticky-writable for every uid
+ * (boot sets 1777 so sqlite can create its journals): a same-uid swap of the
+ * entry between the stat and the chmod would redirect the chmod to another
+ * inode. `open` with O_NOFOLLOW (plus O_DIRECTORY for dirs) binds the fd to
+ * the exact inode the stat saw, and `fchmodSync` through the fd can never
+ * follow a link planted afterwards (OTTR-1291 review).
+ */
+function chmodPinned(path: string, mode: number, dir: boolean): void {
+	const fd = openSync(
+		path,
+		fsConstants.O_RDONLY | oNoFollow | (dir ? fsConstants.O_DIRECTORY : 0),
+	);
+	try {
+		fchmodSync(fd, mode);
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/**
+ * The turn's store path must name the trusted shared store. A pinned layer
+ * copy is uid-owned content, so its `agent.db` state link is a uid-mutable
+ * pointer: a turn can retarget it anywhere, and a chmod that followed it
+ * would hand root's chmod to an arbitrary file. Resolving a path is only a
+ * read, so the check resolves the turn's path and refuses any target that
+ * is not the flat store — the planted-pointer refuse the rest of the module
+ * uses. A dangling link must name the store lexically, or it is a plant too.
+ */
+function requireTrustedStore(storePath: string, trustedDb: string): void {
+	let resolved: string | null = null;
+	try {
+		resolved = realpathSync(storePath);
+	} catch {
+		// The path is absent or the link dangles.
+	}
+	if (resolved !== null) {
+		let trustedReal: string | null = null;
+		try {
+			trustedReal = realpathSync(trustedDb);
+		} catch {
+			// The trusted store is absent: any resolvable foreign target is a plant.
+		}
+		if (trustedReal === null || resolved !== trustedReal)
+			throw new Error(
+				`turn-uid: refusing planted store link ${storePath} -> ${resolved}; the turn's store must resolve to ${trustedDb}`,
+			);
+		return;
+	}
+	const st = statOf(storePath);
+	if (st === null || !st.isSymbolicLink()) return;
+	let target = "";
+	try {
+		target = readlinkSync(storePath);
+	} catch {
+		// Unreadable link content: the compare below refuses it.
+	}
+	if (resolve(dirname(storePath), target) !== trustedDb)
+		throw new Error(
+			`turn-uid: refusing planted store link ${storePath} -> ${target}; the turn's store must resolve to ${trustedDb}`,
+		);
+}
+
+/**
  * Per-turn store access (OTTR-1291): a root omp run between turns resets the
  * shared-home store modes (dir 0700, db 0600), and the next turn-uid turn
- * then dies opening the store. Before every spawn, stat the entries the turn
- * opens through its store path — the layer copy's state link resolves into
- * the flat shared home — and restore the boot modes. Mode bits only: the db
- * is never opened, so the check stays fast enough to sit before each spawn.
+ * then dies opening the store. Before every spawn, verify the store chain's
+ * entries and restore the boot modes. The check acts only on the trusted
+ * flat chain (worker home, `.omp`, `.omp/agent`, the store files): the
+ * turn-facing path is resolved and compared first, a store entry that is a
+ * symlink or not a plain file refuses the run (a turn can plant its own
+ * `-wal`/`-shm` entry in the sticky 1777 dir), and every chmod goes through
+ * a pinned inode (chmodPinned). Mode bits only: the db is never opened for
+ * reading, so the check stays fast enough to sit before each spawn.
  *
  * A drifted entry that sits on a mount is refused instead of chmodded: a
  * chmod through the mount would change the host file's mode, so the host
@@ -884,20 +963,30 @@ export function ensureTurnStoreAccess(
 	ids: TurnIdentity,
 	deps: { isMounted?: (path: string) => boolean } = {},
 ): string | null {
-	let dbFile: string;
-	try {
-		dbFile = realpathSync(storePath);
-	} catch {
-		// The store link dangles (no db yet): check beside the resolved parent
-		// dir instead. When even that parent is missing, boot creates it and
-		// there is nothing to check yet.
-		try {
-			dbFile = join(realpathSync(dirname(storePath)), basename(storePath));
-		} catch {
-			return null;
-		}
-	}
+	const agentDir = join(workerHome, ".omp", "agent");
+	const dbFile = join(agentDir, "agent.db");
+	requireTrustedStore(storePath, dbFile);
 	const mounted = deps.isMounted ?? pathIsMounted;
+	// The chain dirs carry no table mode of their own except the two the boot
+	// table owns; a symlink or non-dir at any of them is a plant. `.omp` has
+	// no table mode (boot never sets one), so it is only verified.
+	for (const [path, name] of [
+		[workerHome, "."],
+		[join(workerHome, ".omp"), ".omp"],
+		[agentDir, ".omp/agent"],
+	] as const) {
+		const st = statOf(path);
+		if (st !== null && st.isDirectory() && !st.isSymbolicLink()) continue;
+		throw new Error(
+			`turn-uid: refusing planted store dir ${path} (${name} is ${
+				st === null
+					? "missing"
+					: st.isSymbolicLink()
+						? "a symlink"
+						: "not a directory"
+			})`,
+		);
+	}
 	// One entry per path the turn opens: the worker home itself (every uid
 	// traverses it), the store's dir (every uid creates the journal beside
 	// the store), and the store with its sqlite siblings (every uid reads
@@ -908,13 +997,21 @@ export function ensureTurnStoreAccess(
 		name: string;
 		need: number;
 		mode: number;
+		dir: boolean;
 	}[] = [
-		{ path: workerHome, name: ".", need: 0o001, mode: WORKER_HOME_MODE },
 		{
-			path: dirname(dbFile),
-			name: relative(workerHome, dirname(dbFile)) || ".",
+			path: workerHome,
+			name: ".",
+			need: 0o001,
+			mode: WORKER_HOME_MODE,
+			dir: true,
+		},
+		{
+			path: agentDir,
+			name: ".omp/agent",
 			need: 0o003,
 			mode: AGENT_DIR_MODE,
+			dir: true,
 		},
 	];
 	for (const suffix of ["", "-wal", "-shm"] as const) {
@@ -924,18 +1021,31 @@ export function ensureTurnStoreAccess(
 			name: basename(file),
 			need: 0o006,
 			mode: STORE_FILE_MODE,
+			dir: false,
 		});
 	}
 	const blocked: { path: string; mode: number }[] = [];
-	const drifted: { path: string; name: string; mode: number; from: number }[] =
-		[];
+	const drifted: {
+		path: string;
+		name: string;
+		mode: number;
+		from: number;
+		dir: boolean;
+	}[] = [];
 	for (const entry of entries) {
-		let st: Stats;
-		try {
-			st = statSync(entry.path);
-		} catch {
-			continue; // A missing entry (no db yet) carries no mode bits.
-		}
+		const st = statOf(entry.path);
+		if (st === null) continue; // A missing entry (no db yet) carries no mode bits.
+		const plain = entry.dir ? st.isDirectory() : st.isFile();
+		if (!plain || st.isSymbolicLink())
+			throw new Error(
+				`turn-uid: refusing planted store entry ${entry.path} (${
+					entry.name
+				} is ${
+					st.isSymbolicLink()
+						? "a symlink"
+						: `not a plain ${entry.dir ? "directory" : "file"}`
+				})`,
+			);
 		if ((st.mode & entry.need) === entry.need) continue; // Healthy.
 		if (mounted(entry.path)) {
 			blocked.push({ path: entry.path, mode: st.mode });
@@ -946,6 +1056,7 @@ export function ensureTurnStoreAccess(
 			name: entry.name,
 			mode: entry.mode,
 			from: st.mode & 0o7777,
+			dir: entry.dir,
 		});
 	}
 	if (blocked.length > 0) {
@@ -955,7 +1066,7 @@ export function ensureTurnStoreAccess(
 		);
 	}
 	if (drifted.length === 0) return null;
-	for (const entry of drifted) chmodSync(entry.path, entry.mode);
+	for (const entry of drifted) chmodPinned(entry.path, entry.mode, entry.dir);
 	const restored = drifted
 		.map(
 			(entry) =>
