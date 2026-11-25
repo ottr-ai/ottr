@@ -3866,6 +3866,17 @@ export async function createApp(deps: AppDeps) {
 	});
 
 	// omp watch: reviews new omp releases per opted-in project; state lives in gstore.
+	// Active sign-ins feed the model fast track (OTTR-1287). An unreadable credential
+	// store counts as no sign-ins: the fast track stays off, the age gate stays normal.
+	const activeSignInProviders = () => {
+		try {
+			return signIns()
+				.filter((s) => s.active)
+				.map((s) => s.provider);
+		} catch {
+			return [];
+		}
+	};
 	const ompWatcher = createOmpWatcher({
 		projects: () => deps.projects.values(),
 		creditHoldActive: deps.creditHoldActive,
@@ -3876,6 +3887,7 @@ export async function createApp(deps: AppDeps) {
 		token: upstreamGithubToken,
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
+		signIns: activeSignInProviders,
 	});
 
 	/**

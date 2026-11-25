@@ -936,6 +936,8 @@ export function ompBumpCardPrompt(o: {
 		verdict: "pass" | "fail";
 		cardId: string | null;
 	}[];
+	/** Sorted `provider/model` ids the version adds for signed-in providers; empty on the normal path. */
+	addedModels: string[];
 }): string {
 	const list = o.covers
 		.map((c) =>
@@ -944,9 +946,16 @@ export function ompBumpCardPrompt(o: {
 				: `- ${c.version}: failed the review, card ${c.cardId} finished`,
 		)
 		.join("\n");
+	const fast = o.addedModels.length > 0;
+	const names = o.addedModels.slice(0, 40).join(", ");
+	const more =
+		o.addedModels.length > 40 ? `, and ${o.addedModels.length - 40} more` : "";
+	const ageLine = fast
+		? `The 7-day release-age wait was skipped for model access: this card is priority P1, and omp ${o.version} adds models that the pinned omp ${o.pin} does not list for providers the board is signed in to: ${names}${more}.`
+		: `${o.version} is at least 7 days old.`;
 	return `Bump omp to ${o.version}
 Set \`ARG OMP_VERSION=${o.version}\` in Dockerfile.worker (today ${o.pin}). Change nothing else. Commit with the message \`chore: bump omp to ${o.version}\`.
-The board's omp watch filed this card. It covers these omp releases above the pin, and ${o.version} is at least 7 days old:
+The board's omp watch filed this card. It covers these omp releases above the pin, and ${ageLine}
 ${list}
 Check: the image builds with the new pin, and omp starts on its bun.`;
 }

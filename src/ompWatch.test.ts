@@ -13,6 +13,7 @@ import {
 	OMP_WATCH_GATES,
 	type OmpRelease,
 	type OmpWatchState,
+	parseModelSet,
 	parseOmpWatchState,
 	parsePackument,
 	parsePin,
@@ -111,11 +112,36 @@ function fakeNet() {
 	};
 }
 
-/** The model: one reply per version (default PASS); records each request's messages. */
+/** The model and the models list: one review reply per version (default PASS); each
+ * `omp models --json` run answers from its version's map (default an empty catalog) and
+ * records its version and env. */
 function fakeModel() {
 	const replies = new Map<string, string>();
+	const models = new Map<string, string>();
+	const modelsCodes = new Map<string, number>();
+	const modelsRequests: {
+		version: string;
+		env: Record<string, string | undefined>;
+	}[] = [];
 	const requests: { model: string; system: string; user: string }[] = [];
 	const spawn: SpawnFn = async (argv, o) => {
+		if (argv[0] === "bunx") {
+			expect(argv).toEqual(["bunx", argv[1]!, "models", "--json"]);
+			const m = /^@oh-my-pi\/pi-coding-agent@(\d+\.\d+\.\d+)$/.exec(
+				argv[1] ?? "",
+			);
+			expect(m).not.toBeNull();
+			const version = m![1]!;
+			modelsRequests.push({ version, env: o.env });
+			const code = modelsCodes.get(version);
+			if (code !== undefined)
+				return { code, stdout: "", stderr: "install failed" };
+			return {
+				code: 0,
+				stdout: models.get(version) ?? '{"models":[]}',
+				stderr: "",
+			};
+		}
 		expect(argv).toEqual(["omp", "auth-gateway", "stdio"]);
 		const req = JSON.parse(o.stdin) as {
 			body: { model: string; messages: { role: string; content: string }[] };
@@ -146,6 +172,11 @@ function fakeModel() {
 		requests,
 		reply: (version: string, text: string) => replies.set(version, text),
 		reviewed: () => requests.map((r) => /^omp (\S+) /.exec(r.user)?.[1] ?? "?"),
+		modelsOut: (version: string, stdout: string) => models.set(version, stdout),
+		modelsExit: (version: string, code: number) =>
+			modelsCodes.set(version, code),
+		modelsAsked: () => modelsRequests.map((r) => r.version),
+		modelsRequests,
 	};
 }
 
@@ -181,6 +212,7 @@ async function setup(
 	const saved = new Map<string, unknown>();
 	const logs: string[] = [];
 	let scheduled = 0;
+	let signedIn: string[] = [];
 	let t = NOW;
 	const watcher = createOmpWatcher({
 		projects: () => projects,
@@ -199,6 +231,7 @@ async function setup(
 		token: () => "test-token",
 		creditHoldActive: o.creditHoldActive,
 		apiBase: () => `${API}/`,
+		signIns: () => signedIn,
 	});
 	const store = project.store;
 	return {
@@ -211,6 +244,9 @@ async function setup(
 		logs,
 		saved,
 		scheduled: () => scheduled,
+		signedIn: (providers: string[]) => {
+			signedIn = providers;
+		},
 		state: (name = project.name) => parseOmpWatchState(saved.get(name)),
 		cards: async (s: ProjectStore = store) =>
 			(await s.listTasks()).filter((x) => x.topic === "omp"),
@@ -356,11 +392,32 @@ describe("parseOmpWatchState", () => {
 	test("missing or malformed values load as the empty state", () => {
 		const empty: OmpWatchState = {
 			verdicts: {},
+			modelSets: {},
 			bumpCard: null,
 			lastError: null,
 		};
 		for (const raw of [undefined, null, "x", 3, [], { verdicts: [] }])
 			expect(parseOmpWatchState(raw)).toEqual(empty);
+	});
+
+	test("a malformed model set entry is dropped, the good ones stay", () => {
+		const s = parseOmpWatchState({
+			verdicts: {},
+			modelSets: {
+				"1.0.0": ["zai/glm-5"],
+				"1.0.1": ["bad id with spaces"],
+				"1.0.2": "nope",
+				"1.0.3": ["zai/ok", 5],
+				"1.0.4": ["zai/glm-5", "anthropic/x"],
+				latest: ["zai/glm-5"],
+			},
+			bumpCard: null,
+			lastError: null,
+		});
+		expect(s.modelSets).toEqual({
+			"1.0.0": ["zai/glm-5"],
+			"1.0.4": ["zai/glm-5", "anthropic/x"],
+		});
 	});
 
 	test("a malformed verdict entry is dropped, the good ones stay", () => {
@@ -380,6 +437,97 @@ describe("parseOmpWatchState", () => {
 		expect(s.bumpCard).toEqual({ id: "T-3", version: "1.0.0" });
 		expect(s.lastError).toBeNull();
 	});
+});
+
+describe("parseModelSet", () => {
+	const json = (models: unknown[]): string => JSON.stringify({ models });
+
+	test("reads sorted unique provider/model pairs", () => {
+		expect(
+			parseModelSet(
+				json([
+					{ provider: "zai", id: "glm-6.2" },
+					{ provider: "anthropic", id: "claude-x" },
+					{ provider: "zai", id: "glm-6.2" },
+					{ provider: "zai", id: "glm-5" },
+				]),
+				100,
+			),
+		).toEqual({
+			pairs: ["anthropic/claude-x", "zai/glm-5", "zai/glm-6.2"],
+		});
+		// An empty catalog is a valid set: the version adds nothing.
+		expect(parseModelSet(json([]), 100)).toEqual({ pairs: [] });
+	});
+
+	test("junk output is an error, never a set", () => {
+		const table = "openai-codex (8)\n│ gpt-6.2-sol │ 500K │";
+		for (const stdout of ["", table, "null", "[1,2]", '{"models":{}}', "42"]) {
+			const r = parseModelSet(stdout, 100);
+			expect("error" in r).toBe(true);
+		}
+		expect(parseModelSet("nope", 100)).toEqual({
+			error: expect.stringContaining("not JSON"),
+		});
+	});
+
+	test("one entry that fails the id patterns rejects the whole run", () => {
+		const bad: unknown[] = [
+			[42],
+			["zai/glm-5"],
+			{ provider: "zai" },
+			{ id: "glm-5" },
+			// A provider id is omp's PROVIDER_ID: lowercase words joined by hyphens.
+			{ provider: "OpenAI Codex", id: "x" },
+			{ provider: "zai/codex", id: "x" },
+			{ provider: "-zai", id: "x" },
+			// A model id starts alphanumeric; dots, hyphens, colons and underscores continue it.
+			{ provider: "zai", id: "-glm" },
+			{ provider: "zai", id: "glm 5" },
+			{ provider: "zai", id: "glm;drop" },
+		];
+		// Each bad entry sits behind i good entries, so the error names its own index.
+		const good = { provider: "zai", id: "glm-5" };
+		for (const [i, m] of bad.entries()) {
+			const r = parseModelSet(
+				json([...Array.from({ length: i }, () => good), m as never]),
+				100,
+			);
+			expect(r).toEqual({ error: expect.stringContaining(`models[${i}]`) });
+		}
+	});
+
+	test("a run over the entry cap or the character cap is an error", () => {
+		const many = Array.from({ length: 1001 }, (_, i) => ({
+			provider: "zai",
+			id: `m-${i}`,
+		}));
+		expect(parseModelSet(json(many), 1000)).toEqual({
+			error: expect.stringContaining("1001 models"),
+		});
+		// The length check runs before the parse: a huge string never parses.
+		expect(
+			parseModelSet(" ".repeat(OMP_WATCH_GATES.modelsMaxChars + 1), 10),
+		).toEqual({ error: expect.stringContaining("characters") });
+	});
+
+	// The live path: the parser reads the installed omp's real output, not a stub. Skipped
+	// where no omp is installed (the GitHub test runners).
+	test.skipIf(Bun.which("omp") === null)(
+		"the installed omp's real models output parses",
+		() => {
+			const run = Bun.spawnSync(["omp", "models", "--json"]);
+			expect(run.exitCode).toBe(0);
+			const r = parseModelSet(run.stdout.toString(), 1000);
+			if (!("pairs" in r)) throw new Error(`real output rejected: ${r.error}`);
+			expect(r.pairs.length).toBeGreaterThan(0);
+			for (const p of r.pairs)
+				expect(p).toMatch(
+					/^([a-z0-9][a-z0-9-]{0,63})\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
+				);
+		},
+		15000,
+	);
 });
 
 describe("bumpTarget", () => {
@@ -498,6 +646,71 @@ describe("bumpTarget", () => {
 		const releases = [rel("1.1.9", 30), rel("1.2.0", 8), rel("1.2.5", 2)];
 		const verdicts = { "1.1.9": pass, "1.2.0": pass, "1.2.5": pass };
 		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.1.9");
+	});
+
+	// Model fast track (OTTR-1287): a passed release that adds a signed-in model is a
+	// candidate before the age rules. The adds callback answers per release version.
+	const adds = (which: string) => (version: string) => version === which;
+
+	test("a passed young release that adds a signed-in model is the target at once", () => {
+		const releases = [rel("1.2.0", 2), rel("1.2.5", 1)];
+		const verdicts = { "1.2.0": pass, "1.2.5": pass };
+		// Without the fast track the unsettled line files nothing.
+		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBeNull();
+		expect(bumpTarget(releases, verdicts, () => true, NOW, adds("1.2.0"))).toBe(
+			"1.2.0",
+		);
+		// The young release itself can carry the added models.
+		expect(bumpTarget(releases, verdicts, () => true, NOW, adds("1.2.5"))).toBe(
+			"1.2.5",
+		);
+	});
+
+	test("the fast track skips the settled-line wait but keeps the walk's stop rule", () => {
+		// 1.1.9 is settled and the highest walked candidate; 1.2.0's line is unsettled,
+		// so without adds the target is 1.1.9. With adds on 1.2.0 the target moves up.
+		const releases = [rel("1.1.9", 30), rel("1.2.0", 8), rel("1.2.5", 2)];
+		const verdicts = { "1.1.9": pass, "1.2.0": pass, "1.2.5": pass };
+		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.1.9");
+		expect(bumpTarget(releases, verdicts, () => true, NOW, adds("1.2.0"))).toBe(
+			"1.2.0",
+		);
+		// The stop rule is unchanged: 1.3.0 is unreviewed, so 1.2.1 above it never counts.
+		const stopped = [rel("1.2.0", 2), rel("1.2.1", 1), rel("1.3.0", 1)];
+		expect(
+			bumpTarget(
+				stopped,
+				{ "1.2.0": pass },
+				() => true,
+				NOW,
+				() => true,
+			),
+		).toBe("1.2.0");
+	});
+
+	test("the fast track never takes a failed or a deprecated release", () => {
+		// A cleared fail is no pass: it walks through the age gate only.
+		const failed = [rel("1.2.0", 2)];
+		expect(
+			bumpTarget(
+				failed,
+				{ "1.2.0": fail("T-1") },
+				() => true,
+				NOW,
+				() => true,
+			),
+		).toBeNull();
+		// A deprecated release never counts, not even on the fast track.
+		const deprecated = [{ ...rel("1.2.0", 2), deprecated: true }];
+		expect(
+			bumpTarget(
+				deprecated,
+				{ "1.2.0": pass },
+				() => true,
+				NOW,
+				() => true,
+			),
+		).toBeNull();
 	});
 });
 
@@ -760,6 +973,147 @@ describe("createOmpWatcher", () => {
 		await w.watcher.tick();
 		await w.watcher.tick();
 		expect((await w.cards()).map((c) => c.id)).toEqual([first!.id]);
+	});
+
+	test("a passed young release that adds a signed-in model files a P1 bump card at once", async () => {
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		w.signedIn(["zai"]);
+		// The release adds zai/glm-6.2; zai/glm-5 the pin already has.
+		w.model.modelsOut(
+			"18.16.0",
+			'{"models":[{"provider":"zai","id":"glm-6.2"},{"provider":"zai","id":"glm-5"}]}',
+		);
+		w.model.modelsOut(PIN, '{"models":[{"provider":"zai","id":"glm-5"}]}');
+		// The models run gets the review's env rule: no GitHub token reaches it.
+		process.env.GH_TOKEN = "secret";
+		try {
+			await w.watcher.tick();
+		} finally {
+			delete process.env.GH_TOKEN;
+		}
+		const cards = await w.cards();
+		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
+		expect(cards[0]!.priority).toBe("P1");
+		expect(cards[0]!.stage).toBe("todo");
+		expect(cards[0]!.prompt).toContain(
+			"release-age wait was skipped for model access",
+		);
+		expect(cards[0]!.prompt).toContain("zai/glm-6.2");
+		// glm-5 is not an added model: the pin already has it.
+		expect(cards[0]!.prompt).not.toContain("glm-5");
+		// One models run per version: the release at its review, the pin in the backfill.
+		expect(w.model.modelsAsked()).toEqual(["18.16.0", PIN]);
+		expect(w.model.modelsRequests[0]!.env.GH_TOKEN).toBeUndefined();
+		expect(w.model.modelsRequests[1]!.env.GH_TOKEN).toBeUndefined();
+		expect(w.scheduled()).toBe(1);
+
+		await w.watcher.tick();
+		expect(await w.cards()).toHaveLength(1);
+	});
+
+	test("the same model set keeps the 7-day wait", async () => {
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		w.signedIn(["zai"]);
+		// Both catalogs are empty by default: the release adds nothing.
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.scheduled()).toBe(0);
+		expect(w.state().modelSets).toEqual({ "18.16.0": [], [PIN]: [] });
+
+		// Aged past the gate the normal path files a normal, unrated card.
+		w.advance(7 * DAY);
+		await w.watcher.tick();
+		const cards = await w.cards();
+		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
+		expect(cards[0]!.priority).toBeNull();
+		// The pin's set is recorded once; the aged tick runs no models list.
+		expect(w.model.modelsAsked()).toEqual(["18.16.0", PIN]);
+	});
+
+	test("an added model for a provider without a sign-in keeps the 7-day wait", async () => {
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		w.model.modelsOut(
+			"18.16.0",
+			'{"models":[{"provider":"zai","id":"glm-6.2"}]}',
+		);
+		w.signedIn(["anthropic"]);
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.scheduled()).toBe(0);
+	});
+
+	test("junk or failing models output files no card and logs a warning", async () => {
+		// The human-readable table instead of the JSON the watcher parses.
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		w.signedIn(["zai"]);
+		w.model.modelsOut(
+			"18.16.0",
+			"openai-codex (8)\n│ gpt-6.2-sol │ 500K │ 128K │ yes │",
+		);
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.scheduled()).toBe(0);
+		expect(
+			w.logs.some((l) =>
+				l.includes("omp 18.16.0: models list: output is not JSON"),
+			),
+		).toBe(true);
+
+		// A nonzero exit is the same: no set, no fast track, a warning.
+		const failed = await setup();
+		failed.release("18.16.0", 1 * DAY);
+		failed.signedIn(["zai"]);
+		failed.model.modelsExit("18.16.0", 1);
+		await failed.watcher.tick();
+		expect(await failed.cards()).toEqual([]);
+		expect(
+			failed.logs.some((l) =>
+				l.includes("omp 18.16.0: models list exited with code 1"),
+			),
+		).toBe(true);
+	});
+
+	test("models output over the entry cap files no card and logs a warning", async () => {
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		w.signedIn(["zai"]);
+		const many = Array.from(
+			{ length: OMP_WATCH_GATES.modelsMaxEntries + 1 },
+			(_, i) => ({ provider: "zai", id: `m-${i}` }),
+		);
+		w.model.modelsOut("18.16.0", JSON.stringify({ models: many }));
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(
+			w.logs.some((l) => l.includes("omp 18.16.0: models list: 1001 models")),
+		).toBe(true);
+		// The unusable set is not stored: no state, no fast track.
+		expect(w.state().modelSets["18.16.0"]).toBeUndefined();
+	});
+
+	test("a backfilled model set can still fast-track the target", async () => {
+		const w = await setup();
+		w.release("18.16.0", 2 * DAY);
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		// The review predates the model recording: its set is missing again.
+		const st = w.state();
+		delete st.modelSets["18.16.0"];
+		w.saved.set(w.project.name, st);
+		w.model.modelsOut(
+			"18.16.0",
+			'{"models":[{"provider":"zai","id":"glm-6.2"}]}',
+		);
+		w.signedIn(["zai"]);
+		await w.watcher.tick();
+		const cards = await w.cards();
+		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
+		expect(cards[0]!.priority).toBe("P1");
+		expect(w.state().modelSets["18.16.0"]).toEqual(["zai/glm-6.2"]);
 	});
 
 	test("the release body cannot end its DATA block early", async () => {

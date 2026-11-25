@@ -2,18 +2,21 @@
  * The omp watch (docs/specs/omp-watch.md): an hourly tick reads the omp pin in a project's
  * Dockerfile.worker, lists the newer omp releases on npm, has a model review each release's
  * notes, files a fail card that holds the pin, and files a "Bump omp to X" card when a
- * reviewed release is old enough.
+ * reviewed release is old enough — or at once, at P1, when it adds model access for a
+ * provider the board is signed in to (OTTR-1287).
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	clean,
+	defaultSpawn,
 	runGatewayWithFallbacks,
 	type SpawnFn,
 } from "./forkAnalysis.ts";
 import type { ForkProject } from "./forks.ts";
 import { upstreamToken } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
+import { PROVIDER_ID, boardOmpEnv } from "./login.ts";
 import { modelFallbacks } from "./models.ts";
 import {
 	OMP_REVIEW_INSTRUCTIONS,
@@ -34,6 +37,14 @@ export const OMP_WATCH_GATES = {
 	notesGraceMs: 86_400_000,
 	/** Release notes are cut to this many characters for the model. */
 	notesCap: 30_000,
+	/** One `omp models --json` run waits at most this long (a cold bunx install included). */
+	modelsTimeoutMs: 180_000,
+	/** Model ids one models run may hold; more rejects the run. */
+	modelsMaxEntries: 1000,
+	/** Stdout characters one models run may hold; more rejects the run before the parse. */
+	modelsMaxChars: 1_000_000,
+	/** Model list runs per tick for one project (the pin's set and backfilled sets). */
+	modelsPerTick: 5,
 } as const;
 
 export const OMP_PACKAGE_URL =
@@ -51,6 +62,12 @@ const REASON_MAX = 500;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const PIN_RE = /^ARG OMP_VERSION=(\d+\.\d+\.\d+)[ \t]*\r?$/m;
+/** One model id of a catalog entry (`gpt-6.2-sol`, `glm-4.5`, `claude_opus_4`); strict: the
+ * models output is untrusted. */
+const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+/** One stored `provider/model` pair; the provider part is omp's PROVIDER_ID (src/login.ts). */
+const PAIR_RE =
+	/^([a-z0-9][a-z0-9-]{0,63})\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/;
 
 export type OmpVerdict = {
 	verdict: "pass" | "fail";
@@ -61,12 +78,15 @@ export type OmpVerdict = {
 
 export type OmpWatchState = {
 	verdicts: Record<string, OmpVerdict>;
+	/** Sorted unique `provider/model` ids per version; a version without an entry never fast-tracks. */
+	modelSets: Record<string, string[]>;
 	bumpCard: { id: string; version: string } | null;
 	lastError: { reason: string; at: number } | null;
 };
 
 const emptyState = (): OmpWatchState => ({
 	verdicts: {},
+	modelSets: {},
 	bumpCard: null,
 	lastError: null,
 });
@@ -135,6 +155,60 @@ function parseLastError(raw: unknown): { reason: string; at: number } | null {
 	return null;
 }
 
+/** The stored model sets; entries that fail the shape checks are dropped (no fast track). */
+function parseModelSets(raw: unknown): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	if (!isObj(raw)) return out;
+	for (const [version, v] of Object.entries(raw)) {
+		if (!VERSION_RE.test(version)) continue;
+		if (!Array.isArray(v) || v.length > OMP_WATCH_GATES.modelsMaxEntries)
+			continue;
+		if (!v.every((p) => typeof p === "string" && PAIR_RE.test(p))) continue;
+		out[version] = [...v];
+	}
+	return out;
+}
+
+/** The parsed model set of one run, or why the run is unusable. */
+export type ModelSetParse = { pairs: string[] } | { error: string };
+
+/**
+ * The model set of one `omp models --json` run (OTTR-1287). The output is untrusted data:
+ * one entry without a valid provider or model id rejects the whole run, and so does a run
+ * with more than `maxEntries` entries or `OMP_WATCH_GATES.modelsMaxChars` characters. The
+ * set is the sorted unique `provider/model` ids.
+ */
+export function parseModelSet(
+	stdout: string,
+	maxEntries: number,
+): ModelSetParse {
+	if (stdout.length > OMP_WATCH_GATES.modelsMaxChars)
+		return { error: `output is ${stdout.length} characters, over the cap` };
+	let body: unknown;
+	try {
+		body = JSON.parse(stdout);
+	} catch {
+		return { error: "output is not JSON" };
+	}
+	if (!isObj(body) || !Array.isArray(body.models))
+		return { error: "no models array" };
+	if (body.models.length > maxEntries)
+		return {
+			error: `${body.models.length} models exceeds the cap of ${maxEntries}`,
+		};
+	const seen = new Set<string>();
+	for (const [i, m] of body.models.entries()) {
+		if (!isObj(m)) return { error: `models[${i}] is not an object` };
+		const { provider, id } = m;
+		if (typeof provider !== "string" || !PROVIDER_ID.test(provider))
+			return { error: `models[${i}] has no valid provider` };
+		if (typeof id !== "string" || !MODEL_ID_RE.test(id))
+			return { error: `models[${i}] has no valid model id` };
+		seen.add(`${provider}/${id}`);
+	}
+	return { pairs: [...seen].sort() };
+}
+
 /**
  * Stored state from the global store. npm and model data passed through it once, so every
  * field is checked: a malformed value loads as the empty state and a malformed verdict entry
@@ -145,6 +219,7 @@ export function parseOmpWatchState(raw: unknown): OmpWatchState {
 	const out = emptyState();
 	if (!isObj(raw)) return out;
 	out.verdicts = parseVerdicts(raw.verdicts);
+	out.modelSets = parseModelSets(raw.modelSets);
 	out.bumpCard = parseBumpCard(raw.bumpCard);
 	out.lastError = parseLastError(raw.lastError);
 	return out;
@@ -228,16 +303,19 @@ export function parsePackument(
 /**
  * The highest version the pin may move to (spec "Bump target"): walk the releases above the
  * pin in ascending order, stop at the first one without a verdict or with a fail whose card
- * is not cleared. The target is the highest walked release that is counted (not deprecated),
- * aged, and accepted by the release line gate (docs/specs/release-line-gate.md): acceptance
- * is evaluated per release against the full release list, so nothing above the walk —
- * settled or cap-lifted — can bless a walked release below it.
+ * is not cleared. The target is the highest walked release that is counted (not deprecated)
+ * and either fast-tracks (`addsSignedInModels`, a passed release that adds model access,
+ * OTTR-1287) or is aged and accepted by the release line gate
+ * (docs/specs/release-line-gate.md); acceptance is evaluated per release against the full
+ * release list, so nothing above the walk — settled or cap-lifted — can bless a walked
+ * release below it.
  */
 export function bumpTarget(
 	releases: OmpRelease[],
 	verdicts: Record<string, OmpVerdict>,
 	cleared: (cardId: string) => boolean,
 	now: number,
+	addsSignedInModels?: (version: string) => boolean,
 ): string | null {
 	const ageMs = OMP_WATCH_GATES.ageDays * DAY_MS;
 	const capMs = OMP_WATCH_GATES.capDays * DAY_MS;
@@ -247,10 +325,14 @@ export function bumpTarget(
 		if (v === undefined) break;
 		if (v.verdict === "fail" && (v.cardId === null || !cleared(v.cardId)))
 			break;
-		// A deprecated release never counts, so it is never the target (check 16).
+		// A deprecated release never counts, so it is never the target, fast-tracked or not.
 		if (r.deprecated === true) continue;
-		if (now - r.publishedAt < ageMs) continue;
-		if (!releaseLineAccepts(releases, r.version, now, ageMs, capMs)) continue;
+		const fastTrack =
+			v.verdict === "pass" && (addsSignedInModels?.(r.version) ?? false);
+		if (!fastTrack) {
+			if (now - r.publishedAt < ageMs) continue;
+			if (!releaseLineAccepts(releases, r.version, now, ageMs, capMs)) continue;
+		}
 		if (target === null || compareVersions(r.version, target) > 0)
 			target = r.version;
 	}
@@ -310,8 +392,15 @@ export function createOmpWatcher(deps: {
 	apiBase?: () => string;
 	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
 	fallbacks?: Record<string, string[]>;
+	/**
+	 * The providers the board has an active sign-in for (production: `signIns()` in
+	 * src/login.ts, active rows only). An unreadable credential store yields no providers:
+	 * a version then never fast-tracks, and the age gate keeps its normal path.
+	 */
+	signIns?: () => string[];
 }): { tick(): Promise<void> } {
 	const doFetch = withGithubRetry(deps.fetch ?? fetch);
+	const doSpawn = deps.spawn ?? defaultSpawn;
 	const now = deps.now ?? Date.now;
 
 	async function getJson(
@@ -350,6 +439,59 @@ export function createOmpWatcher(deps: {
 			throw new Error(`GitHub release v${version} returned HTTP ${r.status}`);
 		const body = isObj(r.body) ? r.body.body : undefined;
 		return { kind: "notes", body: typeof body === "string" ? body : "" };
+	}
+
+	/**
+	 * One version's model set (OTTR-1287): `omp models --json` from an isolated install of
+	 * that exact version, with the review's spawn seam and env rules. Null (warned through
+	 * `warn`) when the run fails or the output is unusable: the version keeps the age gate.
+	 * A failed run is a warning, never a `lastError`: it cannot block or retry the review.
+	 */
+	async function modelSet(
+		version: string,
+		warn: (reason: string) => void,
+	): Promise<string[] | null> {
+		let res: { code: number; stdout: string; stderr: string };
+		try {
+			res = await doSpawn(
+				["bunx", `@oh-my-pi/pi-coding-agent@${version}`, "models", "--json"],
+				{
+					stdin: "",
+					env: boardOmpEnv({
+						...process.env,
+						GH_TOKEN: undefined,
+						GITHUB_TOKEN: undefined,
+					}),
+					timeoutMs: OMP_WATCH_GATES.modelsTimeoutMs,
+				},
+			);
+		} catch (e) {
+			warn(`omp ${version}: models list not run: ${errText(e)}`);
+			return null;
+		}
+		if (res.code !== 0) {
+			warn(
+				`omp ${version}: models list exited with code ${res.code}: ${res.stderr.slice(-200)}`,
+			);
+			return null;
+		}
+		const parsed = parseModelSet(res.stdout, OMP_WATCH_GATES.modelsMaxEntries);
+		if ("error" in parsed) {
+			warn(`omp ${version}: models list: ${parsed.error}`);
+			return null;
+		}
+		return parsed.pairs;
+	}
+
+	/** Runs and records the version's model set when the state has none (OTTR-1287). */
+	async function recordModelSet(
+		state: OmpWatchState,
+		version: string,
+		warn: (reason: string) => void,
+	): Promise<void> {
+		if (state.modelSets[version] !== undefined) return;
+		const pairs = await modelSet(version, warn);
+		if (pairs !== null) state.modelSets[version] = pairs;
 	}
 
 	async function watchProject(project: ForkProject): Promise<void> {
@@ -405,6 +547,10 @@ export function createOmpWatcher(deps: {
 		);
 		filed += await fileBumpCard(project, state, releases, pin, fail, watching);
 
+		// Model sets below the pin are never compared again: the baseline moves with the pin.
+		for (const version of Object.keys(state.modelSets))
+			if (compareVersions(version, pin) < 0) delete state.modelSets[version];
+
 		const reason = failures.at(-1);
 		state.lastError = reason === undefined ? null : { reason, at: now() };
 		await deps.save(project.name, state);
@@ -441,6 +587,8 @@ export function createOmpWatcher(deps: {
 					at: t,
 				};
 				deps.log(`${tag}: omp ${r.version} passed the review`);
+				// The model set feeds the fast track; a failed run only loses it (OTTR-1287).
+				await recordModelSet(state, r.version, (m) => deps.log(`${tag}: ${m}`));
 				continue;
 			}
 			filed += await fileFailCard(store, state, r, pin, v, t, tag, fail);
@@ -502,6 +650,32 @@ export function createOmpWatcher(deps: {
 	): Promise<number> {
 		const store = project.store;
 		let attemptedTarget: string | null = null;
+		// The fast track compares against the live baseline (the pin's set) and only counts
+		// providers with an active sign-in (OTTR-1287).
+		const signedIn = new Set(deps.signIns?.() ?? []);
+		const addedModels = (version: string): string[] => {
+			const live = state.modelSets[pin];
+			const set = state.modelSets[version];
+			if (live === undefined || set === undefined) return [];
+			return set.filter(
+				(p) => !live.includes(p) && signedIn.has(p.slice(0, p.indexOf("/"))),
+			);
+		};
+		// Reviews record the sets; this backfill covers a review that predates the feature
+		// or a first run that failed. At most modelsPerTick runs per tick.
+		const need = releases.flatMap((r) =>
+			state.verdicts[r.version]?.verdict === "pass" &&
+			state.modelSets[r.version] === undefined
+				? [r.version]
+				: [],
+		);
+		if (state.modelSets[pin] === undefined) need.unshift(pin);
+		for (const version of need.slice(0, OMP_WATCH_GATES.modelsPerTick)) {
+			if (!(await watching())) return 0;
+			await recordModelSet(state, version, (m) =>
+				deps.log(`${project.name}: ${m}`),
+			);
+		}
 		try {
 			const result = await store.transaction(async () => {
 				if (!(await watching())) return null;
@@ -521,6 +695,7 @@ export function createOmpWatcher(deps: {
 					state.verdicts,
 					(id) => cleared.has(id),
 					now(),
+					(version) => addedModels(version).length > 0,
 				);
 				if (
 					target === null ||
@@ -537,8 +712,14 @@ export function createOmpWatcher(deps: {
 					if (v === undefined) return [];
 					return [{ version: r.version, verdict: v.verdict, cardId: v.cardId }];
 				});
+				const added = addedModels(target);
 				const card = await store.createTask(
-					ompBumpCardPrompt({ version: target, pin, covers }),
+					ompBumpCardPrompt({
+						version: target,
+						pin,
+						covers,
+						addedModels: added,
+					}),
 					null,
 					"work",
 				);
@@ -546,6 +727,8 @@ export function createOmpWatcher(deps: {
 					title: `Bump omp to ${target}`,
 					promptAuthor: "board",
 					topic: "omp",
+					// The fast-tracked card queues first; the normal card stays unrated.
+					priority: added.length > 0 ? "P1" : null,
 				});
 				return { card, target };
 			});
