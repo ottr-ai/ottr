@@ -10358,6 +10358,7 @@ export async function createApp(deps: AppDeps) {
 		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type,
+				"X-Content-Type-Options": "nosniff",
 				"Cache-Control": "private, max-age=31536000, immutable",
 				Connection: "close",
 			},

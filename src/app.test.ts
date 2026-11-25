@@ -14311,6 +14311,7 @@ describe("project icon", () => {
 		const res = await get("/api/projects/p1/icon");
 		expect(res.status).toBe(200);
 		expect(res.headers.get("Content-Type")).toBe("image/x-icon");
+		expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(ico);
 	});
 
