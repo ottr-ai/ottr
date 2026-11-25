@@ -1236,6 +1236,70 @@ export default function (pi: Pi) {
 		});
 	}
 
+	// The agent-data sync gate (docs/specs/agent-data-sync-gate.md): the turn uid
+	// cannot read the alate checkout (OTTR-994), so the tool routes through the
+	// board like sandbox_run — the board runs sync.mjs with its own rights, records
+	// the run on this card, and answers the stored record. Work runs on agent-data
+	// cards only; retro, review and trending runs never see the tool.
+	if (
+		!retroMode &&
+		!reviewMode &&
+		process.env.OTTR_TRENDING !== "1" &&
+		(process.env.OTTR_PROJECT ?? "").trim() === "agent-data"
+	) {
+		pi.registerTool({
+			name: "sync_gate",
+			label: "Sync gate",
+			description:
+				"Run this agent-data card's sync gate with the board's rights: the board executes `node <alate checkout>/sync.mjs --data .` in this card's worktree, which must be committed-clean, and records the run (exit code, output, sha256 of each installed projects/ file) on the card. " +
+				"No parameters. Commit your work first, then call it when the card's acceptance names the sync gate, and cite the returned record's code and file hashes in report_outcome — the board stores the record, so the citation is tracked data, not your text.",
+			parameters: z.object({}),
+			loadMode: "essential",
+			approval: "read",
+			async execute() {
+				const env = requireBoardEnv("sync_gate");
+				if ("error" in env) return textResult(env.error);
+				if (env.runToken === "")
+					return textResult(
+						"Error: sync_gate is unavailable — this session carries no OTTR_RUN_TOKEN.",
+					);
+				let res: Response;
+				try {
+					res = await fetch(
+						`${env.base}/api/projects/${encodeURIComponent(env.project)}/sync-gate`,
+						{
+							method: "POST",
+							headers: {
+								origin: env.base,
+								...(env.token !== "" ? { "x-board-token": env.token } : {}),
+								"x-run-token": env.runToken,
+							},
+						},
+					);
+				} catch (err) {
+					const why = err instanceof Error ? err.message : String(err);
+					return textResult(
+						`Error: the board at ${env.base} is unreachable (${why}). Report the blocker.`,
+					);
+				}
+				const body = (await res.json().catch(() => null)) as Record<
+					string,
+					unknown
+				> | null;
+				if (!res.ok || body === null) {
+					const why =
+						body !== null && typeof body.error === "string"
+							? ` — ${body.error}`
+							: "";
+					return textResult(
+						`Error: sync gate not run (HTTP ${res.status}${why}). Fix the cause or report the blocker.`,
+					);
+				}
+				return textResult(JSON.stringify(body, null, 2));
+			},
+		});
+	}
+
 	pi.on("session_stop", () => {
 		if (asked && !reported) return undefined;
 		if (!reported && blocks < 2) {

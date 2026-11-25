@@ -717,6 +717,9 @@ export interface Task {
 	uncommittedFiles: string[];
 	/** Second-model checks of this work card, oldest first, capped at the newest 20 runs. */
 	workCheckLog: WorkCheckRun[];
+	/** Agent-data sync gate runs the board executed for this card, oldest first, capped at
+	 *  the newest 20 runs (docs/specs/agent-data-sync-gate.md). Empty on every other project. */
+	syncGateLog: SyncGateRun[];
 	/** Work-check send-backs to the work agent so far; once WORK_CHECK_MAX_SENDBACKS have run, every failing check asks the user (send it back, merge anyway, or cancel) before another send-back. */
 	workCheckSendbacks: number;
 	/** Branch head the last completed check saw; the re-check's diff starts here (empty when the head did not move). */
@@ -836,6 +839,41 @@ export interface WorkCheckRun {
 	 *  check judges the directed approach without parsing the sent-back text. Absent on plain
 	 *  rounds and on old records. */
 	direction?: string;
+}
+
+/** One sha256 comparison the sync gate recorded: the card's changed `projects/` file
+ *  and its installed twin at the workspace root. */
+export interface SyncGateFileHash {
+	/** The data-repo-relative path, for example `projects/ottr/AGENTS.md`. */
+	path: string;
+	/** sha256 of the worktree source file; null when the worktree file is missing. */
+	sourceSha256: string | null;
+	/** sha256 of the installed twin; null when no installed file exists there. */
+	installedSha256: string | null;
+	/** True only when both hashes exist and are equal. */
+	match: boolean;
+}
+
+/** One run of the agent-data sync gate the board executed for a work card
+ *  (docs/specs/agent-data-sync-gate.md). Board-written tracked data: the record
+ *  lands in the store before the turn sees it, so a report can cite it without
+ *  the agent forging it. */
+export interface SyncGateRun {
+	/** Epoch milliseconds when the gate run started. */
+	at: number;
+	/** The gate process's exit code; null when the gate never spawned (a guard or
+	 *  spawn refusal — the reason rides in `error`). */
+	code: number | null;
+	/** Combined stdout+stderr of the gate run, capped. */
+	output: string;
+	/** True when output hit the cap and lost its tail. */
+	truncated: boolean;
+	/** Per-file hash comparison for the card's changed `projects/` files. */
+	files: SyncGateFileHash[];
+	/** Wall-clock duration of the whole gate step (guards, run, hashing). */
+	durationMs: number;
+	/** The refusal reason when the gate never ran or failed to start. */
+	error?: string;
 }
 
 /** What to do with one kept worktree file when finishing the card without an agent turn. */
@@ -1318,6 +1356,7 @@ export type TaskCard = Omit<
 	| "diffFiles"
 	| "diffText"
 	| "workCheckLog"
+	| "syncGateLog"
 	| "workCheckReport"
 	| "gate"
 > & {

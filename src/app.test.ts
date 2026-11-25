@@ -167,6 +167,7 @@ import type {
 	ServiceQuotaReadResult,
 	ServiceQuotaSourceConfig,
 	StateResponse,
+	SyncGateRun,
 	TaskCard,
 } from "./types.ts";
 import {
@@ -12544,6 +12545,299 @@ describe("sandbox endpoint", () => {
 			dropGit();
 		}
 	}, 30_000);
+});
+
+// The sync_gate tool's board leg (docs/specs/agent-data-sync-gate.md): the boot
+// token opens the wall, the run token binds the request to the calling run's own
+// agent-data work card, and the board runs sync.mjs with its own rights, records
+// the run on the card, and answers the stored record.
+describe("sync-gate endpoint", () => {
+	const asRunHeaders = (runToken: string | null) => ({
+		"x-board-token": BOARD_TOKEN,
+		...(runToken === null ? {} : { "x-run-token": runToken }),
+	});
+
+	let gateRoot = "";
+	let agentStore: ProjectStore | null = null;
+	let alateStore: ProjectStore | null = null;
+	let prevAgent: Entry | undefined;
+	let prevAlate: Entry | undefined;
+
+	/** The card worktree fixture: main holds a base commit, the card branch changes
+	 *  one projects/ file. Returns the base sha. */
+	const seedWorktree = (dir: string): string => {
+		mkdirSync(join(dir, "projects/ottr"), { recursive: true });
+		writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "base agents\n");
+		execSync("git init -q -b main", {
+			cwd: dir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
+		execSync("git config user.email t@t && git config user.name t", {
+			cwd: dir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
+		execSync("git add -A && git commit -qm base", {
+			cwd: dir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
+		const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+		execSync("git checkout -q -b ott/card", {
+			cwd: dir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
+		writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "card agents\n");
+		execSync("git add -A && git commit -qm card", {
+			cwd: dir,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
+		return base;
+	};
+
+	/** The fixture alate checkout, mirroring the real script's contract: it reads
+	 *  the data repo at cwd and installs every manifest-covered projects/ file at
+	 *  the projects root its ALATE_HOME config names. */
+	const seedAlate = (dir: string, projectsRoot: string): void => {
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, "sync.mjs"),
+			[
+				`import { readdirSync, readFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";`,
+				`import { join, dirname } from "node:path";`,
+				`const alate = process.env.ALATE_HOME;`,
+				`if (alate === undefined) { console.error("sync: ALATE_HOME is unset"); process.exit(1); }`,
+				`const rootFile = join(alate, "projects-root.txt");`,
+				`if (!existsSync(rootFile)) { console.error("sync: no projects root config"); process.exit(2); }`,
+				`const projectsRoot = readFileSync(rootFile, "utf8").trim();`,
+				`const data = process.cwd();`,
+				`const walk = (dir) => {`,
+				`  for (const e of readdirSync(dir, { withFileTypes: true })) {`,
+				`    const p = join(dir, e.name);`,
+				`    if (e.isDirectory()) walk(p);`,
+				`    else if (e.name.endsWith(".md")) {`,
+				`      const rel = p.slice(data.length + 1);`,
+				`      const rest = rel.slice("projects/".length);`,
+				`      const out = join(projectsRoot, rest);`,
+				`      mkdirSync(dirname(out), { recursive: true });`,
+				`      copyFileSync(p, out);`,
+				`      console.log("sync: installed " + rest);`,
+				`    }`,
+				`  }`,
+				`};`,
+				`walk(join(data, "projects"));`,
+				`console.log("sync: done");`,
+				"",
+			].join("\n"),
+		);
+		writeFileSync(join(dir, "projects-root.txt"), projectsRoot);
+	};
+
+	/** A committed work-kind card wired to a fresh fixture worktree, plus its run grant. */
+	let cardSeq = 0;
+	const seedCard = async (): Promise<{
+		id: string;
+		runToken: string;
+		worktree: string;
+	}> => {
+		cardSeq += 1;
+		const wt = join(gateRoot, `wt-${cardSeq}`);
+		mkdirSync(wt, { recursive: true });
+		const base = seedWorktree(wt);
+		const card = await agentStore!.createTask("gate run");
+		await agentStore!.updateTask(card.id, {
+			branch: "ott/card",
+			base,
+			worktree: wt,
+		});
+		return {
+			id: card.id,
+			runToken: runTokens.issue({ project: "agent-data", taskId: card.id }),
+			worktree: wt,
+		};
+	};
+
+	beforeAll(async () => {
+		gateRoot = mkdtempSync(join(tmpdir(), "ottr-syncgate-endpoint-"));
+		const agentDir = join(gateRoot, "agent-data");
+		mkdirSync(agentDir, { recursive: true });
+		const alateDir = join(gateRoot, "alate");
+		mkdirSync(alateDir, { recursive: true });
+		agentStore = await ProjectStore.open(agentDir);
+		alateStore = await ProjectStore.open(alateDir);
+		prevAgent = projects.get("agent-data");
+		prevAlate = projects.get("alate");
+		projects.set("agent-data", {
+			path: agentDir,
+			name: "agent-data",
+			store: agentStore,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		projects.set("alate", {
+			path: alateDir,
+			name: "alate",
+			store: alateStore,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		});
+		seedAlate(alateDir, gateRoot);
+	});
+
+	afterAll(async () => {
+		// Restore whatever the describe replaced; later describes keep using the
+		// module map. Own stores close here: the file's shutdown closes only the
+		// entries the map still holds.
+		if (prevAgent === undefined) projects.delete("agent-data");
+		else projects.set("agent-data", prevAgent);
+		if (prevAlate === undefined) projects.delete("alate");
+		else projects.set("alate", prevAlate);
+		if (agentStore !== null) await closeTestStore(agentStore);
+		if (alateStore !== null) await closeTestStore(alateStore);
+		rmSync(gateRoot, { recursive: true, force: true });
+	});
+
+	test("a work run asks for the gate and receives the real exit code and output", async () => {
+		const { id, runToken } = await seedCard();
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{},
+			asRunHeaders(runToken),
+		);
+		expect(res.status).toBe(200);
+		const record = (await res.json()) as SyncGateRun;
+		expect(record.code).toBe(0);
+		expect(record.output).toContain("sync: installed ottr/AGENTS.md");
+		expect(record.output).toContain("sync: done");
+		expect(record.files.length).toBe(1);
+		expect(record.files[0]?.path).toBe("projects/ottr/AGENTS.md");
+		expect(record.files[0]?.match).toBe(true);
+		// The record is tracked store data: the response IS the stored record.
+		const task = await agentStore!.getTask(id);
+		expect(task?.syncGateLog.length).toBe(1);
+		expect(task?.syncGateLog[0]).toEqual(record);
+		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+	});
+
+	test("a request without this run's credential refuses and records nothing", async () => {
+		const { id } = await seedCard();
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{},
+			asRunHeaders(null),
+		);
+		expect(res.status).toBe(403);
+		expect(await errorOf(res)).toContain("OTTR_RUN_TOKEN");
+		const task = await agentStore!.getTask(id);
+		expect(task?.syncGateLog.length).toBe(0);
+		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+	});
+
+	test("a grant outside the agent-data project refuses", async () => {
+		const foreign = runTokens.issue({ project: "p1", taskId: "t-x" });
+		const res = await post(
+			"/api/projects/p1/sync-gate",
+			{},
+			asRunHeaders(foreign),
+		);
+		expect(res.status).toBe(403);
+		expect(await errorOf(res)).toContain("agent-data");
+	});
+
+	test("a non-work card refuses", async () => {
+		const review = await agentStore!.createTask("review run", null, "review");
+		const runToken = runTokens.issue({
+			project: "agent-data",
+			taskId: review.id,
+		});
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{},
+			asRunHeaders(runToken),
+		);
+		expect(res.status).toBe(403);
+		expect(await errorOf(res)).toContain("work runs");
+		await agentStore!.updateTask(review.id, { cancelledAt: Date.now() });
+	});
+
+	test("a dirty worktree answers an error record naming the files", async () => {
+		const { id, runToken, worktree } = await seedCard();
+		writeFileSync(join(worktree, "uncommitted.txt"), "x");
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{},
+			asRunHeaders(runToken),
+		);
+		expect(res.status).toBe(200);
+		const record = (await res.json()) as SyncGateRun;
+		expect(record.code).toBe(null);
+		expect(record.error).toContain("worktree not committed");
+		expect(record.error).toContain("uncommitted.txt");
+		const task = await agentStore!.getTask(id);
+		expect(task?.syncGateLog.length).toBe(1);
+		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+	});
+
+	test("an unregistered alate project refuses before the store is touched", async () => {
+		const { id, runToken } = await seedCard();
+		const prev = projects.get("alate");
+		projects.delete("alate");
+		try {
+			const res = await post(
+				"/api/projects/agent-data/sync-gate",
+				{},
+				asRunHeaders(runToken),
+			);
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toContain("alate project is not registered");
+		} finally {
+			if (prev === undefined) projects.delete("alate");
+			else projects.set("alate", prev);
+		}
+		const task = await agentStore!.getTask(id);
+		expect(task?.syncGateLog.length).toBe(0);
+		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+	});
+
+	test("a missing worktree refuses with 409", async () => {
+		const card = await agentStore!.createTask("gate run");
+		await agentStore!.updateTask(card.id, {
+			worktree: join(gateRoot, "no-such-wt"),
+		});
+		const runToken = runTokens.issue({
+			project: "agent-data",
+			taskId: card.id,
+		});
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{},
+			asRunHeaders(runToken),
+		);
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toContain("no worktree");
+		await agentStore!.updateTask(card.id, { cancelledAt: Date.now() });
+	});
 });
 
 // OTTR-1047: the manual start of a done review's batch validation run. The filing

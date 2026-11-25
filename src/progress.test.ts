@@ -81,6 +81,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		diffText: null,
 		uncommittedFiles: [],
 		workCheckLog: [],
+		syncGateLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
 		workCheckReport: null,

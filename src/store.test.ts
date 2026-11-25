@@ -2339,6 +2339,61 @@ describe("work check log", () => {
 	});
 });
 
+describe("sync gate log", () => {
+	test("records survive a reopen; a corrupt entry drops alone", async () => {
+		const store = await open(join(root, "sg-log"));
+		const task = await store.createTask("gated work");
+		await store.updateTask(task.id, {
+			syncGateLog: [
+				{
+					at: 1000,
+					code: null,
+					output: "",
+					truncated: false,
+					files: [],
+					durationMs: 12,
+					error: "worktree not committed:\n M projects/ottr/AGENTS.md",
+				},
+				{
+					at: 2000,
+					code: 0,
+					output: "sync: installed ottr/AGENTS.md\nsync: done\n",
+					truncated: true,
+					files: [
+						{
+							path: "projects/ottr/AGENTS.md",
+							sourceSha256: "b".repeat(64),
+							installedSha256: null,
+							match: false,
+						},
+					],
+					durationMs: 4300,
+				},
+				// A wrong-shaped record drops on parse; the others survive.
+				{ nope: true } as unknown as (typeof task)["syncGateLog"][number],
+			],
+		});
+		await store.close();
+		const reopened = await open(join(root, "sg-log"));
+		const log = (await reopened.getTask(task.id))?.syncGateLog ?? [];
+		expect(log).toHaveLength(2);
+		expect(log[0]?.code).toBe(null);
+		expect(log[0]?.error).toContain("worktree not committed");
+		expect(log[1]?.code).toBe(0);
+		expect(log[1]?.truncated).toBe(true);
+		expect(log[1]?.files[0]?.match).toBe(false);
+		expect(log[1]?.files[0]?.installedSha256).toBe(null);
+		await reopened.close();
+	});
+
+	test("fresh stores default to an empty log", async () => {
+		const store = await open(join(root, "sg-log-empty"));
+		const task = await store.createTask("gated work");
+		expect((await store.getTask(task.id))?.syncGateLog).toEqual([]);
+		await store.close();
+	});
+});
+
 describe("uncommittedFiles", () => {
 	test("updateTask stores and clears the list; fresh stores default to empty", async () => {
 		const store = await open(join(root, "uncommitted"));

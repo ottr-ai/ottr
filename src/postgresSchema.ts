@@ -257,7 +257,15 @@ export const projectMigrations: readonly PostgresMigration[] = [
 			"CREATE INDEX idx_code_scan_alert_task ON code_scan_alert (task_id)",
 		);
 		await db.exec(
-			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
+			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (task_id)",
+		);
+	},
+	// OTTR-1267 agent-data sync gate records (docs/specs/agent-data-sync-gate.md):
+	// the same additive convergence the SQLite ProjectStore.addColumn path runs.
+	// NOT NULL DEFAULT '[]' so every older row reads as "no gate run yet".
+	async (db) => {
+		await db.exec(
+			"ALTER TABLE tasks ADD COLUMN sync_gate_log text NOT NULL DEFAULT '[]'",
 		);
 	},
 	// fixed_threads landed with the re-review's fixed-finding verdicts

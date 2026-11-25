@@ -1881,6 +1881,114 @@ describe("sandbox_run tool", () => {
 	});
 });
 
+// The sync gate tool (docs/specs/agent-data-sync-gate.md): the turn uid cannot
+// read the alate checkout (OTTR-994), so the tool routes through the board like
+// sandbox_run, whose server runs sync.mjs with its own rights and records the
+// run on the card. Work runs on agent-data cards only.
+describe("sync_gate tool", () => {
+	// The board coordinates the runner injects into an agent-data work session.
+	const gateEnv = {
+		OTTR_BOARD_URL: "http://ottr:8080",
+		OTTR_PROJECT: "agent-data",
+		OTTR_TASK_ID: "AGEN-7",
+		OTTR_BOARD_TOKEN: "boot-token",
+		OTTR_RUN_TOKEN: "run-token",
+	};
+	const record = {
+		at: 1764000000000,
+		code: 0,
+		output: "sync: installed ottr/AGENTS.md\nsync: done\n",
+		truncated: false,
+		files: [
+			{
+				path: "projects/ottr/AGENTS.md",
+				sourceSha256: "a".repeat(64),
+				installedSha256: "a".repeat(64),
+				match: true,
+			},
+		],
+		durationMs: 4200,
+	};
+
+	test("absent outside agent-data projects", () => {
+		setEnv({ ...gateEnv, OTTR_PROJECT: "ottr" });
+		expect(fakePi().sync_gate).toBeUndefined();
+	});
+
+	test("absent in review, retro and trending runs even on agent-data", () => {
+		process.env.OTTR_REVIEW = "1";
+		setEnv(gateEnv);
+		expect(fakePi().sync_gate).toBeUndefined();
+		process.env.OTTR_RETRO = "1";
+		expect(fakePi().sync_gate).toBeUndefined();
+		process.env.OTTR_TRENDING = "1";
+		expect(fakePi().sync_gate).toBeUndefined();
+	});
+
+	test("present for work runs on agent-data cards, headless-safe, no parameters", () => {
+		setEnv(gateEnv);
+		const tool = fakePi().sync_gate;
+		expect(tool).toBeDefined();
+		expect(tool?.approval).toBe("read");
+		expect(tool?.loadMode).toBe("essential");
+		expect(Object.keys(tool?.parameters ?? {})).toEqual([]);
+	});
+
+	test("missing run token refuses before any call", async () => {
+		setEnv(gateEnv);
+		delete process.env.OTTR_RUN_TOKEN;
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().sync_gate!.execute("t1", {});
+		expect(text(out)).toContain("no OTTR_RUN_TOKEN");
+		expect(called).toBe(false);
+	});
+
+	test("execute posts the credential headers and returns the stored record", async () => {
+		setEnv(gateEnv);
+		let seen: { url: string; init: RequestInit } | null = null;
+		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {
+			seen = { url: String(url), init };
+			return new Response(JSON.stringify(record), { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().sync_gate!.execute("t1", {});
+		expect(seen!.url).toBe(
+			"http://ottr:8080/api/projects/agent-data/sync-gate",
+		);
+		expect(seen!.init.method).toBe("POST");
+		const headers = seen!.init.headers as Record<string, string>;
+		expect(headers["x-board-token"]).toBe("boot-token");
+		expect(headers["x-run-token"]).toBe("run-token");
+		expect(headers.origin).toBe("http://ottr:8080");
+		expect(JSON.parse(text(out))).toEqual(record);
+	});
+
+	test("an error envelope surfaces the board's reason", async () => {
+		setEnv(gateEnv);
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({ error: "sync_gate runs only in work runs" }),
+				{ status: 403 },
+			)) as unknown as typeof fetch;
+		const out = await fakePi().sync_gate!.execute("t1", {});
+		expect(text(out)).toContain("HTTP 403");
+		expect(text(out)).toContain("sync_gate runs only in work runs");
+	});
+
+	test("an unreachable board reports the blocker", async () => {
+		setEnv(gateEnv);
+		globalThis.fetch = (async () => {
+			throw new Error("connection refused");
+		}) as unknown as typeof fetch;
+		const out = await fakePi().sync_gate!.execute("t1", {});
+		expect(text(out)).toContain("is unreachable");
+		expect(text(out)).toContain("connection refused");
+	});
+});
+
 // The card-env guidance must reach the model, not only the process env: turnEnv sets
 // OTTR_CARD_ENV_NOTE and the extension's before_agent_start handler puts the guidance
 // into the session system prompt on its presence (OTTR-1099).

@@ -118,6 +118,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		diffText: null,
 		uncommittedFiles: [],
 		workCheckLog: [],
+		syncGateLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
 		workCheckReport: null,

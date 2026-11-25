@@ -6901,6 +6901,7 @@ describe("Drawer of a cancelled card opens read-only", () => {
 			summary: null,
 			gate: null,
 			workCheckLog: [],
+			syncGateLog: [],
 			workCheckReport: null,
 		};
 		return renderToStaticMarkup(
@@ -7198,6 +7199,7 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 		summary: null,
 		gate: null,
 		workCheckLog: [],
+		syncGateLog: [],
 		workCheckReport: null,
 	});
 	/** The React prop handler on a node; happy-dom events never reach React's plugins. */

@@ -383,6 +383,12 @@ import {
 	type TaskPatch,
 } from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
+import {
+	appendSyncGateRun,
+	runSyncGateQueued,
+	SYNC_GATE_PROJECT,
+	workspaceRootFor,
+} from "./syncGate.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
 	createSystemSampler,
@@ -5631,7 +5637,7 @@ export async function createApp(deps: AppDeps) {
 		if (!boot && vm === null) return json({ error: "unauthorized" }, 401);
 		const path = new URL(req.url).pathname;
 		const m =
-			/^\/api\/projects\/([^/]+)\/(tasks|trending\/verdicts|sandbox)$/.exec(
+			/^\/api\/projects\/([^/]+)\/(tasks|trending\/verdicts|sandbox|sync-gate)$/.exec(
 				path,
 			);
 		if (req.method !== "POST" || m === null)
@@ -14402,6 +14408,61 @@ export async function createApp(deps: AppDeps) {
 		return json({ ok: true, result: out.result });
 	}
 
+	// The sync_gate tool's board leg (docs/specs/agent-data-sync-gate.md): the run's
+	// boot token opens the wall (agentRefusal), and the handler binds the request to
+	// the run's own credential (OTTR_RUN_TOKEN) before it touches the store — every
+	// classic run holds the same boot token, so the body alone cannot be trusted.
+	// Only the calling run's own agent-data work card qualifies; the board then runs
+	// the gate with its own rights, records it on the task, and answers the stored
+	// record. The agent uid gains no filesystem rights.
+	async function handlePOSTProjectsSyncGateByProject(
+		req: BunRequest<"/api/projects/:project/sync-gate">,
+	): Promise<Response> {
+		const e = deps.projects.get(req.params.project);
+		if (!e) return json({ error: "unknown project" }, 404);
+		const grant = deps.runTokens?.check(req.headers.get("x-run-token")) ?? null;
+		if (grant === null)
+			return json(
+				{ error: "sync_gate needs this run's own credential (OTTR_RUN_TOKEN)" },
+				403,
+			);
+		if (grant.project !== req.params.project)
+			return json(
+				{ error: "sync_gate runs only this run's own card in its own project" },
+				403,
+			);
+		if (grant.project !== SYNC_GATE_PROJECT)
+			return json(
+				{ error: `sync_gate runs only on ${SYNC_GATE_PROJECT} cards` },
+				403,
+			);
+		const task = await e.store.getTask(grant.taskId);
+		if (task === null)
+			return json({ error: `unknown task ${grant.taskId}` }, 403);
+		if (task.kind !== "work")
+			return json({ error: "sync_gate runs only in work runs" }, 403);
+		const alate = deps.projects.get("alate");
+		if (!alate)
+			return json({ error: "the alate project is not registered" }, 400);
+		const wt = task.worktree ?? join(e.store.worktreesDir, task.id);
+		if (!existsSync(wt)) return json({ error: `no worktree at ${wt}` }, 409);
+		const run = await runSyncGateQueued({
+			project: grant.project,
+			worktree: wt,
+			alateDir: alate.path,
+			workspaceRoot: workspaceRootFor(e.path),
+			base: task.base,
+		});
+		// The record lands in the store before the turn sees it: tracked data the
+		// report can cite without the agent forging it. Re-read the current log so
+		// the append never drops a record a concurrent write added.
+		const cur = await e.store.getTask(grant.taskId);
+		await e.store.updateTask(grant.taskId, {
+			syncGateLog: appendSyncGateRun(cur?.syncGateLog ?? [], run),
+		});
+		return json(run);
+	}
+
 	async function resolveFollowUpOf(
 		project: string,
 		value: unknown,
@@ -16410,6 +16471,19 @@ export async function createApp(deps: AppDeps) {
 				return await api(
 					req,
 					async () => await handlePOSTProjectsSandboxByProject(req),
+					{ costly: true },
+				);
+			},
+		},
+		// The sync_gate tool's board leg (docs/specs/agent-data-sync-gate.md): the
+		// gate spawns sync.mjs (up to the 10 minute cap), so it rides the costly lane
+		// like the sandbox and drops the idle request timeout.
+		"/api/projects/:project/sync-gate": {
+			POST: async (req, server) => {
+				server.timeout(req, 0);
+				return await api(
+					req,
+					async () => await handlePOSTProjectsSyncGateByProject(req),
 					{ costly: true },
 				);
 			},

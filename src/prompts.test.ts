@@ -1122,6 +1122,7 @@ describe("handoffMarkdown research report", () => {
 		diffText: null,
 		uncommittedFiles: [],
 		workCheckLog: [],
+		syncGateLog: [],
 		workCheckSendbacks: 0,
 		workCheckHead: null,
 		workCheckReport: null,

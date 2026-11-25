@@ -14608,6 +14608,7 @@ export function Drawer({
 		report: null,
 		diffFiles: null,
 		workCheckLog: [],
+		syncGateLog: [],
 		workCheckReport: null,
 		gate: null,
 	};

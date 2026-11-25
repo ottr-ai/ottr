@@ -72,6 +72,8 @@ import type {
 	RecordedFinding,
 	RunState,
 	Stage,
+	SyncGateFileHash,
+	SyncGateRun,
 	Task,
 	TaskKind,
 	TrendingVerdict,
@@ -410,6 +412,7 @@ interface TaskRow {
 	diff_text: string | null;
 	uncommitted_files: string;
 	work_check_log: string;
+	sync_gate_log: string;
 	work_check_sendbacks: number;
 	work_check_head: string | null;
 	work_check_report: string | null;
@@ -747,6 +750,7 @@ function toListedTask(
 		holdHead: r.hold_head,
 		uncommittedFiles: parseStringList(r.uncommitted_files),
 		workCheckLog: parseWorkCheckLog(r.work_check_log),
+		syncGateLog: parseSyncGateLog(r.sync_gate_log),
 		workCheckSendbacks: r.work_check_sendbacks,
 		workCheckHead: r.work_check_head,
 		workCheckReport: r.work_check_report,
@@ -994,6 +998,57 @@ function parseWorkCheckLog(raw: string): WorkCheckRun[] {
 	return runs.slice(-20);
 }
 
+/** Parses one stored sync-gate record; null drops that entry only, so one corrupt
+ *  record never erases the run history the card shows. */
+function parseSyncGateRun(r: unknown): SyncGateRun | null {
+	if (typeof r !== "object" || r === null) return null;
+	const e = r as Record<string, unknown>;
+	if (typeof e.at !== "number") return null;
+	const files: SyncGateFileHash[] = Array.isArray(e.files)
+		? e.files.flatMap((f): SyncGateFileHash[] => {
+				if (typeof f !== "object" || f === null) return [];
+				const h = f as Record<string, unknown>;
+				if (typeof h.path !== "string") return [];
+				return [
+					{
+						path: h.path,
+						sourceSha256:
+							typeof h.sourceSha256 === "string" ? h.sourceSha256 : null,
+						installedSha256:
+							typeof h.installedSha256 === "string" ? h.installedSha256 : null,
+						match: h.match === true,
+					},
+				];
+			})
+		: [];
+	return {
+		at: e.at,
+		code: typeof e.code === "number" ? e.code : null,
+		output: typeof e.output === "string" ? e.output : "",
+		truncated: e.truncated === true,
+		files,
+		durationMs: typeof e.durationMs === "number" ? e.durationMs : 0,
+		error: typeof e.error === "string" ? e.error : undefined,
+	};
+}
+
+/** Parses the stored sync-gate log; a wrong-shaped record drops that entry only. */
+function parseSyncGateLog(raw: string): SyncGateRun[] {
+	let value: unknown;
+	try {
+		value = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	if (!Array.isArray(value)) return [];
+	const runs: SyncGateRun[] = [];
+	for (const entry of value) {
+		const run = parseSyncGateRun(entry);
+		if (run !== null) runs.push(run);
+	}
+	return runs.slice(-20);
+}
+
 function toTurn(r: TurnRow): Turn {
 	return {
 		id: r.id,
@@ -1116,6 +1171,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	diffText: "diff_text",
 	uncommittedFiles: "uncommitted_files",
 	workCheckLog: "work_check_log",
+	syncGateLog: "sync_gate_log",
 	workCheckSendbacks: "work_check_sendbacks",
 	workCheckHead: "work_check_head",
 	workCheckReport: "work_check_report",
@@ -2759,6 +2815,15 @@ export class ProjectStore {
 					cols,
 					"source_issue",
 					"ALTER TABLE tasks ADD COLUMN source_issue TEXT",
+				);
+				// OTTR-1267 agent-data sync gate records: ALTER-only after both CHECK
+				// rebuilds (a rebuild's explicit column list would drop it), like
+				// source_issue above. Empty array behaves as "no gate run yet".
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"sync_gate_log",
+					"ALTER TABLE tasks ADD COLUMN sync_gate_log TEXT NOT NULL DEFAULT '[]'",
 				);
 				await ProjectStore.convergeSourceIssues(db, store.queue);
 				await ProjectStore.convergeProposalReasons(db, store.queue);
