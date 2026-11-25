@@ -95,29 +95,40 @@ the model set comes from running omp itself.
 
 - When a review ends with `pass`, the watcher runs that version's model list and stores
   the set. The command is `bunx @oh-my-pi/pi-coding-agent@<version> models --json`: an
-  isolated install of that exact version. It runs through the same spawn seam, env rules
-  (`boardOmpEnv`, GitHub tokens removed) and sandbox as the review call.
-  `OMP_WATCH_GATES.modelsTimeoutMs` (180 s) bounds the run. A failed review never runs it:
-  a failed version can never be the target.
+  isolated install of that exact version. The reviewed version is unapproved code, so the
+  run gets its own sandbox, not the review's env: a throwaway HOME doubles as the working
+  directory, and the env is a whitelist that carries no identity, credential or board
+  configuration (no agent.db, no OAuth state, no SSH agent, no GitHub token). Only the
+  immutable package cache is shared across runs. `OMP_WATCH_GATES.modelsTimeoutMs`
+  (180 s) bounds the run. A failed review never runs it: a failed version can never be
+  the target.
 - The output is untrusted data. `parseModelSet` accepts only a JSON object whose `models`
   value is an array. Each entry needs a provider id that matches `PROVIDER_ID`
-  (`src/login.ts`) and a model id that matches `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`. One
-  bad entry rejects the whole run. So does a run with more than `modelsMaxEntries` (1000)
-  entries or `modelsMaxChars` (1 000 000) characters. The stored set is the sorted unique
-  `provider/model` ids.
+  (`src/login.ts`) and a model id in the strict segment grammar: 1 to 3 non-empty
+  segments join with `/` (compatible-provider prefixes exist, for example Baseten's
+  `openai/gpt-oss-120b`), and each segment starts alphanumeric and continues with `.`,
+  `_`, `:`, `-` or alphanumerics, at most 64 characters. One bad entry rejects the whole
+  run. So does a run with more than `modelsMaxEntries` (1000) entries or `modelsMaxChars`
+  (1 000 000) characters. The stored set is the sorted unique `provider/model` ids.
 - A failed or rejected run stores nothing. The tick logs a warning. The version keeps
   today's rule: it can still become the target through the age gate, never through the
   fast track. The backfill below retries the run on a later tick.
-- The state holds `modelSets: Record<version, string[]>`. A malformed entry loads as
-  missing, and a missing set never fast-tracks. Sets below the pin are pruned at save
-  time: the comparison baseline moves with the pin.
+- The state holds `modelSets: Record<version, { providers, pairs }>`. `providers` is the
+  sorted set of providers that had an active sign-in when omp listed the catalog: omp
+  lists only the models its current credentials make available, so a snapshot from a
+  different sign-in set says nothing about now. The watcher drops every stored set whose
+  `providers` differ from the current sign-in set before any comparison, and re-reads it
+  under the current context. A malformed entry loads as missing, and a missing set never
+  fast-tracks. Sets below the pin are pruned at save time: the comparison baseline moves
+  with the pin.
 
 ### The fast track
 
-- The baseline is the live version's set: the model set of the pin. The watcher records it
-  with the same command, once per pin. `backfillModelSets` fills the pin's set and the
-  sets of passed releases above the pin that lack one (a review that predates this change,
-  or a first run that failed). It runs at most `modelsPerTick` (5) model lists per tick.
+- The baseline is the live version's set: the model set of the pin. The watcher records
+  it with the same command and the same sandbox, under the current credential context,
+  once per pin. `backfillModelSets` fills the pin's set and the sets of passed releases
+  above the pin that lack one (a review that predates this change, or a first run that
+  failed). It runs at most `modelsPerTick` (5) model lists per tick.
 - In the bump target walk, a passed release is a candidate before the age rules when its
   set adds at least one id for a provider that the board has an active sign-in for
   (`signIns()` in `src/login.ts`; active rows only; an unreadable credential store counts
@@ -159,7 +170,7 @@ Global store key `ompWatch:<project name>`:
 ```ts
 type OmpWatchState = {
   verdicts: Record<string, { verdict: "pass" | "fail"; reasons: string[]; cardId: string | null; at: number }>;
-  modelSets: Record<string, string[]>;
+  modelSets: Record<string, { providers: string[]; pairs: string[] }>;
   bumpCard: { id: string; version: string } | null;
   lastError: { reason: string; at: number } | null;
 };
@@ -200,6 +211,10 @@ bun (`bun install -g` then `omp --version`). It holds no deploy key and pushes n
 - A passed release whose model set adds nothing for a signed-in provider keeps the 7-day wait.
 - A models list with junk output, or with more entries than the cap, files no card and logs
   a warning.
+- A model id with a compatible-provider prefix (`openai/gpt-oss-120b`) is accepted; a
+  model id with an empty, doubled or over-long segment is rejected with the whole run.
+- A pin snapshot taken before a provider sign-in is dropped when the sign-in set changes:
+  a later release with an identical catalog files no P1 card (sign-in-change regression).
 - The release body cannot end its DATA block early (fence markers are removed).
 - `ompWatch` off: no fetch, no card.
 

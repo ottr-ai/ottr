@@ -5,7 +5,8 @@
  * reviewed release is old enough — or at once, at P1, when it adds model access for a
  * provider the board is signed in to (OTTR-1287).
  */
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	clean,
@@ -16,7 +17,7 @@ import {
 import type { ForkProject } from "./forks.ts";
 import { upstreamToken } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
-import { PROVIDER_ID, boardOmpEnv } from "./login.ts";
+import { PROVIDER_ID } from "./login.ts";
 import { modelFallbacks } from "./models.ts";
 import {
 	OMP_REVIEW_INSTRUCTIONS,
@@ -62,12 +63,17 @@ const REASON_MAX = 500;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const PIN_RE = /^ARG OMP_VERSION=(\d+\.\d+\.\d+)[ \t]*\r?$/m;
-/** One model id of a catalog entry (`gpt-6.2-sol`, `glm-4.5`, `claude_opus_4`); strict: the
- * models output is untrusted. */
-const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-/** One stored `provider/model` pair; the provider part is omp's PROVIDER_ID (src/login.ts). */
-const PAIR_RE =
-	/^([a-z0-9][a-z0-9-]{0,63})\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/;
+/** One model id of a catalog entry; strict, because the models output is untrusted. Model
+ * ids can name a compatible-provider prefix (Baseten serves `openai/gpt-oss-120b`), so 1 to
+ * 3 non-empty segments join with `/`; each segment starts alphanumeric and continues with
+ * `.`, `_`, `:`, `-` or alphanumerics, at most 64 characters. */
+const SEGMENT = "[A-Za-z0-9][A-Za-z0-9._:-]{0,63}";
+const MODEL_ID_RE = new RegExp(`^${SEGMENT}(?:/${SEGMENT}){0,2}$`);
+/** One stored `provider/model` pair; the provider part is omp's PROVIDER_ID (src/login.ts),
+ * which holds no slash, so the first slash splits the pair. */
+export const PAIR_RE = new RegExp(
+	`^([a-z0-9][a-z0-9-]{0,63})/(${SEGMENT}(?:/${SEGMENT}){0,2})$`,
+);
 
 export type OmpVerdict = {
 	verdict: "pass" | "fail";
@@ -76,10 +82,18 @@ export type OmpVerdict = {
 	at: number;
 };
 
+/** One version's model set, read under one credential context: the sorted providers the
+ * board had an active sign-in for when omp listed the catalog. omp lists only the models
+ * its current credentials make available, so sets from different contexts never compare. */
+export type OmpModelSet = {
+	providers: string[];
+	pairs: string[];
+};
+
 export type OmpWatchState = {
 	verdicts: Record<string, OmpVerdict>;
-	/** Sorted unique `provider/model` ids per version; a version without an entry never fast-tracks. */
-	modelSets: Record<string, string[]>;
+	/** One snapshot per version; a version without an entry never fast-tracks. */
+	modelSets: Record<string, OmpModelSet>;
 	bumpCard: { id: string; version: string } | null;
 	lastError: { reason: string; at: number } | null;
 };
@@ -96,6 +110,40 @@ const isObj = (v: unknown): v is Record<string, unknown> =>
 
 const errText = (e: unknown): string =>
 	e instanceof Error ? e.message : String(e);
+
+/** The only inherited vars a candidate release sees in its probe: no identity, no
+ * credentials, no board configuration (no agent.db pointer, no GitHub token, no SSH
+ * agent). Proxy settings stay, so installs also work behind one. */
+const PROBE_ENV_KEYS = [
+	"PATH",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"TMPDIR",
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"NO_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"no_proxy",
+] as const;
+
+/** The shared cache for probe installs: immutable package files of exact versions, never
+ * execution state (that lives and dies in the probe's throwaway HOME). */
+const modelsCacheDir = (): string => join(tmpdir(), "ottr-omp-models-cache");
+
+/** The probe's env: the whitelist, a throwaway HOME, and the shared package cache. */
+function probeEnv(home: string): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = {
+		HOME: home,
+		BUN_INSTALL_CACHE_DIR: modelsCacheDir(),
+	};
+	for (const k of PROBE_ENV_KEYS) {
+		const v = process.env[k];
+		if (v !== undefined) env[k] = v;
+	}
+	return env;
+}
 
 /** The pinned omp version: the first `ARG OMP_VERSION=x.y.z` line, or null. */
 export function parsePin(dockerfile: string): string | null {
@@ -156,22 +204,31 @@ function parseLastError(raw: unknown): { reason: string; at: number } | null {
 }
 
 /** The stored model sets; entries that fail the shape checks are dropped (no fast track). */
-function parseModelSets(raw: unknown): Record<string, string[]> {
-	const out: Record<string, string[]> = {};
+function parseModelSets(raw: unknown): Record<string, OmpModelSet> {
+	const out: Record<string, OmpModelSet> = {};
 	if (!isObj(raw)) return out;
 	for (const [version, v] of Object.entries(raw)) {
-		if (!VERSION_RE.test(version)) continue;
-		if (!Array.isArray(v) || v.length > OMP_WATCH_GATES.modelsMaxEntries)
+		if (!VERSION_RE.test(version) || !isObj(v)) continue;
+		const { providers, pairs } = v;
+		if (
+			!Array.isArray(providers) ||
+			providers.length > 100 ||
+			!providers.every((p) => typeof p === "string" && PROVIDER_ID.test(p))
+		)
 			continue;
-		if (!v.every((p) => typeof p === "string" && PAIR_RE.test(p))) continue;
-		out[version] = [...v];
+		if (
+			!Array.isArray(pairs) ||
+			pairs.length > OMP_WATCH_GATES.modelsMaxEntries ||
+			!pairs.every((p) => typeof p === "string" && PAIR_RE.test(p))
+		)
+			continue;
+		out[version] = { providers: [...providers], pairs: [...pairs] };
 	}
 	return out;
 }
 
 /** The parsed model set of one run, or why the run is unusable. */
 export type ModelSetParse = { pairs: string[] } | { error: string };
-
 /**
  * The model set of one `omp models --json` run (OTTR-1287). The output is untrusted data:
  * one entry without a valid provider or model id rejects the whole run, and so does a run
@@ -223,6 +280,72 @@ export function parseOmpWatchState(raw: unknown): OmpWatchState {
 	out.bumpCard = parseBumpCard(raw.bumpCard);
 	out.lastError = parseLastError(raw.lastError);
 	return out;
+}
+
+/** omp lists only the models its current credentials make available, so a snapshot taken
+ * under a different sign-in set says nothing about now: drop it. The backfill re-reads it
+ * under the current context (OTTR-1287). */
+function dropStaleSnapshots(
+	state: OmpWatchState,
+	providers: readonly string[],
+): void {
+	for (const [version, set] of Object.entries(state.modelSets)) {
+		if (
+			set.providers.length !== providers.length ||
+			set.providers.some((p, i) => p !== providers[i])
+		)
+			delete state.modelSets[version];
+	}
+}
+
+/** Drops model sets below the pin: the comparison baseline moves with the pin. */
+function pruneModelSets(state: OmpWatchState, pin: string): void {
+	for (const version of Object.keys(state.modelSets))
+		if (compareVersions(version, pin) < 0) delete state.modelSets[version];
+}
+
+/** The filed bump card blocks its own version again; only a higher cleared target re-files. */
+function bumpCardBlocks(
+	state: OmpWatchState,
+	target: string,
+	cleared: ReadonlySet<string>,
+): boolean {
+	const card = state.bumpCard;
+	if (card === null) return false;
+	return !cleared.has(card.id) || compareVersions(target, card.version) <= 0;
+}
+
+/** The verdict records for every release through the target. */
+function coveredVersions(
+	releases: readonly OmpRelease[],
+	target: string,
+	verdicts: Record<string, OmpVerdict>,
+): { version: string; verdict: "pass" | "fail"; cardId: string | null }[] {
+	return releases.flatMap((r) => {
+		if (compareVersions(r.version, target) > 0) return [];
+		const v = verdicts[r.version];
+		if (v === undefined) return [];
+		return [{ version: r.version, verdict: v.verdict, cardId: v.cardId }];
+	});
+}
+
+/** The card ids whose task is gone or done: their holds and pointers lifted. */
+async function clearedCardIds(
+	store: ForkProject["store"],
+	state: OmpWatchState,
+): Promise<Set<string>> {
+	const cleared = new Set<string>();
+	const ids = new Set(
+		Object.values(state.verdicts).flatMap((v) =>
+			v.cardId === null ? [] : [v.cardId],
+		),
+	);
+	if (state.bumpCard !== null) ids.add(state.bumpCard.id);
+	for (const id of ids) {
+		const task = await store.getTask(id);
+		if (task === null || task.stage === "done") cleared.add(id);
+	}
+	return cleared;
 }
 
 /**
@@ -319,20 +442,24 @@ export function bumpTarget(
 ): string | null {
 	const ageMs = OMP_WATCH_GATES.ageDays * DAY_MS;
 	const capMs = OMP_WATCH_GATES.capDays * DAY_MS;
+	// A counted release is a candidate when it fast-tracks (a passed release that adds
+	// model access) or passes the age and settled-line rules; deprecated never counts.
+	const isCandidate = (r: OmpRelease, v: OmpVerdict): boolean => {
+		if (r.deprecated === true) return false;
+		if (v.verdict === "pass" && (addsSignedInModels?.(r.version) ?? false))
+			return true;
+		return (
+			now - r.publishedAt >= ageMs &&
+			releaseLineAccepts(releases, r.version, now, ageMs, capMs)
+		);
+	};
 	let target: string | null = null;
 	for (const r of releases) {
 		const v = verdicts[r.version];
 		if (v === undefined) break;
 		if (v.verdict === "fail" && (v.cardId === null || !cleared(v.cardId)))
 			break;
-		// A deprecated release never counts, so it is never the target, fast-tracked or not.
-		if (r.deprecated === true) continue;
-		const fastTrack =
-			v.verdict === "pass" && (addsSignedInModels?.(r.version) ?? false);
-		if (!fastTrack) {
-			if (now - r.publishedAt < ageMs) continue;
-			if (!releaseLineAccepts(releases, r.version, now, ageMs, capMs)) continue;
-		}
+		if (!isCandidate(r, v)) continue;
 		if (target === null || compareVersions(r.version, target) > 0)
 			target = r.version;
 	}
@@ -443,31 +570,37 @@ export function createOmpWatcher(deps: {
 
 	/**
 	 * One version's model set (OTTR-1287): `omp models --json` from an isolated install of
-	 * that exact version, with the review's spawn seam and env rules. Null (warned through
-	 * `warn`) when the run fails or the output is unusable: the version keeps the age gate.
-	 * A failed run is a warning, never a `lastError`: it cannot block or retry the review.
+	 * that exact version. The reviewed version is unapproved code, so it runs in its own
+	 * sandbox, not the review's env: a throwaway HOME doubles as the working directory, and
+	 * the env is a whitelist that carries no identity, credential or board configuration
+	 * (no agent.db, no OAuth state, no SSH agent, no GitHub token). Only the immutable
+	 * package cache is shared across runs. Null (warned through `warn`) when the run fails
+	 * or the output is unusable: the version keeps the age gate. A failed run is a warning,
+	 * never a `lastError`: it cannot block or retry the review.
 	 */
 	async function modelSet(
 		version: string,
 		warn: (reason: string) => void,
 	): Promise<string[] | null> {
 		let res: { code: number; stdout: string; stderr: string };
+		const home = mkdtempSync(join(tmpdir(), "ottr-omp-probe-"));
+		mkdirSync(modelsCacheDir(), { recursive: true });
 		try {
 			res = await doSpawn(
 				["bunx", `@oh-my-pi/pi-coding-agent@${version}`, "models", "--json"],
 				{
 					stdin: "",
-					env: boardOmpEnv({
-						...process.env,
-						GH_TOKEN: undefined,
-						GITHUB_TOKEN: undefined,
-					}),
+					cwd: home,
+					env: probeEnv(home),
 					timeoutMs: OMP_WATCH_GATES.modelsTimeoutMs,
 				},
 			);
 		} catch (e) {
 			warn(`omp ${version}: models list not run: ${errText(e)}`);
 			return null;
+		} finally {
+			// The probe's own scratch: its agent dir, its downloads. Nothing live lives here.
+			rmSync(home, { recursive: true, force: true, maxRetries: 5 });
 		}
 		if (res.code !== 0) {
 			warn(
@@ -483,6 +616,10 @@ export function createOmpWatcher(deps: {
 		return parsed.pairs;
 	}
 
+	/** The sorted active sign-in providers right now: the snapshot's credential context. */
+	const signedInProviders = (): string[] =>
+		[...new Set(deps.signIns?.() ?? [])].sort();
+
 	/** Runs and records the version's model set when the state has none (OTTR-1287). */
 	async function recordModelSet(
 		state: OmpWatchState,
@@ -491,7 +628,8 @@ export function createOmpWatcher(deps: {
 	): Promise<void> {
 		if (state.modelSets[version] !== undefined) return;
 		const pairs = await modelSet(version, warn);
-		if (pairs !== null) state.modelSets[version] = pairs;
+		if (pairs !== null)
+			state.modelSets[version] = { providers: signedInProviders(), pairs };
 	}
 
 	async function watchProject(project: ForkProject): Promise<void> {
@@ -548,8 +686,7 @@ export function createOmpWatcher(deps: {
 		filed += await fileBumpCard(project, state, releases, pin, fail, watching);
 
 		// Model sets below the pin are never compared again: the baseline moves with the pin.
-		for (const version of Object.keys(state.modelSets))
-			if (compareVersions(version, pin) < 0) delete state.modelSets[version];
+		pruneModelSets(state, pin);
 
 		const reason = failures.at(-1);
 		state.lastError = reason === undefined ? null : { reason, at: now() };
@@ -650,15 +787,23 @@ export function createOmpWatcher(deps: {
 	): Promise<number> {
 		const store = project.store;
 		let attemptedTarget: string | null = null;
+		// omp lists only the models its current credentials make available, so a snapshot
+		// taken under a different sign-in set says nothing about now: drop it and re-read
+		// under the current context (OTTR-1287; otherwise a sign-in added after the pin's
+		// snapshot would fast-track an identical catalog as new models).
+		const providers = signedInProviders();
+		dropStaleSnapshots(state, providers);
+		const signedIn = new Set(providers);
 		// The fast track compares against the live baseline (the pin's set) and only counts
-		// providers with an active sign-in (OTTR-1287).
-		const signedIn = new Set(deps.signIns?.() ?? []);
+		// providers with an active sign-in (OTTR-1287). Both snapshots carry the same
+		// context here: the sweep above dropped every set that does not.
 		const addedModels = (version: string): string[] => {
 			const live = state.modelSets[pin];
 			const set = state.modelSets[version];
 			if (live === undefined || set === undefined) return [];
-			return set.filter(
-				(p) => !live.includes(p) && signedIn.has(p.slice(0, p.indexOf("/"))),
+			return set.pairs.filter(
+				(p) =>
+					!live.pairs.includes(p) && signedIn.has(p.slice(0, p.indexOf("/"))),
 			);
 		};
 		// Reviews record the sets; this backfill covers a review that predates the feature
@@ -679,17 +824,7 @@ export function createOmpWatcher(deps: {
 		try {
 			const result = await store.transaction(async () => {
 				if (!(await watching())) return null;
-				const cleared = new Set<string>();
-				const ids = new Set(
-					Object.values(state.verdicts).flatMap((v) =>
-						v.cardId === null ? [] : [v.cardId],
-					),
-				);
-				if (state.bumpCard !== null) ids.add(state.bumpCard.id);
-				for (const id of ids) {
-					const task = await store.getTask(id);
-					if (task === null || task.stage === "done") cleared.add(id);
-				}
+				const cleared = await clearedCardIds(store, state);
 				const target = bumpTarget(
 					releases,
 					state.verdicts,
@@ -697,27 +832,15 @@ export function createOmpWatcher(deps: {
 					now(),
 					(version) => addedModels(version).length > 0,
 				);
-				if (
-					target === null ||
-					(state.bumpCard !== null &&
-						(!cleared.has(state.bumpCard.id) ||
-							compareVersions(target, state.bumpCard.version) <= 0))
-				)
+				if (target === null || bumpCardBlocks(state, target, cleared))
 					return null;
 				attemptedTarget = target;
-				// Every release through the target has a verdict.
-				const covers = releases.flatMap((r) => {
-					if (compareVersions(r.version, target) > 0) return [];
-					const v = state.verdicts[r.version];
-					if (v === undefined) return [];
-					return [{ version: r.version, verdict: v.verdict, cardId: v.cardId }];
-				});
 				const added = addedModels(target);
 				const card = await store.createTask(
 					ompBumpCardPrompt({
 						version: target,
 						pin,
-						covers,
+						covers: coveredVersions(releases, target, state.verdicts),
 						addedModels: added,
 					}),
 					null,

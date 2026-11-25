@@ -13,6 +13,7 @@ import {
 	OMP_WATCH_GATES,
 	type OmpRelease,
 	type OmpWatchState,
+	PAIR_RE,
 	parseModelSet,
 	parseOmpWatchState,
 	parsePackument,
@@ -122,6 +123,7 @@ function fakeModel() {
 	const modelsRequests: {
 		version: string;
 		env: Record<string, string | undefined>;
+		cwd: string | undefined;
 	}[] = [];
 	const requests: { model: string; system: string; user: string }[] = [];
 	const spawn: SpawnFn = async (argv, o) => {
@@ -132,7 +134,7 @@ function fakeModel() {
 			);
 			expect(m).not.toBeNull();
 			const version = m![1]!;
-			modelsRequests.push({ version, env: o.env });
+			modelsRequests.push({ version, env: o.env, cwd: o.cwd });
 			const code = modelsCodes.get(version);
 			if (code !== undefined)
 				return { code, stdout: "", stderr: "install failed" };
@@ -404,19 +406,30 @@ describe("parseOmpWatchState", () => {
 		const s = parseOmpWatchState({
 			verdicts: {},
 			modelSets: {
-				"1.0.0": ["zai/glm-5"],
-				"1.0.1": ["bad id with spaces"],
-				"1.0.2": "nope",
-				"1.0.3": ["zai/ok", 5],
-				"1.0.4": ["zai/glm-5", "anthropic/x"],
-				latest: ["zai/glm-5"],
+				"1.0.0": { providers: ["zai"], pairs: ["zai/glm-5"] },
+				"1.0.1": { providers: ["zai"], pairs: ["bad id with spaces"] },
+				"1.0.2": { providers: ["zai"], pairs: "nope" },
+				"1.0.3": { providers: ["zai"], pairs: ["zai/ok", 5] },
+				"1.0.4": { providers: "zai", pairs: ["zai/ok"] },
+				"1.0.5": { providers: ["zai", 5], pairs: ["zai/ok"] },
+				"1.0.6": { providers: [], pairs: [] },
+				"1.0.7": {
+					providers: [],
+					pairs: ["zai/glm-5", "baseten/openai/gpt-oss-120b"],
+				},
+				"1.0.8": ["zai/glm-5"],
+				latest: { providers: [], pairs: ["zai/glm-5"] },
 			},
 			bumpCard: null,
 			lastError: null,
 		});
 		expect(s.modelSets).toEqual({
-			"1.0.0": ["zai/glm-5"],
-			"1.0.4": ["zai/glm-5", "anthropic/x"],
+			"1.0.0": { providers: ["zai"], pairs: ["zai/glm-5"] },
+			"1.0.6": { providers: [], pairs: [] },
+			"1.0.7": {
+				providers: [],
+				pairs: ["zai/glm-5", "baseten/openai/gpt-oss-120b"],
+			},
 		});
 	});
 
@@ -450,11 +463,21 @@ describe("parseModelSet", () => {
 					{ provider: "anthropic", id: "claude-x" },
 					{ provider: "zai", id: "glm-6.2" },
 					{ provider: "zai", id: "glm-5" },
+					// A compatible-provider prefix is part of the id (Baseten); three
+					// segments stay inside the grammar.
+					{ provider: "baseten", id: "openai/gpt-oss-120b" },
+					{ provider: "zai", id: "org/team/model" },
 				]),
 				100,
 			),
 		).toEqual({
-			pairs: ["anthropic/claude-x", "zai/glm-5", "zai/glm-6.2"],
+			pairs: [
+				"anthropic/claude-x",
+				"baseten/openai/gpt-oss-120b",
+				"zai/glm-5",
+				"zai/glm-6.2",
+				"zai/org/team/model",
+			],
 		});
 		// An empty catalog is a valid set: the version adds nothing.
 		expect(parseModelSet(json([]), 100)).toEqual({ pairs: [] });
@@ -481,10 +504,17 @@ describe("parseModelSet", () => {
 			{ provider: "OpenAI Codex", id: "x" },
 			{ provider: "zai/codex", id: "x" },
 			{ provider: "-zai", id: "x" },
-			// A model id starts alphanumeric; dots, hyphens, colons and underscores continue it.
+			// A model id starts alphanumeric per segment; dots, hyphens, colons and
+			// underscores continue it; at most 3 segments.
 			{ provider: "zai", id: "-glm" },
 			{ provider: "zai", id: "glm 5" },
 			{ provider: "zai", id: "glm;drop" },
+			{ provider: "zai", id: "glm/" },
+			{ provider: "zai", id: "/glm" },
+			{ provider: "zai", id: "glm//x" },
+			{ provider: "zai", id: "a/b/c/d" },
+			{ provider: "zai", id: "x/y/-z" },
+			{ provider: "zai", id: `${"a".repeat(65)}` },
 		];
 		// Each bad entry sits behind i good entries, so the error names its own index.
 		const good = { provider: "zai", id: "glm-5" };
@@ -521,10 +551,7 @@ describe("parseModelSet", () => {
 			const r = parseModelSet(run.stdout.toString(), 1000);
 			if (!("pairs" in r)) throw new Error(`real output rejected: ${r.error}`);
 			expect(r.pairs.length).toBeGreaterThan(0);
-			for (const p of r.pairs)
-				expect(p).toMatch(
-					/^([a-z0-9][a-z0-9-]{0,63})\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/,
-				);
+			for (const p of r.pairs) expect(PAIR_RE.test(p)).toBe(true);
 		},
 		15000,
 	);
@@ -978,19 +1005,28 @@ describe("createOmpWatcher", () => {
 	test("a passed young release that adds a signed-in model files a P1 bump card at once", async () => {
 		const w = await setup();
 		w.release("18.16.0", 1 * DAY);
-		w.signedIn(["zai"]);
-		// The release adds zai/glm-6.2; zai/glm-5 the pin already has.
+		w.signedIn(["baseten", "zai"]);
+		// The release adds zai/glm-6.2 and the prefixed baseten id; zai/glm-5 the pin has.
 		w.model.modelsOut(
 			"18.16.0",
-			'{"models":[{"provider":"zai","id":"glm-6.2"},{"provider":"zai","id":"glm-5"}]}',
+			'{"models":[{"provider":"zai","id":"glm-6.2"},{"provider":"zai","id":"glm-5"},' +
+				'{"provider":"baseten","id":"openai/gpt-oss-120b"}]}',
 		);
 		w.model.modelsOut(PIN, '{"models":[{"provider":"zai","id":"glm-5"}]}');
-		// The models run gets the review's env rule: no GitHub token reaches it.
+		// The probe runs unapproved code: no live identity, credential or board config may
+		// reach it, and it works in a throwaway HOME, not the board's.
+		const realHome = process.env.HOME;
 		process.env.GH_TOKEN = "secret";
+		process.env.PI_CODING_AGENT_DIR = "/live/agent/dir";
+		process.env.SSH_AUTH_SOCK = "/live/ssh.sock";
 		try {
 			await w.watcher.tick();
 		} finally {
 			delete process.env.GH_TOKEN;
+			delete process.env.PI_CODING_AGENT_DIR;
+			delete process.env.SSH_AUTH_SOCK;
+			if (realHome === undefined) delete process.env.HOME;
+			else process.env.HOME = realHome;
 		}
 		const cards = await w.cards();
 		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
@@ -1000,12 +1036,29 @@ describe("createOmpWatcher", () => {
 			"release-age wait was skipped for model access",
 		);
 		expect(cards[0]!.prompt).toContain("zai/glm-6.2");
+		expect(cards[0]!.prompt).toContain("baseten/openai/gpt-oss-120b");
 		// glm-5 is not an added model: the pin already has it.
 		expect(cards[0]!.prompt).not.toContain("glm-5");
 		// One models run per version: the release at its review, the pin in the backfill.
 		expect(w.model.modelsAsked()).toEqual(["18.16.0", PIN]);
-		expect(w.model.modelsRequests[0]!.env.GH_TOKEN).toBeUndefined();
-		expect(w.model.modelsRequests[1]!.env.GH_TOKEN).toBeUndefined();
+		for (const r of w.model.modelsRequests) {
+			// Nothing live reaches the probe: no tokens, no agent dir pointer, no SSH agent.
+			for (const key of [
+				"GH_TOKEN",
+				"GITHUB_TOKEN",
+				"PI_CODING_AGENT_DIR",
+				"SSH_AUTH_SOCK",
+			])
+				expect(r.env[key]).toBeUndefined();
+			// The throwaway HOME doubles as the working directory; only the package cache
+			// is shared across runs.
+			expect(r.cwd).toMatch(/ottr-omp-probe-/);
+			expect(r.cwd).toBe(r.env.HOME);
+			expect(r.env.HOME).not.toBe(realHome);
+			expect(r.env.BUN_INSTALL_CACHE_DIR).toMatch(/ottr-omp-models-cache/);
+			// A PATH survives: the probe needs bunx.
+			expect(typeof r.env.PATH).toBe("string");
+		}
 		expect(w.scheduled()).toBe(1);
 
 		await w.watcher.tick();
@@ -1020,7 +1073,10 @@ describe("createOmpWatcher", () => {
 		await w.watcher.tick();
 		expect(await w.cards()).toEqual([]);
 		expect(w.scheduled()).toBe(0);
-		expect(w.state().modelSets).toEqual({ "18.16.0": [], [PIN]: [] });
+		expect(w.state().modelSets).toEqual({
+			"18.16.0": { providers: ["zai"], pairs: [] },
+			[PIN]: { providers: ["zai"], pairs: [] },
+		});
 
 		// Aged past the gate the normal path files a normal, unrated card.
 		w.advance(7 * DAY);
@@ -1113,7 +1169,60 @@ describe("createOmpWatcher", () => {
 		const cards = await w.cards();
 		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
 		expect(cards[0]!.priority).toBe("P1");
-		expect(w.state().modelSets["18.16.0"]).toEqual(["zai/glm-6.2"]);
+		expect(w.state().modelSets["18.16.0"]).toEqual({
+			providers: ["zai"],
+			pairs: ["zai/glm-6.2"],
+		});
+	});
+
+	test("a sign-in change drops stale snapshots: an identical catalog adds no models", async () => {
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		// No sign-ins yet: the pin's snapshot sees an empty catalog.
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.state().modelSets[PIN]).toEqual({ providers: [], pairs: [] });
+
+		// The user signs in to zai. The pin's snapshot predates the sign-in, so it is
+		// stale: the watcher re-reads it under the current context.
+		w.signedIn(["zai"]);
+		w.model.modelsOut(PIN, '{"models":[{"provider":"zai","id":"glm-6.2"}]}');
+		w.release("18.17.0", 1 * DAY);
+		// 18.17.0's catalog is identical to the re-read pin's: nothing is added.
+		w.model.modelsOut(
+			"18.17.0",
+			'{"models":[{"provider":"zai","id":"glm-6.2"}]}',
+		);
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.state().modelSets[PIN]).toEqual({
+			providers: ["zai"],
+			pairs: ["zai/glm-6.2"],
+		});
+		// The stale empty snapshots were re-read under the current context.
+		expect(w.model.modelsAsked()).toEqual([
+			"18.16.0",
+			PIN,
+			"18.17.0",
+			PIN,
+			"18.16.0",
+		]);
+		expect(w.state().modelSets["18.16.0"]).toEqual({
+			providers: ["zai"],
+			pairs: [],
+		});
+
+		// Under the same context a genuinely new model still fast-tracks.
+		w.model.modelsOut(
+			"18.18.0",
+			'{"models":[{"provider":"zai","id":"glm-6.3"}]}',
+		);
+		w.release("18.18.0", 1 * DAY);
+		await w.watcher.tick();
+		const cards = await w.cards();
+		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.18.0"]);
+		expect(cards[0]!.priority).toBe("P1");
+		expect(cards[0]!.prompt).toContain("zai/glm-6.3");
 	});
 
 	test("the release body cannot end its DATA block early", async () => {
