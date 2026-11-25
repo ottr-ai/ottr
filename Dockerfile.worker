@@ -33,11 +33,11 @@ ARG GITLEAKS_VERSION=8.30.1
 ARG GITLEAKS_SHA256_AMD64=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 ARG GITLEAKS_SHA256_ARM64=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
-# GitHub token (D6). Host runs 2.104.0. A wrong pin 404s the download (fails the build loudly).
-ARG GH_VERSION=2.105.0
+# GitHub token (D6). Host runs 2.103.3. A wrong pin 404s the download (fails the build loudly).
+ARG GH_VERSION=2.104.0
 # Release checksums.txt, one archive per target architecture.
-ARG GH_SHA256_AMD64=79e7ab5db738c48777b696e374f8b428f0647debfb424f44d2f426370407fe2f
-ARG GH_SHA256_ARM64=b1278c75107423d818f1937fd92cafc9e5e9b606631568f68d7fb816f5885a02
+ARG GH_SHA256_AMD64=98cb101ad87dbbd3f6b2f2bfcbd43197ccd07643140121d8a9cfaa91eadbc24e
+ARG GH_SHA256_ARM64=cb34cefc6f4e77b90731374a2b737516bb8f3033c6ca46aa949e5344f68069e3
 # Node.js: npx starts the agent layer's MCP servers (chrome-devtools), and projects run
 # their Node tooling with it (some need >= 24.21.0). Without it, `node` is bun's fallback and
 # npx is missing. A wrong pin 404s the download (fails the build loudly).
