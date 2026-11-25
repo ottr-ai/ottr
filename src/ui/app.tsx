@@ -3762,8 +3762,9 @@ export function ReleaseDialog({
 	const catalog = useModels();
 	const { model, setModel, modelQuery, setModelQuery, roleModel } =
 		useReviewModel(open, catalog);
-	// Mirrors src/releaseSummary.ts: the smol selector when that role is configured, else the default role.
-	const summaryRole = catalog?.roles?.smol !== undefined ? "smol" : "default";
+	// Mirrors src/releaseSummary.ts: the smol selector when that role carries a nonempty
+	// model (a whitespace-only value runs the default role), else the default role.
+	const summaryRole = catalog?.roles?.smol?.trim() ? "smol" : "default";
 	const send = useBusy();
 	const label = projectLabel(project);
 	const first = plan !== null && plan.from === null;

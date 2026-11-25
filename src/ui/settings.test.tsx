@@ -8215,4 +8215,21 @@ describe("ModelRolesSection role feature lines", () => {
 			await unmount();
 		}
 	});
+
+	test("a role named like an Object.prototype member renders the omp-only line", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			rolesFetch({ constructor: "zai/glm-5.3-flash" }, { constructor: [] }),
+		);
+		try {
+			const row = container.querySelector(
+				'.role-row[data-setting-key="constructor"]',
+			);
+			expect(row!.querySelector(".role-use")!.textContent).toBe(
+				"No board feature runs on this role; omp itself uses it.",
+			);
+		} finally {
+			await unmount();
+		}
+	});
 });
