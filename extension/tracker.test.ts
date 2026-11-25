@@ -1925,13 +1925,13 @@ describe("sync_gate tool", () => {
 		expect(fakePi().sync_gate).toBeUndefined();
 	});
 
-	test("present for work runs on agent-data cards, headless-safe, no parameters", () => {
+	test("present for work runs on agent-data cards, headless-safe, files-only parameter", () => {
 		setEnv(gateEnv);
 		const tool = fakePi().sync_gate;
 		expect(tool).toBeDefined();
 		expect(tool?.approval).toBe("read");
 		expect(tool?.loadMode).toBe("essential");
-		expect(Object.keys(tool?.parameters ?? {})).toEqual([]);
+		expect(Object.keys(tool?.parameters ?? {})).toEqual(["files"]);
 	});
 
 	test("missing run token refuses before any call", async () => {
@@ -1963,7 +1963,23 @@ describe("sync_gate tool", () => {
 		expect(headers["x-board-token"]).toBe("boot-token");
 		expect(headers["x-run-token"]).toBe("run-token");
 		expect(headers.origin).toBe("http://ottr:8080");
+		expect(String(seen!.init.body)).toBe("{}");
 		expect(JSON.parse(text(out))).toEqual(record);
+	});
+
+	test("requested files ride the body as strings", async () => {
+		setEnv(gateEnv);
+		let seen: { init: RequestInit } | null = null;
+		globalThis.fetch = (async (_url: string | URL, init: RequestInit) => {
+			seen = { init };
+			return new Response(JSON.stringify(record), { status: 200 });
+		}) as unknown as typeof fetch;
+		await fakePi().sync_gate!.execute("t1", {
+			files: ["projects/ottr/AGENTS.md", "guard.md"],
+		});
+		expect(JSON.parse(String(seen!.init.body))).toEqual({
+			files: ["projects/ottr/AGENTS.md", "guard.md"],
+		});
 	});
 
 	test("an error envelope surfaces the board's reason", async () => {

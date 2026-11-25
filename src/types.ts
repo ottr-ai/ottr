@@ -861,6 +861,10 @@ export interface SyncGateFileHash {
 export interface SyncGateRun {
 	/** Epoch milliseconds when the gate run started. */
 	at: number;
+	/** The commit sha the gate ran against: sync installs an immutable archive of
+	 *  HEAD, never the worktree's disk bytes. Absent on refusal records that
+	 *  never resolved a head and on records written before this field existed. */
+	head?: string;
 	/** The gate process's exit code; null when the gate never spawned (a guard or
 	 *  spawn refusal — the reason rides in `error`). */
 	code: number | null;

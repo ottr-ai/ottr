@@ -32,7 +32,10 @@ to the calling run's own card and project.
 
 - Extension tool `sync_gate` (extension/tracker.ts), registered only when
   the run is a work run (no `OTTR_REVIEW`/`OTTR_RETRO`/`OTTR_TRENDING`)
-  and `OTTR_PROJECT` is `agent-data`. No parameters. It POSTs
+  and `OTTR_PROJECT` is `agent-data`. One optional parameter, `files`:
+  data-repo-relative paths whose installed twins to hash in addition to
+  the branch's changed files (a rules-only card asks for the project
+  context file its acceptance names). It POSTs
   `x-board-token` and `x-run-token` to
   `/api/projects/<project>/sync-gate` and returns the stored record as
   JSON text, or the board's error line.
@@ -46,30 +49,43 @@ to the calling run's own card and project.
      id, the path dispatch already uses) must exist.
   5. Guards before the run: the alate project must be registered and hold
      `sync.mjs`; `git status --porcelain` in the worktree must be empty
-     (the operator runs the gate on committed state; a dirty tree refuses
-     with the status lines in the error).
-  6. File hashes: the card's changed files under `projects/` (the branch
-     diff against its base) map to their installed twins at the workspace
-     root (`projects/<p>/<rest>` to `<workspace>/<p>/<rest>`). Each
-     record carries path, the worktree source sha256, the installed
-     sha256, and `match`. A missing installed file records `match: false`.
-     The workspace root is the parent of the agent-data project's
-     registered checkout, so tests use temp roots and the deployment keeps
-     `/workspace` only as data.
-  7. The gate runs `node <alate checkout>/sync.mjs --data .` with cwd at
-     the worktree, env `ALATE_HOME=<alate checkout>`,
-     `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` pinned like the board's own
-     git, the server `PATH`, and the server `HOME`. 10 minute timeout;
-     stdout+stderr captured in one bounded output field with a
-     `truncated` flag.
-  8. The record `{at, code, output, truncated, files, durationMs, error?}`
+     (the evidence must describe a commit; a dirty tree refuses with the
+     status lines in the error). The status check alone does not pin the
+     bytes — a drilled bypass showed an assume-unchanged edit and an
+     ignored file leave `--porcelain` empty — so the install never reads
+     the worktree's disk (step 7).
+  6. File hashes: the branch's changed files (the diff from the fork
+     point to HEAD, full tree) filtered to the paths the agent-data
+     install contract maps, plus the caller-requested `files` paths.
+     Mappings: `projects/<p>/<rest>` to the installed twin
+     `<workspace>/<p>/<rest>`; `user/<rest>` below the gate child's home;
+     a root `<name>.md` rule to `<home>/.omp/agent/rules/<name>`. Sources
+     are read from the snapshot, never from the worktree; each record
+     carries path, source sha256, installed sha256, and `match`. The
+     workspace root is the parent of the agent-data project's registered
+     checkout and the home is the server's own `HOME`, so tests use temp
+     roots and the deployment keeps `/workspace` only as data. A `files`
+     path the contract maps nowhere refuses the request (HTTP 400) before
+     any record exists; the tool accepts at most 16.
+  7. The gate installs an immutable snapshot of HEAD: `git rev-parse HEAD`
+     pins the commit (recorded as `head`), `git archive <head>` piped into
+     `tar -x` fills a fresh root-owned 0700 temp dir the turn uid cannot
+     reach, and the gate runs `node <alate checkout>/sync.mjs --data .`
+     with cwd at that snapshot. The command is the documented one; the
+     data it reads is the archive, so worktree disk tricks cannot change
+     what sync installs. Env `ALATE_HOME=<alate checkout>`, the pinned
+     `HOME`, git config and proxy vars from the server, nothing else. 10
+     minute timeout; stdout+stderr captured in one bounded output field
+     with a `truncated` flag. The snapshot dir is removed after the run.
+  8. The record
+     `{at, head, code, output, truncated, files, durationMs, error?}`
      appends to the task's `syncGateLog` (new tracked store column, same
      parse/serialize and keep-last-20 cap as `workCheckLog`) and the
-     stored record is the response body. Gate-level refusals (the clean-tree
-     guard, a missing sync.mjs, a spawn failure) append an error record with
-     `code: null`, so every run attempt is tracked data; route-level
-     auth and eligibility refusals answer 403/400/404/409 before any record
-     exists.
+     stored record is the response body. Gate-level refusals (the
+     clean-tree guard, a missing sync.mjs, an unresolvable head, a spawn
+     failure) append an error record with `code: null`, so every run
+     attempt is tracked data; route-level auth and eligibility refusals
+     answer 403/400/404/409 before any record exists.
 - The gate never cleans up, repairs or resets anything. The only
   live-state writes are sync.mjs's own install — the same mutation the
   operator's run makes, now executed by the board. Every other step
@@ -77,19 +93,28 @@ to the calling run's own card and project.
 
 ## Isolation trade-off
 
-The board runs alate-repo code as the server uid with cwd inside a
-uid-writable worktree whose content (`--data .`) the turn shapes, and a
+The board runs alate-repo code as the server uid with the data it reads
+shaped by an agent-data branch (`--data .` at the HEAD snapshot), and a
 successful run installs that content into the live alate home and the
 project checkouts before merge review. Compared with today, the human
 checkpoint between the agent's ask and the install moves to the card flow
 itself: the user filed the card with the sync gate in its acceptance, and
-the record (code, output, per-file hashes with match flags) is tracked
-store data any later check or review reads. Mitigations: the script source
-is the alate project checkout, which the agent uid cannot write; the argv
-is fixed and carries no agent input; the clean-tree guard pins the synced
-content to the committed branch; the log cap bounds repeated runs. The R5-1
-residual the docs already record for board git (a worktree-reachable
-`.git/config`) applies unchanged.
+the record (head, code, output, per-file hashes with match flags) is
+tracked store data any later check or review reads. Mitigations: the
+script source is the alate project checkout, which the agent uid cannot
+write; the argv is fixed and carries no agent input; the install reads an
+immutable archive of HEAD, so worktree disk state — committed or planted
+— cannot change what sync installs; the log cap bounds repeated runs. The
+R5-1 residual the docs already record for board git (a
+worktree-reachable `.git/config`) applies unchanged, and the snapshot
+reads the same shared object store the board's own merge reads.
+
+A limit this repo cannot close: the real sync.mjs lives in the alate
+checkout, which this container cannot read, so the tests pin the
+documented agent-data contract (the `--data <dir>` command shape, the
+install roots above) with a contract-faithful fixture rather than the
+real script. The record's raw output is the honest evidence of what the
+deployed script actually did.
 
 ## Alternatives considered
 

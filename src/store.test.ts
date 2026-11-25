@@ -2356,8 +2356,9 @@ describe("sync gate log", () => {
 				},
 				{
 					at: 2000,
+					head: "e5f2c0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b",
 					code: 0,
-					output: "sync: installed ottr/AGENTS.md\nsync: done\n",
+					output: "sync: installed projects/ottr/AGENTS.md\nsync: done\n",
 					truncated: true,
 					files: [
 						{
@@ -2380,6 +2381,7 @@ describe("sync gate log", () => {
 		expect(log[0]?.code).toBe(null);
 		expect(log[0]?.error).toContain("worktree not committed");
 		expect(log[1]?.code).toBe(0);
+		expect(log[1]?.head).toBe("e5f2c0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b");
 		expect(log[1]?.truncated).toBe(true);
 		expect(log[1]?.files[0]?.match).toBe(false);
 		expect(log[1]?.files[0]?.installedSha256).toBe(null);

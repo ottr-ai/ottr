@@ -1,13 +1,16 @@
 // The agent-data sync gate (docs/specs/agent-data-sync-gate.md): the board runs
-// alate's sync.mjs in a card worktree with its own rights, because the turn uid
-// cannot read the alate checkout (OTTR-994). The record lands in the store before
-// the turn sees it, so a report cites tracked data it cannot forge.
+// alate's sync.mjs against an immutable archive of the card branch's HEAD with
+// its own rights, because the turn uid cannot read the alate checkout (OTTR-994)
+// and must not be able to steer the installed bytes from the worktree disk. The
+// record lands in the store before the turn sees it, so a report cites tracked
+// data it cannot forge.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
 import type { SyncGateFileHash, SyncGateRun } from "./types.ts";
 
 /** The only project whose cards may run the gate: the data repo the sync installs. */
@@ -22,19 +25,79 @@ export const GATE_OUTPUT_CAP = 8192;
 /** The task log keeps the newest runs only, like the work check log. */
 export const SYNC_GATE_LOG_CAP = 20;
 
+/** Cap on the caller-requested extra hash set (sandbox_run's collect cap). */
+export const SYNC_GATE_FILES_CAP = 16;
+
 /** The gate target the route composes from its own deps: no path or name is
  *  hardcoded, so tests point every member at temp fixtures. */
 export interface SyncGateTarget {
 	/** The calling run's own project (must be `agent-data`). */
 	project: string;
-	/** The card's absolute worktree path. */
+	/** The card's absolute worktree path (only the git object store is read). */
 	worktree: string;
 	/** The alate project checkout (holds sync.mjs). */
 	alateDir: string;
 	/** The workspace root: the parent of the project checkouts (installed twins). */
 	workspaceRoot: string;
-	/** The card branch's fork-point sha; null skips the changed-file hashes. */
+	/** The home the gate's child runs with: the base of the user-file and rules
+	 *  twins. In production this is the server's own HOME (the shared worker home). */
+	home: string;
+	/** The card branch's fork-point sha; null skips nothing — the changed set comes
+	 *  from the archive's commit, but the diff needs the fork point. */
 	base: string | null;
+	/** Caller-requested data-repo-relative paths to hash in addition to the branch's
+	 *  changed files (validated by syncGateFilesError before the run). */
+	extraFiles?: string[];
+}
+
+/** The installed twin of one data-repo file, per the documented agent-data
+ *  install contract (projects/<name>/<file> to the project checkout, user/<path>
+ *  below the home, and a root <name>.md rule into .omp/agent/rules). Null when
+ *  the data repo's contract maps the path nowhere — the gate then never hashes
+ *  it, because there is no installed location to compare against. */
+export function installedTwin(
+	path: string,
+	workspaceRoot: string,
+	home: string,
+): string | null {
+	if (path.startsWith("projects/")) {
+		const rest = path.slice("projects/".length);
+		if (rest === "") return null;
+		return join(workspaceRoot, rest);
+	}
+	if (path.startsWith("user/")) {
+		const rest = path.slice("user/".length);
+		if (rest === "") return null;
+		return join(home, rest);
+	}
+	// A root <name>.md file is a global rule: the data repo ships one .md file per
+	// rule name (agent-data AGENTS.md, "a global rule ... the root *.md file with
+	// the same name").
+	if (/^[^/]+\.md$/.test(path))
+		return join(home, ".omp", "agent", "rules", path);
+	return null;
+}
+
+/** Validates the caller-requested extra hash set: present, capped, plain relative
+ *  paths (no traversal, no absolute), each mapped by the install contract. Route
+ *  level: a bad entry refuses the request before any record exists. */
+export function syncGateFilesError(files: unknown): string | null {
+	if (files === undefined) return null;
+	if (!Array.isArray(files))
+		return "files must be a list of data-repo-relative paths";
+	if (files.length > SYNC_GATE_FILES_CAP)
+		return `files carries at most ${SYNC_GATE_FILES_CAP} paths`;
+	for (const entry of files) {
+		if (typeof entry !== "string" || entry.trim() === "")
+			return "every files entry must be a non-empty string";
+		const path = entry.trim();
+		if (isAbsolute(path) || path.split(/[/\\]/).includes(".."))
+			return `files entry must not traverse: ${path}`;
+		if (path.startsWith("projects/") || path.startsWith("user/")) continue;
+		if (!/^[^/]+\.md$/.test(path))
+			return `files entry maps to no installed location: ${path}`;
+	}
+	return null;
 }
 
 /** Appends one run to a task's log, keeping the newest SYNC_GATE_LOG_CAP records. */
@@ -55,13 +118,43 @@ export function sha256File(path: string): Promise<string | null> {
 		.catch(() => null);
 }
 
-/** One pinned-env git query in the worktree: stdout lines, or null when git fails
- *  (no repo, unknown ref). Null never fails the gate; hashes are auxiliary evidence. */
-function gitLines(worktree: string, args: string[]): Promise<string[] | null> {
-	const { promise, resolve } = Promise.withResolvers<string[] | null>();
+/** The env the gate and git children run with: an allowlist picked from the
+ *  server's own env. The server env carries credentials (ALATE_API_KEY), and the
+ *  gate's output lands in the store, so nothing else may ride along. HOME comes
+ *  from the target so the child's install target equals the twin base. Proxy
+ *  vars pass through: a sync.mjs that fetches must reach the board's egress. */
+function gateEnv(alateDir: string, home: string): NodeJS.ProcessEnv {
+	const passThrough = [
+		"GIT_CONFIG_GLOBAL",
+		"GIT_CONFIG_SYSTEM",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"NO_PROXY",
+	] as const;
+	const env: NodeJS.ProcessEnv = {
+		ALATE_HOME: alateDir,
+		HOME: home,
+		PATH: process.env.PATH ?? "",
+	};
+	for (const key of passThrough) {
+		const value = process.env[key];
+		if (value !== undefined) env[key] = value;
+	}
+	return env;
+}
+
+/** One pinned-env git query in the worktree: stdout, or null when git fails
+ *  (no repo, unknown ref). Null never fails the gate step that tolerates it. */
+function gitOut(
+	cwd: string,
+	args: string[],
+	alateDir: string,
+	home: string,
+): Promise<string | null> {
+	const { promise, resolve } = Promise.withResolvers<string | null>();
 	const child = spawn("git", args, {
-		cwd: worktree,
-		env: gateEnv(""),
+		cwd,
+		env: gateEnv(alateDir, home),
 		stdio: ["ignore", "pipe", "pipe"],
 	});
 	let out = "";
@@ -69,32 +162,8 @@ function gitLines(worktree: string, args: string[]): Promise<string[] | null> {
 		out += chunk.toString();
 	});
 	child.on("error", () => resolve(null));
-	child.on("close", (code) => resolve(code === 0 ? out.split("\n") : null));
+	child.on("close", (code) => resolve(code === 0 ? out : null));
 	return promise;
-}
-
-/** The env every gate and git child runs with: an allowlist picked from the
- *  server's own env. The server env carries credentials (ALATE_API_KEY), and the
- *  gate's output lands in the store, so nothing else may ride along. The git
- *  config pins pass through unchanged, so the gate's git runs see exactly what
- *  the board's own git runs see. Proxy vars pass through: a sync.mjs that fetches
- *  must reach the same egress the board uses. */
-function gateEnv(alateDir: string): NodeJS.ProcessEnv {
-	const passThrough = [
-		"PATH",
-		"HOME",
-		"GIT_CONFIG_GLOBAL",
-		"GIT_CONFIG_SYSTEM",
-		"HTTP_PROXY",
-		"HTTPS_PROXY",
-		"NO_PROXY",
-	] as const;
-	const env: NodeJS.ProcessEnv = { ALATE_HOME: alateDir };
-	for (const key of passThrough) {
-		const value = process.env[key];
-		if (value !== undefined) env[key] = value;
-	}
-	return env;
 }
 
 /** Guards that run before the gate spawns. `status` carries `git status --porcelain`
@@ -103,46 +172,98 @@ export type SyncGateGuard =
 	| { ok: true }
 	| { ok: false; error: string; status?: string };
 
-/** Checks the worktree is a clean git tree: the operator runs the gate on committed
- *  state, and a dirty tree would sync uncommitted content. */
+/** Checks the worktree is a clean git tree: the evidence must describe the commit
+ *  the run installs, and a dirty tree means the turn has not committed its work.
+ *  The bytes themselves never come from this tree — the run installs an archive
+ *  of HEAD — so index tricks (assume-unchanged edits, ignored files) cannot
+ *  smuggle content past this guard into the install. */
 export async function checkCleanWorktree(
 	worktree: string,
+	alateDir: string,
+	home: string,
 ): Promise<SyncGateGuard> {
-	const lines = await gitLines(worktree, ["status", "--porcelain"]);
-	if (lines === null) return { ok: false, error: "not a git worktree" };
-	const status = lines.filter((l) => l.trim() !== "").join("\n");
+	const out = await gitOut(worktree, ["status", "--porcelain"], alateDir, home);
+	if (out === null) return { ok: false, error: "not a git worktree" };
+	const status = out
+		.split("\n")
+		.filter((l) => l.trim() !== "")
+		.join("\n");
 	if (status !== "")
 		return { ok: false, error: "worktree not committed", status };
 	return { ok: true };
 }
 
-/** The card's changed files under `projects/`, from the branch diff against its
- *  fork point (three-dot: a rebased branch diffs against its new fork point). */
-async function changedProjectsFiles(target: SyncGateTarget): Promise<string[]> {
-	if (target.base === null) return [];
-	const lines = await gitLines(target.worktree, [
-		"diff",
-		"--name-only",
-		`${target.base}...HEAD`,
-		"--",
-		"projects/",
-	]);
-	if (lines === null) return [];
-	return lines
-		.filter((l) => l.startsWith("projects/") && l.trim() !== "")
-		.map((l) => l.trim());
+/** Extracts an immutable snapshot of one commit into a fresh root-owned 0700
+ *  temp dir: `git archive <sha>` piped into `tar -x`. The worktree's disk bytes
+ *  never reach the snapshot, so assume-unchanged edits and ignored files cannot
+ *  change what sync installs. The caller removes the dir. */
+async function extractSnapshot(
+	worktree: string,
+	head: string,
+	alateDir: string,
+	home: string,
+): Promise<string> {
+	const dir = await mkdtemp(join(tmpdir(), "ottr-syncgate-snap-"));
+	await new Promise<void>((resolve, reject) => {
+		const archive = spawn("git", ["archive", head], {
+			cwd: worktree,
+			env: gateEnv(alateDir, home),
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const tar = spawn("tar", ["-x", "-C", dir], {
+			stdio: ["pipe", "ignore", "pipe"],
+		});
+		let tarErr = "";
+		tar.stderr?.on("data", (chunk: Buffer) => {
+			tarErr += chunk.toString();
+		});
+		archive.stdout?.pipe(tar.stdin!);
+		let archiveCode: number | null = null;
+		let tarCode: number | null = null;
+		let failed = false;
+		const settle = (): void => {
+			if (failed) return;
+			if (archiveCode === null || tarCode === null) return;
+			if (archiveCode !== 0)
+				reject(new Error(`git archive exited ${archiveCode}`));
+			else if (tarCode !== 0)
+				reject(new Error(`tar exited ${tarCode}: ${tarErr.trim()}`));
+			else resolve();
+		};
+		archive.on("error", (err) => {
+			failed = true;
+			reject(err);
+		});
+		tar.on("error", (err) => {
+			failed = true;
+			reject(err);
+		});
+		archive.on("close", (code) => {
+			archiveCode = code;
+			settle();
+		});
+		tar.on("close", (code) => {
+			tarCode = code;
+			settle();
+		});
+	});
+	return dir;
 }
 
-/** sha256 comparison for each changed `projects/<p>/<rest>` file: the worktree
- *  source against its installed twin at the workspace root. */
-async function fileHashes(target: SyncGateTarget): Promise<SyncGateFileHash[]> {
-	const paths = await changedProjectsFiles(target);
+/** sha256 comparison for each requested data-repo path: the snapshot source
+ *  against its installed twin. A path the install contract maps nowhere yields
+ *  null twins and match false — the record shows why the evidence is missing. */
+async function fileHashes(
+	target: SyncGateTarget,
+	snapshot: string,
+	paths: readonly string[],
+): Promise<SyncGateFileHash[]> {
 	return Promise.all(
 		paths.map(async (path) => {
-			const rest = path.slice("projects/".length);
+			const twin = installedTwin(path, target.workspaceRoot, target.home);
 			const [sourceSha256, installedSha256] = await Promise.all([
-				sha256File(join(target.worktree, path)),
-				sha256File(join(target.workspaceRoot, rest)),
+				sha256File(join(snapshot, path)),
+				twin === null ? Promise.resolve(null) : sha256File(twin),
 			]);
 			return {
 				path,
@@ -220,8 +341,26 @@ function runChild(
 	return promise;
 }
 
-/** One gate step: guards, the sync.mjs run in the worktree, the per-file hashes,
- *  and the tracked record. Refusals record too, so every attempt is store data. */
+/** The branch's changed files: the diff from the fork point to HEAD, full tree —
+ *  the hash set filters by the install contract's mappings afterwards. */
+async function changedFiles(target: SyncGateTarget): Promise<string[]> {
+	if (target.base === null) return [];
+	const out = await gitOut(
+		target.worktree,
+		["diff", "--name-only", `${target.base}...HEAD`],
+		target.alateDir,
+		target.home,
+	);
+	if (out === null) return [];
+	return out
+		.split("\n")
+		.map((l) => l.trim())
+		.filter((l) => l !== "");
+}
+
+/** One gate step: guards, an immutable HEAD snapshot, the sync.mjs run inside it,
+ *  the per-file hashes against the installed twins, and the tracked record.
+ *  Refusals record too, so every attempt is store data. */
 export async function runSyncGate(
 	target: SyncGateTarget,
 ): Promise<SyncGateRun> {
@@ -250,7 +389,11 @@ export async function runSyncGate(
 			files: [],
 			error: `no sync.mjs at ${syncMjs}; register the alate project first`,
 		});
-	const clean = await checkCleanWorktree(target.worktree);
+	const clean = await checkCleanWorktree(
+		target.worktree,
+		target.alateDir,
+		target.home,
+	);
 	if (!clean.ok)
 		return record({
 			code: null,
@@ -259,19 +402,53 @@ export async function runSyncGate(
 			files: [],
 			error: clean.status ? `${clean.error}:\n${clean.status}` : clean.error,
 		});
-	const result = await runChild(
+	const headOut = await gitOut(
 		target.worktree,
-		["node", syncMjs, "--data", "."],
-		gateEnv(target.alateDir),
+		["rev-parse", "HEAD"],
+		target.alateDir,
+		target.home,
 	);
-	const files = await fileHashes(target);
-	return record({
-		code: result.code,
-		output: result.output,
-		truncated: result.truncated,
-		files,
-		...(result.spawnError !== undefined ? { error: result.spawnError } : {}),
-	});
+	const head = headOut?.trim().split("\n")[0]?.trim() ?? "";
+	if (!/^[0-9a-f]{40}$/.test(head))
+		return record({
+			code: null,
+			output: "",
+			truncated: false,
+			files: [],
+			error: "cannot resolve the branch head; no snapshot to install",
+		});
+	const snapshot = await extractSnapshot(
+		target.worktree,
+		head,
+		target.alateDir,
+		target.home,
+	);
+	try {
+		// The child runs `--data .` at the snapshot: the documented command, pointed
+		// at immutable archive bytes instead of the worktree's disk.
+		const result = await runChild(
+			snapshot,
+			["node", syncMjs, "--data", "."],
+			gateEnv(target.alateDir, target.home),
+		);
+		const paths = new Set<string>();
+		for (const path of await changedFiles(target)) {
+			if (installedTwin(path, target.workspaceRoot, target.home) !== null)
+				paths.add(path);
+		}
+		for (const path of target.extraFiles ?? []) paths.add(path.trim());
+		const files = await fileHashes(target, snapshot, [...paths]);
+		return record({
+			head,
+			code: result.code,
+			output: result.output,
+			truncated: result.truncated,
+			files,
+			...(result.spawnError !== undefined ? { error: result.spawnError } : {}),
+		});
+	} finally {
+		await rm(snapshot, { recursive: true, force: true }).catch(() => {});
+	}
 }
 
 /** Gate runs serialize per project: sync.mjs installs into live state, so two

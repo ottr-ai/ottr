@@ -387,6 +387,7 @@ import {
 	appendSyncGateRun,
 	runSyncGateQueued,
 	SYNC_GATE_PROJECT,
+	syncGateFilesError,
 	workspaceRootFor,
 } from "./syncGate.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
@@ -14418,6 +14419,17 @@ export async function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsSyncGateByProject(
 		req: BunRequest<"/api/projects/:project/sync-gate">,
 	): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const invalid = syncGateFilesError(
+			(r.body as { files?: unknown } | null)?.files,
+		);
+		if (invalid !== null) return json({ error: invalid }, 400);
+		const extraFiles = Array.isArray(r.body?.files)
+			? (r.body.files as unknown[]).filter(
+					(x): x is string => typeof x === "string",
+				)
+			: undefined;
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		const grant = deps.runTokens?.check(req.headers.get("x-run-token")) ?? null;
@@ -14451,7 +14463,11 @@ export async function createApp(deps: AppDeps) {
 			worktree: wt,
 			alateDir: alate.path,
 			workspaceRoot: workspaceRootFor(e.path),
+			// The child's install target must equal the twin base: the server's own
+			// home (compose: /root on the shared worker home volume).
+			home: process.env.HOME ?? "",
 			base: task.base,
+			...(extraFiles !== undefined ? { extraFiles } : {}),
 		});
 		// The record lands in the store before the turn sees it: tracked data the
 		// report can cite without the agent forging it. Re-read the current log so

@@ -14,7 +14,7 @@ import {
 	test,
 } from "bun:test";
 import { execSync } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import {
 	appendFileSync,
 	existsSync,
@@ -12558,6 +12558,8 @@ describe("sync-gate endpoint", () => {
 	});
 
 	let gateRoot = "";
+	let gateHome = "";
+	let realHome: string | undefined;
 	let agentStore: ProjectStore | null = null;
 	let alateStore: ProjectStore | null = null;
 	let prevAgent: Entry | undefined;
@@ -12567,7 +12569,11 @@ describe("sync-gate endpoint", () => {
 	 *  one projects/ file. Returns the base sha. */
 	const seedWorktree = (dir: string): string => {
 		mkdirSync(join(dir, "projects/ottr"), { recursive: true });
+		mkdirSync(join(dir, "user/.omp/agent"), { recursive: true });
 		writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "base agents\n");
+		writeFileSync(join(dir, "guard.md"), "base rule\n");
+		writeFileSync(join(dir, "user/.omp/agent/config.yml"), "base user\n");
+		writeFileSync(join(dir, ".gitignore"), "scratch-*\n");
 		execSync("git init -q -b main", {
 			cwd: dir,
 			stdio: "ignore",
@@ -12590,6 +12596,8 @@ describe("sync-gate endpoint", () => {
 			env: fixtureGitEnv(),
 		});
 		writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "card agents\n");
+		writeFileSync(join(dir, "guard.md"), "card rule\n");
+		writeFileSync(join(dir, "user/.omp/agent/config.yml"), "card user\n");
 		execSync("git add -A && git commit -qm card", {
 			cwd: dir,
 			stdio: "ignore",
@@ -12598,37 +12606,48 @@ describe("sync-gate endpoint", () => {
 		return base;
 	};
 
-	/** The fixture alate checkout, mirroring the real script's contract: it reads
-	 *  the data repo at cwd and installs every manifest-covered projects/ file at
-	 *  the projects root its ALATE_HOME config names. */
+	/** The fixture alate checkout, under the documented agent-data contract: it
+	 *  requires `--data <dir>` (and uses that value as the data root, never cwd),
+	 *  reads the projects root from its ALATE_HOME config, installs root *.md
+	 *  rules into the home's .omp/agent/rules, user/ files below the home, and
+	 *  projects/ files into the projects root, and echoes its argv. */
 	const seedAlate = (dir: string, projectsRoot: string): void => {
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(
 			join(dir, "sync.mjs"),
 			[
 				`import { readdirSync, readFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";`,
-				`import { join, dirname } from "node:path";`,
+				`import { join, dirname, relative } from "node:path";`,
+				`console.log("argv " + JSON.stringify(process.argv));`,
+				`const flag = process.argv.indexOf("--data");`,
+				`const data = flag === -1 ? null : process.argv[flag + 1];`,
+				`if (data === undefined || data === null) { console.error("sync: no --data path"); process.exit(2); }`,
 				`const alate = process.env.ALATE_HOME;`,
 				`if (alate === undefined) { console.error("sync: ALATE_HOME is unset"); process.exit(1); }`,
 				`const rootFile = join(alate, "projects-root.txt");`,
 				`if (!existsSync(rootFile)) { console.error("sync: no projects root config"); process.exit(2); }`,
+				`const home = process.env.HOME;`,
+				`if (home === undefined) { console.error("sync: HOME is unset"); process.exit(1); }`,
 				`const projectsRoot = readFileSync(rootFile, "utf8").trim();`,
-				`const data = process.cwd();`,
 				`const walk = (dir) => {`,
 				`  for (const e of readdirSync(dir, { withFileTypes: true })) {`,
 				`    const p = join(dir, e.name);`,
 				`    if (e.isDirectory()) walk(p);`,
-				`    else if (e.name.endsWith(".md")) {`,
-				`      const rel = p.slice(data.length + 1);`,
-				`      const rest = rel.slice("projects/".length);`,
-				`      const out = join(projectsRoot, rest);`,
-				`      mkdirSync(dirname(out), { recursive: true });`,
-				`      copyFileSync(p, out);`,
-				`      console.log("sync: installed " + rest);`,
+				`    else {`,
+				`      const rel = relative(data, p);`,
+				`      let out = null;`,
+				`      if (rel.startsWith("projects/")) out = join(projectsRoot, rel.slice("projects/".length));`,
+				`      else if (rel.startsWith("user/")) out = join(home, rel.slice("user/".length));`,
+				`      else if (/^[^/]+\\.md$/.test(rel)) out = join(home, ".omp", "agent", "rules", rel);`,
+				`      if (out !== null) {`,
+				`        mkdirSync(dirname(out), { recursive: true });`,
+				`        copyFileSync(p, out);`,
+				`        console.log("sync: installed " + rel);`,
+				`      }`,
 				`    }`,
 				`  }`,
 				`};`,
-				`walk(join(data, "projects"));`,
+				`walk(data);`,
 				`console.log("sync: done");`,
 				"",
 			].join("\n"),
@@ -12662,6 +12681,13 @@ describe("sync-gate endpoint", () => {
 
 	beforeAll(async () => {
 		gateRoot = mkdtempSync(join(tmpdir(), "ottr-syncgate-endpoint-"));
+		// The route passes the server's HOME as the gate child's install target and
+		// twin base; point it at a fixture home so the tests never write the real
+		// user's .omp tree, and restore it after.
+		gateHome = join(gateRoot, "home");
+		mkdirSync(gateHome, { recursive: true });
+		realHome = process.env.HOME;
+		process.env.HOME = gateHome;
 		const agentDir = join(gateRoot, "agent-data");
 		mkdirSync(agentDir, { recursive: true });
 		const alateDir = join(gateRoot, "alate");
@@ -12715,11 +12741,13 @@ describe("sync-gate endpoint", () => {
 		else projects.set("alate", prevAlate);
 		if (agentStore !== null) await closeTestStore(agentStore);
 		if (alateStore !== null) await closeTestStore(alateStore);
+		if (realHome === undefined) delete process.env.HOME;
+		else process.env.HOME = realHome;
 		rmSync(gateRoot, { recursive: true, force: true });
 	});
 
 	test("a work run asks for the gate and receives the real exit code and output", async () => {
-		const { id, runToken } = await seedCard();
+		const { id, runToken, worktree } = await seedCard();
 		const res = await post(
 			"/api/projects/agent-data/sync-gate",
 			{},
@@ -12728,15 +12756,69 @@ describe("sync-gate endpoint", () => {
 		expect(res.status).toBe(200);
 		const record = (await res.json()) as SyncGateRun;
 		expect(record.code).toBe(0);
-		expect(record.output).toContain("sync: installed ottr/AGENTS.md");
+		// The documented command contract, pinned through the fixture's argv echo.
+		const argvLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("argv "));
+		expect(argvLine).toBeDefined();
+		const argv = JSON.parse(argvLine!.slice("argv ".length)) as string[];
+		expect(argv.slice(-2)).toEqual(["--data", "."]);
+		// The record pins the commit the immutable archive installed.
+		expect(record.head).toBe(
+			execSync("git rev-parse HEAD", { cwd: worktree }).toString().trim(),
+		);
+		expect(record.output).toContain("sync: installed projects/ottr/AGENTS.md");
+		expect(record.output).toContain("sync: installed guard.md");
 		expect(record.output).toContain("sync: done");
-		expect(record.files.length).toBe(1);
-		expect(record.files[0]?.path).toBe("projects/ottr/AGENTS.md");
-		expect(record.files[0]?.match).toBe(true);
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(true);
+		expect(byPath.get("guard.md")?.match).toBe(true);
+		// The rule twin landed in the fixture home the route handed the gate.
+		expect(
+			readFileSync(join(gateHome, ".omp/agent/rules/guard.md"), "utf8"),
+		).toBe("card rule\n");
 		// The record is tracked store data: the response IS the stored record.
 		const task = await agentStore!.getTask(id);
 		expect(task?.syncGateLog.length).toBe(1);
 		expect(task?.syncGateLog[0]).toEqual(record);
+		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+	});
+
+	test("a requested extra file hashes its installed twin beyond the changed set", async () => {
+		const { id, runToken, worktree } = await seedCard();
+		// Back to main: the branch changes nothing, so the changed set is empty
+		// and only the requested extra can carry the acceptance hash.
+		execSync("git checkout -q main", { cwd: worktree });
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{ files: ["projects/ottr/AGENTS.md"] },
+			asRunHeaders(runToken),
+		);
+		expect(res.status).toBe(200);
+		const record = (await res.json()) as SyncGateRun;
+		expect(record.code).toBe(0);
+		expect(record.files.map((f) => f.path)).toEqual([
+			"projects/ottr/AGENTS.md",
+		]);
+		// Main's bytes, installed by the archive of HEAD.
+		expect(record.files[0]?.sourceSha256).toBe(
+			createHash("sha256").update("base agents\n").digest("hex"),
+		);
+		expect(record.files[0]?.match).toBe(true);
+		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+	});
+
+	test("a files entry that maps to no installed location refuses", async () => {
+		const { id, runToken } = await seedCard();
+		const res = await post(
+			"/api/projects/agent-data/sync-gate",
+			{ files: ["docs/readme.md"] },
+			asRunHeaders(runToken),
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toContain("maps to no installed location");
+		const task = await agentStore!.getTask(id);
+		expect(task?.syncGateLog.length).toBe(0);
 		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
 	});
 

@@ -21,6 +21,7 @@ import {
 	runSyncGate,
 	runSyncGateQueued,
 	SYNC_GATE_LOG_CAP,
+	syncGateFilesError,
 	workspaceRootFor,
 } from "./syncGate.ts";
 import { projectTurnUid } from "./turnUid.ts";
@@ -41,11 +42,19 @@ const sh = (cmd: string, cwd: string): void => {
 	execSync(cmd, { cwd, stdio: "ignore", env: fixtureGitEnv() });
 };
 
-/** A committed card worktree: main holds the base commit, the card branch changes
- *  one projects/ file and adds a second commit. Returns the base sha. */
+const shaOf = (content: string): string =>
+	createHash("sha256").update(content).digest("hex");
+
+/** A committed card worktree whose HEAD carries the three install roots the
+ *  agent-data contract maps: a projects/ context file, a root rule, a user file.
+ *  The card branch changes all three. Returns the base sha. */
 function seedWorktree(dir: string): string {
 	mkdirSync(join(dir, "projects/ottr"), { recursive: true });
+	mkdirSync(join(dir, "user/.omp/agent"), { recursive: true });
 	writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "base agents\n");
+	writeFileSync(join(dir, "guard.md"), "base rule\n");
+	writeFileSync(join(dir, "user/.omp/agent/config.yml"), "base user\n");
+	writeFileSync(join(dir, ".gitignore"), "scratch-*\n");
 	writeFileSync(join(dir, "README.md"), "readme\n");
 	sh("git init -q -b main", dir);
 	sh("git config user.email t@t && git config user.name t", dir);
@@ -53,14 +62,18 @@ function seedWorktree(dir: string): string {
 	const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
 	sh("git checkout -q -b ott/card", dir);
 	writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "card agents\n");
+	writeFileSync(join(dir, "guard.md"), "card rule\n");
+	writeFileSync(join(dir, "user/.omp/agent/config.yml"), "card user\n");
 	sh("git add -A && git commit -qm card", dir);
 	return base;
 }
 
-/** The fixture alate checkout: sync.mjs mirrors the real script's contract — it
- *  reads the data repo at cwd, reads the projects root from its ALATE_HOME config,
- *  and installs every manifest-covered projects/ file there. `skips` lists the
- *  data-repo-relative paths the install passes over (a stale twin stays behind). */
+/** The fixture alate checkout: sync.mjs under the documented agent-data contract.
+ *  It requires `--data <dir>` and uses that value as the data root (never cwd, so
+ *  a launcher that drops the flag fails every test), reads the projects root from
+ *  its ALATE_HOME config, installs root *.md rules into the home's
+ *  .omp/agent/rules, user/ files below the home, and projects/ files into the
+ *  projects root, and echoes its argv so tests can pin the spawned command. */
 function seedAlate(
 	dir: string,
 	projectsRoot: string,
@@ -71,30 +84,39 @@ function seedAlate(
 		join(dir, "sync.mjs"),
 		[
 			`import { readdirSync, readFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";`,
-			`import { join, dirname } from "node:path";`,
+			`import { join, dirname, relative } from "node:path";`,
 			`const skip = ${JSON.stringify(skips)};`,
+			`console.log("argv " + JSON.stringify(process.argv));`,
+			`const flag = process.argv.indexOf("--data");`,
+			`const data = flag === -1 ? null : process.argv[flag + 1];`,
+			`if (data === undefined || data === null) { console.error("sync: no --data path"); process.exit(2); }`,
 			`const alate = process.env.ALATE_HOME;`,
 			`if (alate === undefined) { console.error("sync: ALATE_HOME is unset"); process.exit(1); }`,
 			`const rootFile = join(alate, "projects-root.txt");`,
 			`if (!existsSync(rootFile)) { console.error("sync: no projects root config"); process.exit(2); }`,
+			`const home = process.env.HOME;`,
+			`if (home === undefined) { console.error("sync: HOME is unset"); process.exit(1); }`,
 			`const projectsRoot = readFileSync(rootFile, "utf8").trim();`,
-			`const data = process.cwd();`,
 			`const walk = (dir) => {`,
 			`  for (const e of readdirSync(dir, { withFileTypes: true })) {`,
 			`    const p = join(dir, e.name);`,
 			`    if (e.isDirectory()) walk(p);`,
-			`    else if (e.name.endsWith(".md")) {`,
-			`      const rel = p.slice(data.length + 1);`,
+			`    else {`,
+			`      const rel = relative(data, p);`,
 			`      if (skip.includes(rel)) { console.log("sync: skipped " + rel); continue; }`,
-			`      const rest = rel.slice("projects/".length);`,
-			`      const out = join(projectsRoot, rest);`,
-			`      mkdirSync(dirname(out), { recursive: true });`,
-			`      copyFileSync(p, out);`,
-			`      console.log("sync: installed " + rest);`,
+			`      let out = null;`,
+			`      if (rel.startsWith("projects/")) out = join(projectsRoot, rel.slice("projects/".length));`,
+			`      else if (rel.startsWith("user/")) out = join(home, rel.slice("user/".length));`,
+			`      else if (/^[^/]+\\.md$/.test(rel)) out = join(home, ".omp", "agent", "rules", rel);`,
+			`      if (out !== null) {`,
+			`        mkdirSync(dirname(out), { recursive: true });`,
+			`        copyFileSync(p, out);`,
+			`        console.log("sync: installed " + rel);`,
+			`      }`,
 			`    }`,
 			`  }`,
 			`};`,
-			`walk(join(data, "projects"));`,
+			`walk(data);`,
 			`console.log("sync: done");`,
 			"",
 		].join("\n"),
@@ -108,13 +130,17 @@ function targetFor(opts: {
 	base?: string | null;
 	project?: string;
 	alateDir?: string;
+	home?: string;
+	extraFiles?: string[];
 }): Parameters<typeof runSyncGate>[0] {
 	return {
 		project: opts.project ?? "agent-data",
 		worktree: opts.worktree ?? join(opts.root, "wt"),
 		alateDir: opts.alateDir ?? join(opts.root, "alate"),
 		workspaceRoot: workspaceRootFor(join(opts.root, "agent-data")),
+		home: opts.home ?? join(opts.root, "home"),
 		base: opts.base === undefined ? null : opts.base,
+		...(opts.extraFiles !== undefined ? { extraFiles: opts.extraFiles } : {}),
 	};
 }
 
@@ -141,7 +167,9 @@ describe("checkCleanWorktree", () => {
 	test("a committed tree passes", async () => {
 		const root = freshDir("clean");
 		seedWorktree(root);
-		expect(await checkCleanWorktree(root)).toEqual({ ok: true });
+		expect(
+			await checkCleanWorktree(root, join(root, "alate"), join(root, "home")),
+		).toEqual({ ok: true });
 	});
 
 	test("a dirty tree names the status lines", async () => {
@@ -149,7 +177,11 @@ describe("checkCleanWorktree", () => {
 		seedWorktree(root);
 		writeFileSync(join(root, "projects/ottr/AGENTS.md"), "uncommitted\n");
 		writeFileSync(join(root, "untracked.txt"), "x");
-		const guard = await checkCleanWorktree(root);
+		const guard = await checkCleanWorktree(
+			root,
+			join(root, "alate"),
+			join(root, "home"),
+		);
 		expect(guard.ok).toBe(false);
 		if (!guard.ok) expect(guard.status).toContain("AGENTS.md");
 	});
@@ -157,88 +189,177 @@ describe("checkCleanWorktree", () => {
 	test("a non-git dir refuses", async () => {
 		const root = freshDir("nogit");
 		mkdirSync(root, { recursive: true });
-		const guard = await checkCleanWorktree(root);
+		const guard = await checkCleanWorktree(
+			root,
+			join(root, "alate"),
+			join(root, "home"),
+		);
 		expect(guard).toEqual({ ok: false, error: "not a git worktree" });
 	});
 });
 
+describe("syncGateFilesError", () => {
+	test("accepts mapped paths and rejects traversal and unmapped names", () => {
+		expect(syncGateFilesError(undefined)).toBe(null);
+		expect(syncGateFilesError(["projects/ottr/AGENTS.md"])).toBe(null);
+		expect(syncGateFilesError(["user/.omp/agent/config.yml"])).toBe(null);
+		expect(syncGateFilesError(["guard.md"])).toBe(null);
+		expect(syncGateFilesError("nope")).toContain("must be a list");
+		expect(syncGateFilesError(["../evil"])).toContain("must not traverse");
+		expect(syncGateFilesError(["projects/../../x"])).toContain(
+			"must not traverse",
+		);
+		expect(syncGateFilesError(["/abs/path"])).toContain("must not traverse");
+		expect(syncGateFilesError(["docs/readme.md"])).toContain(
+			"maps to no installed location",
+		);
+		expect(
+			syncGateFilesError(Array.from({ length: 17 }, () => "guard.md")),
+		).toContain("at most 16");
+	});
+});
+
 describe("runSyncGate", () => {
-	test("a work run receives the real exit code and output of sync.mjs and the installed hash", async () => {
+	test("spawns the documented command against an immutable HEAD archive and records it", async () => {
 		const root = freshDir("happy");
 		const wt = join(root, "wt");
 		mkdirSync(wt, { recursive: true });
 		const base = seedWorktree(wt);
 		const alateDir = join(root, "alate");
-		const agentCheckout = join(root, "agent-data");
-		mkdirSync(agentCheckout, { recursive: true });
+		const home = join(root, "home");
+		mkdirSync(join(root, "agent-data"), { recursive: true });
 		seedAlate(alateDir, root);
-		// The twin the fixture sync installs: the worktree's committed content, so
-		// the hashes match like a real install.
 		const record = await runSyncGate(
-			targetFor({ root, worktree: wt, base, alateDir }),
+			targetFor({ root, worktree: wt, base, alateDir, home }),
+		);
+		// The command contract: `node <sync.mjs> --data .` exactly — the fixture
+		// echoes its argv, so a launcher that drops the flag fails here.
+		const argvLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("argv "));
+		expect(argvLine).toBeDefined();
+		const argv = JSON.parse(argvLine!.slice("argv ".length)) as string[];
+		expect(argv.slice(-2)).toEqual(["--data", "."]);
+		expect(argv[1]).toBe(join(alateDir, "sync.mjs"));
+		// The run pins the commit it installed.
+		expect(record.head).toBe(
+			execSync("git rev-parse HEAD", { cwd: wt }).toString().trim(),
 		);
 		expect(record.code).toBe(0);
 		expect(record.truncated).toBe(false);
-		expect(record.output).toContain("sync: installed ottr/AGENTS.md");
+		expect(record.output).toContain("sync: installed projects/ottr/AGENTS.md");
+		expect(record.output).toContain("sync: installed guard.md");
+		expect(record.output).toContain(
+			"sync: installed user/.omp/agent/config.yml",
+		);
 		expect(record.output).toContain("sync: done");
-		expect(record.files.length).toBe(1);
-		const hash = record.files[0]!;
-		expect(hash.path).toBe("projects/ottr/AGENTS.md");
-		expect(hash.match).toBe(true);
-		const sha = createHash("sha256").update("card agents\n").digest("hex");
-		expect(hash.sourceSha256).toBe(sha);
-		expect(hash.installedSha256).toBe(sha);
+		// All three install roots hashed against their twins, matching HEAD bytes.
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(true);
+		expect(byPath.get("guard.md")?.match).toBe(true);
+		expect(byPath.get("user/.omp/agent/config.yml")?.match).toBe(true);
+		// The installed twins carry the HEAD bytes at the contract locations.
+		expect(readFileSync(join(root, "ottr/AGENTS.md"), "utf8")).toBe(
+			"card agents\n",
+		);
+		expect(readFileSync(join(home, ".omp/agent/rules/guard.md"), "utf8")).toBe(
+			"card rule\n",
+		);
+		expect(readFileSync(join(home, ".omp/agent/config.yml"), "utf8")).toBe(
+			"card user\n",
+		);
 		expect(record.durationMs).toBeGreaterThanOrEqual(0);
-		// The installed twin really exists at the workspace root, not the checkout.
-		expect(existsSync(join(root, "ottr/AGENTS.md"))).toBe(true);
-		expect(existsSync(join(agentCheckout, "ottr/AGENTS.md"))).toBe(false);
+		// The install target is the workspace root, not the data checkout.
+		expect(existsSync(join(root, "agent-data/ottr/AGENTS.md"))).toBe(false);
 	});
 
-	test("a changed non-projects file hashes nothing", async () => {
-		const root = freshDir("noprefix");
+	test("an assume-unchanged edit and an ignored rule never reach the install", async () => {
+		const root = freshDir("bypass");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		const base = seedWorktree(wt);
+		void base;
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedAlate(alateDir, root);
+		// The drilled bypass: disk bytes that git status --porcelain cannot see.
+		writeFileSync(join(wt, "projects/ottr/AGENTS.md"), "PLANTED-BYTES\n");
+		sh("git update-index --assume-unchanged projects/ottr/AGENTS.md", wt);
+		writeFileSync(join(wt, "scratch-rule.md"), "IGNORED-BYTES\n");
+		// Precondition: the guard alone is blind to both.
+		const status = execSync("git status --porcelain", { cwd: wt }).toString();
+		expect(status).toBe("");
+		const record = await runSyncGate(
+			targetFor({ root, worktree: wt, base, alateDir, home }),
+		);
+		expect(record.code).toBe(0);
+		// The install carries the HEAD bytes, never the planted disk bytes.
+		expect(readFileSync(join(root, "ottr/AGENTS.md"), "utf8")).toBe(
+			"card agents\n",
+		);
+		expect(existsSync(join(home, ".omp/agent/rules/scratch-rule.md"))).toBe(
+			false,
+		);
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		expect(byPath.get("projects/ottr/AGENTS.md")?.sourceSha256).toBe(
+			shaOf("card agents\n"),
+		);
+		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(true);
+	});
+
+	test("a worktree with no branch changes hashes only the requested extras", async () => {
+		const root = freshDir("extras");
 		const wt = join(root, "wt");
 		mkdirSync(wt, { recursive: true });
 		seedWorktree(wt);
+		// Back on main: the branch changed nothing, so the changed set is empty.
 		sh("git checkout -q main", wt);
-		writeFileSync(join(wt, "README.md"), "changed outside projects\n");
-		sh("git add -A && git commit -qm outside", wt);
-		sh("git checkout -q ott/card", wt);
 		const alateDir = join(root, "alate");
+		const home = join(root, "home");
 		seedAlate(alateDir, root);
 		const record = await runSyncGate(
-			targetFor({ root, worktree: wt, base: null, alateDir }),
+			targetFor({
+				root,
+				worktree: wt,
+				base: null,
+				alateDir,
+				home,
+				extraFiles: ["guard.md"],
+			}),
 		);
 		expect(record.code).toBe(0);
-		expect(record.files).toEqual([]);
+		expect(record.files.map((f) => f.path)).toEqual(["guard.md"]);
+		// HEAD's rule bytes are what main carries.
+		expect(record.files[0]?.sourceSha256).toBe(shaOf("base rule\n"));
+		expect(record.files[0]?.match).toBe(true);
 	});
 
-	test("an installed twin that drifts from the worktree records match false", async () => {
+	test("an installed twin that drifts from the commit records match false", async () => {
 		const root = freshDir("drift");
 		const wt = join(root, "wt");
 		mkdirSync(wt, { recursive: true });
 		const base = seedWorktree(wt);
 		const alateDir = join(root, "alate");
+		const home = join(root, "home");
 		// The card's file is not manifest-covered: sync skips it and a stale twin
 		// stays behind — exactly the drift the hashes exist to catch.
 		seedAlate(alateDir, root, ["projects/ottr/AGENTS.md"]);
 		mkdirSync(join(root, "ottr"), { recursive: true });
 		writeFileSync(join(root, "ottr/AGENTS.md"), "stale install\n");
 		const record = await runSyncGate(
-			targetFor({ root, worktree: wt, base, alateDir }),
+			targetFor({ root, worktree: wt, base, alateDir, home }),
 		);
 		expect(record.code).toBe(0);
 		expect(record.output).toContain("sync: skipped projects/ottr/AGENTS.md");
-		expect(record.files[0]?.match).toBe(false);
-		expect(record.files[0]?.sourceSha256).toBe(
-			createHash("sha256").update("card agents\n").digest("hex"),
-		);
-		expect(record.files[0]?.installedSha256).toBe(
-			createHash("sha256").update("stale install\n").digest("hex"),
-		);
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		const projectsEntry = byPath.get("projects/ottr/AGENTS.md");
+		expect(projectsEntry?.match).toBe(false);
+		expect(projectsEntry?.sourceSha256).toBe(shaOf("card agents\n"));
+		expect(projectsEntry?.installedSha256).toBe(shaOf("stale install\n"));
 		// Once the install covers the file again, the same gate records match.
 		seedAlate(alateDir, root);
 		const second = await runSyncGate(
-			targetFor({ root, worktree: wt, base, alateDir }),
+			targetFor({ root, worktree: wt, base, alateDir, home }),
 		);
 		expect(second.files[0]?.match).toBe(true);
 	});
@@ -261,9 +382,10 @@ describe("runSyncGate", () => {
 		seedWorktree(wt);
 		writeFileSync(join(wt, "dirty.txt"), "x");
 		const alateDir = join(root, "alate");
+		const home = join(root, "home");
 		seedAlate(alateDir, root);
 		const record = await runSyncGate(
-			targetFor({ root, worktree: wt, alateDir }),
+			targetFor({ root, worktree: wt, alateDir, home }),
 		);
 		expect(record.code).toBe(null);
 		expect(record.error).toContain("worktree not committed");
@@ -285,6 +407,7 @@ describe("runSyncGate", () => {
 		mkdirSync(wt, { recursive: true });
 		seedWorktree(wt);
 		const alateDir = join(root, "alate");
+		const home = join(root, "home");
 		seedAlate(alateDir, root);
 		// The gate env pins PATH, so a PATH without node must fail the spawn into
 		// an error record instead of a fake pass.
@@ -292,7 +415,7 @@ describe("runSyncGate", () => {
 		process.env.PATH = "/nonexistent-bin";
 		try {
 			const record = await runSyncGate(
-				targetFor({ root, worktree: wt, alateDir }),
+				targetFor({ root, worktree: wt, alateDir, home }),
 			);
 			expect(record.code).toBe(null);
 			expect(record.error).toBeTruthy();
@@ -317,7 +440,7 @@ describe("runSyncGate", () => {
 			].join("\n"),
 		);
 		const record = await runSyncGate(
-			targetFor({ root, worktree: wt, alateDir }),
+			targetFor({ root, worktree: wt, alateDir, home: join(root, "home") }),
 		);
 		expect(record.code).toBe(0);
 		expect(record.truncated).toBe(true);
@@ -366,11 +489,11 @@ describe("runSyncGateQueued", () => {
 			throw new Error(`marker never reached ${text}`);
 		};
 		const first = runSyncGateQueued(
-			targetFor({ root, worktree: wt, alateDir }),
+			targetFor({ root, worktree: wt, alateDir, home: join(root, "home") }),
 		);
 		await until("start ");
 		const second = runSyncGateQueued(
-			targetFor({ root, worktree: wt, alateDir }),
+			targetFor({ root, worktree: wt, alateDir, home: join(root, "home") }),
 		);
 		const [r1, r2] = await Promise.all([first, second]);
 		expect(r1.code).toBe(0);
@@ -401,31 +524,40 @@ describe("agent-data uid cannot write the alate checkout", () => {
 		);
 	});
 
-	rootTest("a mode-700 alate-uid dir denies the agent-data uid", async () => {
-		const root = freshDir("uid");
-		const alateDir = join(root, "alate");
-		mkdirSync(alateDir, { recursive: true });
-		const alateIds = projectTurnUid("alate");
-		const agentIds = projectTurnUid("agent-data");
-		expect(agentIds.uid).not.toBe(alateIds.uid);
-		chownSync(alateDir, alateIds.uid, alateIds.gid);
-		chmodSync(alateDir, 0o700);
-		const script = `require("node:fs").writeFileSync(${JSON.stringify(join(alateDir, "x"))}, "x");`;
-		const runChild = (uid?: number, gid?: number): Promise<number> => {
-			const { promise, resolve } = Promise.withResolvers<number>();
-			const child = spawn(process.execPath, ["-e", script], {
-				...(uid !== undefined ? { uid, gid } : {}),
-				stdio: ["ignore", "ignore", "ignore"],
-			});
-			child.on("error", () => resolve(-1));
-			child.on("close", (code) => resolve(code ?? -1));
-			return promise;
-		};
-		// The agent-data uid cannot create the file: the gate gives a turn no
-		// rights on another project's checkout.
-		expect(await runChild(agentIds.uid, agentIds.gid)).not.toBe(0);
-		expect(existsSync(join(alateDir, "x"))).toBe(false);
-		// Positive control: the board's own uid (root here) writes the same dir.
-		expect(await runChild()).toBe(0);
-	});
+	rootTest(
+		"a traversable workspace keeps the mode-700 alate dir closed to the agent-data uid",
+		async () => {
+			const root = freshDir("uid");
+			// The workspace root mirrors the live layout: traversable, so the
+			// boundary under test is the alate dir's own permissions, never the
+			// parent's.
+			chmodSync(root, 0o755);
+			const alateDir = join(root, "alate");
+			mkdirSync(alateDir, { recursive: true });
+			const alateIds = projectTurnUid("alate");
+			const agentIds = projectTurnUid("agent-data");
+			expect(agentIds.uid).not.toBe(alateIds.uid);
+			chownSync(alateDir, alateIds.uid, alateIds.gid);
+			chmodSync(alateDir, 0o700);
+			const script = `require("node:fs").writeFileSync(${JSON.stringify(join(alateDir, "x"))}, "x");`;
+			const runChild = (uid?: number, gid?: number): Promise<number> => {
+				const { promise, resolve } = Promise.withResolvers<number>();
+				const child = spawn(process.execPath, ["-e", script], {
+					...(uid !== undefined ? { uid, gid } : {}),
+					stdio: ["ignore", "ignore", "ignore"],
+				});
+				child.on("error", () => resolve(-1));
+				child.on("close", (code) => resolve(code ?? -1));
+				return promise;
+			};
+			// The agent-data uid traverses the workspace but cannot create the file:
+			// the gate gives a turn no rights on another project's checkout.
+			expect(await runChild(agentIds.uid, agentIds.gid)).not.toBe(0);
+			expect(existsSync(join(alateDir, "x"))).toBe(false);
+			// Positive control under the alate uid: the same write succeeds for the
+			// dir's owner, so the denial is permission-shaped, not a broken fixture.
+			expect(await runChild(alateIds.uid, alateIds.gid)).toBe(0);
+			expect(existsSync(join(alateDir, "x"))).toBe(true);
+		},
+	);
 });

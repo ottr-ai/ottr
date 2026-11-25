@@ -67,6 +67,9 @@ interface SandboxRunParams {
 	cwd?: unknown;
 	collect?: unknown;
 }
+interface SyncGateParams {
+	files?: unknown;
+}
 interface Pi {
 	zod: ZodBuilder;
 	registerTool(def: Record<string, unknown>): void;
@@ -1251,18 +1254,28 @@ export default function (pi: Pi) {
 			name: "sync_gate",
 			label: "Sync gate",
 			description:
-				"Run this agent-data card's sync gate with the board's rights: the board executes `node <alate checkout>/sync.mjs --data .` in this card's worktree, which must be committed-clean, and records the run (exit code, output, sha256 of each installed projects/ file) on the card. " +
-				"No parameters. Commit your work first, then call it when the card's acceptance names the sync gate, and cite the returned record's code and file hashes in report_outcome — the board stores the record, so the citation is tracked data, not your text.",
-			parameters: z.object({}),
+				"Run this agent-data card's sync gate with the board's rights: the board installs an immutable archive of this card's committed HEAD and executes `node <alate checkout>/sync.mjs --data .` inside it, then records the run (the commit sha, exit code, output, and the sha256 of each installed file the agent-data contract maps: projects/<name>/<file> into the project checkout, user/<path> below the home, and a root <name>.md rule into the home's .omp/agent/rules) on the card. " +
+				"files: optional data-repo-relative paths whose installed twins to hash in addition to the branch's changed files (for example a project context file the card did not touch), at most 16. Commit your work first, then call it when the card's acceptance names the sync gate, and cite the returned record's code, head and file hashes in report_outcome — the board stores the record, so the citation is tracked data, not your text.",
+			parameters: z.object({
+				files: z
+					.array(z.string())
+					.optional()
+					.describe(
+						'Data-repo-relative paths to hash in addition to the branch\'s changed files, for example ["projects/ottr/AGENTS.md"]',
+					),
+			}),
 			loadMode: "essential",
 			approval: "read",
-			async execute() {
+			async execute(_toolCallId: string, params: SyncGateParams) {
 				const env = requireBoardEnv("sync_gate");
 				if ("error" in env) return textResult(env.error);
 				if (env.runToken === "")
 					return textResult(
 						"Error: sync_gate is unavailable — this session carries no OTTR_RUN_TOKEN.",
 					);
+				const files = Array.isArray(params.files)
+					? params.files.filter((x) => typeof x === "string" && x.trim() !== "")
+					: [];
 				let res: Response;
 				try {
 					res = await fetch(
@@ -1270,10 +1283,14 @@ export default function (pi: Pi) {
 						{
 							method: "POST",
 							headers: {
+								"content-type": "application/json",
 								origin: env.base,
 								...(env.token !== "" ? { "x-board-token": env.token } : {}),
 								"x-run-token": env.runToken,
 							},
+							body: JSON.stringify({
+								...(files.length > 0 ? { files } : {}),
+							}),
 						},
 					);
 				} catch (err) {

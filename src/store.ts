@@ -1023,6 +1023,7 @@ function parseSyncGateRun(r: unknown): SyncGateRun | null {
 		: [];
 	return {
 		at: e.at,
+		head: typeof e.head === "string" ? e.head : undefined,
 		code: typeof e.code === "number" ? e.code : null,
 		output: typeof e.output === "string" ? e.output : "",
 		truncated: e.truncated === true,
