@@ -650,6 +650,11 @@ interface AppDeps {
 	/** The local /tmp free-space probe (OTTR-754's local warning); defaults to the real
 	 * statfs probe of /tmp. Tests inject one, so warning assertions never read the host. */
 	tmpSpace?: () => TmpDiskSpace | null;
+	/** The memory backend's health probe (OTTR-763's warning); defaults to the real
+	 * checkMemoryHealth of the process env. Tests inject one, so exact warning
+	 * assertions never read the host's memory store. A null answer means no
+	 * health info: the state carries no memory warning. */
+	memoryProbe?: () => Promise<MemoryHealth | null>;
 	/** Test seam: awaited once at each state build's start; production never sets it.
 	 * Tests hold a build in flight across a guaranteed window (OTTR-866 send-back). */
 	stateBuildGate?: () => Promise<void>;
@@ -3525,7 +3530,11 @@ export async function createApp(deps: AppDeps) {
 	async function memoryHealthTick(boot = false): Promise<void> {
 		const prev = memoryHealth;
 		try {
-			memoryHealth = await checkMemoryHealth(memoryBackendFromEnv(process.env));
+			// A set seam answers instead of the real probe (tests); a null answer
+			// means "no health info": it must not fall through to the real probe.
+			memoryHealth = deps.memoryProbe
+				? await deps.memoryProbe()
+				: await checkMemoryHealth(memoryBackendFromEnv(process.env));
 			// A changed reason lights the bell's warning: publish now, not on the sweep.
 			// The boot load publishes nothing: the first state frame carries the fresh
 			// value, and no client is connected to hold a stale one.
@@ -6710,11 +6719,12 @@ export async function createApp(deps: AppDeps) {
 				...workerSignInWarnings(workerSignInReports, list, roles),
 				// OTTR-754: one bell warning per runner whose /tmp is below the free-space
 				// limit; recomputed per poll, so it disappears when space returns. The
-				// local probe is the injected seam (tests) or the real /tmp statfs.
-				...workerTmpWarnings(
-					workerSignInReports,
-					deps.tmpSpace?.() ?? tmpDiskSpace(),
-				),
+				// local probe is the injected seam (tests) or the real /tmp statfs. A set
+				// seam returning null means "no space known": null must not fall through
+				// to the real probe (OTTR-1295), so only an absent seam reads the host.
+				...(deps.tmpSpace
+					? workerTmpWarnings(workerSignInReports, deps.tmpSpace())
+					: workerTmpWarnings(workerSignInReports, tmpDiskSpace())),
 				// OTTR-763: the checkout guard's ambiguous-change notices; one per change,
 				// naming the commit and the running cards; bounded and expiring in the loop.
 				...(deps.checkoutNotices?.() ?? []),

@@ -529,6 +529,9 @@ const app = await createTestApp({
 	// The local /tmp probe is host state: stubbed, so exact warning assertions in the
 	// state payload never depend on the machine's free space (OTTR-754).
 	tmpSpace: () => null,
+	// The memory probe is host state too: stubbed, so exact warning assertions in
+	// the state payload never depend on the machine's memory store (OTTR-1295).
+	memoryProbe: () => Promise.resolve(null),
 	schedule: () => {
 		calls++;
 	},
@@ -27253,6 +27256,9 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 			// The local /tmp probe is host state: stubbed, so only the worker report's
 			// warning shows and exact warning assertions never read the machine (OTTR-754).
 			tmpSpace: () => null,
+			// Same for the memory store (OTTR-1295): a real unwritable store would add
+			// its warning to the exact assertion below.
+			memoryProbe: () => Promise.resolve(null),
 			shared: {
 				maxTotalRuns: 3,
 				reviewCheck: true,
