@@ -1,4 +1,4 @@
-// The shared base for the five mutation configs. The factory lives here and not in
+// The shared base for all fourteen mutation configs. The factory lives here and not in
 // stryker.config.mjs so a wrapper run evaluates exactly one factory call with its own cap:
 // every config file calls makeBaseConfig once, so every run logs exactly one concurrency
 // line, and the logged slot count is the count the run uses (OTTR-886 send-back).
@@ -14,7 +14,7 @@ import {
 } from "./stryker-load.mjs";
 
 // One mutation run at a time on a worker: every Stryker run imports this module, so the
-// host-global lock (/tmp/ott-stryker.lock) serializes all five Stryker runs here. A second run
+// host-global lock (/tmp/ott-stryker.lock) serializes all fourteen Stryker runs here. A second run
 // waits and logs; a lock from a killed run is taken over. Only a run takes the lock, never a
 // plain import: a tool that reads the configs to learn their mutate arrays
 // (scripts/mutation-delta.ts) must not hold the lock its own Stryker children then wait for
@@ -52,9 +52,10 @@ if (isStrykerRun()) {
 	});
 }
 
-// Mutation testing: `bun run test:mutation` runs stryker.config.mjs (bare `stryker run`
-// discovers it), then stryker.release.config.mjs, stryker.turn.config.mjs,
-// stryker.worktree.config.mjs and stryker.update-image.config.mjs.
+// Mutation testing: `bun run test:mutation` runs the ten area configs (store, supervisor,
+// workers, vm, git, ui, integrations, insights, ops, rest), then the four module configs
+// (release, turn, worktree, update-image). stryker.config.mjs keeps the full mutate set as
+// the reference universe and is no longer run by the script.
 // @hughescr/stryker-bun-runner runs bun test with per-test coverage: each mutant runs only the
 // tests that reach it, and unreached mutants are reported NoCoverage. The 2026-09-30 retry
 // blocker (a mangled Windows preload path) is gone: releases 1.5/1.6 fixed it and mutation runs
@@ -87,7 +88,7 @@ export function makeBaseConfig(cap) {
 		// only its covering tests up to the killer. The dry run never bails. worktree.test.ts and
 		// release.test.ts drive real git repos and stay isolated into their own configs, so only the
 		// matching module's mutants pay for them.
-		// Incremental, one cache file per config: the five configs share this base module, so the
+		// Incremental, one cache file per config: all fourteen configs share this base module, so the
 		// single default path would let one run reuse another config's verdicts (why incremental
 		// was off). With perTest coverage the cache tracks changed tests too (the command runner's
 		// R8-3 staleness is gone). Release reviews run --force so a release never reuses verdicts

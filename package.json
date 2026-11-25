@@ -7,11 +7,11 @@
     "dev": "bun src/dev.ts",
     "readme-screenshot": "bun scripts/readme-screenshot.ts",
     "update": "git fetch origin && git merge --ff-only origin/main && bun install --frozen-lockfile",
-    "check": "tsc --noEmit && biome check src scripts extension .agents/skills/check-ottr-board/scripts && bun scripts/boot-smoke.ts && bun scripts/licenses.ts && bun scripts/no-scratch-images.ts && bun scripts/check-markers.ts && bun scripts/eval-bridge-contract.ts && bun scripts/agent-data-sync.ts && bun scripts/check-release-lines.ts && bun scripts/ui-shot-reminder.ts",
+    "check": "tsc --noEmit && biome check src scripts extension .agents/skills/check-ottr-board/scripts && bun scripts/boot-smoke.ts && bun scripts/licenses.ts && bun scripts/no-scratch-images.ts && bun scripts/check-markers.ts && bun scripts/stryker-areas.ts && bun scripts/eval-bridge-contract.ts && bun scripts/agent-data-sync.ts && bun scripts/check-release-lines.ts && bun scripts/ui-shot-reminder.ts",
     "audit:quality": "jscpd src scripts extension --min-tokens 70 --reporters console --threshold 2.92 && knip",
     "test": "bun test",
     "test:e2e": "bun scripts/e2e-steer.js",
-    "test:mutation": "stryker run && stryker run stryker.release.config.mjs && stryker run stryker.turn.config.mjs && stryker run stryker.worktree.config.mjs && stryker run stryker.update-image.config.mjs",
+    "test:mutation": "stryker run stryker.store.config.mjs && stryker run stryker.supervisor.config.mjs && stryker run stryker.workers.config.mjs && stryker run stryker.vm.config.mjs && stryker run stryker.git.config.mjs && stryker run stryker.ui.config.mjs && stryker run stryker.integrations.config.mjs && stryker run stryker.insights.config.mjs && stryker run stryker.ops.config.mjs && stryker run stryker.rest.config.mjs && stryker run stryker.release.config.mjs && stryker run stryker.turn.config.mjs && stryker run stryker.worktree.config.mjs && stryker run stryker.update-image.config.mjs",
     "test:mutation:delta": "bun scripts/mutation-delta.ts"
   },
   "dependencies": {

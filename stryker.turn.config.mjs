@@ -18,7 +18,7 @@ export default {
   // runaway from OOMing the host; the runner's own temp dirs are removed when the run ends.
   bun: { ...base.bun, timeout: 300_000, testFiles: ["src/turn.test.ts"] },
   mutate: ["src/turn.ts"],
-  // Own cache file: all five configs share the base module (scripts/stryker-base.mjs).
+  // Own cache file: all fourteen configs share the base module (scripts/stryker-base.mjs).
   incrementalFile: "reports/stryker-incremental-turn.json",
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time: the store-heavy suite inflates
   // in the cold sandbox under parallel runners.

@@ -20,7 +20,7 @@ export default {
     bunArgs: ["--timeout=60000"],
   },
   mutate: ["src/worktree.ts"],
-  // Own cache file: all five configs share the base module (scripts/stryker-base.mjs).
+  // Own cache file: all fourteen configs share the base module (scripts/stryker-base.mjs).
   incrementalFile: "reports/stryker-incremental-worktree.json",
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time, sized for the slow machine
   // state: a git spawn's cost on Windows swings ~3x, and the git-heavy suite inflates with it.

@@ -17,7 +17,7 @@ export default {
   // when the run ends.
   bun: { ...base.bun, timeout: 600_000, testFiles: ["src/release.test.ts"] },
   mutate: ["src/release.ts"],
-  // Own cache file: all five configs share the base module (scripts/stryker-base.mjs).
+  // Own cache file: all fourteen configs share the base module (scripts/stryker-base.mjs).
   incrementalFile: "reports/stryker-incremental-release.json",
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time. The git-heavy suite inflates
   // under parallel runners, and a git spawn's cost on Windows swings ~3x with machine state

@@ -92,7 +92,7 @@ Review button and an auto-started review keep the full suite
 
 The gate spawns every Stryker run with `--force`
 (scripts/mutation-delta.ts): the configs run with incremental caches
-(`reports/stryker-incremental-<config>.json`, gitignored), but the differ
+(`reports/stryker-incremental-<config>.json`, tracked in git), but the differ
 cannot see changes outside the mutated and test files — fixtures, configs,
 dependencies, the Stryker version. A release must measure everything, so no
 verdict in a release review comes from a cache; only ordinary runs and the
