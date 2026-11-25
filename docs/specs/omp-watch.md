@@ -17,6 +17,8 @@ uses omp. Only the server moves the pin, and only to a release that passed the r
 - The server owns the bump. On a pass, it files a "Bump omp to X" card. The merge turn of
   that card pushes the bump. `.github/workflows/omp-bump.yml` no longer pushes.
 - The 7-day release age gate stays.
+- A release that adds model access files its bump card at once, at priority P1 (OTTR-1287;
+  the user approved this second exception to the 7-day rule on 2026-11-25).
 - A failed version blocks itself and every later version until its card is cleared. A card
   is cleared when its stage is `done` (finished or cancelled) or when the card no longer exists.
 
@@ -79,6 +81,53 @@ flight: a tick that starts while one runs joins it. For each project with `ompWa
   card clears the hold.
 - One card for each failed version. The card id is stored with the verdict.
 
+## Model sets and the model fast track (OTTR-1287)
+
+The 7-day release age gate is the general rule. The global dependency rule knows one
+exception: a security fix. The user approved a second exception on 2026-11-25 (OTTR-1287):
+a release that adds model access files its bump card at once, at priority P1. Motivation:
+omp 19.1.1 (2026-11-23) added gpt-6.2-sol and gpt-6.2-astra for openai-codex, and the age
+gate would have held the board's access to them until 2026-11-30. The operator filed the
+bump card by hand (OTTR-1286). A static search of the package text finds no model ids, so
+the model set comes from running omp itself.
+
+### The model set of one version
+
+- When a review ends with `pass`, the watcher runs that version's model list and stores
+  the set. The command is `bunx @oh-my-pi/pi-coding-agent@<version> models --json`: an
+  isolated install of that exact version. It runs through the same spawn seam, env rules
+  (`boardOmpEnv`, GitHub tokens removed) and sandbox as the review call.
+  `OMP_WATCH_GATES.modelsTimeoutMs` (180 s) bounds the run. A failed review never runs it:
+  a failed version can never be the target.
+- The output is untrusted data. `parseModelSet` accepts only a JSON object whose `models`
+  value is an array. Each entry needs a provider id that matches `PROVIDER_ID`
+  (`src/login.ts`) and a model id that matches `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`. One
+  bad entry rejects the whole run. So does a run with more than `modelsMaxEntries` (1000)
+  entries or `modelsMaxChars` (1 000 000) characters. The stored set is the sorted unique
+  `provider/model` ids.
+- A failed or rejected run stores nothing. The tick logs a warning. The version keeps
+  today's rule: it can still become the target through the age gate, never through the
+  fast track. The backfill below retries the run on a later tick.
+- The state holds `modelSets: Record<version, string[]>`. A malformed entry loads as
+  missing, and a missing set never fast-tracks. Sets below the pin are pruned at save
+  time: the comparison baseline moves with the pin.
+
+### The fast track
+
+- The baseline is the live version's set: the model set of the pin. The watcher records it
+  with the same command, once per pin. `backfillModelSets` fills the pin's set and the
+  sets of passed releases above the pin that lack one (a review that predates this change,
+  or a first run that failed). It runs at most `modelsPerTick` (5) model lists per tick.
+- In the bump target walk, a passed release is a candidate before the age rules when its
+  set adds at least one id for a provider that the board has an active sign-in for
+  (`signIns()` in `src/login.ts`; active rows only; an unreadable credential store counts
+  as no sign-ins). A deprecated release never fast-tracks. The walk's stop rule is
+  unchanged, and the settled-line rule applies to the normal path only.
+- The fast-tracked bump card gets priority `P1`. Its prompt names the added models (up to
+  40) and says that the release-age wait was skipped for model access.
+- No added model for a signed-in provider, or no usable model set: today's rule (7 days,
+  normal priority).
+
 ## Bump target
 
 Walk the reviewed versions above the pin in ascending order:
@@ -86,16 +135,21 @@ Walk the reviewed versions above the pin in ascending order:
 - Stop at the first version that has no verdict, or that failed and whose card is not cleared.
 - A version is a candidate when it passed (or failed with a cleared card) and it also
   satisfies the settled-line rule of docs/specs/release-line-gate.md; that rule holds the
-  7-day age gate and its 14-day cap.
+  7-day age gate and its 14-day cap. A passed version that fast-tracks (see the model fast
+  track section) is a candidate before the age rules: only the counted rule (stable, not
+  deprecated, still listed) still applies to it.
 - The target is the highest candidate before the stop.
 
 File the bump card when a target exists, no earlier bump card is still open (stage not `done`),
 and the target is higher than the version of the last bump card. A cancelled bump card is never
 filed again for the same version: only a higher target files a new one.
 
-Bump card: `createTask(prompt, null, "work")`, title `Bump omp to <version>`, topic `omp`, queued.
-Prompt (`ompBumpCardPrompt`): set `ARG OMP_VERSION=<version>` in `Dockerfile.worker`, change
-nothing else, commit `chore: bump omp to <version>`. It names the reviewed versions it covers.
+Bump card: `createTask(prompt, null, "work")`, title `Bump omp to <version>`, topic `omp`,
+queued. A fast-tracked card also gets priority `P1`; a normal card stays unrated. Prompt
+(`ompBumpCardPrompt`): set `ARG OMP_VERSION=<version>` in `Dockerfile.worker`, change
+nothing else, commit `chore: bump omp to <version>`. It names the reviewed versions it
+covers. A fast-tracked prompt names the added models (up to 40) and says that the
+release-age wait was skipped for model access.
 After a card is filed, the watcher calls `deps.schedule()`.
 
 ## State
@@ -105,13 +159,15 @@ Global store key `ompWatch:<project name>`:
 ```ts
 type OmpWatchState = {
   verdicts: Record<string, { verdict: "pass" | "fail"; reasons: string[]; cardId: string | null; at: number }>;
+  modelSets: Record<string, string[]>;
   bumpCard: { id: string; version: string } | null;
   lastError: { reason: string; at: number } | null;
 };
 ```
 
 A missing or malformed value loads as the empty state. A malformed verdict entry is dropped,
-so the version is reviewed again.
+so the version is reviewed again. A malformed model set entry is dropped, so the version has
+no fast track until a later tick records its set again.
 
 ## CI
 
@@ -139,6 +195,11 @@ bun (`bun install -g` then `omp --version`). It holds no deploy key and pushes n
 - No release notes: younger than one day, no verdict. Older, a fail with the "no release notes" reason.
 - At most 5 reviews in one tick.
 - A cancelled bump card for X files no new card for X. A higher target files one.
+- A passed release younger than 7 days that adds a model id for a signed-in provider files
+  one P1 bump card at once (OTTR-1287). A second tick files no second card.
+- A passed release whose model set adds nothing for a signed-in provider keeps the 7-day wait.
+- A models list with junk output, or with more entries than the cap, files no card and logs
+  a warning.
 - The release body cannot end its DATA block early (fence markers are removed).
 - `ompWatch` off: no fetch, no card.
 

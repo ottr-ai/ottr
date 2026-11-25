@@ -151,7 +151,8 @@ existing imports keep working.
   `releaseLineAccepts(releases, r.version, now, ageMs, capMs)`: acceptance is evaluated
   for each walked release against the full release list, so no release above the walk —
   settled or cap-lifted — can bless a walked release below it. No walked accepted
-  release, no target.
+  release, no target. One exception outside this rule: a passed release that adds model
+  access fast-tracks before the age rules (docs/specs/omp-watch.md, OTTR-1287).
 - `parsePackument` keeps `time` entries only for versions the packument still lists in its
   `versions` map (removed versions drop out) and carries `deprecated: typeof
   versions[v]?.deprecated === "string"` on each release. The `OmpRelease` type gains
