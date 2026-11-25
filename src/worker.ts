@@ -6,7 +6,7 @@ import {
 	sweepCacheRootsLog,
 } from "./cachesweep.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
-import { sweepTmpDirsLogged } from "./tmpsweep.ts";
+import { sweepTmpDirsLogged, touchRunMarkers } from "./tmpsweep.ts";
 import {
 	bootTurnIsolation,
 	ensureForkCapacity,
@@ -65,7 +65,10 @@ if (import.meta.main) {
 
 	// OTTR-754: the sweep passes the live turn starts so a running turn's /tmp
 	// scratch survives, and logs each removal line for the worker's own console.
+	// OTTR-1295: each pass also refreshes the live runs' liveness markers, so a
+	// sibling worker sharing the turn-homes volume keeps a live foreign scratch.
 	const sweep = (): void => {
+		touchRunMarkers(server.runScratches());
 		sweepTmpDirsLogged(tmpdir(), { liveTurnStarts: server.runStarts() });
 	};
 	sweep();
@@ -74,8 +77,11 @@ if (import.meta.main) {
 	// OTTR-1211: the daily cache sweep — TTL and cap per project's turn-home cache —
 	// plus the aged sweep of each project's per-card tmp dirs, so a scratch orphaned
 	// by a dead worker still goes. The hourly /tmp sweep above stays the safety net;
-	// the live run starts guard keeps a running turn's scratch in both.
+	// the live run starts guard keeps a running turn's scratch in both. OTTR-1295:
+	// the tick refreshes this daemon's live runs' markers first, so a sibling
+	// worker's tick over the same volume reads fresh markers and keeps the scratch.
 	const cacheSweep = (): void => {
+		touchRunMarkers(server.runScratches());
 		const starts = server.runStarts();
 		for (const tmp of projectSubDirs(turnHomesRoot(), "tmp"))
 			sweepTmpDirsLogged(tmp, { liveTurnStarts: starts });

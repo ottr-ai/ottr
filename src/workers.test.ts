@@ -14,7 +14,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
@@ -1195,6 +1195,13 @@ describe("serveWorker", () => {
 			expect(bunCache).toBe(join(homes, "alpha", "cache", "bun"));
 			// The run really used its scratch before the test ends it.
 			expect(existsSync(join(scratch!, "used"))).toBe(true);
+			// OTTR-1295: the daemon writes the liveness marker beside the scratch,
+			// daemon-owned, so a sibling worker sharing the volume keeps a live run.
+			const marker = `${scratch}.live`;
+			expect(existsSync(marker)).toBe(true);
+			expect(readFileSync(marker, "utf8")).toBe(`${basename(scratch!)}\n`);
+			if (typeof process.getuid === "function")
+				expect(statSync(marker).uid).toBe(process.getuid());
 			// The card's run ends here: the child dies, and the close handler removes
 			// the scratch. The child's close event lives inside the daemon, so the test
 			// has no promise to await — poll the observable condition like awaitBeatStall.
@@ -1206,8 +1213,13 @@ describe("serveWorker", () => {
 				// an aborted stream equally proves the child is gone
 			}
 			const deadline = Date.now() + 10_000;
-			while (existsSync(scratch!) && Date.now() < deadline) await Bun.sleep(20);
+			while (
+				(existsSync(scratch!) || existsSync(marker)) &&
+				Date.now() < deadline
+			)
+				await Bun.sleep(20);
 			expect(existsSync(scratch!)).toBe(false);
+			expect(existsSync(marker)).toBe(false);
 			// The scratch parent and the cache dirs stay: other cards of the project use them.
 			expect(existsSync(join(homes, "alpha", "tmp"))).toBe(true);
 			expect(existsSync(join(homes, "alpha", "cache", "bun"))).toBe(true);

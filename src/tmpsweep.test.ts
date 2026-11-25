@@ -1,20 +1,28 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
+	chmodSync,
+	chownSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
 	formatBytes,
+	runMarkerPath,
 	SWEEP_CLOCK_SKEW_MS,
 	sweepTmpDirs,
 	sweepTmpDirsLogged,
+	touchRunMarker,
+	touchRunMarkers,
 } from "./tmpsweep.ts";
 
 describe("sweepTmpDirs", () => {
@@ -233,6 +241,131 @@ describe("sweepTmpDirs", () => {
 		expect(formatBytes(1024 * 1024)).toBe("1 MiB");
 		expect(formatBytes(3 * 1024 * 1024 * 1024)).toBe("3 GiB");
 		expect(formatBytes(5 * 1024 * 1024 * 1024 * 1024)).toBe("5 TiB");
+	});
+
+	afterAll(() => {
+		for (const p of [root, procRoot])
+			rmSync(p, { recursive: true, force: true });
+	});
+});
+
+describe("scratch liveness markers (OTTR-1295)", () => {
+	const root = mkdtempSync(join(tmpdir(), "sweepmarker-"));
+	const procRoot = mkdtempSync(join(tmpdir(), "sweepmarkproc-"));
+	const old = Date.now() / 1000 - 25 * 60 * 60;
+	const hour = 60 * 60;
+
+	/** One aged scratch dir with an aged inner temp write; returns its path. */
+	const makeScratch = (name: string, innerAgeS: number = 25 * hour): string => {
+		const p = join(root, name);
+		mkdirSync(p);
+		writeFileSync(join(p, "used"), "x");
+		utimesSync(p, old, old);
+		const t = Date.now() / 1000 - innerAgeS;
+		utimesSync(join(p, "used"), t, t);
+		return p;
+	};
+
+	/** The scratch's liveness marker, fresh (1 min) unless aged on purpose. */
+	const makeMarker = (scratch: string, ageS: number = 60): string => {
+		const m = runMarkerPath(scratch);
+		writeFileSync(m, `${basename(scratch)}\n`);
+		const t = Date.now() / 1000 - ageS;
+		utimesSync(m, t, t);
+		return m;
+	};
+
+	test("a foreign worker's fresh marker keeps a quiet aged scratch; an unmarked scratch goes", () => {
+		const live = makeScratch("run-foreign-live");
+		const marker = makeMarker(live);
+		makeScratch("run-foreign-dead");
+		// Worker B's invocation over the shared volume: its own run starts are
+		// disjoint (none here) and its /proc holds nothing in the fixture.
+		const removed = sweepTmpDirs(root, { procRoot }).map((e) => e.name);
+		expect(removed).toContain("run-foreign-dead");
+		expect(removed).not.toContain("run-foreign-live");
+		expect(existsSync(live)).toBe(true);
+		expect(existsSync(join(root, "run-foreign-dead"))).toBe(false);
+		// The fresh marker itself survives like any fresh entry.
+		expect(existsSync(marker)).toBe(true);
+	});
+
+	test("the owning worker's tick refreshes the marker and keeps its own scratch", () => {
+		const live = makeScratch("run-own-live");
+		makeMarker(live, 2 * hour); // unrefreshed since the last tick
+		touchRunMarkers([live]); // the owner's pass runs first
+		const removed = sweepTmpDirs(root, { procRoot }).map((e) => e.name);
+		expect(removed).not.toContain("run-own-live");
+		expect(existsSync(live)).toBe(true);
+	});
+
+	test("a crashed worker's stale marker stops guarding and both go in one pass", () => {
+		const crashed = makeScratch("run-crashed");
+		makeMarker(crashed, 26 * hour); // the owner died before its last refresh
+		const removed = sweepTmpDirs(root, { procRoot }).map((e) => e.name);
+		expect(removed).toContain("run-crashed");
+		expect(removed).toContain("run-crashed.live");
+		expect(existsSync(crashed)).toBe(false);
+		expect(existsSync(runMarkerPath(crashed))).toBe(false);
+	});
+
+	test("a stale marker goes while a not-yet-quiet scratch waits for the next tick", () => {
+		const recent = makeScratch("run-recent", 60); // wrote temp a minute ago
+		makeMarker(recent, 26 * hour);
+		const removed = sweepTmpDirs(root, { procRoot }).map((e) => e.name);
+		expect(removed).toContain("run-recent.live");
+		expect(existsSync(runMarkerPath(recent))).toBe(false);
+		expect(existsSync(recent)).toBe(true);
+	});
+
+	test("touchRunMarker creates a daemon-owned marker naming its scratch", () => {
+		const scratch = makeScratch("run-touched");
+		touchRunMarker(scratch);
+		const m = runMarkerPath(scratch);
+		expect(existsSync(m)).toBe(true);
+		expect(readFileSync(m, "utf8")).toBe(`${basename(scratch)}\n`);
+		if (typeof process.getuid === "function")
+			expect(statSync(m).uid).toBe(process.getuid());
+	});
+
+	test("a turn uid cannot create, touch, or delete the marker", () => {
+		if (!(typeof process.getuid === "function" && process.getuid() === 0))
+			return;
+		// The real layout: root-owned 0711 scratch parent (prepareTurnCache makes
+		// it), daemon-owned marker, uid-owned scratch with a uid-owned temp file.
+		const turnUid = 12345;
+		chmodSync(root, 0o711);
+		const scratch = makeScratch("run-uid-proof");
+		chownSync(scratch, turnUid, turnUid);
+		touchRunMarker(scratch);
+		const m = runMarkerPath(scratch);
+		expect(statSync(m).uid).toBe(0);
+		// Run the three attempts as the turn uid; each reports pass/fail on stdout.
+		const probe = `(async () => {
+			const fs = require("node:fs");
+			const out = [];
+			const attempt = (name, fn) =>
+				out.push(name + ":" + (() => { try { fn(); return "ok"; } catch { return "denied"; } })());
+			attempt("delete-marker", () => fs.unlinkSync(${JSON.stringify(m)}));
+			attempt("create-marker", () =>
+				fs.writeFileSync(${JSON.stringify(join(root, "run-evil.live"))}, "x"));
+			attempt("touch-marker", () => fs.utimesSync(${JSON.stringify(m)}, new Date(), new Date()));
+			attempt("delete-own-temp", () => fs.unlinkSync(${JSON.stringify(join(scratch, "used"))}));
+			console.log(out.join(" "));
+		})()`;
+		const run = spawnSync(process.execPath, ["-e", probe], {
+			uid: turnUid,
+			gid: turnUid,
+			encoding: "utf8",
+			timeout: 30_000,
+		});
+		expect(run.status).toBe(0);
+		expect(run.stdout.trim().split(" ").sort()).toEqual([
+			"create-marker:denied",
+			"delete-marker:denied",
+			"delete-own-temp:ok",
+			"touch-marker:denied",
+		]);
 	});
 
 	afterAll(() => {

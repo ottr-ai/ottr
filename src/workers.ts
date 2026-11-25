@@ -58,7 +58,7 @@ import {
 } from "./staleTurn.ts";
 import { watchProgress } from "./stryker.ts";
 import { readCgroup } from "./systemStats.ts";
-import { tmpDiskSpace } from "./tmpsweep.ts";
+import { runMarkerPath, tmpDiskSpace, touchRunMarker } from "./tmpsweep.ts";
 import {
 	buildToolsPath,
 	installTools,
@@ -196,6 +196,10 @@ interface ActiveRun extends DetachedRun {
 	detached: boolean;
 	/** Ends the client stream without touching the child; the push helper guards closed. */
 	closeStream(): void;
+	/** The run's per-card scratch dir (OTTR-1295): the sweeps refresh this run's
+	 * liveness marker at it, so a sibling worker sharing the turn-homes volume
+	 * keeps the dir. */
+	scratch: string;
 }
 
 export interface DetachedRun {
@@ -297,7 +301,10 @@ export function serveWorker(opts: {
 	/** Only for tests: the signal call /stalefix kill uses instead of process.kill, so
 	 * a test can never signal a process it did not create (OTTR-1261). */
 	staleKill?: typeof process.kill;
-}): Bun.Server<never> & { runStarts(): number[] } {
+}): Bun.Server<never> & {
+	runStarts(): number[];
+	runScratches(): string[];
+} {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
 	// ends in " (deleted)" while the turn still has to push and report. Removed on close.
@@ -433,8 +440,9 @@ export function serveWorker(opts: {
 			pruneDetached();
 			return Response.json(
 				[...detached.values()].map(
-					// The internal detach flag and the stream closure stay off the wire.
-					({ closeStream: _c, detached: _d, ...entry }) => entry,
+					// The internal detach flag, the stream closure, and the run's scratch
+					// path (OTTR-1295, daemon-internal) stay off the wire.
+					({ closeStream: _c, detached: _d, scratch: _s, ...entry }) => entry,
 				),
 			);
 		}
@@ -738,6 +746,11 @@ export function serveWorker(opts: {
 		const scratch = mkdtempSync(
 			join(scratchParent, `run-${runIdSegment(body.id)}-`),
 		);
+		// OTTR-1295: the liveness marker rides beside the scratch in the daemon-owned
+		// parent (written before the scratch's chown, never chowned itself), so a
+		// sibling worker sharing the turn-homes volume sees a live run its own
+		// starts and /proc cannot. Best effort, like the scratch prep.
+		touchRunMarker(scratch);
 		env.TMPDIR = scratch;
 		env.OTTR_TMP_ROOT = tmpdir();
 		if (ids !== null) chownSync(scratch, ids.uid, ids.gid);
@@ -747,6 +760,11 @@ export function serveWorker(opts: {
 			} catch {
 				// A leftover process still holds an entry (a detached dev server's cwd):
 				// the next aged sweep takes the tree when its holds clear.
+			}
+			try {
+				rmSync(runMarkerPath(scratch), { force: true });
+			} catch {
+				// A stale marker expires under the sweep's age rule.
 			}
 		};
 		let child: ChildProcess;
@@ -787,6 +805,7 @@ export function serveWorker(opts: {
 			startedAt,
 			dataDir: body.env?.OTTR_DATA_DIR ?? null,
 			detached: false,
+			scratch,
 			closeStream: (): void => {},
 		};
 		active.set(entry.id, entry);
@@ -865,6 +884,12 @@ export function serveWorker(opts: {
 	const runStarts = (): number[] => [
 		...[...active.values(), ...detached.values()].map((e) => e.startedAt),
 	];
+	// OTTR-1295: the same entries' scratch paths — the sweeps refresh each run's
+	// liveness marker from them, so a sibling worker sharing the turn-homes
+	// volume keeps a live foreign scratch its own guards cannot see.
+	const runScratches = (): string[] => [
+		...[...active.values(), ...detached.values()].map((e) => e.scratch),
+	];
 	const server = Bun.serve({
 		port: opts.port ?? 8787,
 		hostname: "0.0.0.0",
@@ -872,7 +897,7 @@ export function serveWorker(opts: {
 		idleTimeout: 0,
 		fetch: (request) => route(request),
 	});
-	return Object.assign(server, { runStarts });
+	return Object.assign(server, { runStarts, runScratches });
 }
 
 /** The request's list fields; every one optional, a string when present. */

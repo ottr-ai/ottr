@@ -6,12 +6,63 @@ import {
 	rmSync,
 	type Stats,
 	statfsSync,
+	utimesSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 /** OTTR-754: 24 h. A top-level entry older than this goes, live holds aside. */
 const AGE_MS = 24 * 60 * 60 * 1000;
+
+/** OTTR-1295: the scratch liveness marker rides beside its scratch, one `.live`
+ * suffix on the scratch's basename. The daemon owns the marker; the sweep only
+ * reads its mtime. */
+const RUN_MARKER_SUFFIX = ".live";
+
+/** OTTR-1295: the marker path for a run's scratch — for example
+ * `<tmp>/run-<id>-<rand>.live` beside `<tmp>/run-<id>-<rand>`. */
+export function runMarkerPath(scratchPath: string): string {
+	return `${scratchPath}${RUN_MARKER_SUFFIX}`;
+}
+
+/** OTTR-1295: create or refresh a run's liveness marker (mtime = now). Best
+ * effort: a failed marker leaves the run with the pre-marker guards only, and
+ * never fails the run or the sweep tick. */
+export function touchRunMarker(scratchPath: string): void {
+	const path = runMarkerPath(scratchPath);
+	try {
+		const now = new Date();
+		utimesSync(path, now, now);
+		return;
+	} catch {
+		// absent — create below
+	}
+	try {
+		writeFileSync(path, `${basename(scratchPath)}\n`);
+	} catch {
+		// unwritable parent: the run keeps the pre-marker guards
+	}
+}
+
+/** OTTR-1295: create or refresh every listed run's marker; one failed marker
+ * never stops the others. The tick calls this for its own live runs' scratches
+ * before its sweep passes. */
+export function touchRunMarkers(scratches: readonly string[]): void {
+	for (const scratch of scratches) touchRunMarker(scratch);
+}
+
+/** OTTR-1295: true when a fresh (younger than the age TTL) marker guards the
+ * entry, so its owning run is live on some daemon sharing this root. A stale
+ * marker — its owner crashed or stopped refreshing — guards nothing and is
+ * left to the uniform age rule. */
+function freshRunMarker(entryPath: string, now: number): boolean {
+	try {
+		return now - lstatSync(runMarkerPath(entryPath)).mtimeMs < AGE_MS;
+	} catch {
+		return false;
+	}
+}
 
 /** OTTR-1211: how far a kernel-assigned inode timestamp may sit behind the sweep
  * process's Date.now(). The two clocks skew by a few ms in these containers
@@ -230,6 +281,10 @@ function sweepEntry(
 	// own just-created scratch (see the constant's comment).
 	if (starts.some((start) => start - SWEEP_CLOCK_SKEW_MS <= newest))
 		return null;
+	// OTTR-1295: a per-card scratch whose fresh liveness marker names it belongs
+	// to a run that is live on another daemon sharing this root (the shared
+	// turn-homes volume) — this container's starts and /proc cannot see it.
+	if (name.startsWith("run-") && freshRunMarker(entryPath, now)) return null;
 	if (held.some((h) => h === entryPath || h.startsWith(`${entryPath}/`)))
 		return null;
 	const bytes = sumFileBytes(entryPath);

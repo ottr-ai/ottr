@@ -368,6 +368,16 @@ omp. Two parts do the work:
    `/tmp` sweep stays as the safety net for scratch a run wrote outside its
    dirs.
 
+   OTTR-1295: the live-run guard of a sweep only sees its own container, and
+   compose workers share the turn-homes volume — so the daemon writes one
+   liveness marker `<scratch>.live` beside each run's scratch (in the
+   daemon-owned scratch parent; the turn uid cannot create, touch or delete
+   it), refreshes its own live runs' markers at every sweep pass, and removes
+   the marker with the scratch at close. A sweep skips a `run-*` scratch
+   whose marker is fresh, so worker B never deletes worker A's live scratch;
+   a marker whose owner died stops refreshing, expires after 24 h like any
+   entry, and its scratch follows within a day.
+
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule, with the old hold-first
    behavior and no idle phase: it holds new turns on the whole board, waits for

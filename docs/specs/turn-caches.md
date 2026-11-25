@@ -43,6 +43,52 @@ closes — a normal end and a cancel (kill) both pass through close — and the
 worker's daily tick sweeps per-card tmp dirs orphaned by a worker restart with
 the live-run-starts guard.
 
+## Scratch liveness markers (OTTR-1295)
+
+The keep-guards of the sweeps (live-run starts, `/proc` holds) are
+per-container. On the compose deployment several workers share the
+`turn-homes` volume and each runs the daily tick over every project's
+`tmp/`, so one worker can delete another worker's live run scratch whose
+temp files stayed quiet for 24h. The daemon therefore writes one liveness
+marker per run beside the scratch:
+
+- Path: `<scratch>.live` (for example
+  `<turnHomesRoot>/P/tmp/run-<sanitized id>-<random>.live`), a plain file in
+  the root-owned 0711 scratch parent. The daemon writes it right after the
+  scratch's `mkdtemp`, before the scratch's chown, and never chowns it: the
+  marker stays daemon-owned, and the turn uid has no write bit on the parent,
+  so it can neither create, touch, nor delete the marker.
+- Content: the scratch's basename, for forensics only. The mtime is the
+  signal, never the content.
+- Creation and deletion are best effort and never fail the run; a failed
+  marker leaves the run with exactly the pre-OTTR-1295 guards. The marker is
+  removed in the same close path that removes the scratch.
+
+Sweep rule (`sweepTmpDirs`, so every sweep pass on every root obeys it): a
+top-level entry named `run-*` whose sibling `<entry>.live` marker exists and
+whose marker mtime is younger than the 24h age is never removed. Markers are
+ordinary entries otherwise: a stale marker (older than 24h — its owner died
+or stopped refreshing) is removed by the uniform age rule, and with the
+marker gone its scratch loses the guard and goes at the same pass when its
+own quiet age has also passed 24h.
+
+Each daemon refreshes (`utimes`) the markers of its own live runs — active
+and detached, exposed next to `runStarts()` as `runScratches()` — at the
+start of every sweep tick, hourly on the worker and at boot. A live run's
+marker is therefore never more than roughly one hour old, and the 24h
+freshness window has ample slack against timer lag. A crashed worker's
+markers stop refreshing and expire within 24h, so its leftover scratches are
+swept at a later tick (bounded leak of at most about 48h after the last temp
+write); the refresh is per run and best effort.
+
+No OTTR-1179-style decision lock guards the marker: every daemon touches
+only markers of its own runs (from its own `runScratches()`), foreign daemons
+only read markers, each marker is one root-only path with no
+read-modify-write, and the worst overlap (one daemon's stale-marker prune
+racing the dead owner's refresh) recovers at the next tick. There is no
+shared claim to serialize, unlike the layer-copy pin where two servers must
+not copy or prune the same layer.
+
 ## Cache sweep
 
 A timer inside each worker and the server, at boot and every 24h, sweeps every
@@ -73,6 +119,13 @@ Constants are named; per-entry failures skip the entry for the next sweep.
 - Fixture tests prove TTL removal, cap eviction order, and that a live-held
   entry survives. A sweep test never signals or touches a process it did not
   create.
+- Two sweep invocations with disjoint run-start sets on one fixture tmp
+  parent prove the OTTR-1295 rule: an aged quiet scratch with a fresh marker
+  survives the foreign sweep; an unmarked aged scratch goes; a stale marker
+  stops guarding and is removed, and its scratch follows within the tick
+  bound. A run with a turn uid cannot create, touch, or delete its marker
+  (root-owned parent, 0711), and its marker stays daemon-owned after the
+  scratch chown.
 
 ## Non-goals
 
