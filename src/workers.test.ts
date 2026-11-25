@@ -2868,8 +2868,11 @@ describe("serveWorker turn identity", () => {
 
 			// OTTR-1210: the run's marker line. A foreign holder line (a live
 			// turn on the other worker) pre-exists; the run appends its own
-			// line at start and releases exactly it at child close.
+			// line at start and releases exactly it at child close. The layers
+			// dir does not exist yet (prepareTurnHome makes it inside the run),
+			// so the pre-write makes it first.
 			const markerA = join(homesRoot, "proj-a", "layers", "l1.inuse");
+			mkdirSync(join(homesRoot, "proj-a", "layers"), { recursive: true });
 			const foreignLine = "cafe0102 2026-11-22T00:00:00.000Z\n";
 			writeFileSync(markerA, foreignLine);
 			const resA = await post(url, {
