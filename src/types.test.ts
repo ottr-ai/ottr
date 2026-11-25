@@ -280,27 +280,43 @@ test("property: askQuestions never throws, keeps the text invariant and is idemp
 	);
 });
 
-test("askAnswerWithNote: a blank note adds nothing, a note rides behind the pick", () => {
+test("askAnswerWithNote: a blank note adds nothing, a note rides on its own line", () => {
 	expect(askAnswerWithNote("Postgres", "  ")).toBe("Postgres");
 	expect(askAnswerWithNote("Postgres", " use v17 ")).toBe(
-		"Postgres — note: use v17",
+		"Postgres\nNote: use v17",
 	);
 	expect(askAnswerParts("Postgres")).toEqual({ pick: "Postgres", note: "" });
+	// A pick that holds separator-like text stays whole (OTTR-1281 send-back 2).
+	expect(askAnswerParts("A — note: legacy")).toEqual({
+		pick: "A — note: legacy",
+		note: "",
+	});
+	expect(askAnswerParts(askAnswerWithNote("A\nNote: x", ""))).toEqual({
+		pick: "A\nNote: x",
+		note: "",
+	});
 });
 
 // Gate: 150 runs, fixed seed. fast-check prints the seed and path on failure.
-test("property: askAnswerParts splits askAnswerWithNote back into its pick and trimmed note", () => {
-	const pick = fc.string().filter((s) => !s.includes(" — note: "));
+test("property: askAnswerParts splits askAnswerWithNote back into any pick and its folded note", () => {
+	const text = fc.oneof(
+		fc.string(),
+		fc.constantFrom("\nNote: ", "x\nNote: y", " — note: ", "\n"),
+	);
 	fc.assert(
-		fc.property(pick, fc.string(), (p, n) => {
+		fc.property(text, text, (p, n) => {
 			const { pick: back, note } = askAnswerParts(askAnswerWithNote(p, n));
 			expect(back).toBe(p);
-			expect(note).toBe(n.trim());
+			expect(note).toBe(n.replace(/\n/g, " ").trim());
 		}),
 		{
 			seed: 20261125,
 			numRuns: 150,
-			examples: [["A", "x — note: y"]],
+			examples: [
+				["A", "x\nNote: y"],
+				["A\nNote: x", ""],
+				["A — note: legacy", "z"],
+			],
 		},
 	);
 });

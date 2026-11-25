@@ -138,19 +138,25 @@ export function askAnswerLine(question: string, answer: string): string {
 }
 
 /** The separator between an ask answer's pick and the optional note the drawer's note
- * field adds (OTTR-1281). */
-const ASK_NOTE_SEP = " — note: ";
+ * field adds (OTTR-1281). The note never holds a newline (askAnswerWithNote folds them),
+ * so the last separator is always the note's own: no pick text (an option label, an
+ * Other answer) can be split by mistake. */
+const ASK_NOTE_SEP = "\nNote: ";
 
-/** An ask answer with the user's optional note behind the pick; a blank note adds nothing. */
+/** An ask answer with the user's optional note on its own line behind the pick. A blank
+ * note adds nothing, unless the pick itself holds the separator text: then an empty note
+ * line keeps askAnswerParts from splitting the pick. */
 export function askAnswerWithNote(answer: string, note: string): string {
-	const n = note.trim();
-	return n === "" ? answer : `${answer}${ASK_NOTE_SEP}${n}`;
+	const n = note.replace(/\n/g, " ").trim();
+	return n === "" && !answer.includes(ASK_NOTE_SEP)
+		? answer
+		: `${answer}${ASK_NOTE_SEP}${n}`;
 }
 
-/** Splits an ask answer into its pick and its note (empty when it carries none); the first
- * separator splits, so a note may itself contain the separator text. */
+/** Splits an ask answer into its pick and its note (empty when it carries none): the
+ * inverse of askAnswerWithNote. */
 export function askAnswerParts(answer: string): { pick: string; note: string } {
-	const at = answer.indexOf(ASK_NOTE_SEP);
+	const at = answer.lastIndexOf(ASK_NOTE_SEP);
 	return at === -1
 		? { pick: answer, note: "" }
 		: {

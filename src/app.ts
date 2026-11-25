@@ -13174,26 +13174,46 @@ export async function createApp(deps: AppDeps) {
 			hasImages
 		)
 			return null;
-		if (trimmed === WORK_CHECK_ASK_MERGE) {
+		// A click may carry the drawer's note (OTTR-1281): the pick picks the action,
+		// and the note goes with it instead of turning the click into a plain reply.
+		const { pick, note } = askAnswerParts(trimmed);
+		if (pick === WORK_CHECK_ASK_MERGE) {
 			await updateSnapshot(
 				e,
 				task,
-				mergeAnywayPatch(task, "Merge anyway, chosen in the work-check ask"),
+				mergeAnywayPatch(
+					task,
+					`Merge anyway, chosen in the work-check ask${note === "" ? "" : `. The user's note: ${note}`}`,
+				),
 			);
 			await deps.schedule();
 			return await taskResponse(e, task.id);
 		}
-		if (capPark && trimmed === WORK_CHECK_ASK_SEND_BACK)
-			return await applyWorkCheckSendBack(e, task, open);
+		if (capPark && pick === WORK_CHECK_ASK_SEND_BACK)
+			return await applyWorkCheckSendBack(
+				e,
+				task,
+				open,
+				note === "" ? null : note,
+			);
 		if (divergePark) {
-			if (trimmed === WORK_CHECK_ASK_CANCEL) {
+			if (pick === WORK_CHECK_ASK_CANCEL) {
 				const out = await deps.cancel(e, task.id, false);
 				if ("error" in out) return json({ error: out.error }, out.status);
 				if ("kept" in out) return json({ ok: false, kept: out.kept });
+				if (note !== "")
+					await e.store.updateTask(task.id, {
+						needsReason: `Cancelled in the work-check ask. The user's note: ${note}`,
+					});
 				return await taskResponse(e, task.id);
 			}
+			// A note on the new-approach pick is the user's new direction.
 			const direction =
-				trimmed === WORK_CHECK_ASK_NEW_APPROACH ? null : trimmed;
+				pick === WORK_CHECK_ASK_NEW_APPROACH
+					? note === ""
+						? null
+						: note
+					: trimmed;
 			return await applyWorkCheckSendBack(e, task, open, direction);
 		}
 		return null;
@@ -13294,14 +13314,21 @@ export async function createApp(deps: AppDeps) {
 		hasImages: boolean,
 	): Promise<Response | null> {
 		const gate = task.gate;
-		if (gate?.parked !== true || !isStartAnywayReply(trimmed) || hasImages)
+		// The click may carry the drawer's note (OTTR-1281): the note queues as the
+		// user's reply, and the approval covers it, so the gate does not re-run on it.
+		const { pick, note } = askAnswerParts(trimmed);
+		if (gate?.parked !== true || !isStartAnywayReply(pick) || hasImages)
 			return null;
 		const handoff = gateHandoff({
 			prompt: task.prompt,
 			handoffsDir: join(e.store.tasksDir, "handoffs"),
 			anchor: e.store.dataRoot,
 		});
+		const queued = note === "" ? {} : replyPatch(task, note);
+		const pending =
+			note === "" ? task.pendingPrompt : queuedReply(task.pendingPrompt, note);
 		await updateSnapshot(e, task, {
+			...queued,
 			state: "queued",
 			queuedAt: Date.now(),
 			needsReason: null,
@@ -13310,11 +13337,11 @@ export async function createApp(deps: AppDeps) {
 				hash: gateFingerprint(
 					gateCompareText(
 						gateJudgedPrompt(task.prompt, handoff),
-						task.pendingPrompt,
+						pending,
 						gate.seen,
 					),
 				),
-				seen: gateUserText(task.pendingPrompt, gate.seen),
+				seen: gateUserText(pending, gate.seen),
 				fails: 0,
 				sig: null,
 				parked: false,

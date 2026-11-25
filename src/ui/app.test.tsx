@@ -1915,12 +1915,24 @@ describe("AskBlock", () => {
 				{...base}
 				q={multiQ}
 				answered
-				selected="A — note: keep it small"
+				selected={"A\nNote: keep it small"}
 			/>,
 		);
 		expect(html.split('checked=""').length - 1).toBe(1);
 		expect(html).toContain('value="keep it small"');
 		expect(html).toContain("Note (optional)");
+	});
+
+	test("a saved Other answer that holds separator-like text stays whole in the Other field", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				q={{ ...multiQ, multi: false, recommended: null }}
+				answered
+				selected="C — note: legacy"
+			/>,
+		);
+		expect(html).toContain('value="C — note: legacy"');
 	});
 
 	test("a text question renders a labeled field and no choice controls", () => {
@@ -2198,9 +2210,9 @@ describe("AskBlock multi answers", () => {
 		await act(async () => {
 			onChangeOf(b)({ target: b, currentTarget: b });
 		});
-		expect(answers).toEqual(["B — note: prefer the small diff"]);
+		expect(answers).toEqual(["B\nNote: prefer the small diff"]);
 		await typeNote(note, "ship it today");
-		expect(drafts).toEqual(["B — note: ship it today"]);
+		expect(drafts).toEqual(["B\nNote: ship it today"]);
 		// Clearing the note leaves the bare pick recorded.
 		await typeNote(note, "");
 		expect(drafts.at(-1)).toBe("B");
@@ -2223,7 +2235,7 @@ describe("AskBlock multi answers", () => {
 		await act(async () => {
 			form.dispatchEvent(submitEvent());
 		});
-		expect(answers).toEqual(["C — note: only for staging"]);
+		expect(answers).toEqual(["C\nNote: only for staging"]);
 		// The note did not leak into the Other field: it shows the bare custom answer.
 		expect(text.value).toBe("C");
 	});
@@ -2237,7 +2249,7 @@ describe("AskBlock multi answers", () => {
 			onChangeOf(a)({ target: a, currentTarget: a });
 		});
 		await typeNote(note, "and keep B for later");
-		expect(drafts).toEqual(["A", "A — note: and keep B for later"]);
+		expect(drafts).toEqual(["A", "A\nNote: and keep B for later"]);
 		expect(a.checked).toBe(true);
 	});
 });

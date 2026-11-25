@@ -90,6 +90,7 @@ import {
 	gateCompareText,
 	gateFingerprint,
 	hasOpenQuestionsSection,
+	START_ANYWAY,
 	startAnywayQuestion,
 } from "./promptGate.ts";
 import {
@@ -125,7 +126,9 @@ import {
 	SILENT_LOG_MS,
 	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_CANCEL,
+	WORK_CHECK_ASK_MERGE,
 	WORK_CHECK_ASK_NEW_APPROACH,
+	WORK_CHECK_ASK_SEND_BACK,
 	workCheckAsk,
 	workCheckDivergeAsk,
 	workCheckDivergeReason,
@@ -6674,6 +6677,38 @@ describe("alate routes", () => {
 			expect(revised.gate?.hash).toBeNull();
 		});
 
+		test("a noted Start anyway approves the gate park and queues the note under the approval (OTTR-1281)", async () => {
+			const p1 = projects.get("p1")!;
+			const q = startAnywayQuestion();
+			const parked = await p1.store.createTask("gate park noted");
+			await p1.store.updateTask(parked.id, {
+				needsReason: "Prompt gate: the gate still has open questions",
+				state: "needs_you",
+				asked: [q],
+				gate: {
+					hash: null,
+					seen: null,
+					fails: 3,
+					sig: "Which store?",
+					parked: true,
+				},
+			});
+			const res = await post(`/api/projects/p1/tasks/${parked.id}/reply`, {
+				text: askAnswerWithNote(START_ANYWAY, "use SQLite"),
+			});
+			expect(res.status).toBe(200);
+			const started = (await p1.store.getTask(parked.id))!;
+			expect(started.state).toBe("queued");
+			expect(started.asked).toBeNull();
+			expect(started.pendingPrompt).toBe("use SQLite");
+			expect(started.pendingBy).toBe("user");
+			expect(started.gate?.parked).toBe(false);
+			// The approval covers the queued note, so the next start skips the gate.
+			expect(started.gate?.hash).toBe(
+				gateFingerprint(gateCompareText(parked.prompt, "use SQLite", null)),
+			);
+		});
+
 		test("a reply on a parked merge-mismatch card approves the parked push head", async () => {
 			const p1 = projects.get("p1")!;
 			const held = await p1.store.createTask("held merge");
@@ -13199,6 +13234,35 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.pendingPrompt).toContain(WORK_CHECK_SENDBACK_OPENING);
 	});
 
+	test("a noted Merge anyway still merges and records the note (OTTR-1281)", async () => {
+		const t = await parked();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: askAnswerWithNote(WORK_CHECK_ASK_MERGE, "the blocker is a nit"),
+		});
+		expect(res.status).toBe(200);
+		const row = (await store.getTask(t.id))!;
+		expect(row.stage).toBe("merging");
+		expect(row.state).toBe("queued");
+		expect(row.pendingPrompt).toBeNull();
+		const b = row.workCheckLog[0]!.blockers[0]!;
+		expect(b.status).toBe("overridden");
+		expect(b.statusReason).toContain("the blocker is a nit");
+	});
+
+	test("a noted Send it back still sends the blockers back and counts the send-back (OTTR-1281)", async () => {
+		const t = await parked();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: askAnswerWithNote(WORK_CHECK_ASK_SEND_BACK, "use rev-list"),
+		});
+		expect(res.status).toBe(200);
+		const row = (await store.getTask(t.id))!;
+		expect(row.stage).toBe("in_progress");
+		expect(row.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS + 1);
+		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+		expect(row.pendingPrompt).toContain("still open");
+		expect(row.pendingPrompt).toContain("use rev-list");
+	});
+
 	test("any other answer is a plain reply to the agent", async () => {
 		const t = await parked();
 		await post(`/api/projects/p1/tasks/${t.id}/reply`, {
@@ -13356,6 +13420,58 @@ describe("diverging work-check ask", () => {
 		expect(row.asked).toBeNull();
 		const open = row.workCheckLog[1]!.blockers;
 		expect(open.every((b) => b.status === "overridden")).toBe(true);
+	});
+
+	test("a noted Merge anyway on a diverging park still merges (OTTR-1281)", async () => {
+		const t = await divergePark();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: askAnswerWithNote(WORK_CHECK_ASK_MERGE, "reviewed by hand"),
+		});
+		expect(res.status).toBe(200);
+		const row = (await store.getTask(t.id))!;
+		expect(row.stage).toBe("merging");
+		expect(row.state).toBe("queued");
+		expect(row.pendingPrompt).toBeNull();
+	});
+
+	test("a noted new-approach click sends the blockers back with the note as the direction (OTTR-1281)", async () => {
+		const t = await divergePark();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: askAnswerWithNote(WORK_CHECK_ASK_NEW_APPROACH, "drop the cache"),
+		});
+		expect(res.status).toBe(200);
+		const row = (await store.getTask(t.id))!;
+		expect(row.workCheckSendbacks).toBe(3);
+		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+		expect(row.pendingPrompt).toContain("New direction for the approach:");
+		const log = row.workCheckLog;
+		expect(
+			log[log.findLastIndex((r) => r.outcome === "blockers")]!.direction,
+		).toBe("drop the cache");
+	});
+
+	test("a noted Cancel cancels the card and keeps the note as its reason (OTTR-1281)", async () => {
+		const t = await divergePark();
+		const previousCancel = cancelImpl;
+		let cancels = 0;
+		cancelImpl = async (_e, id) => {
+			cancels += 1;
+			await store.updateTask(id, { cancelledAt: Date.now(), state: "idle" });
+			return { removed: true };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: askAnswerWithNote(WORK_CHECK_ASK_CANCEL, "obsolete"),
+			});
+			expect(res.status).toBe(200);
+			expect(cancels).toBe(1);
+			const row = (await store.getTask(t.id))!;
+			expect(row.cancelledAt).not.toBeNull();
+			expect(row.pendingPrompt).toBeNull();
+			expect(row.needsReason).toContain("obsolete");
+		} finally {
+			cancelImpl = previousCancel;
+		}
 	});
 
 	test("Cancel cancels the card", async () => {
