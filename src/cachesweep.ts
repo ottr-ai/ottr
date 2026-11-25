@@ -64,9 +64,13 @@ export function prepareTurnCache(
 		// The project level stays root-owned like the rest of the turn home, so a
 		// turn uid can never rename or swap the dirs the daemon chowns and sweeps.
 		chmodSync(dir, 0o755);
-		chmodSync(cache, 0o755);
-		chmodSync(tmp, 0o755);
 		if (ids !== null) chownTree(cache, ids);
+		// OTTR-1211 review: the cache holds the project's dependency artifacts, the
+		// same class closeProjectDir protects — private to the project uid, like
+		// home. The scratch parent lets other uids reach their own run's dir by
+		// name (0700 inside) without listing the sibling run ids.
+		chmodSync(cache, 0o700);
+		chmodSync(tmp, 0o711);
 		return {
 			cacheEnv: {
 				XDG_CACHE_HOME: join(cache, "xdg"),

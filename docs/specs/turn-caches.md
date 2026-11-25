@@ -12,9 +12,11 @@ Per project `P` (name guarded by `assertProjectSegment`):
 
 - Worker: `<turnHomesRoot>/P/cache/` with the subdirs `xdg`, `bun`, `pip`,
   `uv`, `npm`, and `<turnHomesRoot>/P/tmp/` for per-card scratch. The project
-  level stays root-owned 0755 like the rest of the turn home; the cache
-  subdirs and each scratch dir belong to the project uid when the daemon runs
-  isolated, else to the daemon user.
+  level stays root-owned 0755 like the rest of the turn home. The cache tree
+  is project-private (0700, uid-owned when the daemon runs isolated, else
+  daemon-owned — its artifacts are the same class `closeProjectDir`
+  protects), and the scratch parent is 0711: another uid reaches its own
+  run's dir by name but cannot list the siblings. Each scratch dir is 0700.
 - Server (worker-less fallback, server-local runs): the same layout under
   `serverTurnCacheRoot()` — `OTTR_TURN_CACHE_ROOT` or
   `<homedir()>/.cache/ottr-turns`. The provision guard is not tripped: it

@@ -4,6 +4,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	utimesSync,
 	writeFileSync,
@@ -158,6 +159,15 @@ describe("prepareTurnCache", () => {
 			for (const sub of ["xdg", "bun", "pip", "uv", "npm"])
 				expect(existsSync(join(root, "proj.one-x", "cache", sub))).toBe(true);
 			expect(existsSync(join(root, "proj.one-x", "tmp"))).toBe(true);
+			// OTTR-1211 review: the cache is project-private (a turn of another
+			// project must not read its artifacts), the scratch parent traversable
+			// but not listable.
+			expect(statSync(join(root, "proj.one-x", "cache")).mode & 0o777).toBe(
+				0o700,
+			);
+			expect(statSync(join(root, "proj.one-x", "tmp")).mode & 0o777).toBe(
+				0o711,
+			);
 			// The second call is the same project, later in time: the same dirs.
 			const again = prepareTurnCache(root, "proj.one-x", null);
 			expect(again!.cacheEnv).toEqual(dirs!.cacheEnv);
