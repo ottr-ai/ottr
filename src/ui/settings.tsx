@@ -6173,7 +6173,9 @@ function RoleRow({
 			<p className="role-use">
 				{/* Own-key read (src/ui/models.ts ownField): a role named like an
 				    Object.prototype member must not resolve an inherited function. */}
-				{(Object.hasOwn(ROLE_FEATURES, name) ? ROLE_FEATURES[name] : undefined) ??
+				{(Object.hasOwn(ROLE_FEATURES, name)
+					? ROLE_FEATURES[name]
+					: undefined) ??
 					"No board feature runs on this role; omp itself uses it."}
 			</p>
 			{notesId !== undefined && (
