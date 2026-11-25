@@ -635,8 +635,11 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				const { exitCode, stderrTail } = await runBake(project, lists, push);
 				// vm-runner POSTs /shutdown after a clean sentinel, so PID 1 unmounts
 				// the layer and powers the VM off: the installs must be on the layer
-				// disk before it can read the line.
-				await exec(["sync"]);
+				// disk before it can read the line. syncfs of the layer's filesystem
+				// (`sync -f <home>`): the machine-wide sync(2) flushes every mounted
+				// filesystem on the host, and one mount whose daemon died (a FUSE
+				// mount, OTTR-1282) blocks it forever and so every bake.
+				await exec(["sync", "-f", opts.home ?? "/root"]);
 				push(
 					`${JSON.stringify({ [WORKER_DONE]: { exitCode, stderrTail } })}\n`,
 				);

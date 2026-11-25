@@ -624,6 +624,58 @@ describe("POST /bake", () => {
 		});
 		expect(bad.status).toBe(400);
 	});
+
+	// A machine-wide sync(2) flushes every mounted filesystem on the host, and one
+	// mount whose daemon died (a FUSE mount, OTTR-1282) blocks it forever; the bake
+	// then never reaches its sentinel. The pre-sentinel flush must be syncfs of the
+	// bake home's filesystem (`sync -f <home>`) only: this planted sync hangs unless
+	// it gets a -f target, so the test fails if the guest ever goes back to sync(2).
+	test("the pre-sentinel flush targets the bake home's filesystem, not all filesystems", async () => {
+		const shimDir = fresh("sync-shim");
+		mkdirSync(shimDir, { recursive: true });
+		const recorded = join(shimDir, "calls");
+		writeFileSync(
+			join(shimDir, "sync"),
+			`#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+appendFileSync(${JSON.stringify(recorded)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.argv.length > 2) process.exit(0);
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+`,
+		);
+		chmodSync(join(shimDir, "sync"), 0o755);
+		const home = fresh("sync-home");
+		mkdirSync(home, { recursive: true });
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${shimDir}:${savedPath ?? ""}`;
+		try {
+			const url = start({
+				home,
+				ensure: {
+					packages: async () => [],
+					tools: async () => [],
+					python: async () => [],
+				},
+			});
+			const res = await fetch(`${url}/bake`, {
+				method: "POST",
+				headers: AUTH,
+				body: JSON.stringify({ project: "proj" }),
+			});
+			const lines = (await res.text()).split("\n").filter((l) => l !== "");
+			expect(lines).toEqual([
+				JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }),
+			]);
+		} finally {
+			process.env.PATH = savedPath;
+		}
+		expect(
+			readFileSync(recorded, "utf8")
+				.trim()
+				.split("\n")
+				.map((l) => JSON.parse(l) as string[]),
+		).toEqual([["-f", home]]);
+	});
 });
 
 describe("POST /bake lists", () => {
