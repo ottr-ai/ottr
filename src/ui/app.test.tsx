@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type Node as HappyNode, Window } from "happy-dom";
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { DeepenCheck } from "../deepen.ts";
@@ -1909,11 +1909,27 @@ describe("AskBlock", () => {
 		expect(html).not.toContain("Deploy only the API");
 	});
 
+	test("a saved answer with a note checks its pick and refills the note field", () => {
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				q={multiQ}
+				answered
+				selected="A — note: keep it small"
+			/>,
+		);
+		expect(html.split('checked=""').length - 1).toBe(1);
+		expect(html).toContain('value="keep it small"');
+		expect(html).toContain("Note (optional)");
+	});
+
 	test("a text question renders a labeled field and no choice controls", () => {
 		const html = renderToStaticMarkup(<AskBlock {...base} q={textQ} />);
 		expect(html).toContain('type="text"');
 		expect(html).not.toContain('type="radio"');
 		expect(html).not.toContain('type="checkbox"');
+		// The field is the whole answer: no separate note field.
+		expect(html).not.toContain("ask-note");
 		// The field carries the question text as its label.
 		expect(html).toContain('aria-label="Name the branch"');
 		// Nothing typed: the Answer button stays disabled.
@@ -2114,6 +2130,115 @@ describe("AskBlock multi answers", () => {
 		});
 		expect(drafts).toEqual(["release-branch", null]);
 		expect(button.disabled).toBe(true);
+	});
+
+	/** One mounted choice AskBlock that feeds every recorded answer back as `selected`,
+	 * like AskPanel does for a card with several questions. */
+	async function mountRecordingAsk(q: typeof multiQ) {
+		const answers: string[] = [];
+		const drafts: (string | null)[] = [];
+		function Block() {
+			const [selected, setSelected] = useState<string | null>(null);
+			return (
+				<AskBlock
+					q={q}
+					name="ask-0"
+					answered={selected !== null}
+					selected={selected}
+					busy={false}
+					changed={[]}
+					onOpenDiff={() => {}}
+					onAnswer={(t: string) => {
+						answers.push(t);
+						setSelected(t);
+					}}
+					onDraft={(t: string | null) => {
+						drafts.push(t);
+						setSelected(t);
+					}}
+				/>
+			);
+		}
+		const { container } = await mount(<Block />);
+		const note = container.querySelector(
+			".ask-note input",
+		) as unknown as HTMLInputElement | null;
+		if (note === null) throw new Error("ask block rendered no note field");
+		return { container, answers, drafts, note };
+	}
+	const singleQ = { ...multiQ, multi: false, recommended: null };
+	const typeNote = async (note: HTMLInputElement, v: string) => {
+		await act(async () => {
+			typeInto(note, v);
+			onChangeOf(note)({ target: note, currentTarget: note });
+		});
+	};
+
+	test("a preset pick without a note answers with the bare label", async () => {
+		const { container, answers } = await mountRecordingAsk(singleQ);
+		const a = container.querySelector(
+			'input[aria-label="A"]',
+		) as unknown as HTMLInputElement;
+		await act(async () => {
+			onChangeOf(a)({ target: a, currentTarget: a });
+		});
+		expect(answers).toEqual(["A"]);
+	});
+
+	test("a note typed before the pick rides with it, and a later edit re-records the pick", async () => {
+		const { container, answers, drafts, note } =
+			await mountRecordingAsk(singleQ);
+		await typeNote(note, " prefer the small diff ");
+		// No pick yet: the note alone records nothing.
+		expect(answers).toEqual([]);
+		expect(drafts).toEqual([]);
+		const b = container.querySelector(
+			'input[aria-label="B"]',
+		) as unknown as HTMLInputElement;
+		await act(async () => {
+			onChangeOf(b)({ target: b, currentTarget: b });
+		});
+		expect(answers).toEqual(["B — note: prefer the small diff"]);
+		await typeNote(note, "ship it today");
+		expect(drafts).toEqual(["B — note: ship it today"]);
+		// Clearing the note leaves the bare pick recorded.
+		await typeNote(note, "");
+		expect(drafts.at(-1)).toBe("B");
+		expect(b.checked).toBe(true);
+	});
+
+	test("the Other answer still works and carries the note", async () => {
+		const { container, answers, note } = await mountRecordingAsk(singleQ);
+		await typeNote(note, "only for staging");
+		const text = container.querySelector(
+			".ask-custom label input",
+		) as unknown as HTMLInputElement;
+		const form = container.querySelector(
+			"form.ask-custom",
+		) as unknown as HTMLFormElement;
+		await act(async () => {
+			typeInto(text, "C");
+			onChangeOf(text)({ target: text, currentTarget: text });
+		});
+		await act(async () => {
+			form.dispatchEvent(submitEvent());
+		});
+		expect(answers).toEqual(["C — note: only for staging"]);
+		// The note did not leak into the Other field: it shows the bare custom answer.
+		expect(text.value).toBe("C");
+	});
+
+	test("a multi pick carries the note in its comma list", async () => {
+		const { container, drafts, note } = await mountRecordingAsk(multiQ);
+		const a = container.querySelector(
+			'input[aria-label="A"]',
+		) as unknown as HTMLInputElement;
+		await act(async () => {
+			onChangeOf(a)({ target: a, currentTarget: a });
+		});
+		await typeNote(note, "and keep B for later");
+		expect(drafts).toEqual(["A", "A — note: and keep B for later"]);
+		expect(a.checked).toBe(true);
 	});
 });
 

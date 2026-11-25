@@ -137,6 +137,28 @@ export function askAnswerLine(question: string, answer: string): string {
 	return `For "${question}": ${answer}`;
 }
 
+/** The separator between an ask answer's pick and the optional note the drawer's note
+ * field adds (OTTR-1281). */
+const ASK_NOTE_SEP = " — note: ";
+
+/** An ask answer with the user's optional note behind the pick; a blank note adds nothing. */
+export function askAnswerWithNote(answer: string, note: string): string {
+	const n = note.trim();
+	return n === "" ? answer : `${answer}${ASK_NOTE_SEP}${n}`;
+}
+
+/** Splits an ask answer into its pick and its note (empty when it carries none); the first
+ * separator splits, so a note may itself contain the separator text. */
+export function askAnswerParts(answer: string): { pick: string; note: string } {
+	const at = answer.indexOf(ASK_NOTE_SEP);
+	return at === -1
+		? { pick: answer, note: "" }
+		: {
+				pick: answer.slice(0, at),
+				note: answer.slice(at + ASK_NOTE_SEP.length),
+			};
+}
+
 /** One normalized ask question, or null when its question text is unusable; unusable or
  * missing options degrade to a text question instead of null. */
 function askQuestionOf(item: unknown): AskQuestion | null {

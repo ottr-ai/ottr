@@ -429,6 +429,7 @@ import {
 	type AskQuestion,
 	answeredCard,
 	askAnswerLine,
+	askAnswerParts,
 	type CheckRoutingSetting,
 	DONE_PAGE,
 	doneReadKey,
@@ -13553,7 +13554,12 @@ export async function createApp(deps: AppDeps) {
 						continue;
 					const live = await e.store.getTask(lead.id);
 					if (live === null) continue;
-					const answerLabel = m.answer.trim().replace(/\.$/, "").toLowerCase();
+					// A note behind the pick (OTTR-1281) keeps the label match; the full
+					// answer, note included, still lands in the lead.
+					const answerLabel = askAnswerParts(m.answer)
+						.pick.trim()
+						.replace(/\.$/, "")
+						.toLowerCase();
 					const verdict =
 						answerLabel === appliesLabel || answerLabel === legacyAppliesLabel
 							? ("applies" as const)

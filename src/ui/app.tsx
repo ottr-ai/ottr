@@ -59,6 +59,8 @@ import {
 	type AskQuestion,
 	answeredCard,
 	askAnswerLine,
+	askAnswerParts,
+	askAnswerWithNote,
 	doneReadKey,
 	type GhStatus,
 	type HostedCreditsView,
@@ -8941,17 +8943,19 @@ function AskTextRow({
 
 /** One ask question: single-choice presets answer in one click; multi questions collect
  * checkbox picks plus an "Other" pick or typed text and answer with one comma list; a
- * text question answers from one labeled free-text field. */
+ * text question answers from one labeled free-text field. A choice question also carries
+ * an optional note field: its text rides behind the pick (askAnswerWithNote), so the user
+ * can pick a preset and still add guidance (OTTR-1281). */
 export function AskBlock({
 	q,
 	name,
 	answered,
-	selected,
+	selected: saved,
 	busy,
 	changed,
 	onOpenDiff,
-	onAnswer,
-	onDraft,
+	onAnswer: sendAnswer,
+	onDraft: sendDraft,
 }: {
 	q: AskQuestion;
 	/** Radio group name: groups a single-choice question's presets. */
@@ -8969,6 +8973,20 @@ export function AskBlock({
 	onDraft: (text: string | null) => void;
 }) {
 	const multi = q.multi;
+	// The recorded answer is the pick plus an optional note: the pick seeds the controls,
+	// the note seeds its own field, and every recorded pick carries the current note.
+	const parts = saved === null ? null : askAnswerParts(saved);
+	const selected = parts === null ? null : parts.pick;
+	const [note, setNote] = useState(() => parts?.note ?? "");
+	const onAnswer = (text: string): void =>
+		sendAnswer(askAnswerWithNote(text, note));
+	const onDraft = (text: string | null): void =>
+		sendDraft(text === null ? null : askAnswerWithNote(text, note));
+	// A note edit re-records an existing pick; with no pick yet it stays local until one.
+	const changeNote = (next: string): void => {
+		setNote(next);
+		if (selected !== null) sendDraft(askAnswerWithNote(selected, next));
+	};
 	const customRef = useRef<HTMLInputElement>(null);
 	const savedParts = selected === null ? [] : selected.split(", ");
 	const [picked, setPicked] = useState<string[]>(() =>
@@ -9015,9 +9033,9 @@ export function AskBlock({
 				<AskTextRow
 					q={q}
 					busy={busy}
-					selected={selected}
-					onDraft={onDraft}
-					onAnswer={onAnswer}
+					selected={saved}
+					onDraft={sendDraft}
+					onAnswer={sendAnswer}
 				/>
 			</div>
 		);
@@ -9057,6 +9075,16 @@ export function AskBlock({
 				onAnswer={onAnswer}
 				multiTotal={multiTotal}
 			/>
+			<label className="ask-note">
+				<span>Note (optional)</span>
+				<input
+					type="text"
+					value={note}
+					disabled={busy}
+					placeholder="Guidance that goes with your pick"
+					onChange={(e) => changeNote(e.target.value)}
+				/>
+			</label>
 		</div>
 	);
 }

@@ -1,6 +1,12 @@
 import { expect, test } from "bun:test";
 import fc from "fast-check";
-import { answeredCard, askQuestions, type OutcomeStatus } from "./types.ts";
+import {
+	answeredCard,
+	askAnswerParts,
+	askAnswerWithNote,
+	askQuestions,
+	type OutcomeStatus,
+} from "./types.ts";
 
 const turn = (kind: "work" | "merge", outcome: OutcomeStatus | null) => ({
 	kind,
@@ -271,5 +277,30 @@ test("property: askQuestions never throws, keeps the text invariant and is idemp
 			expect(askQuestions({ questions: out })).toEqual(out);
 		}),
 		{ seed: 20261120, numRuns: 150 },
+	);
+});
+
+test("askAnswerWithNote: a blank note adds nothing, a note rides behind the pick", () => {
+	expect(askAnswerWithNote("Postgres", "  ")).toBe("Postgres");
+	expect(askAnswerWithNote("Postgres", " use v17 ")).toBe(
+		"Postgres — note: use v17",
+	);
+	expect(askAnswerParts("Postgres")).toEqual({ pick: "Postgres", note: "" });
+});
+
+// Gate: 150 runs, fixed seed. fast-check prints the seed and path on failure.
+test("property: askAnswerParts splits askAnswerWithNote back into its pick and trimmed note", () => {
+	const pick = fc.string().filter((s) => !s.includes(" — note: "));
+	fc.assert(
+		fc.property(pick, fc.string(), (p, n) => {
+			const { pick: back, note } = askAnswerParts(askAnswerWithNote(p, n));
+			expect(back).toBe(p);
+			expect(note).toBe(n.trim());
+		}),
+		{
+			seed: 20261125,
+			numRuns: 150,
+			examples: [["A", "x — note: y"]],
+		},
 	);
 });

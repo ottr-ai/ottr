@@ -169,6 +169,7 @@ import {
 	type AddProjectResponse,
 	answeredCard,
 	askAnswerLine,
+	askAnswerWithNote,
 	DONE_PAGE,
 	doneReadKey,
 	type ListedTask,
@@ -2670,6 +2671,29 @@ describe("task routes", () => {
 		expect(freeLead.details).toBe(
 			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
+	});
+
+	test("a lead-question pick with a note still queues the applies lead and carries the note (OTTR-1281)", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		const applies = askAnswerWithNote(
+			LEAD_APPLIES_OPTION,
+			"check the IPv6 path",
+		);
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: `${askAnswerLine(`Q one? (card #${lead1.id})`, applies)}\n${askAnswerLine(`Q two? (card #${lead2.id})`, askAnswerWithNote(LEAD_NOT_APPLY_OPTION, "fixed in v2"))}`,
+		});
+		expect(res.status).toBe(200);
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		expect(
+			one.prompt.endsWith(
+				`The user answered the review's question: ${applies}`,
+			),
+		).toBe(true);
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.cancelledAt).not.toBeNull();
+		expect(two.needsReason).toContain("fixed in v2");
 	});
 
 	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
