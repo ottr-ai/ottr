@@ -29,7 +29,7 @@ import {
 	trustedAnchor,
 	writeBelow,
 } from "./confine.ts";
-import { githubHost, hostMatcher } from "./githubHost.ts";
+import { githubHost, hostMatcher, isGithubRepoHost } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
 import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import { platform } from "./platform/index.ts";
@@ -2504,17 +2504,52 @@ async function catFileBatch(
  * from a locking endpoint must not fail an upload whose batch works.
  */
 function lfsEndpointPin(originUrl: string): readonly string[] {
-	if (!/^https?:\/\//i.test(originUrl)) return [];
-	const base = originUrl.replace(/\/+$/, "");
-	const endpoint = base.endsWith(".git")
-		? `${base}/info/lfs`
-		: `${base}.git/info/lfs`;
+	const endpoint = lfsEndpointFor(originUrl);
+	if (endpoint === null) return [];
 	return [
 		"-c",
 		`lfs.url=${endpoint}`,
 		"-c",
 		`lfs.${endpoint}.locksverify=false`,
 	];
+}
+
+/** The LFS endpoint git-lfs derives for an http(s) origin URL; null for any other scheme. */
+function lfsEndpointFor(originUrl: string): string | null {
+	if (!/^https?:\/\//i.test(originUrl)) return null;
+	const base = originUrl.replace(/\/+$/, "");
+	return base.endsWith(".git") ? `${base}/info/lfs` : `${base}.git/info/lfs`;
+}
+
+/**
+ * OTTR-1283: persists the .git-form LFS endpoint in the project's repo config, so every
+ * git-lfs run without the push's own command-line pin (a work turn's checkout, `git lfs
+ * env`) resolves the endpoint the board pushes to. Boot and project add call this beside
+ * the origin pin (R5-1). Convergence rules, in order: an origin that is not http(s), is
+ * not on a GitHub host (github.com, a *.ghe.com tenant, or the configured host), or ends
+ * .git is untouched — git-lfs derives the .git form itself there and the push pins its
+ * own endpoint. An absent value, or the bare `<url>/info/lfs` residue of the OTTR-1058
+ * pin (GitHub answers that form 422, MYST-34), becomes the .git form. Any other value is
+ * an operator's own endpoint and stays. The endpoint built here never carries the
+ * remote's userinfo, so an embedded token cannot reach the repo config this writes.
+ */
+export async function convergeLfsEndpoint(
+	mainPath: string,
+	originUrl: string,
+): Promise<void> {
+	if (!/^https?:\/\//i.test(originUrl)) return;
+	const u = new URL(originUrl);
+	if (!isGithubRepoHost(u.host, githubHost().host)) return;
+	// Rebuild without userinfo (a token embedded in the remote must not persist) and
+	// without a trailing slash.
+	const base = `${u.protocol}//${u.host}${u.pathname}`.replace(/\/+$/, "");
+	if (base.endsWith(".git")) return;
+	const bare = `${base}/info/lfs`;
+	const endpoint = `${base}.git/info/lfs`;
+	const r = await git(["config", "lfs.url"], mainPath).catch(() => null);
+	const cur = r !== null && r.code === 0 ? r.stdout.trim() : null;
+	if (cur === endpoint || (cur !== null && cur !== bare)) return;
+	await git(["config", "lfs.url", endpoint], mainPath);
 }
 
 /**

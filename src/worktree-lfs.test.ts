@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	convergeLfsEndpoint,
 	lfsPointerOids,
 	pushBranch,
 	pushLfsObjects,
@@ -736,6 +737,166 @@ exit 1
 		} finally {
 			process.env.PATH = path;
 			rmSync(r.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("convergeLfsEndpoint (OTTR-1283)", () => {
+	/** A plain repo whose origin names `originUrl` (no clone: convergence reads git config). */
+	const repoAt = async (originUrl: string): Promise<string> => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-lfs-converge-"));
+		const repo = join(dir, "repo");
+		await run(dir, "init", "-q", "-b", "main", repo);
+		await run(repo, "remote", "add", "origin", originUrl);
+		return repo;
+	};
+	/** The repo's persisted lfs.url, null when unset. */
+	const lfsUrlConfig = async (repo: string): Promise<string | null> => {
+		const proc = Bun.spawn(["git", "config", "lfs.url"], {
+			cwd: repo,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			proc.exited,
+		]);
+		return code === 0 ? out.trim() : null;
+	};
+	/** The endpoint `git lfs env` resolves in the repo — the acceptance's own reader. */
+	const envEndpoint = async (repo: string): Promise<string> =>
+		/^Endpoint=(.*)$/m.exec(await run(repo, "lfs", "env"))?.[1] ?? "(none)";
+
+	test("a github.com remote without .git reports the .git endpoint after convergence (acceptance)", async () => {
+		// MYST-36: the merge push's batch went to https://…/info/lfs (the bare form),
+		// which GitHub answers 422. The board converges the persisted lfs.url to the
+		// .git form, so the endpoint git lfs env resolves for the push — and every
+		// git-lfs run without the push's own command-line pin — ends in .git/info/lfs.
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			// The residue this card converges: the bare OTTR-1058 pin form, plantable by
+			// a work turn into the worker-writable repo config. Pre-fix, git lfs env
+			// resolves exactly this bare value and the assertion below fails.
+			await run(
+				repo,
+				"config",
+				"lfs.url",
+				"https://github.com/octo/repo/info/lfs",
+			);
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
+			expect(await lfsUrlConfig(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+			expect(await envEndpoint(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs (auth=none)",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("an absent lfs.url is set to the .git form", async () => {
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
+			expect(await lfsUrlConfig(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+			expect(await envEndpoint(repo)).toMatch(
+				/^https:\/\/github\.com\/octo\/repo\.git\/info\/lfs/,
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a correct lfs.url does not change", async () => {
+		// The operator's stopgap on mystic-realms wrote exactly this value; convergence
+		// must leave it byte-identical.
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(
+				repo,
+				"config",
+				"lfs.url",
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
+			expect(await lfsUrlConfig(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a .git remote gains no lfs.url: git-lfs derives the same endpoint itself", async () => {
+		const repo = await repoAt("https://github.com/octo/repo.git");
+		try {
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo.git");
+			expect(await lfsUrlConfig(repo)).toBeNull();
+			expect(await envEndpoint(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs (auth=none)",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("an endpoint that is neither bare nor the .git form is an operator's own and stays", async () => {
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(
+				repo,
+				"config",
+				"lfs.url",
+				"https://lfs.example.com/api/g/parent",
+			);
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
+			expect(await lfsUrlConfig(repo)).toBe(
+				"https://lfs.example.com/api/g/parent",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a non-GitHub host keeps today's behavior: no config write", async () => {
+		const repo = await repoAt("https://gitlab.com/g/sub");
+		try {
+			await convergeLfsEndpoint(repo, "https://gitlab.com/g/sub");
+			expect(await lfsUrlConfig(repo)).toBeNull();
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("an ssh origin is untouched: the board pins no LFS endpoint there", async () => {
+		const repo = await repoAt("git@github.com:octo/repo");
+		try {
+			await convergeLfsEndpoint(repo, "ssh://git@github.com/octo/repo");
+			expect(await lfsUrlConfig(repo)).toBeNull();
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("the persisted endpoint never carries the remote's userinfo", async () => {
+		// An origin URL can embed a token; a config value the board writes must not
+		// copy it into the repo config (and `git lfs env` prints the endpoint).
+		const repo = await repoAt(
+			"https://x-access-token:secret-token@github.com/octo/repo",
+		);
+		try {
+			await convergeLfsEndpoint(
+				repo,
+				"https://x-access-token:secret-token@github.com/octo/repo",
+			);
+			expect(await lfsUrlConfig(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
 		}
 	});
 });
