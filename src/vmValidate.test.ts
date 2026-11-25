@@ -534,7 +534,9 @@ describe("parseLimitsReadback", () => {
 		expect(readback.pidsMax).toBe(String(VM_VALIDATE.maxProcesses));
 		expect(readback.nprocLimit).toBeNull();
 		expect(readback.cpus).toBe(String(VM_VALIDATE.vcpus));
-		expect(readback.memKb).toBe(524288);
+		// The fixture's MemTotal default is the band reading: the configured RAM
+		// minus the kernel's reservation (the same floor the limits check uses).
+		expect(readback.memKb).toBe(Math.floor(VM_VALIDATE.memMiB * 1024 * 0.96));
 	});
 
 	test("reads a 'max' cap and misses a failed or empty pids read", () => {
