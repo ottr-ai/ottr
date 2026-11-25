@@ -1076,8 +1076,17 @@ async function dryRunLine(
 	return parts.join(", ");
 }
 
-/** Names the release command's env always keeps from the server env. */
-export const RELEASE_ENV_BASE = ["PATH", "HOME", "LANG", "TERM"] as const;
+/** Names the release command's env always keeps from the server env. The two PG names are the
+ * safe database env every board child keeps (the test URL and the require-tests flag); the
+ * production OTTR_DATABASE_URL never passes (childDatabaseEnv strips it after the merge). */
+export const RELEASE_ENV_BASE = [
+	"PATH",
+	"HOME",
+	"LANG",
+	"TERM",
+	"OTTR_TEST_PG_URL",
+	"OTTR_REQUIRE_PG_TESTS",
+] as const;
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -1107,9 +1116,9 @@ function releaseArgv(command: string): string[] {
 
 /** The release command's child env: the command's git names its repos with path arguments,
  * so the ambient repo-relocating vars are stripped (OTTR-1162). Exported for the strip test.
- * The base env holds only PATH, HOME, LANG and TERM plus the operator's releaseEnv allowlist
- * (names only — values always come from the server env at spawn time), so no setting value
- * and no other server env var reaches the command. */
+ * The base env holds PATH, HOME, LANG, TERM and the safe PG env, plus the operator's
+ * releaseEnv allowlist (names only — values always come from the server env at spawn
+ * time), so no setting value and no other server env var reaches the command. */
 export function releaseEnv(o: {
 	sha: string;
 	version: string;

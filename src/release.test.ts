@@ -2111,9 +2111,14 @@ describe.skipIf(process.platform === "win32")(
 				.split("\n")
 				.filter((l) => l !== "")
 				.map((l) => l.slice(0, l.indexOf("=")));
-			const base = ["PATH", "HOME", "LANG", "TERM"].filter(
-				(k) => process.env[k] !== undefined,
-			);
+			const base = [
+				"PATH",
+				"HOME",
+				"LANG",
+				"TERM",
+				"OTTR_TEST_PG_URL",
+				"OTTR_REQUIRE_PG_TESTS",
+			].filter((k) => process.env[k] !== undefined);
 			// Bun.spawn adds PWD for the child's cwd; it is not a leaked server env var.
 			expect(keys.sort()).toEqual(
 				[
@@ -2256,4 +2261,3 @@ describe.skipIf(process.platform === "win32")(
 		}, 60_000);
 	},
 );
->>>>>>> bd0ffe81 (fix: narrow the release command env and bind it to the reviewed commit)

@@ -10325,7 +10325,7 @@ function ProjectReviewsCards({
 							settingKey="releaseEnv"
 							name="Release env allowlist"
 							action={save}
-							help="Extra env var names the release command keeps from the server env, separated by spaces. Empty: only PATH, HOME, LANG and TERM. The values come from the server env; this field never holds values."
+							help="Extra env var names the release command keeps from the server env, separated by spaces. Empty: only PATH, HOME, LANG, TERM and the safe PostgreSQL test env. The values come from the server env; this field never holds values."
 							shape="space-separated names"
 						>
 							<label>

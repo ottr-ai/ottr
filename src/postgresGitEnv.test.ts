@@ -9,6 +9,7 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { gitExe } from "./worktree.ts";
 
 type Observation = {
 	kind: string;
@@ -229,11 +230,11 @@ return { helpers, keys, fingerprint: key?.fingerprint };
 		});
 
 		test("release commands exclude server secrets after release facts merge", async () => {
-			const commandSource = `${observationSource}
+			const commandTemplate = `${observationSource}
 observe("release");
 console.log(JSON.stringify({
   version: process.env.OTTR_RELEASE_VERSION === "v1.2.3",
-  commit: process.env.OTTR_RELEASE_COMMIT === "synthetic-commit",
+  commit: process.env.OTTR_RELEASE_COMMIT === "__SHA__",
   notes: process.env.OTTR_RELEASE_NOTES_FILE === "synthetic-notes",
   review: process.env.OTTR_ARCH_REVIEW === "3",
 }));
@@ -243,19 +244,43 @@ process.exit(17);
 				`
 process.env.OTTR_DATABASE_URL = ${JSON.stringify(productionMarker)};
 const lines = [];
+// The release guard executes only the board's own clean linked worktree at the
+// reviewed commit, so plant one with the real git before the command runs. The
+// real git replaces the fixture's fake git binary: the guard must talk to a real
+// repository, and Bun.which caches its PATH scan, so a PATH prepend cannot
+// reroute it after module init. node:fs is imported dynamically because this
+// body runs inside generated bun --eval source, which cannot carry a static
+// import statement.
+const { chmodSync, copyFileSync } = await import("node:fs");
+const realGit = ${JSON.stringify(gitExe())};
+copyFileSync(realGit, root + "/bin/git");
+chmodSync(root + "/bin/git", 0o755);
+const git = (args, cwd) => {
+	const r = Bun.spawnSync([root + "/bin/git", ...args], { cwd, stdout: "ignore", stderr: "pipe" });
+	if (r.exitCode !== 0) throw new Error("git " + args[0] + " failed: " + r.stderr.toString().trim());
+};
+const repo = root + "/repo";
+git(["init", "-q", "-b", "main", repo], root);
+git(["config", "user.name", "t"], repo);
+git(["config", "user.email", "t@example.com"], repo);
+git(["commit", "-q", "--allow-empty", "-m", "one"], repo);
+const sha = new TextDecoder().decode(Bun.spawnSync([root + "/bin/git", "rev-parse", "HEAD"], { cwd: repo }).stdout).trim();
+const wt = root + "/wt";
+git(["worktree", "add", "-q", "--detach", wt, sha], repo);
+await Bun.write(root + "/command.ts", ${JSON.stringify(commandTemplate)}.replaceAll("__SHA__", sha));
 try {
   await release.runReleaseCommand({
     command: '"' + process.execPath + '" "' + root + '/command.ts"',
-    cwd: root, mainPath: root, originUrl: null, target: "main",
-    sha: "synthetic-commit", version: "v1.2.3", notesFile: "synthetic-notes",
-    archReview: { delta: 3 }, log: (line) => lines.push(line),
+    cwd: wt, mainPath: repo, originUrl: null, target: "main",
+    sha, version: "v1.2.3", notesFile: "synthetic-notes",
+    archReview: { delta: 3 }, allowEnv: "PROBE_LOG", log: (line) => lines.push(line),
   });
 } catch (error) {
   return { failedAsExpected: error.message.startsWith("release command exited with code 17"), facts: JSON.parse(lines[0]) };
 }
 throw new Error("the fixture command must exit 17");
 `,
-				{ "command.ts": commandSource },
+				{},
 			);
 			expect(result).toEqual({
 				failedAsExpected: true,

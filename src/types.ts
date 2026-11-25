@@ -244,8 +244,9 @@ export interface ProjectSettings {
 	 */
 	releaseCommand: string | null;
 	/** Extra env var names the release command keeps from the server env, whitespace-separated
-	 * and stored deduped; null = only PATH, HOME, LANG and TERM. Names only: the values always
-	 * come from the server env at spawn time, never from this setting. */
+	 * and stored deduped; null = only PATH, HOME, LANG, TERM and the safe PostgreSQL test env.
+	 * Names only: the values always come from the server env at spawn time, never from this
+	 * setting. */
 	releaseEnv: string | null;
 	/** Commits on the integration target before an architecture review is due. */
 	archReviewCap: number;
