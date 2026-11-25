@@ -4444,6 +4444,37 @@ describe("settings routes", () => {
 		expect(await errorOf(bad)).toBe("autoTend must be a boolean");
 	});
 
+	test("nonProductPaths validate and round-trip through the project settings route", async () => {
+		const ok = await post("/api/projects/p1/settings", {
+			nonProductPaths: ["www/**", "docs/site/**"],
+		});
+		expect(ok.status).toBe(200);
+		const body: unknown = await ok.json();
+		expect(
+			typeof body === "object" && body !== null && "settings" in body
+				? body.settings
+				: undefined,
+		).toMatchObject({ nonProductPaths: ["www/**", "docs/site/**"] });
+		const notArray = await post("/api/projects/p1/settings", {
+			nonProductPaths: "www/**",
+		});
+		expect(notArray.status).toBe(400);
+		expect(await errorOf(notArray)).toBe(
+			"nonProductPaths must be an array of at most 50 glob patterns",
+		);
+		const badEntry = await post("/api/projects/p1/settings", {
+			nonProductPaths: ["ok/**", 5],
+		});
+		expect(badEntry.status).toBe(400);
+		expect(await errorOf(badEntry)).toBe(
+			"nonProductPaths must be an array of at most 50 glob patterns",
+		);
+		const tooMany = await post("/api/projects/p1/settings", {
+			nonProductPaths: Array.from({ length: 51 }, () => "a/**"),
+		});
+		expect(tooMany.status).toBe(400);
+	});
+
 	test("retro maps onto retroSince: on sets it once, re-save keeps it, off clears it; retroFilter passes through", async () => {
 		// A pre-existing mark must survive a re-save while on (no sleep: the stored
 		// timestamp itself is the assertion).
@@ -10660,6 +10691,53 @@ describe("release-summary route", () => {
 			expect(b.reason).toBeNull();
 			expect(gw.calls).toHaveLength(1);
 			expect(gw.calls[0]).toBe(RELEASE_SUMMARY_INSTRUCTIONS);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("the model input drops non-product commits and non-product cards", async () => {
+		const s = await setup("p-relsum-filter");
+		try {
+			// Product-typed (feat) commits over non-product paths: the path filter drops
+			// them, the type does not.
+			mkdirSync(join(s.dir, "landing"), { recursive: true });
+			commit(
+				s.dir,
+				"landing/index.html",
+				"feat: center the built with Ottr badge",
+			);
+			commit(
+				s.dir,
+				"README.md",
+				"feat: add the built with Ottr badge to README.md",
+			);
+			// The card's captured diff names a product file, so the card stays in the input.
+			const t = (await s.store.listTasks()).at(0);
+			if (t === undefined) throw new Error("fixture: no task");
+			await s.store.updateTask(t.id, {
+				diffFiles: [{ file: "feat.txt", plus: 1, minus: 0 }],
+			});
+			const gw = gateway("## New features\n\n- Consolidated feature");
+			const { call } = await mount({
+				projects: s.projects,
+				releaseSummarySpawn: gw.spawn,
+			});
+			const res = await call("/api/projects/p-relsum-filter/release-summary", {
+				sha: run(s.dir, "git rev-parse HEAD"),
+			});
+			expect(res.status).toBe(200);
+			const b = (await res.json()) as {
+				summary: string | null;
+				reason: string | null;
+			};
+			expect(b.reason).toBeNull();
+			// The model input holds the product bullet and the product card, and names
+			// neither badge commit; the same filtered notes are the dialog's fallback.
+			expect(gw.users[0]).toContain("Consolidated feature");
+			expect(gw.users[0]).toContain(t.id);
+			expect(gw.users[0]).not.toContain("badge");
+			expect(gw.users[0]).not.toContain("README");
 		} finally {
 			s.cleanup();
 		}

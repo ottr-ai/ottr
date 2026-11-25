@@ -2067,6 +2067,37 @@ export function parseValidateAgainBody(
 	return { before: at };
 }
 
+function parseNonProductPaths(
+	body: Record<string, unknown>,
+	patch: Partial<ProjectSettings>,
+): Response | null {
+	const npp = body.nonProductPaths;
+	if (npp === undefined) return null;
+	if (!Array.isArray(npp) || npp.length > 50)
+		return json(
+			{ error: "nonProductPaths must be an array of at most 50 glob patterns" },
+			400,
+		);
+	const globs: string[] = [];
+	for (const item of npp) {
+		if (
+			typeof item !== "string" ||
+			item.length < 1 ||
+			item.length > 200 ||
+			/[\p{Cc}]/u.test(item)
+		)
+			return json(
+				{
+					error: "nonProductPaths must be an array of at most 50 glob patterns",
+				},
+				400,
+			);
+		globs.push(item);
+	}
+	patch.nonProductPaths = globs;
+	return null;
+}
+
 const settingParsers: FieldParser[] = [
 	parseMaxParallel,
 	parseCopyExtra,
@@ -2085,6 +2116,7 @@ const settingParsers: FieldParser[] = [
 	parseBooleanSettings,
 	parseAutoTendLimit,
 	parseTendChurnGlobs,
+	parseNonProductPaths,
 	parseJiraSettings,
 ];
 
@@ -9829,6 +9861,7 @@ export async function createApp(deps: AppDeps) {
 			target: resolved.target,
 			sha,
 			originUrl: (await e.store.getSettings()).originUrl,
+			nonProductPaths: (await e.store.getSettings()).nonProductPaths,
 		}).catch((err) => json({ error: errmsg(err) }, 409));
 		if (plan instanceof Response) return plan;
 		// Before the first release there is nothing to consolidate: the dialog
@@ -9853,10 +9886,15 @@ export async function createApp(deps: AppDeps) {
 				const ready = (await e.store.listTurns(t.id))
 					.filter((turn) => turn.outcome === "ready")
 					.at(-1);
+				// Done cards read the branch stat captured at merge start (OTTR-1213's
+				// non-product filter); null when never captured, which keeps the card.
+				const files =
+					(await e.store.getTask(t.id))?.diffFiles?.map((f) => f.file) ?? null;
 				return {
 					id: t.id,
 					title: t.title,
 					details: ready?.details ?? null,
+					files,
 				};
 			}),
 		);
@@ -9871,6 +9909,7 @@ export async function createApp(deps: AppDeps) {
 			creditHoldActive: deps.creditHoldActive,
 			projectName: e.name,
 			projectDescription: readProductDescription(e.path),
+			nonProductPaths: (await e.store.getSettings()).nonProductPaths,
 		});
 		// The fallback is a normal outcome, not an error status.
 		return json(result);
@@ -14868,6 +14907,7 @@ export async function createApp(deps: AppDeps) {
 			target: resolved.target,
 			sha: sha ?? resolved.sha,
 			originUrl: (await e.store.getSettings()).originUrl,
+			nonProductPaths: (await e.store.getSettings()).nonProductPaths,
 		}).catch((err) => json({ error: errmsg(err) }, 409));
 		if (plan instanceof Response) return plan;
 		return { target: resolved.target, sha: resolved.sha, plan };

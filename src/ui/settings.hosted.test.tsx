@@ -150,6 +150,7 @@ const project = (): ProjectView =>
 			autoTend: false,
 			autoTendLimit: 5,
 			tendChurnGlobs: [],
+			nonProductPaths: [],
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,

@@ -10294,6 +10294,8 @@ function ProjectReviewsCards({
 	setLanding,
 	pathsText,
 	setPathsText,
+	npp,
+	setNpp,
 	cap,
 	setCap,
 	reviewCap,
@@ -10314,12 +10316,18 @@ function ProjectReviewsCards({
 	setLanding: (v: "card" | "commit-push") => void;
 	pathsText: string;
 	setPathsText: (v: string) => void;
+	npp: string;
+	setNpp: (v: string) => void;
 	cap: string;
 	setCap: (v: string) => void;
 	reviewCap: number;
 	tasks: TaskCard[];
 	openTask: (id: string) => void;
 }) {
+	const nppLines = npp
+		.split("\n")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
 	return (
 		<>
 			<SaveCard
@@ -10330,7 +10338,8 @@ function ProjectReviewsCards({
 					relenv.trim() !== (st.releaseEnv ?? "") ||
 					postcmd.trim() !== (st.postReleaseCommand ?? "") ||
 					landing !== st.postReleaseLanding ||
-					pathsText.trim() !== st.postReleasePaths.join("\n")
+					pathsText.trim() !== st.postReleasePaths.join("\n") ||
+					nppLines.join("\n") !== st.nonProductPaths.join("\n")
 				}
 				save={() =>
 					send({
@@ -10342,6 +10351,7 @@ function ProjectReviewsCards({
 							.split("\n")
 							.map((s) => s.trim())
 							.filter(Boolean),
+						nonProductPaths: nppLines,
 					})
 				}
 				title="Releases"
@@ -10447,6 +10457,22 @@ function ProjectReviewsCards({
 								/>
 							</label>
 						</DefRow>
+						<DefRow
+							settingKey="nonProductPaths"
+							name="Non-product paths"
+							help="Bun.Glob patterns for repo paths that are not the product (a landing page, the marketing site, README and root docs, .github, agent files). Commits and cards that touch only these paths stay out of the consolidated release notes. The built-in defaults already cover the common paths; add project-specific ones here."
+							shape="one glob per line"
+						>
+							<label>
+								<textarea
+									rows={3}
+									value={npp}
+									onChange={(e) => setNpp(e.target.value)}
+									placeholder="e.g. www/**"
+									aria-label="Non-product paths"
+								/>
+							</label>
+						</DefRow>
 					</>
 				)}
 			</SaveCard>
@@ -10530,6 +10556,7 @@ export function ProjectSettingsForm({
 	const [kwd, setKwd] = useState(String(project.settings.keptWorktreeDays));
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
 	const [relcmd, setRelcmd] = useState(project.settings.releaseCommand ?? "");
+	const [npp, setNpp] = useState(project.settings.nonProductPaths.join("\n"));
 	const [relenv, setRelenv] = useState(project.settings.releaseEnv ?? "");
 	const [postcmd, setPostcmd] = useState(
 		project.settings.postReleaseCommand ?? "",
@@ -10690,6 +10717,8 @@ export function ProjectSettingsForm({
 					send={send}
 					relcmd={relcmd}
 					setRelcmd={setRelcmd}
+					npp={npp}
+					setNpp={setNpp}
 					relenv={relenv}
 					setRelenv={setRelenv}
 					postcmd={postcmd}

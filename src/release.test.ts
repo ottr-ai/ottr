@@ -473,6 +473,63 @@ describe("computeRelease", () => {
 	});
 });
 
+describe("computeRelease non-product path filter", () => {
+	test("non-product commits drop their bullets, the product feature stays", () => {
+		const { notes, releasable } = computeRelease("v1.0.0", [
+			{ subject: "feat: export dialog", body: "", files: ["src/export.ts"] },
+			{
+				subject: "feat: center the built with Ottr badge",
+				body: "",
+				files: ["landing/index.html"],
+			},
+			{
+				subject: "feat: add the built with Ottr badge to README.md",
+				body: "",
+				files: ["README.md"],
+			},
+		]);
+		expect(notes).toBe("## New features\n\n- Export dialog");
+		expect(releasable).toBe(true);
+	});
+
+	test("a breaking commit under a non-product path keeps its bullet", () => {
+		const { notes } = computeRelease("v1.0.0", [
+			{
+				subject: "feat!: new config format",
+				body: "",
+				files: [".github/workflows/ci.yml"],
+			},
+		]);
+		expect(notes).toBe("## New features\n\n- **Breaking:** New config format");
+	});
+
+	test("the version bump reads every commit, the filter shapes the notes only", () => {
+		const all = [
+			{ subject: "feat: export dialog", body: "", files: ["src/export.ts"] },
+			{
+				subject: "feat: center the badge",
+				body: "",
+				files: ["landing/index.html"],
+			},
+		];
+		expect(computeRelease("v1.2.3", all).version).toBe("v1.3.0");
+	});
+
+	test("the project's patterns extend the defaults, commits without files keep", () => {
+		const all = [
+			{
+				subject: "feat: generated client",
+				body: "",
+				files: ["src/generated/client.ts"],
+			},
+			{ subject: "fix: b", body: "" },
+		];
+		expect(computeRelease("v1.0.0", all, ["src/generated/**"]).notes).toBe(
+			"## Bug fixes\n\n- B",
+		);
+	});
+});
+
 describe("includedTasks", () => {
 	// Rows in creation order with a growing target-commits counter; a no-op card repeats the count.
 	const t = (
@@ -1190,6 +1247,69 @@ describe("against real repos", () => {
 			if (sh) process.env.PATH = saved;
 			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
 		}
+	}, 60_000);
+});
+
+// The non-product path filter over the real collectCommits reader (OTTR-1213): the
+// notes drop the landing-page and README badge commits and keep the product feature
+// and the breaking commit under .github.
+describe("planRelease drops non-product commits from the notes", () => {
+	let root = "";
+	let dir = "";
+	let head = "";
+	beforeAll(async () => {
+		root = mkdtempSync(join(tmpdir(), "ott-release-nonproduct-"));
+		dir = join(root, "repo");
+		await must(root, "init", "-q", "-b", "main", dir);
+		await must(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+		await must(dir, "tag", "v0.1.0");
+		mkdirSync(join(dir, "src"), { recursive: true });
+		writeFileSync(join(dir, "src", "export.ts"), "x");
+		await must(dir, "add", ".");
+		await must(dir, "commit", "-q", "-m", "feat: export dialog");
+		mkdirSync(join(dir, "landing"), { recursive: true });
+		writeFileSync(join(dir, "landing", "index.html"), "x");
+		await must(dir, "add", ".");
+		await must(
+			dir,
+			"commit",
+			"-q",
+			"-m",
+			"feat: center the built with Ottr badge",
+		);
+		writeFileSync(join(dir, "README.md"), "x");
+		await must(dir, "add", ".");
+		await must(
+			dir,
+			"commit",
+			"-q",
+			"-m",
+			"feat: add the built with Ottr badge to README.md",
+		);
+		mkdirSync(join(dir, ".github", "workflows"), { recursive: true });
+		writeFileSync(join(dir, ".github", "workflows", "ci.yml"), "x");
+		await must(dir, "add", ".");
+		await must(dir, "commit", "-q", "-m", "feat!: new config format");
+		head = await must(dir, "rev-parse", "HEAD");
+	}, 60_000);
+	afterAll(
+		() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }),
+		60_000,
+	);
+
+	test("the notes hold the feature and the breaking item, never the badge commits", async () => {
+		const plan = await planRelease({
+			mainPath: dir,
+			target: "main",
+			sha: head,
+			originUrl: null,
+		});
+		expect(plan.notes).toBe(
+			"## New features\n\n- **Breaking:** New config format\n- Export dialog",
+		);
+		// The version still reads every commit: a feat lifts the minor.
+		expect(plan.version).toBe("v0.2.0");
+		expect(plan.blocked).toBeNull();
 	}, 60_000);
 });
 

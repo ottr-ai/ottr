@@ -124,6 +124,7 @@ const baseSettings = {
 	autoTend: false,
 	autoTendLimit: 5,
 	tendChurnGlobs: [],
+	nonProductPaths: [],
 	holdUpdateMerges: false,
 	retroSince: null,
 	retroFilter: true,
@@ -185,6 +186,7 @@ const watchBaseSettings = {
 	autoTend: false,
 	autoTendLimit: 5,
 	tendChurnGlobs: [],
+	nonProductPaths: [],
 	setupChecklist: false,
 	targetBranch: null,
 	originUrl: null,
@@ -1028,6 +1030,45 @@ describe("ProjectSettingsForm target branch", () => {
 	});
 });
 
+describe("ProjectSettingsForm non-product paths", () => {
+	const project = projectView();
+
+	test("the Releases card shows the non-product paths textarea and saving posts both fields", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const fetchMock = projectFormFetch(project, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(project, fetchMock);
+		try {
+			const card = container.querySelector("#project-releases-section");
+			expect(card).not.toBeNull();
+			expect(card?.textContent).toContain("Non-product paths");
+			const area = card?.querySelector<HTMLTextAreaElement>(
+				'textarea[aria-label="Non-product paths"]',
+			);
+			if (area === null || area === undefined)
+				throw new Error("non-product paths textarea did not render");
+			expect(area.value).toBe("");
+			expect(area.getAttribute("placeholder")).toBe("e.g. www/**");
+			await act(async () => {
+				typeInto(area, "www/**\nassets/**");
+				onChangeOf(area)({ target: area, currentTarget: area });
+			});
+			// The Releases card saves its own fields through its own form.
+			const form = container.querySelector("#project-releases-section form");
+			if (form === null) throw new Error("form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postBody).not.toBeUndefined();
+			expect(postBody?.nonProductPaths).toEqual(["www/**", "assets/**"]);
+			expect(postBody?.releaseCommand).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+});
+
 describe("ProjectSettingsForm icon text marker", () => {
 	const project = projectView(
 		{
@@ -1832,6 +1873,7 @@ describe("Project switch cards", () => {
 				autoTend: false,
 				autoTendLimit: 5,
 				tendChurnGlobs: [],
+				nonProductPaths: [],
 				setupChecklist: false,
 				targetBranch: null,
 				originUrl: null,
@@ -2193,6 +2235,7 @@ describe("Code scanning watch facts and Check alerts now", () => {
 			autoTend: false,
 			autoTendLimit: 5,
 			tendChurnGlobs: [],
+			nonProductPaths: [],
 			setupChecklist: false,
 			targetBranch: null,
 			originUrl: null,
@@ -2390,6 +2433,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 				autoTend: false,
 				autoTendLimit: 5,
 				tendChurnGlobs: [],
+				nonProductPaths: [],
 				setupChecklist: false,
 				targetBranch: null,
 				originUrl: null,

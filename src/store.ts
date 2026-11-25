@@ -127,6 +127,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	taskIdPrefix: null,
 	jiraConnection: null,
 	jiraLastJql: null,
+	nonProductPaths: [],
 };
 
 /** The tasks table DDL, kept separate so the CHECK migration below reuses the exact shape. */
@@ -1446,6 +1447,7 @@ const SETTINGS_SHAPES = {
 	taskIdPrefix: "string|null",
 	jiraConnection: "string|null",
 	jiraLastJql: "string|null",
+	nonProductPaths: "string[]",
 } as const satisfies Record<keyof ProjectSettings, string>;
 
 /** Validates one stored settings value; undefined when corrupt or of the wrong shape (keep default). */

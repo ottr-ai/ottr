@@ -1341,6 +1341,7 @@ describe("settings", () => {
 			targetBranch: null,
 			originUrl: null,
 			taskIdPrefix: null,
+			nonProductPaths: [],
 		});
 		await store.setSettings({
 			displayName: null,
@@ -1392,6 +1393,7 @@ describe("settings", () => {
 			targetBranch: null,
 			originUrl: null,
 			taskIdPrefix: null,
+			nonProductPaths: [],
 		});
 		await store.close();
 	});

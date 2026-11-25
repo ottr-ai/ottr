@@ -310,6 +310,13 @@ export interface ProjectSettings {
 	autoTendLimit: number;
 	/** Bun.Glob patterns for generated-file paths (e.g. Godot .import churn) whose uncommitted changes the supervisor may auto-restore; empty disables that rule. */
 	tendChurnGlobs: string[];
+	/**
+	 * Bun.Glob patterns for repository paths that are not the product (a landing page, the
+	 * marketing site, root docs, CI, agent or board files), extending the built-in defaults.
+	 * Commits and cards that touch only these paths stay out of the consolidated release
+	 * notes.
+	 */
+	nonProductPaths: string[];
 	/** Update cards park at needs_you when a work turn ends ready; a reply approves the merge (U7). */
 	holdUpdateMerges: boolean;
 	/** Fork-born cards park at needs_you before their merge; a reply approves the parked head. Default on; turning it off does not release already parked cards. */

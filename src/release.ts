@@ -6,6 +6,7 @@ import { gitAuthEnv, parseGitToken, parseGitUrl } from "./gitHosts.ts";
 import { ghEnvFor, githubHost, hostMatcher } from "./githubHost.ts";
 import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
 import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
+import { keepCommitFiles, nonProductGlobs } from "./nonProductPaths.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LateCommit, LatestImage, ReleasePlan, Task } from "./types.ts";
@@ -143,10 +144,13 @@ function noteSection(c: ConventionalCommit | null): string {
 				: "## Changes";
 }
 
-/** One bullet per listed commit, in commit order; unlisted types only when breaking; dedupe. */
+/** One bullet per listed commit, in commit order; unlisted types only when breaking; dedupe.
+ * A commit whose changed files all sit under non-product paths gets no bullet (OTTR-1213),
+ * unless it is breaking — breaking items are never dropped. */
 function buildNotes(
-	commits: { subject: string; body: string }[],
+	commits: { subject: string; body: string; files?: string[] }[],
 	parsed: (ConventionalCommit | null)[],
+	globs: Bun.Glob[] = [],
 ): { notes: string; releasable: boolean } {
 	const sections: Record<string, string[]> = {
 		"## New features": [],
@@ -156,6 +160,7 @@ function buildNotes(
 	const seen = new Set<string>();
 	for (const [i, commit] of commits.entries()) {
 		const c = parsed[i] ?? null;
+		if (!keepCommitFiles(commit.files, globs, c?.breaking ?? false)) continue;
 		let text: string;
 		if (c === null) text = upperFirst(commit.subject.trim());
 		else if (!LISTED[c.type] && !c.breaking) continue;
@@ -180,7 +185,8 @@ function buildNotes(
 
 export function computeRelease(
 	from: string | null,
-	all: { sha?: string; subject: string; body: string }[],
+	all: { sha?: string; subject: string; body: string; files?: string[] }[],
+	extraNonProductPaths?: string[] | null,
 ): { version: string; notes: string; releasable: boolean } {
 	if (from === null) {
 		return {
@@ -195,7 +201,8 @@ export function computeRelease(
 	const commits = all.filter((_, i) => !dropped.has(i));
 	const parsed = commits.map((c) => parseCommit(c.subject, c.body));
 	const version = bumpVersion(m, parsed);
-	const { notes, releasable } = buildNotes(commits, parsed);
+	const globs = nonProductGlobs(extraNonProductPaths);
+	const { notes, releasable } = buildNotes(commits, parsed, globs);
 	return { version, notes, releasable };
 }
 
@@ -547,12 +554,15 @@ async function resolveSha(
 }
 
 /** The commits the release notes cover: count placeholders before the first release, full
- * bodies since `from` after it. */
+ * bodies plus changed files since `from` after it (the files feed the non-product path
+ * filter, OTTR-1213). */
 async function collectCommits(
 	mainPath: string,
 	from: string | null,
 	sha: string,
-): Promise<{ sha?: string; subject: string; body: string }[]> {
+): Promise<
+	{ sha?: string; subject: string; body: string; files?: string[] }[]
+> {
 	if (from === null) {
 		const count = await git(
 			["rev-list", "--count", "--no-merges", sha],
@@ -564,17 +574,33 @@ async function collectCommits(
 			body: "",
 		}));
 	}
+	// The format's leading NUL splits the records: each record is
+	// `<sha>\x1f<subject>\x1f<body>\x1e` followed by the changed-file lines, so a body
+	// that quotes or holds newlines cannot shift the fields.
 	const log = await git(
-		["log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${from}..${sha}`],
+		[
+			"log",
+			"--no-merges",
+			"--format=%x00%H%x1f%s%x1f%b%x1e",
+			"--name-only",
+			`${from}..${sha}`,
+		],
 		mainPath,
 	);
 	return log.stdout
-		.split("\x1e")
-		.map((r) => r.trim())
-		.filter(Boolean)
+		.split("\x00")
+		.slice(1)
 		.map((r) => {
-			const [hash = "", subject = "", body = ""] = r.split("\x1f");
-			return { sha: hash, subject, body };
+			const metaEnd = r.indexOf("\x1e");
+			const [hash = "", subject = "", body = ""] = r
+				.slice(0, metaEnd)
+				.split("\x1f");
+			const files = r
+				.slice(metaEnd + 1)
+				.split("\n")
+				.map((f) => f.trim())
+				.filter(Boolean);
+			return { sha: hash, subject, body, files };
 		});
 }
 
@@ -584,6 +610,9 @@ export async function planRelease(o: {
 	sha: string;
 	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null skips the fetch. */
 	originUrl: string | null;
+	/** The project's non-product path patterns (besides the defaults); non-breaking commits
+	 * that touch only such paths get no notes bullet (OTTR-1213). */
+	nonProductPaths?: string[] | null;
 }): Promise<Omit<ReleasePlan, "tasks">> {
 	// R5-1: the fetch names the pinned origin URL, never the remote name a work turn can
 	// re-point. No pin (or a refused one): skip — the plan reads the tags already fetched,
@@ -602,7 +631,11 @@ export async function planRelease(o: {
 	const tags = await git(["tag", "--list", "v*", "--merged", sha], o.mainPath);
 	const from = highestTag(tags.stdout.split("\n"));
 	const commits = await collectCommits(o.mainPath, from, sha);
-	const { version, notes, releasable } = computeRelease(from, commits);
+	const { version, notes, releasable } = computeRelease(
+		from,
+		commits,
+		o.nonProductPaths,
+	);
 	let blocked = offTarget;
 	if (blocked === null) {
 		if (!releasable)

@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
 import { modelFallbacks, modelRoles } from "./models.ts";
 import {
+	keepSummaryCard,
+	nonProductGlobs,
+} from "./nonProductPaths.ts";
+import {
 	RELEASE_SUMMARY_CHUNK_INSTRUCTIONS,
 	RELEASE_SUMMARY_INSTRUCTIONS,
 } from "./prompts.ts";
@@ -24,6 +28,9 @@ export type ReleaseSummaryCard = {
 	id: string;
 	title: string;
 	details: string | null;
+	/** Repo-relative paths the card's branch changed, captured at merge-turn start;
+	 * null when never captured. The non-product path filter reads them (OTTR-1213). */
+	files?: string[] | null;
 };
 
 /** Trim one card's details at a line boundary, but only when that boundary keeps most of
@@ -184,6 +191,9 @@ export async function summarizeRelease(o: {
 	cards: ReleaseSummaryCard[];
 	projectName: string;
 	projectDescription?: string | null;
+	/** The project's non-product path patterns (besides the defaults); a card whose
+	 * captured files all sit under them stays out of every model call (OTTR-1213). */
+	nonProductPaths?: string[] | null;
 	spawn?: SpawnFn;
 	roles?: Record<string, string>;
 	fallbacks?: Record<string, string[]>;
@@ -196,6 +206,10 @@ export async function summarizeRelease(o: {
 	const selector = smol || "@default";
 	const role = smol !== "" ? "smol" : "default";
 	const chain = (o.fallbacks ?? modelFallbacks())[role] ?? [];
+	// OTTR-1213: the model never sees a card whose changed files are all non-product;
+	// a Breaking report or an uncaptured diff keeps the card.
+	const globs = nonProductGlobs(o.nonProductPaths);
+	const cards = o.cards.filter((c) => keepSummaryCard(c, globs));
 	const call = async (system: string, user: string): Promise<string | null> => {
 		try {
 			if (o.creditHoldActive?.() === true)
@@ -217,12 +231,12 @@ export async function summarizeRelease(o: {
 		}
 	};
 	try {
-		let input = buildSummaryInput(o.notes, o.cards, true);
-		if (input.length > INPUT_CAP && o.cards.length > 0) {
+		let input = buildSummaryInput(o.notes, cards, true);
+		if (input.length > INPUT_CAP && cards.length > 0) {
 			// All chunk calls run in parallel so the whole summary stays within one
 			// call ceiling; Promise.all keeps the oldest-first order of the inputs.
 			const chunkReplies = await Promise.all(
-				chunkInputs(o.cards).map((chunk) =>
+				chunkInputs(cards).map((chunk) =>
 					call(RELEASE_SUMMARY_CHUNK_INSTRUCTIONS, chunk),
 				),
 			);

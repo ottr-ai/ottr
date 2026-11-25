@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
+	isNonProductPath,
+	keepSummaryCard,
+	nonProductGlobs,
+} from "./nonProductPaths.ts";
+import {
 	RELEASE_SUMMARY_CHUNK_INSTRUCTIONS,
 	RELEASE_SUMMARY_INSTRUCTIONS,
 } from "./prompts.ts";
@@ -462,6 +467,111 @@ describe("summarizeRelease", () => {
 		expect(out.summary).toBeNull();
 		expect(out.reason).toBe("gateway exited with code 1: stop");
 		expect(models).toEqual(["a/b:max"]);
+	});
+});
+
+describe("non-product path filter", () => {
+	const globs = nonProductGlobs(["www/**"]);
+	const reply = "## New features\n\n- Export dialog";
+
+	test("the defaults cover landing pages, root docs, CI and agent files, not nested docs", () => {
+		expect(isNonProductPath("landing/index.html", globs)).toBe(true);
+		expect(isNonProductPath("README.md", globs)).toBe(true);
+		expect(isNonProductPath("CONTRIBUTING.md", globs)).toBe(true);
+		expect(isNonProductPath(".github/workflows/ci.yml", globs)).toBe(true);
+		expect(isNonProductPath(".agents/skills/x.md", globs)).toBe(true);
+		expect(isNonProductPath("docs/guide.md", globs)).toBe(false);
+		expect(isNonProductPath("src/app.ts", globs)).toBe(false);
+	});
+
+	test("the project's patterns extend the defaults", () => {
+		expect(isNonProductPath("www/hero.png", globs)).toBe(true);
+	});
+
+	test("a card whose files are all non-product drops; any product file keeps it", () => {
+		expect(
+			keepSummaryCard({ details: null, files: ["landing/index.html"] }, globs),
+		).toBe(false);
+		expect(
+			keepSummaryCard(
+				{ details: null, files: ["src/app.ts", "README.md"] },
+				globs,
+			),
+		).toBe(true);
+	});
+
+	test("a card without captured files keeps", () => {
+		expect(keepSummaryCard({ details: null, files: null }, globs)).toBe(true);
+		expect(keepSummaryCard({ details: "report" }, globs)).toBe(true);
+	});
+
+	test("an empty captured diff drops the card, a breaking report keeps it", () => {
+		expect(keepSummaryCard({ details: "no change", files: [] }, globs)).toBe(
+			false,
+		);
+		expect(
+			keepSummaryCard(
+				{
+					details: "## Changes\n\n- **Breaking:** the config format moved",
+					files: ["landing/index.html"],
+				},
+				globs,
+			),
+		).toBe(true);
+	});
+
+	test("the model input drops the non-product card and keeps the product card", async () => {
+		const { spawn, users } = okSpawn(reply);
+		const out = await summarizeRelease({
+			notes: "- feat: export dialog",
+			cards: [
+				{
+					id: "A-1",
+					title: "Export dialog",
+					details: "quokka counter notes",
+					files: ["src/export.ts"],
+				},
+				{
+					id: "B-2",
+					title: "Badge polish",
+					details: "badge notes",
+					files: ["landing/index.html", "README.md"],
+				},
+			],
+			spawn,
+			projectName: "p",
+		});
+		expect(out.reason).toBeNull();
+		expect(users[0]).toContain("[A-1] Export dialog");
+		expect(users[0]).not.toContain("B-2");
+		expect(users[0]).not.toContain("badge");
+	});
+
+	test("five commits that build one feature feed the writer as one feature", async () => {
+		const lines = [
+			"- feat: export dialog",
+			"- feat: export to csv",
+			"- fix: export quote escaping",
+			"- fix: export large files",
+			"- feat: export preview",
+		];
+		const oneBullet =
+			"## New features\n\n- Export your data to csv, with a preview";
+		const { spawn, calls, users } = okSpawn(oneBullet);
+		const out = await summarizeRelease({
+			notes: lines.join("\n"),
+			cards: [],
+			spawn,
+			projectName: "p",
+		});
+		expect(out).toEqual({ summary: oneBullet, reason: null });
+		// The writer's contract: one bullet per feature, never one per commit.
+		expect(calls[0]).toContain("never one bullet per commit");
+		expect(calls[0]).toContain(
+			"Several commits or reports that build one feature become one bullet",
+		);
+		// All five commits reach the writer as material for that one bullet.
+		for (const line of lines) expect(users[0]).toContain(line.slice(2));
 	});
 });
 
