@@ -1004,7 +1004,10 @@ describe("ProjectSettingsForm target branch", () => {
 			expect(textarea.value).toBe("landing");
 			await act(async () => {
 				typeInto(textarea, "landing\nshots");
-				handlerOf(textarea, "onChange")({
+				handlerOf(
+					textarea,
+					"onChange",
+				)({
 					target: textarea,
 					currentTarget: textarea,
 				});
