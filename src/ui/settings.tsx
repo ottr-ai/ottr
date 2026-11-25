@@ -10515,9 +10515,13 @@ export function ProjectSettingsForm({
 	const [postcmd, setPostcmd] = useState(
 		project.settings.postReleaseCommand ?? "",
 	);
-	const [landing, setLanding] = useState(project.settings.postReleaseLanding);
+	// The stored settings always carry both fields; the ?? forms keep partial
+	// ProjectView fixtures (and a corrupt stored value) on the card defaults.
+	const [landing, setLanding] = useState(
+		project.settings.postReleaseLanding ?? "card",
+	);
 	const [pathsText, setPathsText] = useState(
-		project.settings.postReleasePaths.join("\n"),
+		project.settings.postReleasePaths?.join("\n") ?? "",
 	);
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
