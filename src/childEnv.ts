@@ -1,9 +1,10 @@
-/** Apply this filter after all child environment merges. */
+/** Apply this filter after all child environment merges. The database URL stays on the server, and the SecretBox master key unseals the whole sealed credential store: no child of the server (gate, release command, git helper, tool install) ever needs it. */
 export function childDatabaseEnv(
 	base: Record<string, string | undefined> = process.env,
 ): Record<string, string | undefined> {
 	const env = { ...base };
 	delete env.OTTR_DATABASE_URL;
+	delete env.OTTR_SECRET_KEY;
 	return env;
 }
 

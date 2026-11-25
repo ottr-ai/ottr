@@ -42,6 +42,32 @@ describe("loadSecretBox", () => {
 		expect(b64.open(hex.seal("same"))).toBe("same");
 	});
 
+	test("a malformed key throws and still leaves the env", () => {
+		const env: Record<string, string | undefined> = {
+			OTTR_SECRET_KEY: "nope",
+		};
+		// The dir stays unread on the throw path, so a plain path needs no cleanup.
+		expect(() =>
+			loadSecretBox({ dir: join(tmpdir(), "ottr-unused-box"), env }),
+		).toThrow("OTTR_SECRET_KEY must be 32 bytes as hex or base64");
+		expect("OTTR_SECRET_KEY" in env).toBe(false);
+	});
+
+	test("an explicit env is the only source: process.env stays untouched", () => {
+		const prev = process.env.OTTR_SECRET_KEY;
+		try {
+			const box = loadSecretBox({
+				dir: join(tmpdir(), "ottr-unused-box"),
+				env: { OTTR_SECRET_KEY: HEX_A },
+			});
+			expect(box.open(box.seal("x"))).toBe("x");
+			expect(process.env.OTTR_SECRET_KEY).toBe(prev);
+		} finally {
+			if (prev === undefined) delete process.env.OTTR_SECRET_KEY;
+			else process.env.OTTR_SECRET_KEY = prev;
+		}
+	});
+
 	test("changed key, tampering and garbage open to null", () => {
 		const dir = tmp();
 		const a = loadSecretBox({ dir, env: { OTTR_SECRET_KEY: HEX_A } });

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -71,14 +72,17 @@ describe("server secrets never reach a child process", () => {
 
 	test("the check gate does not see it", async () => {
 		const dir = fixture(
-			'echo "secret=$' + '{OTTR_HOSTED_SECRET:-absent}"; exit 1',
+			'echo "secret=$' +
+				"{OTTR_HOSTED_SECRET:-absent} master=$" +
+				'{OTTR_SECRET_KEY:-absent}"; exit 1',
 			"",
 		);
 		try {
 			const r = await withSecret(() => runMergeGates(dir));
 			expect(r.ok).toBe(false);
-			expect(r.output).toContain("secret=absent");
+			expect(r.output).toContain("secret=absent master=absent");
 			expect(r.output).not.toContain(SECRET);
+			expect(r.output).not.toContain(MASTER_KEY);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -87,13 +91,15 @@ describe("server secrets never reach a child process", () => {
 	test("the test gate does not see it", async () => {
 		const dir = fixture(
 			"exit 0",
-			'throw new Error("secret=" + (process.env.OTTR_HOSTED_SECRET ?? "absent"));',
+			'throw new Error("secret=" + (process.env.OTTR_HOSTED_SECRET ?? "absent") + " master=" + (process.env.OTTR_SECRET_KEY ?? "absent"));',
 		);
 		try {
 			const r = await withSecret(() => runMergeGates(dir));
 			expect(r.ok).toBe(false);
 			expect(r.output).toContain("secret=absent");
+			expect(r.output).toContain("master=absent");
 			expect(r.output).not.toContain(SECRET);
+			expect(r.output).not.toContain(MASTER_KEY);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -196,4 +202,36 @@ describe("server secrets never reach a child process", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+	test.skipIf(process.platform !== "linux")(
+		"the boot read: a child process cannot read the master key from /proc/<server>/environ",
+		() => {
+			const mod = new URL("./secretBox.ts", import.meta.url).pathname;
+			const dir = mkdtempSync(join(tmpdir(), "ottr-master-key-boot-"));
+			// The "server" loads its box, then a child (a repository check) reads the
+			// server's startup env block, as any same-user process can.
+			const script = `
+				const { loadSecretBox } = await import(${JSON.stringify(mod)});
+				const box = loadSecretBox({ dir: ${JSON.stringify(dir)} });
+				const r = Bun.spawnSync(["cat", "/proc/" + process.pid + "/environ"]);
+				const leaked = r.stdout.toString().includes(${JSON.stringify(MASTER_KEY)});
+				console.log(JSON.stringify({ keyId: box.keyId, leaked, inEnv: "OTTR_SECRET_KEY" in process.env }));
+			`;
+			try {
+				const r = Bun.spawnSync(["bun", "-e", script], {
+					env: { ...process.env, OTTR_SECRET_KEY: MASTER_KEY },
+				});
+				expect(r.stderr.toString()).toBe("");
+				expect(JSON.parse(r.stdout.toString())).toEqual({
+					keyId: createHash("sha256")
+						.update(Buffer.from(MASTER_KEY, "hex"))
+						.digest("hex")
+						.slice(0, 16),
+					leaked: false,
+					inEnv: false,
+				});
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });

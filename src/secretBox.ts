@@ -6,6 +6,7 @@ import {
 } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { scrubProcEnviron } from "./hosted.ts";
 
 export interface SecretBox {
 	seal(plain: string): string;
@@ -56,12 +57,25 @@ export function isSealed(v: unknown): boolean {
 	return parts[0] === "v1" && /^[0-9a-f]{16}$/.test(parts[1] ?? "");
 }
 
-/** Key: env OTTR_SECRET_KEY (32 bytes as 64 hex chars or base64) else `<dir>/secret.key` (created once, 32 random bytes, hex, mode 0o600). Throws on a malformed OTTR_SECRET_KEY. */
+/** Key: env OTTR_SECRET_KEY (32 bytes as 64 hex chars or base64) else `<dir>/secret.key` (created once, 32 random bytes, hex, mode 0o600). Throws on a malformed OTTR_SECRET_KEY. The key always leaves the env it was read from (also on a throw); on the real process env it also leaves /proc/<pid>/environ, so no turn child or same-user process inherits or reads it. */
 export function loadSecretBox(o: {
 	dir: string;
 	env?: Record<string, string | undefined>;
 }): SecretBox {
-	const envKey = (o.env ?? process.env).OTTR_SECRET_KEY;
+	const source = o.env ?? process.env;
+	try {
+		return secretBoxFrom(source, o.dir);
+	} finally {
+		delete source.OTTR_SECRET_KEY;
+		if (source === process.env) scrubProcEnviron("OTTR_SECRET_KEY");
+	}
+}
+
+function secretBoxFrom(
+	source: Record<string, string | undefined>,
+	dir: string,
+): SecretBox {
+	const envKey = source.OTTR_SECRET_KEY;
 	let key: Buffer;
 	if (envKey) {
 		const k = parseKey(envKey);
@@ -69,7 +83,7 @@ export function loadSecretBox(o: {
 			throw new Error("OTTR_SECRET_KEY must be 32 bytes as hex or base64");
 		key = k;
 	} else {
-		key = fileKey(o.dir);
+		key = fileKey(dir);
 	}
 	const keyId = createHash("sha256").update(key).digest("hex").slice(0, 16);
 	return {
