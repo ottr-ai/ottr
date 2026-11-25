@@ -16,10 +16,13 @@ import {
 	type JobProcess,
 	type JobSpawn,
 	type JobSpawnOptions,
+	killProcessGroup,
 	LIMITS_PROBE_ARGV,
 	parseJobSpec,
 	parseLimitsReadback,
 	promoteArtifacts,
+	realFs,
+	realSpawn,
 	runJob,
 	runSelfCheck,
 	runValidationMode,
@@ -113,6 +116,38 @@ function hangingProc(pid: number): HangingProc {
 	};
 }
 
+/**
+ * A spawn that answers the two self-check probes with fakes and spawns every other
+ * argv for real. The real branch skips the job wrapper (the cgroup path does not
+ * exist on the test host) and spawns the payload argv directly, detached, so the
+ * job leads its own process group for the group kill.
+ */
+const realJobSpawn: JobSpawn = (argv, opts) => {
+	const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
+	if (inner[0] === "env") return textProc(envText(), 0);
+	if (inner[0] === "sh" && inner[2]?.includes("/proc/self/limits"))
+		return textProc(limitsText(), 0);
+	const proc = Bun.spawn(inner, {
+		env: opts.env,
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		detached: true,
+	});
+	return {
+		pid: proc.pid,
+		exited: proc.exited,
+		get exitCode() {
+			return proc.exitCode;
+		},
+		get signalCode() {
+			return typeof proc.signalCode === "string" ? proc.signalCode : null;
+		},
+		stdout: proc.stdout,
+		stderr: proc.stderr,
+	};
+};
+
 /** The env the env probe must print: exactly the allowlist, sorted. */
 const envText = (): string =>
 	Object.entries(VM_VALIDATE.envAllowlist)
@@ -177,8 +212,7 @@ function makeDeps(
 	};
 	const deps: ValidateDeps = {
 		fs: {
-			readFile: (path) => readFileSync(path),
-			lstat: (path) => lstatSync(path),
+			...realFs(),
 			writeFile: (path, content) => {
 				fsWrites.push({ path, content });
 			},
@@ -211,6 +245,7 @@ function makeDeps(
 		now: () => 1_700_000_000_000,
 		writeResult: async () => undefined,
 		killTree: () => undefined,
+		killGroup: () => undefined,
 		timeoutSec: 0.05,
 		collectFileBytes: VM_VALIDATE.collectFileBytes,
 		collectTotalBytes: VM_VALIDATE.collectTotalBytes,
@@ -223,16 +258,36 @@ function makeDeps(
 const fsWithSpec = (
 	spec: ValidateJobSpec,
 	writes: { path: string; content: string }[] = [],
-): ValidateDeps["fs"] => ({
-	readFile: (path) => {
-		if (path === "/job/job.json") return Buffer.from(JSON.stringify(spec));
-		return readFileSync(path);
-	},
-	lstat: (path) => lstatSync(path),
-	writeFile: (path, content) => {
-		writes.push({ path, content });
-	},
-});
+): ValidateDeps["fs"] => {
+	const real = realFs();
+	return {
+		...real,
+		readFile: (path) => {
+			if (path === "/job/job.json") return Buffer.from(JSON.stringify(spec));
+			return real.readFile(path);
+		},
+		writeFile: (path, content) => {
+			writes.push({ path, content });
+		},
+	};
+};
+
+/** The real fs seam with every path rewritten under `dir`: the promotion tests' scratch root. */
+const fsUnder = (dir: string): ValidateDeps["fs"] => {
+	const real = realFs();
+	const map = (path: string): string => join(dir, path.replace(/^\//, ""));
+	return {
+		readFile: (path) => real.readFile(map(path)),
+		lstat: (path) => real.lstat(map(path)),
+		// The cgroup policy write has no target on the test host; promotion tests
+		// never read it back.
+		writeFile: () => {},
+		openRead: (path) => real.openRead(map(path)),
+		fstat: real.fstat,
+		readAll: real.readAll,
+		close: real.close,
+	};
+};
 
 function decodeResult(bytes: Uint8Array): ValidateResult {
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -553,6 +608,7 @@ describe("runJob", () => {
 	test("a hung job is killed at the timeout and still reported", async () => {
 		const proc = hangingProc(777);
 		const killedPids: number[] = [];
+		const groupKills: number[] = [];
 		const { deps } = makeDeps({
 			spawnImpl: () => proc,
 			overrides: {
@@ -560,11 +616,15 @@ describe("runJob", () => {
 					killedPids.push(pid);
 					proc.killNow();
 				},
+				killGroup: (pid) => {
+					groupKills.push(pid);
+				},
 				timeoutSec: 0.05,
 			},
 		});
 		const outcome = await runJob(markedSpec(), deps);
 		expect(killedPids).toEqual([777]);
+		expect(groupKills).toEqual([777]);
 		expect(outcome.timedOut).toBe(true);
 		expect(outcome.exitCode).toBeNull();
 		expect(outcome.signal).toBe("SIGKILL");
@@ -573,14 +633,71 @@ describe("runJob", () => {
 	});
 
 	test("a job that exits keeps its code and its output tails", async () => {
+		const groupKills: number[] = [];
 		const { deps } = makeDeps({
 			spawnImpl: () => textProc("out line\n", 3),
+			overrides: {
+				killGroup: (pid) => {
+					groupKills.push(pid);
+				},
+			},
 		});
 		const outcome = await runJob(markedSpec(), deps);
 		expect(outcome.timedOut).toBe(false);
 		expect(outcome.exitCode).toBe(3);
 		expect(outcome.signal).toBeNull();
 		expect(outcome.stdoutTail).toBe("out line\n");
+		// The normal exit path ends the job's whole group too.
+		expect(groupKills).toEqual([4242]);
+	});
+
+	test("a job that dies on a signal also has its group killed", async () => {
+		const groupKills: number[] = [];
+		const { deps } = makeDeps({
+			spawnImpl: () => ({
+				pid: 4242,
+				exited: Promise.resolve(null),
+				exitCode: null,
+				signalCode: "SIGKILL",
+				stdout: streamOf(""),
+				stderr: streamOf(""),
+			}),
+			overrides: {
+				killGroup: (pid) => {
+					groupKills.push(pid);
+				},
+			},
+		});
+		const outcome = await runJob(markedSpec(), deps);
+		expect(groupKills).toEqual([4242]);
+		expect(outcome.exitCode).toBeNull();
+		expect(outcome.signal).toBe("SIGKILL");
+	});
+
+	test("the real spawn detaches the job into its own process group", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "vm-validate-group-"));
+		try {
+			const proc = realSpawn(["sh", "-c", "sleep 30"], {
+				cwd: dir,
+				env: buildJobEnv(),
+			});
+			// A group-led child answers a group-scoped existence probe at its own pid;
+			// a child that stayed in this runner's group would answer at no pid of its own.
+			const groupAlive = (pid: number): boolean => {
+				try {
+					process.kill(-pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			expect(groupAlive(proc.pid)).toBe(true);
+			killProcessGroup(proc.pid);
+			await proc.exited;
+			expect(groupAlive(proc.pid)).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -597,14 +714,7 @@ describe("promoteArtifacts", () => {
 				Buffer.alloc(VM_VALIDATE.collectFileBytes + 1),
 			);
 			const { deps } = makeDeps({
-				overrides: {
-					fs: {
-						readFile: (path) =>
-							readFileSync(join(scratch, path.replace(/^\//, ""))),
-						lstat: (path) => lstatSync(join(scratch, path.replace(/^\//, ""))),
-						writeFile: () => {},
-					},
-				},
+				overrides: { fs: fsUnder(scratch) },
 			});
 			const artifacts = promoteArtifacts(
 				[
@@ -642,12 +752,7 @@ describe("promoteArtifacts", () => {
 			writeFileSync(join(scratch, "tmp", "b.txt"), "12345"); // 5 bytes: 6 + 5 > 10
 			const { deps } = makeDeps({
 				overrides: {
-					fs: {
-						readFile: (path) =>
-							readFileSync(join(scratch, path.replace(/^\//, ""))),
-						lstat: (path) => lstatSync(join(scratch, path.replace(/^\//, ""))),
-						writeFile: () => {},
-					},
+					fs: fsUnder(scratch),
 					collectFileBytes: 8,
 					collectTotalBytes: 10,
 				},
@@ -657,6 +762,24 @@ describe("promoteArtifacts", () => {
 			expect(artifacts[0]?.size).toBe(6);
 			expect(artifacts[1]?.dropped).toContain("total cap");
 			expect(artifacts[1]?.bytes).toBe("");
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
+		}
+	});
+
+	test("a read that disagrees with the descriptor's own facts drops", () => {
+		const scratch = mkdtempSync(join(tmpdir(), "vm-validate-fd-"));
+		try {
+			mkdirSync(join(scratch, "tmp"), { recursive: true });
+			writeFileSync(join(scratch, "tmp", "poc.txt"), "proof");
+			const fs = {
+				...fsUnder(scratch),
+				readAll: (fd: number) =>
+					Buffer.concat([readFileSync(fd), Buffer.from("!")]),
+			};
+			const { deps } = makeDeps({ overrides: { fs } });
+			const artifacts = promoteArtifacts(["tmp/poc.txt"], deps);
+			expect(artifacts[0]?.dropped).toContain("changed size");
 		} finally {
 			rmSync(scratch, { recursive: true, force: true });
 		}
@@ -857,9 +980,8 @@ describe("runValidationMode", () => {
 		const { deps, spawns } = makeDeps({
 			overrides: {
 				fs: {
+					...realFs(),
 					readFile: () => Buffer.from("{ not json"),
-					lstat: (path) => lstatSync(path),
-					writeFile: () => {},
 				},
 				writeResult: async (bytes) => {
 					written.push(bytes);
@@ -882,11 +1004,10 @@ describe("runValidationMode", () => {
 		const { deps } = makeDeps({
 			overrides: {
 				fs: {
+					...realFs(),
 					readFile: () => {
 						throw new Error("no medium");
 					},
-					lstat: (path) => lstatSync(path),
-					writeFile: () => {},
 				},
 				writeResult: async (bytes) => {
 					written.push(bytes);
@@ -903,11 +1024,10 @@ describe("runValidationMode", () => {
 		const { deps } = makeDeps({
 			overrides: {
 				fs: {
+					...realFs(),
 					readFile: () => {
 						throw new Error("no medium");
 					},
-					lstat: (path) => lstatSync(path),
-					writeFile: () => {},
 				},
 				writeResult: async () => {
 					throw new Error("drive gone");
@@ -915,5 +1035,113 @@ describe("runValidationMode", () => {
 			},
 		});
 		await expect(runValidationMode(deps)).resolves.toBeUndefined();
+	});
+
+	test("a detached child holding a pipe end cannot hold the job open", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "vm-validate-drain-"));
+		try {
+			const artifact = join(dir, "late.bin");
+			writeFileSync(artifact, "CLEAN");
+			const { deps } = makeDeps({
+				spawnImpl: realJobSpawn,
+				overrides: {
+					killGroup: killProcessGroup,
+					timeoutSec: 30,
+				},
+			});
+			const started = Date.now();
+			const outcome = await runJob(
+				{
+					schema: 1,
+					id: "val-drain",
+					cwd: dir,
+					argv: [
+						"sh",
+						"-c",
+						`( sleep 3; printf TAMPERED >> '${artifact}' ) & printf held`,
+					],
+				},
+				deps,
+			);
+			// The sleeper holds the job's stdout pipe end; the group kill before the
+			// drain ends it, so runJob returns long before the sleeper's 3 s elapse.
+			expect(Date.now() - started).toBeLessThan(2000);
+			expect(outcome.exitCode).toBe(0);
+			expect(outcome.stdoutTail).toBe("held");
+			// Real-delay exception: the sleeper is a separate OS process whose clock
+			// fake timers cannot advance; only elapsed wall time proves its append
+			// never landed after the group kill.
+			const deadline = Promise.withResolvers<void>();
+			setTimeout(deadline.resolve, 3200);
+			await deadline.promise;
+			expect(readFileSync(artifact, "utf8")).toBe("CLEAN");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a detached writer that outlives the job cannot change the collected artifact", async () => {
+		// The architecture review's sandbox repro (OTTR-1186): the job exits and leaves
+		// a background writer that appends to a collected scratch file long after the
+		// job is gone. Promotion must find the job's group already dead, so the late
+		// append never lands; before the group kill this file gained TAMPERED bytes
+		// after the board had collected the CLEAN ones.
+		const scratch = mkdtempSync(join(tmpdir(), "vm-validate-writer-"));
+		try {
+			mkdirSync(join(scratch, "tmp"), { recursive: true });
+			const artifactPath = join(scratch, "tmp", "out.bin");
+			const proofPath = join(scratch, "tmp", "proof.txt");
+			writeFileSync(artifactPath, "CLEAN");
+			const spec = jobSpec({
+				collect: ["tmp/out.bin"],
+				argv: [
+					"sh",
+					"-c",
+					`printf FORKED > '${proofPath}'; ( sleep 0.7; printf TAMPERED >> '${artifactPath}' ) >/dev/null 2>&1 & exit 0`,
+				],
+			});
+			const under = fsUnder(scratch);
+			const fs: ValidateDeps["fs"] = {
+				...under,
+				readFile: (path) =>
+					path === "/job/job.json"
+						? Buffer.from(JSON.stringify(spec))
+						: under.readFile(path),
+			};
+			const written: Uint8Array[] = [];
+			const { deps } = makeDeps({
+				spawnImpl: realJobSpawn,
+				overrides: {
+					fs,
+					killGroup: killProcessGroup,
+					timeoutSec: 30,
+					writeResult: async (bytes) => {
+						written.push(bytes);
+					},
+				},
+			});
+			await runValidationMode(deps);
+			const result = decodeResult(written[0]!);
+			expect(result.missingControl).toBeNull();
+			expect(result.job?.exitCode).toBe(0);
+			// The job really ran and really forked the writer.
+			expect(readFileSync(proofPath, "utf8")).toBe("FORKED");
+			// The board collected the artifact; give the writer its full deadline. The
+			// group kill at job exit must have silenced it before its append.
+			// Real-delay exception: the writer is a separate OS process whose clock
+			// fake timers cannot advance; only elapsed wall time proves absence of
+			// its write.
+			const deadline = Promise.withResolvers<void>();
+			setTimeout(deadline.resolve, 900);
+			await deadline.promise;
+			expect(readFileSync(artifactPath, "utf8")).toBe("CLEAN");
+			const promoted = result.artifacts[0]!;
+			expect(promoted.dropped).toBeUndefined();
+			expect(Buffer.from(promoted.bytes, "base64").toString("utf8")).toBe(
+				"CLEAN",
+			);
+		} finally {
+			rmSync(scratch, { recursive: true, force: true });
+		}
 	});
 });

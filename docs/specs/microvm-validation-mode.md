@@ -138,10 +138,15 @@ The limit value stays 256; the response's `limits.maxProcesses` reports it.
    `prlimit` with `RLIMIT_CORE` 0 and `RLIMIT_FSIZE` 1 GiB; no `RLIMIT_NPROC`.
    The move happens before any fork, so no job task is born outside the cgroup.
    `env` is exactly the allowlist, cwd under `/target`, the timeout kills the
-   tree. It captures stdout and stderr tails (64 KiB each).
-5. The agent writes the result JSON to `/dev/vdd` (8-byte little-endian length,
-   then UTF-8 JSON), then exits. Init kills the tree, syncs, unmounts, powers off
-   as today.
+   tree. The job spawns detached, so it leads its own process group. It
+   captures stdout and stderr tails (64 KiB each).
+5. On every exit path — exit code, signal, timeout — the agent kills the job's
+   process group before anything else touches the job's files. A writer that
+   detached and reparented to init escapes the timeout's descendant walk, but
+   not its group.
+6. The agent promotes the collected scratch files (below) and writes the result
+   JSON to `/dev/vdd` (8-byte little-endian length, then UTF-8 JSON), then
+   exits. Init kills the tree, syncs, unmounts, powers off as today.
 
 ### Self-check
 
@@ -164,13 +169,16 @@ powers off. Checks:
 ### Artifact promotion
 
 The job spec carries `collect`: scratch-relative paths with per-file and
-cumulative byte caps. After the job's process tree is gone, the agent promotes
-each allowlisted file into the result, with the harness's promotion rules:
+cumulative byte caps. The job's process group is dead before promotion starts
+(step 5), so no job writer races the walk. The agent promotes each allowlisted
+file into the result, with the harness's promotion rules:
 
 - reject absolute, empty, `.`, `..`, or symlinked components;
 - walk every parent no-follow from the scratch root, reopen by descriptor only;
 - leaf open no-follow; `fstat` a regular file with link count 1 inside its caps;
-- inline the bytes as base64 in the result JSON, re-checking the caps while reading.
+- inline the bytes as base64 in the result JSON, read through that descriptor,
+  and drop the file when the bytes disagree with the descriptor's own `fstat`
+  size.
 
 Anything that fails a rule is dropped from the result and named. The result
 medium is parent-owned afterwards (`/data/<project>/validate-jobs/<id>/`), which

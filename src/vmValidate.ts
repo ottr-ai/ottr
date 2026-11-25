@@ -1,5 +1,7 @@
 import {
 	closeSync,
+	constants as fsConstants,
+	fstatSync,
 	lstatSync,
 	openSync,
 	readdirSync,
@@ -89,6 +91,14 @@ export interface ValidateFs {
 	lstat(path: string): ValidateStat;
 	/** One policy write: the job cgroup's `pids.max`, before the limits probe. */
 	writeFile(path: string, content: string): void;
+	/** Opens the path read-only, no-follow on the leaf; throws on failure (ELOOP on a leaf symlink). */
+	openRead(path: string): number;
+	/** The open descriptor's own facts. */
+	fstat(fd: number): ValidateStat;
+	/** Reads the whole file the descriptor names, from offset 0. */
+	readAll(fd: number): Uint8Array;
+	/** Closes the descriptor. */
+	close(fd: number): void;
 }
 
 export interface JobSpawnOptions {
@@ -152,8 +162,10 @@ export interface ValidateDeps {
 	now(): number;
 	/** Writes the encoded result to the raw result drive. */
 	writeResult(bytes: Uint8Array): Promise<void>;
-	/** The job's process-tree killer (platform.killTree). */
+	/** The job's process-tree killer (platform.killTree), for the timeout kill. */
 	killTree(pid: number): void;
+	/** Kills every process in the job's own process group (the group realSpawn creates). */
+	killGroup(pid: number): void;
 	/** The job timeout in seconds; a fraction in tests keeps the suite fast. */
 	timeoutSec: number;
 	/** The promotion caps; smaller in tests so the cumulative cap needs no 4 MiB files. */
@@ -317,6 +329,13 @@ async function runProcess(
 	} finally {
 		clearTimeout(timer);
 	}
+	// Every exit path ends the job's whole process group before anything collects.
+	// The timeout kill above walks descendants while the job runs; a writer that
+	// detached and reparented to init escapes that walk but not its group. The job
+	// leads its own group (realSpawn detaches it), so this never reaches the agent.
+	// Killing before the drain also ends the tails: a detached child holding a pipe
+	// write-end would otherwise hold the drain open until it exits on its own.
+	deps.killGroup(proc.pid);
 	await Promise.all([out, err]);
 	return {
 		exitCode,
@@ -627,9 +646,11 @@ export async function runSelfCheck(
 }
 
 /**
- * Promotes the collected scratch files into the result. The job's process tree is already
- * dead here, so no writer races this walk: the lstat then read below cannot TOCTOU against
- * a live writer. Any name that fails a promotion rule is dropped and named, never fatal.
+ * Promotes the collected scratch files into the result. The job's process group is
+ * already dead here (runProcess kills it on every exit path), so no job writer races
+ * this walk; the facts and the bytes come from one no-follow descriptor, so even a
+ * racer outside the group cannot change a file between its stat and its read. Any
+ * name that fails a promotion rule is dropped and named, never fatal.
  */
 export function promoteArtifacts(
 	collect: readonly string[],
@@ -666,7 +687,8 @@ function promoteOne(
 	if (root === undefined)
 		return drop("not under a scratch root (tmp, home, work)");
 	const below = parts.slice(1);
-	// Every component no-follow: a symlink anywhere in the chain is rejected.
+	// Every parent component no-follow: a symlink parent is rejected. The leaf open
+	// below is no-follow too.
 	for (let i = 0; i < below.length - 1; i++) {
 		let parent: ValidateStat;
 		try {
@@ -677,35 +699,49 @@ function promoteOne(
 		if (parent.isSymbolicLink())
 			return drop("a parent path component is a symlink");
 	}
-	let leaf: ValidateStat;
+	// One no-follow descriptor carries the facts and the bytes: the leaf open rejects
+	// a swapped-in symlink, and nothing can change the file between its fstat and its
+	// read. The group kill already removed the job's writers; the descriptor closes
+	// the last window for a racer outside the group.
+	let fd: number;
 	try {
-		leaf = deps.fs.lstat(join(root, ...below));
-	} catch {
-		return drop("the file is missing or unreadable");
-	}
-	if (leaf.isSymbolicLink()) return drop("the file is a symlink");
-	if (!leaf.isFile()) return drop("not a regular file");
-	if (leaf.nlink !== 1) return drop("the file has more than one hard link");
-	if (leaf.size > deps.collectFileBytes)
+		fd = deps.fs.openRead(join(root, ...below));
+	} catch (err) {
 		return drop(
-			`larger than the per-file cap (${deps.collectFileBytes} bytes)`,
+			(err as NodeJS.ErrnoException)?.code === "ELOOP"
+				? "the file is a symlink"
+				: "the file is missing or unreadable",
 		);
-	if (total + leaf.size > deps.collectTotalBytes)
-		return drop(`would exceed the total cap (${deps.collectTotalBytes} bytes)`);
-	let bytes: Uint8Array;
-	try {
-		bytes = deps.fs.readFile(join(root, ...below));
-	} catch {
-		return drop("the file could not be read");
 	}
-	// Re-check against the read: the size lstat saw must be the size the read returned.
-	if (bytes.byteLength !== leaf.size)
-		return drop("the file changed size between stat and read");
-	return {
-		name,
-		size: bytes.byteLength,
-		bytes: Buffer.from(bytes).toString("base64"),
-	};
+	try {
+		const leaf = deps.fs.fstat(fd);
+		if (!leaf.isFile()) return drop("not a regular file");
+		if (leaf.nlink !== 1) return drop("the file has more than one hard link");
+		if (leaf.size > deps.collectFileBytes)
+			return drop(
+				`larger than the per-file cap (${deps.collectFileBytes} bytes)`,
+			);
+		if (total + leaf.size > deps.collectTotalBytes)
+			return drop(
+				`would exceed the total cap (${deps.collectTotalBytes} bytes)`,
+			);
+		let bytes: Uint8Array;
+		try {
+			bytes = deps.fs.readAll(fd);
+		} catch {
+			return drop("the file could not be read");
+		}
+		// The bytes must be exactly what the descriptor's own facts named.
+		if (bytes.byteLength !== leaf.size)
+			return drop("the file changed size between stat and read");
+		return {
+			name,
+			size: bytes.byteLength,
+			bytes: Buffer.from(bytes).toString("base64"),
+		};
+	} finally {
+		deps.fs.close(fd);
+	}
 }
 
 /** 8-byte little-endian length prefix, then the UTF-8 JSON payload. */
@@ -889,10 +925,12 @@ export async function runValidationMode(
 	}
 }
 
-/** Bun.spawn narrowed to the job path; Bun's numeric signal codes become null here. */
-const realSpawn: JobSpawn = (argv, opts) => {
+/** Bun.spawn narrowed to the job path; Bun's numeric signal codes become null here.
+ * The job runs detached (setsid), so it leads its own process group for killGroup. */
+export const realSpawn: JobSpawn = (argv, opts) => {
 	const proc = Bun.spawn(argv, {
 		...opts,
+		detached: true,
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -910,6 +948,34 @@ const realSpawn: JobSpawn = (argv, opts) => {
 		stderr: proc.stderr,
 	};
 };
+
+/**
+ * Kills every process in the process group `pid` leads (the job's group). Never
+ * throws: a group whose members are all gone is fine, and `pid <= 0` is a no-op.
+ */
+export const killProcessGroup = (pid: number): void => {
+	if (pid <= 0) return;
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {
+		// The group is already gone.
+	}
+};
+
+/**
+ * The real promotion reader: every collected name opens no-follow and reads through
+ * its own descriptor, so the facts and the bytes come from one open file.
+ */
+export const realFs = (): ValidateFs => ({
+	readFile: (path) => readFileSync(path),
+	lstat: (path) => lstatSync(path),
+	writeFile: (path, content) => writeFileSync(path, content),
+	openRead: (path) =>
+		openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0)),
+	fstat: (fd) => fstatSync(fd),
+	readAll: (fd) => readFileSync(fd),
+	close: (fd) => closeSync(fd),
+});
 
 const realExec = async (
 	argv: string[],
@@ -934,11 +1000,7 @@ const realExec = async (
 
 /** The real environment: node fs, Bun spawn and connect, the platform's tree killer. */
 const realDeps = (): ValidateDeps => ({
-	fs: {
-		readFile: (path) => readFileSync(path),
-		lstat: (path) => lstatSync(path),
-		writeFile: (path, content) => writeFileSync(path, content),
-	},
+	fs: realFs(),
 	stat: (path) => lstatSync(path),
 	readdir: (path) => readdirSync(path),
 	spawn: realSpawn,
@@ -980,6 +1042,7 @@ const realDeps = (): ValidateDeps => ({
 		}
 	},
 	killTree: (pid) => platform.killTree(pid),
+	killGroup: killProcessGroup,
 	timeoutSec: VM_VALIDATE.timeoutSec,
 	collectFileBytes: VM_VALIDATE.collectFileBytes,
 	collectTotalBytes: VM_VALIDATE.collectTotalBytes,
