@@ -32,6 +32,13 @@ Body: `{ "dependsOn": string[] }`. The list replaces the card's `dependsOn`
   not `running` or `preparing`. Refusals: cancelled → 404 (`task is
   cancelled`), stage `done` → 409, state `running`/`preparing` → 409. A
   `queued` card (including a usage-limit hold) may edit its list.
+- The cycle walk and the write share one process-wide lock, so two concurrent
+  edits of two parked cards cannot each validate against the other's
+  pre-write snapshot and together form a cycle.
+- The walk resolves each id in the project whose card names it (own project
+  first, `PREFIX-n` handles after) — the same rule the scheduler applies at
+  the hold. A foreign card's local legacy id therefore resolves in its own
+  project, and a cycle through it is still caught.
 - Success answers the task view with the stored list. The scheduler reads the
   new list on its next tick: a queued card with an open dependency keeps
   waiting (`depHold` in `src/scheduler.ts`); a held card with every dependency
@@ -42,24 +49,38 @@ Body: `{ "dependsOn": string[] }`. The list replaces the card's `dependsOn`
 The existing route gains a second source: a stage `in_progress` card in state
 `needs_you` or `idle` moves back to `todo`/`queued`.
 
-- Allowed only when the card holds no work: the worktree, if one exists, must
-  be clean (`git status` empty) and hold no commits past its base/target
-  (`unsavedWork` in `src/worktree.ts`). Otherwise the route answers **409**
-  with the reason (uncommitted changes, N commits not on target, or the
-  unreadable-tree reason), and the card keeps its worktree — cancel stays the
-  path for cards with work.
 - Before any state write the route refuses 409 when a reply or steer is still
   queued (`pendingPrompt`), or when the state is `queued`, `preparing`, or
   `running`.
+- The route reserves the card before it touches git: a transaction writes
+  state `idle` (a needs-you card flips, an idle card bumps its revision).
+  A reply, restart, or steer that lands during the git work fails its
+  revision/state guard, and the scheduler never picks `idle`, so no run can
+  claim the worktree while the route works on it.
+- Allowed only when the card holds no work: the worktree, if one exists, must
+  be clean (`git status` empty) and hold no commits past its base/target
+  (`unsavedWork` in `src/worktree.ts`). A husk (unlinked or missing worktree
+  directory) hides no checkout, so its branch is checked instead, like
+  cancel's kept-worktree verdict: a branch with commits that never reached
+  the target refuses the move. Otherwise the route answers **409** with the
+  reason, restores the parked state, and the card keeps its worktree — cancel
+  stays the path for cards with work.
+- Disposal must land before the row forgets the fields: when the removal
+  throws, or the directory or the branch still exists afterwards, the route
+  answers 500, restores the parked state, and keeps `worktree`/`branch` — the
+  card stays retryable instead of queueing while it still owns them.
 - On success the route removes the clean worktree and its branch
   (`removeWorktree`), then writes: stage `todo`, state `queued`, `queuedAt`
   set, `holdUntil` null, `needsReason` null, `asked` null, `sessionId` null,
   `worktree` null, `branch` null, `keptFiles` empty, work-check send-back
   counter and head/report cleared — so the next start is a fresh work turn in
-  a fresh session. Kept: id, prompt, turn history, lineage
-  (`followUpOf`/`followUpOfProject`/`updateIds`), `starred`, `dependsOn`,
-  model, priority, notes, and the check log. The card then starts as a fresh
-  work turn when its dependencies are done.
+  a fresh session. The stale `base` clears too: a fresh worktree would
+  otherwise branch from the old sha and miss a dependency that merged
+  meanwhile. Review cards (a review runs at its frozen base) and release,
+  update, fork, and hold cards keep their base. Kept: id, prompt, turn
+  history, lineage (`followUpOf`/`followUpOfProject`/`updateIds`), `starred`,
+  `dependsOn`, model, priority, notes, and the check log. The card then starts
+  as a fresh work turn when its dependencies are done.
 - `backlog → todo` (promote) keeps its current behavior; `todo → backlog`
   (park) keeps its current behavior; `merging`/`done` cards stay ineligible.
 
@@ -109,7 +130,12 @@ The existing route gains a second source: a stage `in_progress` card in state
 - A cross-project cycle can only be detected while both cards' projects are on
   the board; an id the resolver cannot reach counts as satisfied at
   scheduling, so the walk treats it the same way (no cycle through it).
-- `unsavedWork` reads the worktree live; a run that starts between the check
-  and the state write could dirty the tree. The eligible states
-  (`needs_you`, `idle`) have no live run, and the state write re-checks the
-  snapshot (`withTask`), so the window is the check's own read span.
+- The cycle lock serializes the route's walk and write inside one server
+  process. A worker's `report_outcome` write of a new dependsOn list runs in
+  its own process and is not part of the lock; the settle block rejects bad
+  ids itself (`badDep` in `src/scheduler.ts`), and the scheduler never starts
+  a card whose hold does not clear, so a lost race parks instead of merging.
+- A cancel that lands while the route holds the reservation fails the route's
+  final snapshot guard and answers 409; the worktree the route already
+  removed leaves cancel its husk path (branch verdict), which is the same
+  state a crashed turn leaves.

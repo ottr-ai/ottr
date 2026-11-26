@@ -14597,8 +14597,9 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 
 	/** One real git repo with a pushed main (origin/main names the entry's target), a
 	 * store and an entry wired for a fresh app mount; the disposal path must run through
-	 * real git, so no stubs here. cleanup removes the folders. */
-	const setup = async (name: string): Promise<Dep1318Fixture> => {
+	 * real git, so no stubs here. cleanup removes the folders. An optional prefix sets
+	 * the store's taskIdPrefix, so createTask hands out PREFIX-n ids. */
+	const setup = async (name: string, prefix?: string): Promise<Dep1318Fixture> => {
 		const origin = join(root, `${name}-origin`);
 		const dir = join(root, name);
 		run(root, `git init -q --bare -b main ${origin}`);
@@ -14609,6 +14610,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 		run(dir, `git remote add origin ${origin}`);
 		run(dir, "git push -q origin main");
 		const store = await ProjectStore.open(dir);
+		if (prefix !== undefined) await store.setSettings({ taskIdPrefix: prefix });
 		const entry: Entry = {
 			path: dir,
 			name,
@@ -14644,7 +14646,8 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 		};
 	};
 
-	/** A parked in-progress card the way a finished work turn leaves it. */
+	/** A parked in-progress card the way a finished work turn leaves it: base names the
+	 * commit the worktree branched from (runTurn stamps it with the worktree). */
 	const parkCard = async (
 		s: Dep1318Fixture,
 		prompt: string,
@@ -14666,6 +14669,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				},
 			],
 			sessionId: "sess-parked",
+			base: run(s.dir, "git rev-parse HEAD"),
 			worktree: wt,
 			branch,
 			queuedAt: 1,
@@ -14812,6 +14816,9 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 			expect(after.needsReason).toBeNull();
 			expect(after.asked).toBeNull();
 			expect(after.sessionId).toBeNull();
+			// The stale base went too: the fresh worktree must branch from the target
+			// head, so a dependency that merged meanwhile is in.
+			expect(after.base).toBeNull();
 			expect(after.dependsOn).toEqual([blocker.id]);
 			// The clean worktree went through real git: folder, registration and branch gone.
 			expect(existsSync(wt)).toBe(false);
@@ -14897,12 +14904,211 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 			const after = (await s.store.getTask(dep.id))!;
 			expect(after.stage).toBe("todo");
 			expect(after.state).toBe("queued");
+			// The stale base cleared: the fresh turn branches from the target, not from
+			// the parked attempt's point.
+			expect(after.base).toBeNull();
 			// The blocker done lifts the hold: the dependent is now pickable.
 			await s.store.updateTask(blocker.id, {
 				stage: "done",
 				state: "idle",
 			});
 			expect(await picked()).toEqual([dep.id]);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a review card keeps its frozen base when it moves back to todo", async () => {
+		const s = await setup("p-dep1318-revbase");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-rev");
+			const card = await parkCard(s, "review card", wt, "card-rev");
+			const base = run(s.dir, "git rev-parse HEAD");
+			// A review card isReview via its release version: kind itself never patches.
+			await s.store.updateTask(card.id, { releaseVersion: "v9.9.9" });
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(200);
+			// A review reviews the sha it was created with: the base stays.
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.base).toBe(base);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo refuses a husk whose branch holds commits past the target", async () => {
+		const s = await setup("p-dep1318-husk");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-husk");
+			const card = await parkCard(s, "husk card", wt, "card-husk");
+			writeFileSync(join(wt, "lost.txt"), "lost");
+			run(wt, "git add lost.txt && git commit -qm lost");
+			// The directory is gone; the worktree registration and the branch remain.
+			rmSync(wt, { recursive: true, force: true });
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"cannot move back to todo, branch card-husk holds commits that never reached origin/main",
+			);
+			// The branch with the unmerged commit survives: cancel stays the path.
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.branch).toBe("card-husk");
+			expect(run(s.dir, "git rev-parse --verify card-husk")).toBeTruthy();
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo moves a husk whose branch is merged", async () => {
+		const s = await setup("p-dep1318-huskmerge");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-merged");
+			const card = await parkCard(s, "merged husk", wt, "card-merged");
+			// No commits past the target: the branch is an ancestor of origin/main.
+			rmSync(wt, { recursive: true, force: true });
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(200);
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.state).toBe("queued");
+			expect(after.worktree).toBeNull();
+			expect(after.branch).toBeNull();
+			expect(run(s.dir, "git for-each-ref refs/heads/card-merged")).toBe("");
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo fails and keeps the fields when the branch cannot be removed", async () => {
+		const s = await setup("p-dep1318-stuck");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-stuck");
+			const card = await parkCard(s, "stuck card", wt, "card-stuck");
+			// A second worktree holds the branch, so git branch -D fails best-effort
+			// inside removeWorktree; the route must notice and refuse to queue.
+			const holder = join(s.dir, ".worktrees", "holder");
+			run(s.dir, `git worktree add --force "${holder}" card-stuck`);
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(500);
+			expect(await errorOf(res)).toBe(
+				"the worktree or its branch could not be removed",
+			);
+			// The row still owns what git could not remove, and the card stays parked
+			// and retryable instead of queueing without its worktree.
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.worktree).toBe(wt);
+			expect(after.branch).toBe("card-stuck");
+			expect(run(s.dir, "git rev-parse --verify card-stuck")).toBeTruthy();
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("two concurrent back-to-todo moves cannot both win or lose the worktree", async () => {
+		const s = await setup("p-dep1318-race");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-race");
+			const card = await parkCard(s, "raced card", wt, "card-race");
+			const move = (): Promise<Response> =>
+				m.call(`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`, {
+					to: "todo",
+				});
+			const [r1, r2] = await Promise.all([move(), move()]);
+			// The reservation lets one move finish; the other meets the moved row and
+			// answers 409. No outcome may claim success twice while git ran once.
+			for (const r of [r1, r2]) {
+				expect([200, 409]).toContain(r.status);
+				if (r.status !== 200) await r.body?.cancel();
+			}
+			expect([r1.status, r2.status]).toContain(200);
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.state).toBe("queued");
+			expect(after.worktree).toBeNull();
+			expect(existsSync(wt)).toBe(false);
+			expect(run(s.dir, "git for-each-ref refs/heads/card-race")).toBe("");
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a cycle through a foreign card's legacy id is refused", async () => {
+		const a = await setup("p-dep1318-cya", "A");
+		const b = await setup("p-dep1318-cyb");
+		try {
+			// Project B holds a legacy hex card created before its prefix existed; its
+			// id resolves only inside B, the way the scheduler resolves a hold there.
+			const bHex = await b.store.createTask("legacy root");
+			await b.store.setSettings({ taskIdPrefix: "B" });
+			const b1 = await b.store.createTask("middle");
+			const a1 = await a.store.createTask("edited root");
+			expect(a1.id).toBe("A-1");
+			// The id counter ran before the prefix landed, so the first prefixed B id is B-2.
+			expect(b1.id).toBe("B-2");
+			await b.store.updateTask(b1.id, { dependsOn: [bHex.id] });
+			await b.store.updateTask(bHex.id, { dependsOn: ["A-1"] });
+			const m = await mount({
+				projects: new Map([
+					[a.entry.name, a.entry],
+					[b.entry.name, b.entry],
+				]),
+			});
+			// Editing A-1 to wait for B-2 closes A-1 → B-2 → <hex> → A-1: the walk must
+			// resolve the hex id inside B, not in the edited card's project.
+			const res = await m.call(
+				`/api/projects/${a.entry.name}/tasks/${a1.id}/depends-on`,
+				{ dependsOn: [b1.id] },
+			);
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toBe("dependsOn would form a cycle");
+			expect((await a.store.getTask(a1.id))?.dependsOn).toEqual([]);
+		} finally {
+			a.cleanup();
+			b.cleanup();
+		}
+	});
+
+	test("concurrent opposite dependsOn edits cannot form a cycle", async () => {
+		const s = await setup("p-dep1318-lock");
+		try {
+			const m = await mount({ projects: s.projects });
+			const a = await parkCard(s, "card a", null, null);
+			const b = await parkCard(s, "card b", null, null);
+			const edit = (id: string, dep: string): Promise<Response> =>
+				m.call(dependsOnRoute(s.entry.name, id), { dependsOn: [dep] });
+			// The walk and the write share the route's lock, so the second edit reads
+			// the first edit's write and refuses, whatever order the requests land in.
+			const [r1, r2] = await Promise.all([
+				edit(a.id, b.id),
+				edit(b.id, a.id),
+			]);
+			const statuses = [r1.status, r2.status].sort();
+			expect(statuses).toEqual([200, 400]);
+			const winner = r1.status === 200 ? a.id : b.id;
+			const loser = r1.status === 200 ? b.id : a.id;
+			expect((await s.store.getTask(winner))?.dependsOn).toHaveLength(1);
+			expect((await s.store.getTask(loser))?.dependsOn).toEqual([]);
 		} finally {
 			s.cleanup();
 		}
