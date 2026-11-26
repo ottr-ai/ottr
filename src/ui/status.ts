@@ -1,5 +1,6 @@
 import { isProposalReason } from "../prompts.ts";
 import {
+	type DepCard,
 	type DepIndex,
 	depHold,
 	isReview,
@@ -137,33 +138,77 @@ type StatusTasks = ReviewTask &
 	> &
 	Partial<Pick<TaskCard, "pushHold" | "vmHold" | "sandboxLead">>;
 
-/** The queued card's dependency line (OTTR-1321): depHold's "waiting for #<id> <title>"
- * over the project's cards, cross-project ids through foreign — an open dependency
- * blocks the dispatch at every stage, so the line outranks the resume words. With one
- * open dependency whose own hold the cards carry, the line names that hold the way the
- * dependency's own card would: "waiting for #d1 schema (held · zai limit · 12m left)".
- * Several open dependencies keep the plain list; null with none open. */
+/** A dependency card the status line may name: the board's cross-project index hands
+ * back the full wire card (depIndexOf keeps every project's TaskCard), so the hold
+ * fields may ride along; a narrower index (the scheduler's store lookups) omits them
+ * and the segment keeps the plain wording. */
+type IndexedDep = DepCard & Partial<TaskCard>;
+
+/** The dependency's own hold, in the order its own card shows it: a live usage-limit
+ * countdown first, then holdFor (merge gate, push hold, its own dependencies). The
+ * bridge fills only the fields a narrow index card lacks, and every fallback is inert
+ * (no retries, no pending merge, no validation wait), so a full wire card reads exactly
+ * as its own card would. null with no hold. */
+function depOwnHold(
+	dep: IndexedDep,
+	tasks: readonly StatusTasks[],
+	foreign: DepIndex | undefined,
+	now: number,
+): string | null {
+	if (dep.holdUntil != null && dep.holdUntil > now) {
+		return (
+			holdLeft(dep.holdUntil, now, dep.needsReason ?? null) ??
+			dep.needsReason ??
+			null
+		);
+	}
+	return holdFor(
+		{
+			id: dep.id,
+			stage: dep.stage,
+			state: dep.state ?? "queued",
+			dependsOn: dep.dependsOn ?? [],
+			pushRetries: dep.pushRetries ?? 0,
+			pendingBy: dep.pendingBy ?? null,
+			validatedAt: dep.validatedAt ?? null,
+			followUpOf: dep.followUpOf ?? null,
+			cancelledAt: dep.cancelledAt ?? null,
+			pushHold: dep.pushHold,
+			vmHold: dep.vmHold,
+			sandboxLead: dep.sandboxLead,
+		},
+		tasks,
+		foreign,
+		now,
+	);
+}
+
+/** The queued card's dependency line (OTTR-1321): "waiting for #<id> <title>" per open
+ * dependency, cross-project ids through foreign — an open dependency blocks the
+ * dispatch at every stage, so the line outranks the resume words. Each open dependency
+ * whose own hold the cards carry names that hold the way its own card would:
+ * "waiting for #d1 schema (held · zai limit · 12m left), #d2 notes". null with none
+ * open. */
 function depHoldLine(
 	t: Pick<Task, "dependsOn">,
 	tasks: readonly StatusTasks[] | undefined,
 	foreign?: DepIndex,
+	now: number = Date.now(),
 ): string | null {
-	const base = depHold(tasks ?? [], t, foreign);
-	if (base === null || tasks === undefined) return base;
-	const waiting = waitingOn(tasks, t, foreign);
-	const open = waiting[0];
-	if (waiting.length !== 1 || open === undefined) return base;
-	const dep = tasks.find((c) => c.id === open.id);
-	if (dep === undefined) return base;
-	// The dependency's own hold, in the order its own card shows it: a live usage-limit
-	// countdown first, then holdFor (merge gate, push hold, its own dependencies).
-	const countdown =
-		dep.holdUntil !== null && dep.holdUntil > Date.now()
-			? (holdLeft(dep.holdUntil, Date.now(), dep.needsReason) ??
-				dep.needsReason)
-			: null;
-	const own = countdown ?? holdFor(dep, tasks, foreign);
-	return own === null ? base : `${base} (${own})`;
+	const list = tasks ?? [];
+	const waiting = waitingOn(list, t, foreign);
+	if (waiting.length === 0) return null;
+	const segments = waiting.map((d) => {
+		const base = `#${d.id} ${d.title}`;
+		// The board's own list and its foreign index both hand back full wire cards,
+		// so the dep's hold facts may ride on either; a narrower lookup omits them.
+		const dep: IndexedDep | undefined =
+			list.find((c) => c.id === d.id) ?? foreign?.(d.id) ?? undefined;
+		if (dep === undefined) return base;
+		const own = depOwnHold(dep, list, foreign, now);
+		return own === null ? base : `${base} (${own})`;
+	});
+	return `waiting for ${segments.join(", ")}`;
 }
 
 /** The statusLine words for a queued card: a pending sandbox lead waits for its review's

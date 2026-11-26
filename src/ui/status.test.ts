@@ -99,7 +99,84 @@ test("statusLine: a cross-project dependency id resolves to its title", () => {
 	);
 });
 
-test("statusLine: the one open dependency's own hold rides the dep line", () => {
+test("statusLine: a foreign dependency's own hold rides the dep line", () => {
+	// The board's foreign index hands back the full wire card, so the hold facts
+	// ride the same lookup (depIndexOf keeps every project's TaskCard).
+	const foreign: DepIndex = (id) =>
+		id === "AGEN-162"
+			? {
+					id,
+					title: "Sync the alate gate rule",
+					stage: "merging",
+					cancelledAt: null,
+					pushHold: true,
+				}
+			: null;
+	const parked = t({
+		stage: "in_progress",
+		needsReason: "waiting for #AGEN-162 Sync the alate gate rule",
+		dependsOn: ["AGEN-162"],
+	});
+	expect(statusLine(parked, true, undefined, false, [], foreign)).toBe(
+		`waiting for #AGEN-162 Sync the alate gate rule (${PUSH_HOLD})`,
+	);
+});
+
+test("statusLine: every held dependency names its hold, not only one", () => {
+	const held = card({
+		id: "d1",
+		title: "Schema",
+		stage: "merging",
+		pushHold: true,
+	});
+	const bare = card({ id: "d2", title: "Notes", stage: "todo" });
+	expect(
+		statusLine(
+			t({ stage: "in_progress", dependsOn: ["d1", "d2"] }),
+			true,
+			undefined,
+			false,
+			[held, bare],
+		),
+	).toBe(`waiting for #d1 Schema (${PUSH_HOLD}), #d2 Notes`);
+});
+
+test("statusLine: an expired review hold frees the dependency's line", () => {
+	// The 48h review cap only runs when the dependency's hold reads the current
+	// time; without it a stale merge hold shows forever (send-back 3).
+	const openReview = (createdAt: number): TaskCard =>
+		card({
+			id: "r1",
+			title: "Cap review",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			createdAt,
+		});
+	const mergeDep = card({
+		id: "d1",
+		title: "Big review",
+		stage: "merging",
+		pushHold: true,
+	});
+	const parked = t({
+		stage: "in_progress",
+		needsReason: "waiting for #d1 Big review",
+		dependsOn: ["d1"],
+	});
+	// Past the cap: the review hold expires, the push hold names the blocker.
+	const expired = openReview(Date.now() - REVIEW_HOLD_MAX_MS - 1000);
+	expect(statusLine(parked, true, undefined, false, [expired, mergeDep])).toBe(
+		`waiting for #d1 Big review (${PUSH_HOLD})`,
+	);
+	// Inside the cap: the running review is the dependency's own hold.
+	const fresh = openReview(Date.now() - 60_000);
+	expect(statusLine(parked, true, undefined, false, [fresh, mergeDep])).toBe(
+		"waiting for #d1 Big review (waiting for the review to finish)",
+	);
+});
+
+test("statusLine: the open dependency's own hold rides the dep line", () => {
 	const parked = t({
 		stage: "in_progress",
 		needsReason: "waiting for #d1 Schema",
@@ -152,7 +229,7 @@ test("statusLine: the one open dependency's own hold rides the dep line", () => 
 			[bare],
 		),
 	).toBe("waiting for #d3 Lint");
-	// Several open dependencies keep depHold's plain list, no per-card suffixes.
+	// Dependencies without hold facts keep the plain list wording.
 	const a = card({ id: "d4", title: "Alpha", stage: "todo" });
 	const b = card({ id: "d5", title: "Beta", stage: "todo" });
 	expect(
