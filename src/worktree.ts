@@ -606,7 +606,8 @@ async function openGitStub(
 			// gains no repo config line or info/attributes from it.
 			symlinkSync(path.join(common, "refs"), path.join(stub, "refs"));
 			const packed = path.join(common, "packed-refs");
-			if (existsSync(packed)) symlinkSync(packed, path.join(stub, "packed-refs"));
+			if (existsSync(packed))
+				symlinkSync(packed, path.join(stub, "packed-refs"));
 		} else {
 			mkdirSync(path.join(stub, "refs"));
 		}
@@ -2702,7 +2703,9 @@ export async function rebaseTargetBranch(
 					ok: false,
 					conflict: false,
 					error:
-						co.stderr.split("\n").find((line) => /^(error|fatal):/i.test(line)) ??
+						co.stderr
+							.split("\n")
+							.find((line) => /^(error|fatal):/i.test(line)) ??
 						co.stderr.trim().split("\n").filter(Boolean).pop() ??
 						`git checkout ${branch} exited ${co.code}`,
 				};

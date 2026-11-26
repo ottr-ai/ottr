@@ -785,12 +785,15 @@ describe("serverMergePush", () => {
 			);
 			if (interrupted.exitCode === 0)
 				throw new Error("expected the rebase to conflict");
-			const gm = Bun.spawnSync(["git", "rev-parse", "--git-path", "rebase-merge"], {
-				cwd: f.main,
-				env: fixtureGitEnv(),
-				stdout: "pipe",
-				stderr: "pipe",
-			});
+			const gm = Bun.spawnSync(
+				["git", "rev-parse", "--git-path", "rebase-merge"],
+				{
+					cwd: f.main,
+					env: fixtureGitEnv(),
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
 			expect(existsSync(join(f.main, gm.stdout.toString().trim()))).toBe(true);
 			const detached = Bun.spawnSync(["git", "symbolic-ref", "HEAD"], {
 				cwd: f.main,
@@ -2352,7 +2355,10 @@ describe("planted git drivers (OTTR-1038)", () => {
 			return p;
 		};
 		const clean = sh("drv-clean.sh", `echo clean-fired "$1" >> ${f.log}; cat`);
-		const smudge = sh("drv-smudge.sh", `echo smudge-fired "$1" >> ${f.log}; cat`);
+		const smudge = sh(
+			"drv-smudge.sh",
+			`echo smudge-fired "$1" >> ${f.log}; cat`,
+		);
 		const merge = sh(
 			"drv-merge.sh",
 			`echo merge-driver-fired "$1" >> ${f.log}; cp "$3" "$1"; exit 1`,
