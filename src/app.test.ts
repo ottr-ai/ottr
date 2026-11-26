@@ -78,6 +78,7 @@ import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
 import { acquireLayerUse } from "./layers.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
+import type { MemoryHealth } from "./memory.ts";
 import { MERMAID_VERSION, mermaidSrc } from "./mermaidVersion.ts";
 import { modelRoles } from "./models.ts";
 import {
@@ -512,6 +513,9 @@ let branchRulesImpl: (url: string, init?: RequestInit) => Promise<Response> =
 // OTTR-1181: the model route's resume-gate quota report; tests swap it per case. Null
 // answers unknown, so an unset stub keeps every resume at the fail-open default.
 let quotaSnapshotImpl: (() => QuotaState | null) | null = null;
+// OTTR-1307: the memory probe seam; tests swap memoryProbeImpl per case. Null
+// answers no health info, so an unset stub keeps every no-memory warning off.
+let memoryProbeImpl: (() => Promise<MemoryHealth | null>) | null = null;
 const app = await createTestApp({
 	gstore,
 	secretBox: testBox(gstore),
@@ -536,7 +540,7 @@ const app = await createTestApp({
 	tmpSpace: () => null,
 	// The memory probe is host state too: stubbed, so exact warning assertions in
 	// the state payload never depend on the machine's memory store (OTTR-1295).
-	memoryProbe: () => Promise.resolve(null),
+	memoryProbe: () => memoryProbeImpl?.() ?? Promise.resolve(null),
 	schedule: () => {
 		calls++;
 	},
@@ -27341,6 +27345,30 @@ describe("board warnings", () => {
 			};
 			expect(state.warnings).toEqual([UNSEEDED]);
 		}));
+
+	// OTTR-1307: a failing injected probe lights the no-memory warning, so the
+	// production append path stays asserted without reading the host's store.
+	test("a failing injected memory probe warns no memory in the state payload", async () => {
+		memoryProbeImpl = () =>
+			Promise.resolve({
+				backend: "mnemopi",
+				ok: false,
+				reason: "mnemopi store not writable: /tmp/app-test-memories",
+				checkedAt: new Date().toISOString(),
+			});
+		try {
+			await app.memoryHealthTick();
+			const state = (await (await get("/api/state")).json()) as {
+				warnings: string[];
+			};
+			expect(state.warnings).toContain(
+				"The omp process runs with no memory: mnemopi store not writable: /tmp/app-test-memories",
+			);
+		} finally {
+			memoryProbeImpl = null;
+			await app.memoryHealthTick();
+		}
+	});
 
 	test("a seeded dir with a role but no sign-in warns for that provider; an active row silences it", async () =>
 		withAgentDir(async (dir) => {
