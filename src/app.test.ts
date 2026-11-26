@@ -20023,6 +20023,7 @@ describe("update cycle control (OTTR-752)", () => {
 			if (previousKey === undefined) delete process.env.ALATE_API_KEY;
 			else process.env.ALATE_API_KEY = previousKey;
 		}
+	});
 	test("the hosted credit hold refuses the board's own model-call routes", async () => {
 		const secret = crypto.randomUUID();
 		let hold = false;
