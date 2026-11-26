@@ -117,6 +117,7 @@ describe("server secrets never reach a child process", () => {
 		"GITHUB_ENTERPRISE_TOKEN",
 		"GIT_ASKPASS",
 		"OTTR_GIT_TOKEN_1",
+		"HINDSIGHT_TENANT_KEY",
 	];
 	const PROXY_WITH_CREDS =
 		"http://proxy-user:proxy-pass@corp-proxy.invalid:8080";
