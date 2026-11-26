@@ -184,7 +184,7 @@ function findingOpen(
 
 /** The findings the findings hold counts for review `r`: findingOpen, minus a lead the
  * store flagged as a parked backlog lead at the review's doneAt (OTTR-963). Shared by
- * reviewHoldFor and the drawer's hold banner (OTTR-1258), so the banner cannot name a
+ * reviewHoldDetail and the drawer's hold banner (OTTR-1258), so the banner cannot name a
  * card the hold does not count. */
 export function reviewOpenFindings<T extends ReviewTask>(
 	findings: readonly T[],
