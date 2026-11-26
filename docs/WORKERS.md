@@ -1467,12 +1467,15 @@ command line, where `<endpoint>` mirrors git-lfs's own derivation —
 answers 422 to the locks/verify call and to the batch alike there (MYST-34).
 OTTR-1283: the board also converges the endpoint on disk, so every git-lfs run
 without the push's own pin resolves the same URL. At boot and at project add
-the board writes `lfs.url` into the project's repo config, when the pinned
-origin is an http(s) URL on a GitHub host (github.com, a `*.ghe.com` tenant,
-or the configured host) and the URL has no `.git` suffix. The convergence sets
-an absent `lfs.url`, overwrites the bare residue, and leaves the `.git` form
-and any operator-set endpoint alone. A remote with the `.git` suffix gets no
-write: git-lfs derives the same endpoint itself.
+the board reads the endpoint keys in git-lfs's own resolution order
+(`lfs.<url>.lfsurl`, `remote.<remote>.lfsurl`, `lfs.url`) and converges the
+first key that holds a value, when the pinned origin is an http(s) URL on a
+GitHub host (github.com, a `*.ghe.com` tenant, or the configured host) and the
+URL has no `.git` suffix. The convergence writes an absent `lfs.url`, fixes a
+bare residue in the key that carries it, re-points a stale `.git`-form value
+that named an earlier origin on the same host, and leaves any operator-set
+endpoint alone, with no shadowing `lfs.url` next to it. A remote with the
+`.git` suffix gets no write: git-lfs derives the same endpoint itself.
 The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
 verified against git-lfs 3.6.1), the URL argument means `remote.<name>.lfsurl`
 is never read, and the lock pin turns the locking API off: the board never uses

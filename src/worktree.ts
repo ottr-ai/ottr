@@ -2528,10 +2528,17 @@ function lfsEndpointFor(originUrl: string): string | null {
  * the origin pin (R5-1). Convergence rules, in order: an origin that is not http(s), is
  * not on a GitHub host (github.com, a *.ghe.com tenant, or the configured host), or ends
  * .git is untouched — git-lfs derives the .git form itself there and the push pins its
- * own endpoint. An absent value, or the bare `<url>/info/lfs` residue of the OTTR-1058
- * pin (GitHub answers that form 422, MYST-34), becomes the .git form. Any other value is
- * an operator's own endpoint and stays. The endpoint built here never carries the
- * remote's userinfo, so an embedded token cannot reach the repo config this writes.
+ * own endpoint. The explicit endpoint keys are read in git-lfs's own resolution order
+ * (lfsapi/endpoint_finder.go: the URL-keyed `lfs.<url>.lfsurl`, then
+ * `remote.<remote>.lfsurl`, then `lfs.url`), and the first key that holds a value
+ * decides: the .git form keeps it, the bare `<url>/info/lfs` residue of the OTTR-1058
+ * pin (GitHub answers that form 422, MYST-34) is overwritten in that key, a stale
+ * .git-form value on the origin's own host — the shape this convergence wrote for an
+ * earlier origin, which would otherwise keep targeting the old repository — is
+ * re-pointed, and any other value is an operator's own endpoint and stays, with no
+ * shadowing `lfs.url` written next to it. No set key at all writes `lfs.url`. The
+ * endpoint built here never carries the remote's userinfo, so an embedded token cannot
+ * reach the repo config this writes.
  */
 export async function convergeLfsEndpoint(
 	mainPath: string,
@@ -2546,10 +2553,35 @@ export async function convergeLfsEndpoint(
 	if (base.endsWith(".git")) return;
 	const bare = `${base}/info/lfs`;
 	const endpoint = `${base}.git/info/lfs`;
-	const r = await git(["config", "lfs.url"], mainPath).catch(() => null);
-	const cur = r !== null && r.code === 0 ? r.stdout.trim() : null;
-	if (cur === endpoint || (cur !== null && cur !== bare)) return;
+	for (const key of [
+		`lfs.${originUrl}.lfsurl`,
+		"remote.origin.lfsurl",
+		"lfs.url",
+	]) {
+		const r = await git(["config", key], mainPath).catch(() => null);
+		if (r === null || r.code !== 0) continue; // unset: the next key decides
+		const cur = r.stdout.trim();
+		if (cur === endpoint) return;
+		if (cur === bare || lfsStaleEndpoint(cur, u.host)) {
+			await git(["config", key, endpoint], mainPath);
+		}
+		return; // the first set key decides, whatever it holds
+	}
 	await git(["config", "lfs.url", endpoint], mainPath);
+}
+
+/** True when `value` is a .git/info/lfs-form endpoint on `host` — the shape this
+ * convergence writes, stale after the origin moved to another repository there. */
+function lfsStaleEndpoint(value: string, host: string): boolean {
+	try {
+		const v = new URL(value);
+		return (
+			v.host.toLowerCase() === host.toLowerCase() &&
+			/\.git\/info\/lfs$/.test(v.pathname)
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**

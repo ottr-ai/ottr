@@ -763,6 +763,19 @@ describe("convergeLfsEndpoint (OTTR-1283)", () => {
 		]);
 		return code === 0 ? out.trim() : null;
 	};
+	/** The repo's persisted remote.origin.lfsurl, null when unset. */
+	const remoteLfsUrl = async (repo: string): Promise<string | null> => {
+		const proc = Bun.spawn(["git", "config", "remote.origin.lfsurl"], {
+			cwd: repo,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			proc.exited,
+		]);
+		return code === 0 ? out.trim() : null;
+	};
 	/** The endpoint `git lfs env` resolves in the repo — the acceptance's own reader. */
 	const envEndpoint = async (repo: string): Promise<string> =>
 		/^Endpoint=(.*)$/m.exec(await run(repo, "lfs", "env"))?.[1] ?? "(none)";
@@ -858,6 +871,88 @@ describe("convergeLfsEndpoint (OTTR-1283)", () => {
 			);
 		} finally {
 			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a remote.origin.lfsurl endpoint is never overridden or duplicated", async () => {
+		// git-lfs resolves remote.<remote>.lfsurl above lfs.url, so the custom endpoint
+		// keeps its authority either way; convergence must still not write a shadowing
+		// lfs.url next to it, and must leave the remote-scoped value untouched.
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(
+				repo,
+				"config",
+				"remote.origin.lfsurl",
+				"https://lfs.example.com/api/octo/repo",
+			);
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
+			expect(await remoteLfsUrl(repo)).toBe(
+				"https://lfs.example.com/api/octo/repo",
+			);
+			expect(await lfsUrlConfig(repo)).toBeNull();
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a bare residue in remote.origin.lfsurl is overwritten in place", async () => {
+		// The bare form lives in the remote-scoped key: convergence must fix that key
+		// itself, because a new lfs.url would sit below it in git-lfs's resolution
+		// order and never take effect.
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(
+				repo,
+				"config",
+				"remote.origin.lfsurl",
+				"https://github.com/octo/repo/info/lfs",
+			);
+			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
+			expect(await remoteLfsUrl(repo)).toBe(
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+			expect(await lfsUrlConfig(repo)).toBeNull();
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a stale same-host .git-form endpoint from a moved origin is re-pointed", async () => {
+		// The origin moved from octo/repo to octo/other: the value convergence wrote
+		// for the old origin matches neither the new endpoint nor the bare form, so
+		// the old custom-endpoint guard kept it and git-lfs kept targeting octo/repo.
+		// A .git/info/lfs-form value on the origin's own host is a stale board write:
+		// re-point it. A different host stays (an operator's mirror).
+		const stale = await repoAt("https://github.com/octo/other");
+		try {
+			await run(
+				stale,
+				"config",
+				"lfs.url",
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+			await convergeLfsEndpoint(stale, "https://github.com/octo/other");
+			expect(await lfsUrlConfig(stale)).toBe(
+				"https://github.com/octo/other.git/info/lfs",
+			);
+		} finally {
+			rmSync(join(stale, ".."), { recursive: true, force: true });
+		}
+		const mirror = await repoAt("https://github.com/octo/other");
+		try {
+			await run(
+				mirror,
+				"config",
+				"lfs.url",
+				"https://lfs.example.com/x.git/info/lfs",
+			);
+			await convergeLfsEndpoint(mirror, "https://github.com/octo/other");
+			expect(await lfsUrlConfig(mirror)).toBe(
+				"https://lfs.example.com/x.git/info/lfs",
+			);
+		} finally {
+			rmSync(join(mirror, ".."), { recursive: true, force: true });
 		}
 	});
 
