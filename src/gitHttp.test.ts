@@ -12,11 +12,11 @@ import { deflateSync } from "node:zlib";
 import type { Server } from "bun";
 import {
 	handleGit,
+	type PushCommand,
 	packSupplyRefusal,
 	pushRefusal,
 	receiveCommands,
 	syncWorktreeTo,
-	type PushCommand,
 } from "./gitHttp.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { type VmGrant, VmTokens } from "./vmTokens.ts";

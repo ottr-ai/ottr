@@ -1,4 +1,12 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+	closeSync,
+	mkdtempSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type VmGrant, type VmTokens, vmTokenOf } from "./vmTokens.ts";
@@ -312,11 +320,11 @@ async function packBases(tmp: string): Promise<Set<string> | null> {
 	const packDir = path.join(tmp, "objects", "pack");
 	const idx = readdirSync(packDir).find((f) => f.endsWith(".idx"));
 	if (idx === undefined) return null;
-	const checked = await tmpGit(
-		tmp,
-		null,
-		["verify-pack", "-v", path.join(packDir, idx)],
-	);
+	const checked = await tmpGit(tmp, null, [
+		"verify-pack",
+		"-v",
+		path.join(packDir, idx),
+	]);
 	if (checked.code !== 0) return null;
 	const out = new Set<string>();
 	for (const line of checked.stdout.split("\n")) {
@@ -333,7 +341,11 @@ async function visibleObjects(
 	alternates: string,
 	tips: string[],
 ): Promise<Set<string> | null> {
-	const walk = await tmpGit(tmp, alternates, ["rev-list", "--objects", ...tips]);
+	const walk = await tmpGit(tmp, alternates, [
+		"rev-list",
+		"--objects",
+		...tips,
+	]);
 	if (walk.code !== 0) return null;
 	const out = new Set<string>();
 	for (const line of walk.stdout.split("\n")) {
@@ -398,7 +410,7 @@ export async function packSupplyRefusal(
 	// The pack trailer holds one digest of the store's hash: 20 bytes for SHA-1, 32 for
 	// SHA-256, so the guest's data ends there and --fix-thin's appends start.
 	const trailer = store.format === "sha256" ? 32 : 20;
-	const packSize = typeof pack === "object" ? pack.size : pack.length;
+	const packSize = "size" in pack ? pack.size : pack.length;
 	const tips = await visibleTips(grant);
 	const tmp = mkdtempSync(path.join(tmpdir(), "ottr-push-"));
 	try {
@@ -412,8 +424,7 @@ export async function packSupplyRefusal(
 		if (made.code !== 0)
 			return "push refused: the pushed pack cannot be checked";
 		if (packSize > 0) {
-			const input =
-				typeof pack === "object" ? Bun.file(pack.path).stream() : pack;
+			const input = "path" in pack ? Bun.file(pack.path).stream() : pack;
 			const indexed = await tmpGit(
 				tmp,
 				store.objects,
@@ -866,7 +877,11 @@ async function gitInput(
 			cleanup();
 			return { response: plain(supply, 403) };
 		}
-		return { stdin: Bun.file(bodyPath).stream(), pushed: parsed.commands, scratch };
+		return {
+			stdin: Bun.file(bodyPath).stream(),
+			pushed: parsed.commands,
+			scratch,
+		};
 	}
 	if (rest === "git-upload-pack") {
 		// Streamed; http-backend inflates a gzip body itself (git gzips large fetch requests).
@@ -929,8 +944,31 @@ async function extractPackFile(
 		await Bun.write(packPath, new Uint8Array(0));
 		return 0;
 	}
-	await Bun.write(packPath, Bun.file(bodyPath).slice(packAt));
-	return size - packAt;
+	// Bun.write of a sliced file blob writes the source file whole, so the pack section is
+	// copied by stream, skipping the command head.
+	const reader = Bun.file(bodyPath).stream().getReader();
+	const fd = openSync(packPath, "w");
+	let skipped = 0;
+	try {
+		for (;;) {
+			const { value, done } = await reader.read();
+			if (done) break;
+			if (value === undefined || value.length === 0) continue;
+			let chunk = value;
+			if (skipped < packAt) {
+				if (skipped + chunk.length <= packAt) {
+					skipped += chunk.length;
+					continue;
+				}
+				chunk = chunk.subarray(packAt - skipped);
+				skipped = packAt;
+			} else skipped += chunk.length;
+			writeSync(fd, chunk);
+		}
+		return size - packAt;
+	} finally {
+		closeSync(fd);
+	}
 }
 
 /** One running http-backend: the CGI answer and the process's exit code. */
