@@ -21742,6 +21742,7 @@ describe(
 					postedLogin: prev?.postedLogin ?? null,
 					postedEvent: prev?.postedEvent ?? null,
 					postedVia: prev?.postedVia ?? null,
+					fixedThreads: prev?.fixedThreads ?? [],
 					state: "open",
 					draft: false,
 					title: "Fix it",
