@@ -39,7 +39,7 @@ import { resetCatalogCache } from "./models.ts";
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 import { ServiceQuotas } from "./serviceQuotas.tsx";
 // Static: status.ts touches no browser global at load.
-import { bellAlarms, type DepHoldContext, statusLine } from "./status.ts";
+import { bellAlarms, statusLine } from "./status.ts";
 import {
 	installBrowserGlobals,
 	mount,
@@ -16666,7 +16666,8 @@ test("depHoldContexts follows the resolver's project, not the first id hit", asy
 	// Two projects hold the same historical id (a prefix change left the old copy
 	// in archive). The follower's foreign index resolves AGEN-162 to agent-data by
 	// its id handle, so the hold context must be agent-data's too (OTTR-1321
-	// send-back 3): archive's live review must not replace agent-data's push hold.
+	// send-backs 3 and 4): archive's live review must not replace agent-data's
+	// push hold, in either task order.
 	const view = (name: string, prefix: string): ProjectView =>
 		({ name, taskPrefix: prefix }) as unknown as ProjectView;
 	const projects = [
@@ -16693,23 +16694,17 @@ test("depHoldContexts follows the resolver's project, not the first id hit", asy
 			validatedAt: null,
 			...over,
 		}) as unknown as TaskCard;
-	const tasks: TaskCard[] = [
-		// The historical copy in archive: a live review holds its merge.
-		dep({ project: "archive", title: "Old copy" }),
-		dep({
-			id: "ar1",
-			title: "Archive review",
-			kind: "review",
-			project: "archive",
-			stage: "in_progress",
-			state: "running",
-			createdAt: Date.now() - 60_000,
-		}),
-	];
+	const archiveCopy = dep({ project: "archive", title: "Old copy" });
+	const archiveReview = dep({
+		id: "ar1",
+		title: "Archive review",
+		kind: "review",
+		project: "archive",
+		stage: "in_progress",
+		state: "running",
+		createdAt: Date.now() - 60_000,
+	});
 	const agentData = dep({ pushHold: true });
-	tasks.push(agentData);
-	const foreign = depIndexOf(projects, tasks, view("ottr", "OTTR"));
-	const foreignHolds = depHoldContexts(projects, tasks, view("ottr", "OTTR"));
 	const parked = {
 		id: "OTTR-1",
 		kind: "work",
@@ -16729,10 +16724,19 @@ test("depHoldContexts follows the resolver's project, not the first id hit", asy
 		followUpOf: null,
 		dependsOn: ["AGEN-162"],
 	} as unknown as TaskCard;
-	const foreignCtx: (id: string) => DepHoldContext | null = foreignHolds;
-	expect(
-		statusLine(parked, true, undefined, false, [], foreign, foreignCtx),
-	).toBe(`waiting for #AGEN-162 Sync rules (${PUSH_HOLD})`);
-	// The context picks the resolved card's project: agent-data's own list.
-	expect(foreignCtx("AGEN-162")?.cards).toContain(agentData);
+	// Both task orders: the prior id-keyed builder kept its Map.set's LAST hit, so
+	// a single order can pass it by accident — agent-data first is the order that
+	// catches it (send-back 4).
+	for (const agentDataFirst of [true, false]) {
+		const tasks: TaskCard[] = agentDataFirst
+			? [agentData, archiveCopy, archiveReview]
+			: [archiveCopy, archiveReview, agentData];
+		const foreign = depIndexOf(projects, tasks, view("ottr", "OTTR"));
+		const foreignHolds = depHoldContexts(projects, tasks, view("ottr", "OTTR"));
+		expect(
+			statusLine(parked, true, undefined, false, [], foreign, foreignHolds),
+		).toBe(`waiting for #AGEN-162 Sync rules (${PUSH_HOLD})`);
+		// The context picks the resolved card's project: agent-data's own list.
+		expect(foreignHolds("AGEN-162")?.cards).toContain(agentData);
+	}
 });
