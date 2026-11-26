@@ -109,12 +109,19 @@ R5-1 residual the docs already record for board git (a
 worktree-reachable `.git/config`) applies unchanged, and the snapshot
 reads the same shared object store the board's own merge reads.
 
-A limit this repo cannot close: the real sync.mjs lives in the alate
-checkout, which this container cannot read, so the tests pin the
-documented agent-data contract (the `--data <dir>` command shape, the
-install roots above) with a contract-faithful fixture rather than the
-real script. The record's raw output is the honest evidence of what the
-deployed script actually did.
+A limit this repo cannot close from a turn uid: the real sync.mjs lives in
+the alate checkout, which is mode 700 for the alate uid (OTTR-994), so the
+work-turn environment cannot read it. The acceptance tests therefore
+execute the real script where it is readable (the board's root-side check
+runs: the tests copy the deployed script into an isolated ALATE_HOME
+fixture with isolated install targets) and skip visibly with that reason
+everywhere else, instead of proving a replacement's behavior. The
+observed contract those runs pin, reported by the review check that read
+the deployed script: sync.mjs processes only root rules and rejects rule
+files without frontmatter; the mechanics tests (guards, snapshot, argv,
+serialization, hashing) use a transparent probe that installs nothing, so
+no test can mistake its behavior for the real sync's. The record's raw
+output remains the honest evidence of what the deployed script did.
 
 ## Alternatives considered
 

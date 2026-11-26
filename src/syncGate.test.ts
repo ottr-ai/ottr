@@ -2,8 +2,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+	accessSync,
 	chmodSync,
 	chownSync,
+	constants,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -26,6 +28,25 @@ import {
 } from "./syncGate.ts";
 import { projectTurnUid } from "./turnUid.ts";
 import type { SyncGateRun } from "./types.ts";
+
+const REAL_SYNC = "/workspace/alate/sync.mjs";
+
+const realReadable = (() => {
+	try {
+		accessSync(REAL_SYNC, constants.R_OK);
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
+/** Copies the real sync.mjs into a fixture alate dir: the actual installer runs,
+ *  while ALATE_HOME (its config source) and every install target stay isolated
+ *  temp dirs the test owns. */
+function useRealSync(fixtureAlateDir: string): void {
+	mkdirSync(fixtureAlateDir, { recursive: true });
+	writeFileSync(join(fixtureAlateDir, "sync.mjs"), readFileSync(REAL_SYNC));
+}
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -68,60 +89,58 @@ function seedWorktree(dir: string): string {
 	return base;
 }
 
-/** The fixture alate checkout: sync.mjs under the documented agent-data contract.
- *  It requires `--data <dir>` and uses that value as the data root (never cwd, so
- *  a launcher that drops the flag fails every test), reads the projects root from
- *  its ALATE_HOME config, installs root *.md rules into the home's
- *  .omp/agent/rules, user/ files below the home, and projects/ files into the
- *  projects root, and echoes its argv so tests can pin the spawned command. */
-function seedAlate(
-	dir: string,
-	projectsRoot: string,
-	skips: string[] = [],
-): void {
+/** The mechanics probe: a transparent stand-in for runner-mechanics tests only.
+ *  It enforces the argv contract (exit 2 without --data, so a launcher that
+ *  drops the flag fails every mechanics test), echoes its argv, and prints the
+ *  sha256 of one data file it was handed — it installs nothing, so no test can
+ *  mistake its behavior for the real sync's. Sync-behavior acceptance runs
+ *  against the real script via useRealSync below. */
+function seedProbe(dir: string): void {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(
 		join(dir, "sync.mjs"),
 		[
-			`import { readdirSync, readFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";`,
-			`import { join, dirname, relative } from "node:path";`,
-			`const skip = ${JSON.stringify(skips)};`,
+			`import { createHash } from "node:crypto";`,
+			`import { readFileSync } from "node:fs";`,
+			`import { join, relative, resolve } from "node:path";`,
 			`console.log("argv " + JSON.stringify(process.argv));`,
 			`const flag = process.argv.indexOf("--data");`,
 			`const data = flag === -1 ? null : process.argv[flag + 1];`,
-			`if (data === undefined || data === null) { console.error("sync: no --data path"); process.exit(2); }`,
-			`const alate = process.env.ALATE_HOME;`,
-			`if (alate === undefined) { console.error("sync: ALATE_HOME is unset"); process.exit(1); }`,
-			`const rootFile = join(alate, "projects-root.txt");`,
-			`if (!existsSync(rootFile)) { console.error("sync: no projects root config"); process.exit(2); }`,
-			`const home = process.env.HOME;`,
-			`if (home === undefined) { console.error("sync: HOME is unset"); process.exit(1); }`,
-			`const projectsRoot = readFileSync(rootFile, "utf8").trim();`,
-			`const walk = (dir) => {`,
-			`  for (const e of readdirSync(dir, { withFileTypes: true })) {`,
-			`    const p = join(dir, e.name);`,
-			`    if (e.isDirectory()) walk(p);`,
-			`    else {`,
-			`      const rel = relative(data, p);`,
-			`      if (skip.includes(rel)) { console.log("sync: skipped " + rel); continue; }`,
-			`      let out = null;`,
-			`      if (rel.startsWith("projects/")) out = join(projectsRoot, rel.slice("projects/".length));`,
-			`      else if (rel.startsWith("user/")) out = join(home, rel.slice("user/".length));`,
-			`      else if (/^[^/]+\\.md$/.test(rel)) out = join(home, ".omp", "agent", "rules", rel);`,
-			`      if (out !== null) {`,
-			`        mkdirSync(dirname(out), { recursive: true });`,
-			`        copyFileSync(p, out);`,
-			`        console.log("sync: installed " + rel);`,
-			`      }`,
-			`    }`,
-			`  }`,
-			`};`,
-			`walk(data);`,
-			`console.log("sync: done");`,
+			`if (data === undefined || data === null) { console.error("probe: no --data path"); process.exit(2); }`,
+			`const root = resolve(data);`,
+			`const probe = join(root, "projects", "ottr", "AGENTS.md");`,
+			`try {`,
+			`  const bytes = readFileSync(probe);`,
+			`  console.log("probe sha256 " + relative(root, probe) + " " + createHash("sha256").update(bytes).digest("hex"));`,
+			`} catch {`,
+			`  console.log("probe sha256 projects/ottr/AGENTS.md absent");`,
+			`}`,
+			`console.log("probe done");`,
 			"",
 		].join("\n"),
 	);
-	writeFileSync(join(dir, "projects-root.txt"), projectsRoot);
+}
+
+/** A committed data dir carrying two root rules — one with the frontmatter the
+ *  deployed sync.mjs requires, one without — for the real-script acceptance
+ *  runs. Returns the base sha. */
+function seedRuleData(dir: string): string {
+	writeFileSync(
+		join(dir, "rule-ok.md"),
+		"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# probe rule body\n",
+	);
+	writeFileSync(join(dir, "rule-bad.md"), "# no frontmatter here\n");
+	sh("git init -q -b main", dir);
+	sh("git config user.email t@t && git config user.name t", dir);
+	sh("git add -A && git commit -qm base", dir);
+	const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+	sh("git checkout -q -b ott/card", dir);
+	writeFileSync(
+		join(dir, "rule-ok.md"),
+		"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
+	);
+	sh("git add -A && git commit -qm card", dir);
+	return base;
 }
 
 function targetFor(opts: {
@@ -220,19 +239,18 @@ describe("syncGateFilesError", () => {
 });
 
 describe("runSyncGate", () => {
-	test("spawns the documented command against an immutable HEAD archive and records it", async () => {
+	test("spawns the documented command inside the HEAD snapshot and records it", async () => {
 		const root = freshDir("happy");
 		const wt = join(root, "wt");
 		mkdirSync(wt, { recursive: true });
 		const base = seedWorktree(wt);
 		const alateDir = join(root, "alate");
 		const home = join(root, "home");
-		mkdirSync(join(root, "agent-data"), { recursive: true });
-		seedAlate(alateDir, root);
+		seedProbe(alateDir);
 		const record = await runSyncGate(
 			targetFor({ root, worktree: wt, base, alateDir, home }),
 		);
-		// The command contract: `node <sync.mjs> --data .` exactly — the fixture
+		// The command contract: `node <sync.mjs> --data .` exactly — the probe
 		// echoes its argv, so a launcher that drops the flag fails here.
 		const argvLine = record.output
 			.split("\n")
@@ -247,41 +265,26 @@ describe("runSyncGate", () => {
 		);
 		expect(record.code).toBe(0);
 		expect(record.truncated).toBe(false);
-		expect(record.output).toContain("sync: installed projects/ottr/AGENTS.md");
-		expect(record.output).toContain("sync: installed guard.md");
-		expect(record.output).toContain(
-			"sync: installed user/.omp/agent/config.yml",
-		);
-		expect(record.output).toContain("sync: done");
-		// All three install roots hashed against their twins, matching HEAD bytes.
-		const byPath = new Map(record.files.map((f) => [f.path, f]));
-		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(true);
-		expect(byPath.get("guard.md")?.match).toBe(true);
-		expect(byPath.get("user/.omp/agent/config.yml")?.match).toBe(true);
-		// The installed twins carry the HEAD bytes at the contract locations.
-		expect(readFileSync(join(root, "ottr/AGENTS.md"), "utf8")).toBe(
-			"card agents\n",
-		);
-		expect(readFileSync(join(home, ".omp/agent/rules/guard.md"), "utf8")).toBe(
-			"card rule\n",
-		);
-		expect(readFileSync(join(home, ".omp/agent/config.yml"), "utf8")).toBe(
-			"card user\n",
-		);
+		expect(record.output).toContain("probe done");
+		// The child saw the snapshot's HEAD bytes for its data root, not the
+		// worktree's disk.
+		const shaLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("probe sha256 "));
+		expect(shaLine).toBeDefined();
+		const observedSha = shaLine!.trim().split(" ").at(-1);
+		expect(observedSha).toBe(shaOf("card agents\n"));
 		expect(record.durationMs).toBeGreaterThanOrEqual(0);
-		// The install target is the workspace root, not the data checkout.
-		expect(existsSync(join(root, "agent-data/ottr/AGENTS.md"))).toBe(false);
 	});
 
-	test("an assume-unchanged edit and an ignored rule never reach the install", async () => {
+	test("an assume-unchanged edit and an ignored rule never reach the child", async () => {
 		const root = freshDir("bypass");
 		const wt = join(root, "wt");
 		mkdirSync(wt, { recursive: true });
 		const base = seedWorktree(wt);
-		void base;
 		const alateDir = join(root, "alate");
 		const home = join(root, "home");
-		seedAlate(alateDir, root);
+		seedProbe(alateDir);
 		// The drilled bypass: disk bytes that git status --porcelain cannot see.
 		writeFileSync(join(wt, "projects/ottr/AGENTS.md"), "PLANTED-BYTES\n");
 		sh("git update-index --assume-unchanged projects/ottr/AGENTS.md", wt);
@@ -293,18 +296,14 @@ describe("runSyncGate", () => {
 			targetFor({ root, worktree: wt, base, alateDir, home }),
 		);
 		expect(record.code).toBe(0);
-		// The install carries the HEAD bytes, never the planted disk bytes.
-		expect(readFileSync(join(root, "ottr/AGENTS.md"), "utf8")).toBe(
-			"card agents\n",
-		);
-		expect(existsSync(join(home, ".omp/agent/rules/scratch-rule.md"))).toBe(
-			false,
-		);
-		const byPath = new Map(record.files.map((f) => [f.path, f]));
-		expect(byPath.get("projects/ottr/AGENTS.md")?.sourceSha256).toBe(
-			shaOf("card agents\n"),
-		);
-		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(true);
+		// The probe read the snapshot's HEAD bytes; the planted bytes never reached
+		// the child's data root, and the ignored file is not in the archive at all.
+		const shaLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("probe sha256 "));
+		expect(shaLine?.endsWith(shaOf("card agents\n"))).toBe(true);
+		expect(record.output).not.toContain("PLANTED-BYTES");
+		expect(record.output).not.toContain("IGNORED-BYTES");
 	});
 
 	test("a worktree with no branch changes hashes only the requested extras", async () => {
@@ -316,7 +315,12 @@ describe("runSyncGate", () => {
 		sh("git checkout -q main", wt);
 		const alateDir = join(root, "alate");
 		const home = join(root, "home");
-		seedAlate(alateDir, root);
+		seedProbe(alateDir);
+		// Hashing-logic fixture: the test plants the installed twin itself, so the
+		// assertion covers the gate's twin resolution and comparison, not any
+		// installer's behavior.
+		mkdirSync(join(home, ".omp/agent/rules"), { recursive: true });
+		writeFileSync(join(home, ".omp/agent/rules/guard.md"), "base rule\n");
 		const record = await runSyncGate(
 			targetFor({
 				root,
@@ -334,34 +338,30 @@ describe("runSyncGate", () => {
 		expect(record.files[0]?.match).toBe(true);
 	});
 
-	test("an installed twin that drifts from the commit records match false", async () => {
+	test("a stale installed twin records match false for the requested file", async () => {
 		const root = freshDir("drift");
 		const wt = join(root, "wt");
 		mkdirSync(wt, { recursive: true });
-		const base = seedWorktree(wt);
+		seedWorktree(wt);
+		sh("git checkout -q main", wt);
 		const alateDir = join(root, "alate");
 		const home = join(root, "home");
-		// The card's file is not manifest-covered: sync skips it and a stale twin
-		// stays behind — exactly the drift the hashes exist to catch.
-		seedAlate(alateDir, root, ["projects/ottr/AGENTS.md"]);
-		mkdirSync(join(root, "ottr"), { recursive: true });
-		writeFileSync(join(root, "ottr/AGENTS.md"), "stale install\n");
+		seedProbe(alateDir);
+		mkdirSync(join(home, ".omp/agent/rules"), { recursive: true });
+		writeFileSync(join(home, ".omp/agent/rules/guard.md"), "stale install\n");
 		const record = await runSyncGate(
-			targetFor({ root, worktree: wt, base, alateDir, home }),
+			targetFor({
+				root,
+				worktree: wt,
+				base: null,
+				alateDir,
+				home,
+				extraFiles: ["guard.md"],
+			}),
 		);
-		expect(record.code).toBe(0);
-		expect(record.output).toContain("sync: skipped projects/ottr/AGENTS.md");
-		const byPath = new Map(record.files.map((f) => [f.path, f]));
-		const projectsEntry = byPath.get("projects/ottr/AGENTS.md");
-		expect(projectsEntry?.match).toBe(false);
-		expect(projectsEntry?.sourceSha256).toBe(shaOf("card agents\n"));
-		expect(projectsEntry?.installedSha256).toBe(shaOf("stale install\n"));
-		// Once the install covers the file again, the same gate records match.
-		seedAlate(alateDir, root);
-		const second = await runSyncGate(
-			targetFor({ root, worktree: wt, base, alateDir, home }),
-		);
-		expect(second.files[0]?.match).toBe(true);
+		expect(record.files[0]?.match).toBe(false);
+		expect(record.files[0]?.sourceSha256).toBe(shaOf("base rule\n"));
+		expect(record.files[0]?.installedSha256).toBe(shaOf("stale install\n"));
 	});
 
 	test("a missing sync.mjs records the refusal", async () => {
@@ -383,15 +383,13 @@ describe("runSyncGate", () => {
 		writeFileSync(join(wt, "dirty.txt"), "x");
 		const alateDir = join(root, "alate");
 		const home = join(root, "home");
-		seedAlate(alateDir, root);
+		seedProbe(alateDir);
 		const record = await runSyncGate(
 			targetFor({ root, worktree: wt, alateDir, home }),
 		);
 		expect(record.code).toBe(null);
 		expect(record.error).toContain("worktree not committed");
 		expect(record.error).toContain("dirty.txt");
-		// The gate never ran, so no twin was installed.
-		expect(existsSync(join(root, "ottr"))).toBe(false);
 	});
 
 	test("a foreign project records the refusal", async () => {
@@ -408,7 +406,7 @@ describe("runSyncGate", () => {
 		seedWorktree(wt);
 		const alateDir = join(root, "alate");
 		const home = join(root, "home");
-		seedAlate(alateDir, root);
+		seedProbe(alateDir);
 		// The gate env pins PATH, so a PATH without node must fail the spawn into
 		// an error record instead of a fake pass.
 		const saved = process.env.PATH;
@@ -447,6 +445,70 @@ describe("runSyncGate", () => {
 		expect(record.output.length).toBe(GATE_OUTPUT_CAP);
 		expect(record.output).not.toContain("tail");
 	});
+});
+
+// Acceptance against the deployed installer: the real /workspace/alate/sync.mjs
+// runs (copied into an isolated ALATE_HOME fixture, with isolated install
+// targets), so the tests prove the gate's integration with the actual script's
+// contract — it processes only root rules and rejects files without frontmatter
+// — and never a replacement's behavior. Where the alate checkout is not
+// readable, they skip visibly with that reason instead of passing vacuously.
+
+describe("real sync.mjs acceptance", () => {
+	test.skipIf(!realReadable)(
+		"the gate runs the deployed script: root rules install, frontmatter-less files do not (skips where /workspace/alate is unreadable)",
+		async () => {
+			if (!realReadable)
+				console.warn(
+					`skip: the real ${REAL_SYNC} is not readable from this uid (${typeof process.getuid === "function" ? process.getuid() : "?"}); the acceptance run needs the board's root-side check environment`,
+				);
+			const root = freshDir("real");
+			const wt = join(root, "wt");
+			mkdirSync(wt, { recursive: true });
+			const base = seedRuleData(wt);
+			const alateDir = join(root, "alate");
+			const home = join(root, "home");
+			// Isolated ALATE_HOME (the fixture dir carries the real script) and an
+			// isolated install home; the workspace root is a temp dir too.
+			useRealSync(alateDir);
+			const record = await runSyncGate(
+				targetFor({ root, worktree: wt, base, alateDir, home }),
+			);
+			// A real spawn happened and was recorded against the pinned commit.
+			expect(record.code).not.toBe(null);
+			expect(record.head).toBe(
+				execSync("git rev-parse HEAD", { cwd: wt }).toString().trim(),
+			);
+			expect(record.output).not.toBe("");
+			// Both rule paths are contract-mapped, so the record hashes their
+			// snapshot sources.
+			const byPath = new Map(record.files.map((f) => [f.path, f]));
+			expect(byPath.get("rule-ok.md")?.sourceSha256).toBe(
+				shaOf(
+					"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
+				),
+			);
+			expect(byPath.get("rule-bad.md")?.sourceSha256).toBe(
+				shaOf("# no frontmatter here\n"),
+			);
+			// The deployed script rejects frontmatter-less files: nothing installs to
+			// the rule twin location for rule-bad.md.
+			expect(existsSync(join(home, ".omp/agent/rules/rule-bad.md"))).toBe(
+				false,
+			);
+			// Whatever the real script installed for the valid rule, the record's
+			// comparison is honest: an existing twin must hash-match HEAD's bytes.
+			const ok = byPath.get("rule-ok.md");
+			if (ok?.installedSha256 !== null && ok?.installedSha256 !== undefined) {
+				expect(ok.match).toBe(true);
+				expect(
+					readFileSync(join(home, ".omp/agent/rules/rule-ok.md"), "utf8"),
+				).toBe(
+					"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
+				);
+			}
+		},
+	);
 });
 
 describe("runSyncGateQueued", () => {

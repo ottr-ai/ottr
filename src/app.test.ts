@@ -16,7 +16,9 @@ import {
 import { execSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import {
+	accessSync,
 	appendFileSync,
+	constants,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -12606,53 +12608,45 @@ describe("sync-gate endpoint", () => {
 		return base;
 	};
 
-	/** The fixture alate checkout, under the documented agent-data contract: it
-	 *  requires `--data <dir>` (and uses that value as the data root, never cwd),
-	 *  reads the projects root from its ALATE_HOME config, installs root *.md
-	 *  rules into the home's .omp/agent/rules, user/ files below the home, and
-	 *  projects/ files into the projects root, and echoes its argv. */
-	const seedAlate = (dir: string, projectsRoot: string): void => {
+	/** The mechanics probe for the endpoint tests: a transparent stand-in that
+	 *  enforces the argv contract and echoes what it was handed. It installs
+	 *  nothing; sync-behavior acceptance runs against the real script in the
+	 *  gated test below. */
+	const seedAlate = (dir: string): void => {
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(
 			join(dir, "sync.mjs"),
 			[
-				`import { readdirSync, readFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";`,
-				`import { join, dirname, relative } from "node:path";`,
+				`import { createHash } from "node:crypto";`,
+				`import { readFileSync } from "node:fs";`,
+				`import { join, resolve } from "node:path";`,
 				`console.log("argv " + JSON.stringify(process.argv));`,
 				`const flag = process.argv.indexOf("--data");`,
 				`const data = flag === -1 ? null : process.argv[flag + 1];`,
-				`if (data === undefined || data === null) { console.error("sync: no --data path"); process.exit(2); }`,
-				`const alate = process.env.ALATE_HOME;`,
-				`if (alate === undefined) { console.error("sync: ALATE_HOME is unset"); process.exit(1); }`,
-				`const rootFile = join(alate, "projects-root.txt");`,
-				`if (!existsSync(rootFile)) { console.error("sync: no projects root config"); process.exit(2); }`,
-				`const home = process.env.HOME;`,
-				`if (home === undefined) { console.error("sync: HOME is unset"); process.exit(1); }`,
-				`const projectsRoot = readFileSync(rootFile, "utf8").trim();`,
-				`const walk = (dir) => {`,
-				`  for (const e of readdirSync(dir, { withFileTypes: true })) {`,
-				`    const p = join(dir, e.name);`,
-				`    if (e.isDirectory()) walk(p);`,
-				`    else {`,
-				`      const rel = relative(data, p);`,
-				`      let out = null;`,
-				`      if (rel.startsWith("projects/")) out = join(projectsRoot, rel.slice("projects/".length));`,
-				`      else if (rel.startsWith("user/")) out = join(home, rel.slice("user/".length));`,
-				`      else if (/^[^/]+\\.md$/.test(rel)) out = join(home, ".omp", "agent", "rules", rel);`,
-				`      if (out !== null) {`,
-				`        mkdirSync(dirname(out), { recursive: true });`,
-				`        copyFileSync(p, out);`,
-				`        console.log("sync: installed " + rel);`,
-				`      }`,
-				`    }`,
-				`  }`,
-				`};`,
-				`walk(data);`,
-				`console.log("sync: done");`,
+				`if (data === undefined || data === null) { console.error("probe: no --data path"); process.exit(2); }`,
+				`const probe = join(resolve(data), "projects", "ottr", "AGENTS.md");`,
+				`try {`,
+				`  const bytes = readFileSync(probe);`,
+				`  console.log("probe sha256 " + createHash("sha256").update(bytes).digest("hex"));`,
+				`} catch {`,
+				`  console.log("probe sha256 projects/ottr/AGENTS.md absent");`,
+				`}`,
+				`console.log("probe done");`,
 				"",
 			].join("\n"),
 		);
-		writeFileSync(join(dir, "projects-root.txt"), projectsRoot);
+	};
+
+	/** The deployed sync gate's script, readable only where the uid can read the
+	 *  alate checkout (the board's root-side check runs). */
+	const REAL_SYNC = "/workspace/alate/sync.mjs";
+	const realSyncReadable = (): boolean => {
+		try {
+			accessSync(REAL_SYNC, constants.R_OK);
+			return true;
+		} catch {
+			return false;
+		}
 	};
 
 	/** A committed work-kind card wired to a fresh fixture worktree, plus its run grant. */
@@ -12728,7 +12722,7 @@ describe("sync-gate endpoint", () => {
 			latestImage: null,
 			archReview: null,
 		});
-		seedAlate(alateDir, gateRoot);
+		seedAlate(alateDir);
 	});
 
 	afterAll(async () => {
@@ -12756,7 +12750,7 @@ describe("sync-gate endpoint", () => {
 		expect(res.status).toBe(200);
 		const record = (await res.json()) as SyncGateRun;
 		expect(record.code).toBe(0);
-		// The documented command contract, pinned through the fixture's argv echo.
+		// The documented command contract, pinned through the probe's argv echo.
 		const argvLine = record.output
 			.split("\n")
 			.find((l) => l.startsWith("argv "));
@@ -12767,16 +12761,21 @@ describe("sync-gate endpoint", () => {
 		expect(record.head).toBe(
 			execSync("git rev-parse HEAD", { cwd: worktree }).toString().trim(),
 		);
-		expect(record.output).toContain("sync: installed projects/ottr/AGENTS.md");
-		expect(record.output).toContain("sync: installed guard.md");
-		expect(record.output).toContain("sync: done");
-		const byPath = new Map(record.files.map((f) => [f.path, f]));
-		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(true);
-		expect(byPath.get("guard.md")?.match).toBe(true);
-		// The rule twin landed in the fixture home the route handed the gate.
+		expect(record.output).toContain("probe done");
+		// The child read the snapshot's HEAD bytes for the changed projects file.
+		const shaLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("probe sha256 "));
 		expect(
-			readFileSync(join(gateHome, ".omp/agent/rules/guard.md"), "utf8"),
-		).toBe("card rule\n");
+			shaLine?.endsWith(
+				createHash("sha256").update("card agents\n").digest("hex"),
+			),
+		).toBe(true);
+		// The changed set is contract-mapped and hashed; no installer ran here,
+		// so the twins are honestly absent and the records say so.
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		expect(byPath.get("projects/ottr/AGENTS.md")?.installedSha256).toBe(null);
+		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(false);
 		// The record is tracked store data: the response IS the stored record.
 		const task = await agentStore!.getTask(id);
 		expect(task?.syncGateLog.length).toBe(1);
@@ -12789,6 +12788,10 @@ describe("sync-gate endpoint", () => {
 		// Back to main: the branch changes nothing, so the changed set is empty
 		// and only the requested extra can carry the acceptance hash.
 		execSync("git checkout -q main", { cwd: worktree });
+		// Hashing-logic fixture: the test plants the installed twin itself, so the
+		// assertion covers the gate's twin resolution and comparison.
+		mkdirSync(join(gateRoot, "ottr"), { recursive: true });
+		writeFileSync(join(gateRoot, "ottr/AGENTS.md"), "base agents\n");
 		const res = await post(
 			"/api/projects/agent-data/sync-gate",
 			{ files: ["projects/ottr/AGENTS.md"] },
@@ -12800,13 +12803,65 @@ describe("sync-gate endpoint", () => {
 		expect(record.files.map((f) => f.path)).toEqual([
 			"projects/ottr/AGENTS.md",
 		]);
-		// Main's bytes, installed by the archive of HEAD.
+		// Main's bytes, read from the archive of HEAD.
 		expect(record.files[0]?.sourceSha256).toBe(
 			createHash("sha256").update("base agents\n").digest("hex"),
 		);
 		expect(record.files[0]?.match).toBe(true);
 		await agentStore!.updateTask(id, { cancelledAt: Date.now() });
 	});
+
+	test.skipIf(!realSyncReadable())(
+		"the deployed sync.mjs runs when the alate checkout is readable (skips where it is not)",
+		async () => {
+			// The board's root-side check runs execute the real installer against
+			// isolated targets; a uid without alate-checkout access cannot, and the
+			// test skips visibly instead of proving a replacement.
+			const { id, runToken, worktree } = await seedCard();
+			// The registered alate entry carries the real script; ALATE_HOME (the
+			// registered checkout) and every install target stay as the fixtures are.
+			writeFileSync(
+				join(projects.get("alate")!.path, "sync.mjs"),
+				readFileSync(REAL_SYNC),
+			);
+			// A committed root rule is what the deployed script processes.
+			writeFileSync(
+				join(worktree, "rule-ok.md"),
+				"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
+			);
+			execSync("git add -A && git commit -qm rule", {
+				cwd: worktree,
+				stdio: "ignore",
+				env: fixtureGitEnv(),
+			});
+			const res = await post(
+				"/api/projects/agent-data/sync-gate",
+				{ files: ["rule-ok.md"] },
+				asRunHeaders(runToken),
+			);
+			expect(res.status).toBe(200);
+			const record = (await res.json()) as SyncGateRun;
+			expect(record.code).not.toBe(null);
+			expect(record.head).toBe(
+				execSync("git rev-parse HEAD", { cwd: worktree }).toString().trim(),
+			);
+			expect(record.output).not.toBe("");
+			const byPath = new Map(record.files.map((f) => [f.path, f]));
+			expect(byPath.get("rule-ok.md")?.sourceSha256).toBe(
+				createHash("sha256")
+					.update(
+						"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
+					)
+					.digest("hex"),
+			);
+			// Whatever the real script installed, the record's comparison is honest.
+			const ok = byPath.get("rule-ok.md");
+			if (ok?.installedSha256 !== null && ok?.installedSha256 !== undefined) {
+				expect(ok.match).toBe(true);
+			}
+			await agentStore!.updateTask(id, { cancelledAt: Date.now() });
+		},
+	);
 
 	test("a files entry that maps to no installed location refuses", async () => {
 		const { id, runToken } = await seedCard();

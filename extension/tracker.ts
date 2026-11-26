@@ -535,6 +535,46 @@ const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 // POST one trending verdict to the board (src/app.ts /trending/verdicts, the board token like
 // create_task) with this run's card as the scout. Returns the filed proposal's id (null for
 // no_fit and deferred) or a ready-to-show error text; the tool's own validation runs first.
+// POST the sync-gate request to the board and interpret the response: the
+// stored record as ready-to-show JSON text, or a ready-to-show error. The
+// board records the run before it answers, so the text cites tracked data.
+async function runSyncGateViaBoard(
+	env: BoardEnv,
+	files: string[],
+): Promise<string> {
+	let res: Response;
+	try {
+		res = await fetch(
+			`${env.base}/api/projects/${encodeURIComponent(env.project)}/sync-gate`,
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					origin: env.base,
+					...(env.token !== "" ? { "x-board-token": env.token } : {}),
+					"x-run-token": env.runToken,
+				},
+				body: JSON.stringify({
+					...(files.length > 0 ? { files } : {}),
+				}),
+			},
+		);
+	} catch (err) {
+		const why = err instanceof Error ? err.message : String(err);
+		return `Error: the board at ${env.base} is unreachable (${why}). Report the blocker.`;
+	}
+	const body = (await res.json().catch(() => null)) as Record<
+		string,
+		unknown
+	> | null;
+	if (!res.ok || body === null) {
+		const why =
+			body !== null && typeof body.error === "string" ? ` — ${body.error}` : "";
+		return `Error: sync gate not run (HTTP ${res.status}${why}). Fix the cause or report the blocker.`;
+	}
+	return JSON.stringify(body, null, 2);
+}
+
 async function postVerdict(
 	tool: string,
 	body: {
@@ -1276,43 +1316,7 @@ export default function (pi: Pi) {
 				const files = Array.isArray(params.files)
 					? params.files.filter((x) => typeof x === "string" && x.trim() !== "")
 					: [];
-				let res: Response;
-				try {
-					res = await fetch(
-						`${env.base}/api/projects/${encodeURIComponent(env.project)}/sync-gate`,
-						{
-							method: "POST",
-							headers: {
-								"content-type": "application/json",
-								origin: env.base,
-								...(env.token !== "" ? { "x-board-token": env.token } : {}),
-								"x-run-token": env.runToken,
-							},
-							body: JSON.stringify({
-								...(files.length > 0 ? { files } : {}),
-							}),
-						},
-					);
-				} catch (err) {
-					const why = err instanceof Error ? err.message : String(err);
-					return textResult(
-						`Error: the board at ${env.base} is unreachable (${why}). Report the blocker.`,
-					);
-				}
-				const body = (await res.json().catch(() => null)) as Record<
-					string,
-					unknown
-				> | null;
-				if (!res.ok || body === null) {
-					const why =
-						body !== null && typeof body.error === "string"
-							? ` — ${body.error}`
-							: "";
-					return textResult(
-						`Error: sync gate not run (HTTP ${res.status}${why}). Fix the cause or report the blocker.`,
-					);
-				}
-				return textResult(JSON.stringify(body, null, 2));
+				return textResult(await runSyncGateViaBoard(env, files));
 			},
 		});
 	}
