@@ -39,7 +39,6 @@ import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 import { ServiceQuotas } from "./serviceQuotas.tsx";
 // Static: status.ts touches no browser global at load.
 import { bellAlarms } from "./status.ts";
-import { stamp } from "./time.ts";
 import {
 	installBrowserGlobals,
 	mount,
@@ -47,6 +46,7 @@ import {
 	onClickOf,
 	stubFetch,
 } from "./testDom.tsx";
+import { stamp } from "./time.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
