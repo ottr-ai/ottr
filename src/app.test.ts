@@ -15597,6 +15597,7 @@ describe("web push (R1-1, R2-3)", () => {
 					draft: false,
 					title: task.title,
 					postError: null,
+					fixedThreads: [],
 					commentsAt: null,
 					commentsUnseen: false,
 				});
@@ -15795,6 +15796,7 @@ describe("web push (R1-1, R2-3)", () => {
 				draft: false,
 				title: "Review",
 				postError: null,
+				fixedThreads: [],
 				commentsAt: null,
 				commentsUnseen: false,
 			});
