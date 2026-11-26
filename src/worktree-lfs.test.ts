@@ -372,11 +372,14 @@ describe("serverMergePush with Git LFS", () => {
 	test("an operator-set lfs.url wins: the push follows the repo config endpoint", async () => {
 		// OTTR-1283 (operator decision): on a GitHub-host origin, lfs.url holding a value
 		// skips the command-line pin, so the upload resolves the config's endpoint — here
-		// a second full LFS server that receives the object while the origin's own LFS
-		// API sees no batch at all. The board stores nothing either way. The origin
-		// argument names github.com (the skip rule's scope); only lfs.url is reachable.
+		// a bare LFS-only server that receives the object while the origin's own LFS API
+		// sees no batch at all. The board stores nothing either way. The origin argument
+		// names github.com (the skip rule's scope); only lfs.url is reachable.
 		const f = await fixture({ lfs: true });
-		const f2 = await fixture({ lfs: true });
+		const f2dir = mkdtempSync(join(tmpdir(), "ottr-lfs-mirror-"));
+		const f2bare = join(f2dir, "bare.git");
+		await run(f2dir, "init", "-q", "--bare", "-b", "main", f2bare);
+		const f2 = serveGitLfs(f2dir, f2bare);
 		try {
 			await run(f.main, "config", "lfs.url", `${f2.url}/info/lfs`);
 			const tip = await run(f.main, "rev-parse", "refs/heads/main");
@@ -396,7 +399,7 @@ describe("serverMergePush with Git LFS", () => {
 			);
 		} finally {
 			cleanup(f.dir, f.close);
-			cleanup(f2.dir, f2.close);
+			cleanup(f2dir, f2.close);
 		}
 	}, 20_000);
 
