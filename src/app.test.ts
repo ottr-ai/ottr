@@ -31,7 +31,7 @@ import {
 } from "node:fs";
 import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
 import {
 	type App,
@@ -13705,19 +13705,18 @@ describe("registration pins before refreshRemote (OTTR-1004)", () => {
 			const e = regProjects.get("reg-pin")!;
 			// The identity is derived from the stored pin — a file:// URL no remote read
 			// would ever produce — and the probe ran inside registration.
-			const pin = (await e.store.getSettings()).originUrl;
+			const pin = (await e.store.getSettings()).originUrl ?? "";
 			expect(pin).toBe(`file://${fixtureRepos}/reg-pin`);
-			expect(e.github).toBe(
-				`https://tmp/${basename(root)}/fixture-repos/reg-pin`,
-			);
+			// The identity is the pin under the configured host, wherever the suite's
+			// tmpdir nests it: the host match consumes the leading file:///tmp/ label.
+			const fromPin = `https://tmp/${pin.slice("file:///tmp/".length)}`;
+			expect(e.github).toBe(fromPin);
 			expect(e.protectedTarget).toBe(true);
 			expect(probes).toBe(1);
 			const view = (await add.json()) as {
 				project: { github: string | null; prModeSuggestion: boolean };
 			};
-			expect(view.project.github).toBe(
-				`https://tmp/${basename(root)}/fixture-repos/reg-pin`,
-			);
+			expect(view.project.github).toBe(fromPin);
 			expect(view.project.prModeSuggestion).toBe(true);
 		} finally {
 			const added = regProjects.get("reg-pin");
