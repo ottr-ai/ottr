@@ -1465,18 +1465,17 @@ command line, where `<endpoint>` mirrors git-lfs's own derivation —
 `<originUrl>/info/lfs` when it carries one. OTTR-1109: the bare
 `<originUrl>/info/lfs` form lands on a different server route, and GitHub
 answers 422 to the locks/verify call and to the batch alike there (MYST-34).
-OTTR-1283: the board also converges the endpoint on disk, so every git-lfs run
-without the push's own pin resolves the same URL. At boot and at project add
-the board reads the endpoint keys in git-lfs's own resolution order
-(`lfs.<url>.lfsurl`, `remote.<remote>.lfsurl`, `lfs.url`) and converges the
-first key that holds a value, when the pinned origin is an http(s) URL on a
-GitHub host (github.com, a `*.ghe.com` tenant, or the configured host) and the
-URL has no `.git` suffix. The convergence writes an absent `lfs.url`, fixes a
-bare residue in the key that carries it, re-points a stale `.git`-form value
-that named an earlier origin on the same host, and leaves any operator-set
-endpoint alone, with no shadowing `lfs.url` next to it. A remote with the
-`.git` suffix gets no write: git-lfs derives the same endpoint itself.
-The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
+OTTR-1283: the board stores no endpoint. At each server-side push the upload
+derives the endpoint from the origin it is given, in git-lfs's own derivation
+(`<originUrl>.git/info/lfs` when the URL lacks the `.git` suffix), and pins it
+on the upload's command line only — nothing lands in the project's git config,
+so an origin change re-derives at the next push and nothing can go stale. On a
+GitHub host (github.com, a `*.ghe.com` tenant, or the configured host) the pin
+is skipped when the repo config already holds `lfs.url` or
+`remote.<remote>.lfsurl`: the operator's own endpoint wins, its lock behavior
+included. A config a work turn planted would win with it; that trade is the
+operator's call. Non-GitHub hosts keep the unconditional pin: today's
+behavior. The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
 verified against git-lfs 3.6.1), the URL argument means `remote.<name>.lfsurl`
 is never read, and the lock pin turns the locking API off: the board never uses
 LFS locks, and on github hosts git-lfs verifies locks by default, so a locking

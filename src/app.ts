@@ -502,7 +502,6 @@ import {
 import type { WorkerTarget } from "./workers.ts";
 import {
 	archReviewDelta,
-	convergeLfsEndpoint,
 	diffStat,
 	diffText,
 	git,
@@ -7733,15 +7732,6 @@ export async function createApp(deps: AppDeps) {
 			});
 		});
 		await refreshRemote(e);
-		// OTTR-1283: a project added here (clone, gh create, re-add) converges its LFS
-		// endpoint beside the pin. A failed write must not fail the add: the push pins
-		// its own endpoint either way, so the error lands in the server log only.
-		if (pin !== null)
-			await convergeLfsEndpoint(p, pin).catch((err: unknown) =>
-				console.error(
-					`lfs endpoint convergence failed for ${key}: ${errmsg(err)}`,
-				),
-			);
 		// The rules interview waits for the wizard's last step: the settings saves land
 		// first, so PR mode and the target branch hold for the interview's first commit
 		// (docs/specs/add-project-wizard.md). POST /interview starts it.

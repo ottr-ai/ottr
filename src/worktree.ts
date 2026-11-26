@@ -2487,23 +2487,37 @@ async function catFileBatch(
 }
 
 /**
- * The LFS endpoint git-lfs derives for an http(s) origin URL, plus the lock-check
- * opt-out, both pinned on the command line so a planted `lfs.url` cannot move the
- * upload (verified against git-lfs 3.6.1: an empty `-c lfs.url=` fails the push, the
- * derived value overrides the plant).
+ * The endpoint pins for one LFS upload: git-lfs's own derivation of the origin URL
+ * (lfsapi/endpoint_finder.go NewEndpointFromCloneURL: `<url>.git/info/lfs` when the URL
+ * lacks the `.git` suffix, `<url>/info/lfs` when it carries it) plus the lock-check
+ * opt-out, passed on the upload's command line only — nothing is stored. OTTR-1109:
+ * the bare `<url>/info/lfs` form lands on a different server route — GitHub answers
+ * 422 to the locks/verify call and to the batch alike there (MYST-34) — where
+ * git-lfs's own derivation appends `.git`. git-lfs reads the lock opt-out as
+ * `lfs.<endpoint>.locksverify` (commands/lockverifier.go getVerifyStateFor), so the
+ * second pin scopes that same endpoint: the board never uses LFS locks, and on github
+ * hosts git-lfs verifies locks by default, so a 422 from a locking endpoint must not
+ * fail an upload whose batch works.
  *
- * The endpoint mirrors git-lfs's own derivation (lfsapi/endpoint_finder.go
- * NewEndpointFromCloneURL): `<url>.git/info/lfs` when the URL lacks the `.git`
- * suffix, `<url>/info/lfs` when it carries it. OTTR-1109: the bare
- * `<url>/info/lfs` form this pin used before lands on a different server route —
- * GitHub answers 422 to the locks/verify call and to the batch alike there
- * (MYST-34) — where git-lfs's own derivation appends `.git`. git-lfs reads the lock
- * opt-out as `lfs.<endpoint>.locksverify` (commands/lockverifier.go
- * getVerifyStateFor), so the second pin scopes that same endpoint: the board never
- * uses LFS locks, and on github hosts git-lfs verifies locks by default, so a 422
- * from a locking endpoint must not fail an upload whose batch works.
+ * OTTR-1283 (operator decision): an operator's own `lfs.url` or
+ * `remote.origin.lfsurl` in the repo config must win. On a GitHub-host origin (the
+ * board's isGithubRepoHost rule), either key holding a value skips both pins — the
+ * upload then follows the repo config endpoint, its lock behavior included, and a
+ * config a work turn planted would win with it; that trade is the operator's call.
+ * Non-GitHub http(s) hosts keep the unconditional pin: today's behavior.
  */
-function lfsEndpointPin(originUrl: string): readonly string[] {
+export async function lfsEndpointPin(
+	mainPath: string,
+	originUrl: string,
+): Promise<readonly string[]> {
+	if (!/^https?:\/\//i.test(originUrl)) return [];
+	const u = new URL(originUrl);
+	if (isGithubRepoHost(u.host, githubHost().host)) {
+		for (const key of ["lfs.url", "remote.origin.lfsurl"]) {
+			const r = await git(["config", key], mainPath).catch(() => null);
+			if (r !== null && r.code === 0 && r.stdout.trim() !== "") return [];
+		}
+	}
 	const endpoint = lfsEndpointFor(originUrl);
 	if (endpoint === null) return [];
 	return [
@@ -2519,69 +2533,6 @@ function lfsEndpointFor(originUrl: string): string | null {
 	if (!/^https?:\/\//i.test(originUrl)) return null;
 	const base = originUrl.replace(/\/+$/, "");
 	return base.endsWith(".git") ? `${base}/info/lfs` : `${base}.git/info/lfs`;
-}
-
-/**
- * OTTR-1283: persists the .git-form LFS endpoint in the project's repo config, so every
- * git-lfs run without the push's own command-line pin (a work turn's checkout, `git lfs
- * env`) resolves the endpoint the board pushes to. Boot and project add call this beside
- * the origin pin (R5-1). Convergence rules, in order: an origin that is not http(s), is
- * not on a GitHub host (github.com, a *.ghe.com tenant, or the configured host), or ends
- * .git is untouched — git-lfs derives the .git form itself there and the push pins its
- * own endpoint. The explicit endpoint keys are read in git-lfs's own resolution order
- * (lfsapi/endpoint_finder.go: the URL-keyed `lfs.<url>.lfsurl`, then
- * `remote.<remote>.lfsurl`, then `lfs.url`), and the first key that holds a value
- * decides: the .git form keeps it, the bare `<url>/info/lfs` residue of the OTTR-1058
- * pin (GitHub answers that form 422, MYST-34) is overwritten in that key, a stale
- * .git-form value on the origin's own host — the shape this convergence wrote for an
- * earlier origin, which would otherwise keep targeting the old repository — is
- * re-pointed, and any other value is an operator's own endpoint and stays, with no
- * shadowing `lfs.url` written next to it. No set key at all writes `lfs.url`. The
- * endpoint built here never carries the remote's userinfo, so an embedded token cannot
- * reach the repo config this writes.
- */
-export async function convergeLfsEndpoint(
-	mainPath: string,
-	originUrl: string,
-): Promise<void> {
-	if (!/^https?:\/\//i.test(originUrl)) return;
-	const u = new URL(originUrl);
-	if (!isGithubRepoHost(u.host, githubHost().host)) return;
-	// Rebuild without userinfo (a token embedded in the remote must not persist) and
-	// without a trailing slash.
-	const base = `${u.protocol}//${u.host}${u.pathname}`.replace(/\/+$/, "");
-	if (base.endsWith(".git")) return;
-	const bare = `${base}/info/lfs`;
-	const endpoint = `${base}.git/info/lfs`;
-	for (const key of [
-		`lfs.${originUrl}.lfsurl`,
-		"remote.origin.lfsurl",
-		"lfs.url",
-	]) {
-		const r = await git(["config", key], mainPath).catch(() => null);
-		if (r === null || r.code !== 0) continue; // unset: the next key decides
-		const cur = r.stdout.trim();
-		if (cur === endpoint) return;
-		if (cur === bare || lfsStaleEndpoint(cur, u.host)) {
-			await git(["config", key, endpoint], mainPath);
-		}
-		return; // the first set key decides, whatever it holds
-	}
-	await git(["config", "lfs.url", endpoint], mainPath);
-}
-
-/** True when `value` is a .git/info/lfs-form endpoint on `host` — the shape this
- * convergence writes, stale after the origin moved to another repository there. */
-function lfsStaleEndpoint(value: string, host: string): boolean {
-	try {
-		const v = new URL(value);
-		return (
-			v.host.toLowerCase() === host.toLowerCase() &&
-			/\.git\/info\/lfs$/.test(v.pathname)
-		);
-	} catch {
-		return false;
-	}
 }
 
 /**
@@ -2620,7 +2571,13 @@ export async function pushLfsObjects(
 	if ((await lfsPointerOids(mainPath, tip, base)).length === 0) return null;
 	if (/^https?:\/\//i.test(originUrl)) {
 		const r = await git(
-			[...lfsEndpointPin(originUrl), "lfs", "push", originUrl, refName],
+			[
+				...(await lfsEndpointPin(mainPath, originUrl)),
+				"lfs",
+				"push",
+				originUrl,
+				refName,
+			],
 			mainPath,
 			undefined,
 			authEnv,

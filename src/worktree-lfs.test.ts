@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	convergeLfsEndpoint,
+	lfsEndpointPin,
 	lfsPointerOids,
 	pushBranch,
 	pushLfsObjects,
@@ -369,42 +369,36 @@ describe("serverMergePush with Git LFS", () => {
 		}
 	});
 
-	test("a planted lfs.url cannot move the upload off the pinned origin", async () => {
+	test("an operator-set lfs.url wins: the push follows the repo config endpoint", async () => {
+		// OTTR-1283 (operator decision): on a GitHub-host origin, lfs.url holding a value
+		// skips the command-line pin, so the upload resolves the config's endpoint — here
+		// a second full LFS server that receives the object while the origin's own LFS
+		// API sees no batch at all. The board stores nothing either way. The origin
+		// argument names github.com (the skip rule's scope); only lfs.url is reachable.
 		const f = await fixture({ lfs: true });
+		const f2 = await fixture({ lfs: true });
 		try {
-			let hijackAttempts = 0;
-			const hostile = Bun.serve({
-				port: 0,
-				fetch: () => {
-					hijackAttempts++;
-					return new Response("{}", { status: 200 });
-				},
-			});
-			try {
-				await run(
+			await run(f.main, "config", "lfs.url", `${f2.url}/info/lfs`);
+			const tip = await run(f.main, "rev-parse", "refs/heads/main");
+			const base = await run(f.main, "rev-parse", "origin/main");
+			expect(
+				await pushLfsObjects(
 					f.main,
-					"config",
-					"lfs.url",
-					`http://127.0.0.1:${hostile.port}/hijack`,
-				);
-				const r = await serverMergePush(
-					f.main,
-					f.wt,
-					"origin/main",
-					"ott/x",
-					null,
-					f.url,
-				);
-				expect(r.status).toBe("pushed");
-				expect(readFileSync(f.storeFile, "utf8")).toContain(f.oid);
-				expect(hijackAttempts).toBe(0);
-			} finally {
-				hostile.stop(true);
-			}
+					"https://github.com/octo/repo",
+					"main",
+					tip,
+					base,
+				),
+			).toBeNull();
+			expect(readFileSync(f2.storeFile, "utf8")).toContain(f.oid);
+			expect(f.requests.filter((p) => p.includes("/objects/batch"))).toEqual(
+				[],
+			);
 		} finally {
 			cleanup(f.dir, f.close);
+			cleanup(f2.dir, f2.close);
 		}
-	});
+	}, 20_000);
 
 	test("pins the endpoint with git-lfs's own derivation for an origin URL without .git (OTTR-1109)", async () => {
 		// OTTR-1058 pinned <originUrl>/info/lfs verbatim; git-lfs's own derivation
@@ -741,14 +735,31 @@ exit 1
 	});
 });
 
-describe("convergeLfsEndpoint (OTTR-1283)", () => {
-	/** A plain repo whose origin names `originUrl` (no clone: convergence reads git config). */
+describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
+	/** A plain repo whose origin names `originUrl` (no clone: the pin reads git config). */
 	const repoAt = async (originUrl: string): Promise<string> => {
-		const dir = mkdtempSync(join(tmpdir(), "ottr-lfs-converge-"));
+		const dir = mkdtempSync(join(tmpdir(), "ottr-lfs-pin-"));
 		const repo = join(dir, "repo");
 		await run(dir, "init", "-q", "-b", "main", repo);
 		await run(repo, "remote", "add", "origin", originUrl);
 		return repo;
+	};
+	/** The endpoint git-lfs resolves with the push command's own pins on the line. */
+	const pushEnvEndpoint = async (
+		repo: string,
+		pins: readonly string[],
+	): Promise<string> => {
+		const proc = Bun.spawn(["git", ...pins, "lfs", "env"], {
+			cwd: repo,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [out, code] = await Promise.all([
+			new Response(proc.stdout).text(),
+			proc.exited,
+		]);
+		if (code !== 0) throw new Error("git lfs env failed");
+		return /^Endpoint=(.*)$/m.exec(out)?.[1] ?? "(none)";
 	};
 	/** The repo's persisted lfs.url, null when unset. */
 	const lfsUrlConfig = async (repo: string): Promise<string | null> => {
@@ -763,92 +774,28 @@ describe("convergeLfsEndpoint (OTTR-1283)", () => {
 		]);
 		return code === 0 ? out.trim() : null;
 	};
-	/** The repo's persisted remote.origin.lfsurl, null when unset. */
-	const remoteLfsUrl = async (repo: string): Promise<string | null> => {
-		const proc = Bun.spawn(["git", "config", "remote.origin.lfsurl"], {
-			cwd: repo,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		const [out, code] = await Promise.all([
-			new Response(proc.stdout).text(),
-			proc.exited,
-		]);
-		return code === 0 ? out.trim() : null;
-	};
-	/** The endpoint `git lfs env` resolves in the repo — the acceptance's own reader. */
-	const envEndpoint = async (repo: string): Promise<string> =>
-		/^Endpoint=(.*)$/m.exec(await run(repo, "lfs", "env"))?.[1] ?? "(none)";
 
-	test("a github.com remote without .git reports the .git endpoint after convergence (acceptance)", async () => {
-		// MYST-36: the merge push's batch went to https://…/info/lfs (the bare form),
-		// which GitHub answers 422. The board converges the persisted lfs.url to the
-		// .git form, so the endpoint git lfs env resolves for the push — and every
-		// git-lfs run without the push's own command-line pin — ends in .git/info/lfs.
+	test("a bare origin pins the .git endpoint for the push and stores nothing", async () => {
 		const repo = await repoAt("https://github.com/octo/repo");
 		try {
-			// The residue this card converges: the bare OTTR-1058 pin form, plantable by
-			// a work turn into the worker-writable repo config. Pre-fix, git lfs env
-			// resolves exactly this bare value and the assertion below fails.
-			await run(
-				repo,
-				"config",
-				"lfs.url",
-				"https://github.com/octo/repo/info/lfs",
-			);
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
-			expect(await lfsUrlConfig(repo)).toBe(
-				"https://github.com/octo/repo.git/info/lfs",
-			);
-			expect(await envEndpoint(repo)).toBe(
+			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
+			expect(await pushEnvEndpoint(repo, pins)).toBe(
 				"https://github.com/octo/repo.git/info/lfs (auth=none)",
 			);
+			expect(await lfsUrlConfig(repo)).toBeNull();
 		} finally {
 			rmSync(join(repo, ".."), { recursive: true, force: true });
 		}
 	});
 
-	test("an absent lfs.url is set to the .git form", async () => {
-		const repo = await repoAt("https://github.com/octo/repo");
-		try {
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
-			expect(await lfsUrlConfig(repo)).toBe(
-				"https://github.com/octo/repo.git/info/lfs",
-			);
-			expect(await envEndpoint(repo)).toMatch(
-				/^https:\/\/github\.com\/octo\/repo\.git\/info\/lfs/,
-			);
-		} finally {
-			rmSync(join(repo, ".."), { recursive: true, force: true });
-		}
-	});
-
-	test("a correct lfs.url does not change", async () => {
-		// The operator's stopgap on mystic-realms wrote exactly this value; convergence
-		// must leave it byte-identical.
-		const repo = await repoAt("https://github.com/octo/repo");
-		try {
-			await run(
-				repo,
-				"config",
-				"lfs.url",
-				"https://github.com/octo/repo.git/info/lfs",
-			);
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
-			expect(await lfsUrlConfig(repo)).toBe(
-				"https://github.com/octo/repo.git/info/lfs",
-			);
-		} finally {
-			rmSync(join(repo, ".."), { recursive: true, force: true });
-		}
-	});
-
-	test("a .git remote gains no lfs.url: git-lfs derives the same endpoint itself", async () => {
+	test("a .git origin pins the derived /info/lfs endpoint for the push", async () => {
 		const repo = await repoAt("https://github.com/octo/repo.git");
 		try {
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo.git");
-			expect(await lfsUrlConfig(repo)).toBeNull();
-			expect(await envEndpoint(repo)).toBe(
+			const pins = await lfsEndpointPin(
+				repo,
+				"https://github.com/octo/repo.git",
+			);
+			expect(await pushEnvEndpoint(repo, pins)).toBe(
 				"https://github.com/octo/repo.git/info/lfs (auth=none)",
 			);
 		} finally {
@@ -856,39 +803,28 @@ describe("convergeLfsEndpoint (OTTR-1283)", () => {
 		}
 	});
 
-	test("an endpoint that is neither bare nor the .git form is an operator's own and stays", async () => {
+	test("an origin change between two pushes re-derives from the current origin", async () => {
+		// Store nothing: the second push's pin comes from the origin as it is now, so
+		// the endpoint can never go stale behind a stored value.
 		const repo = await repoAt("https://github.com/octo/repo");
 		try {
+			const first = await lfsEndpointPin(repo, "https://github.com/octo/repo");
+			expect(await pushEnvEndpoint(repo, first)).toBe(
+				"https://github.com/octo/repo.git/info/lfs (auth=none)",
+			);
 			await run(
 				repo,
-				"config",
-				"lfs.url",
-				"https://lfs.example.com/api/g/parent",
+				"remote",
+				"set-url",
+				"origin",
+				"https://github.com/octo/other",
 			);
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
-			expect(await lfsUrlConfig(repo)).toBe(
-				"https://lfs.example.com/api/g/parent",
-			);
-		} finally {
-			rmSync(join(repo, ".."), { recursive: true, force: true });
-		}
-	});
-
-	test("a remote.origin.lfsurl endpoint is never overridden or duplicated", async () => {
-		// git-lfs resolves remote.<remote>.lfsurl above lfs.url, so the custom endpoint
-		// keeps its authority either way; convergence must still not write a shadowing
-		// lfs.url next to it, and must leave the remote-scoped value untouched.
-		const repo = await repoAt("https://github.com/octo/repo");
-		try {
-			await run(
+			const second = await lfsEndpointPin(
 				repo,
-				"config",
-				"remote.origin.lfsurl",
-				"https://lfs.example.com/api/octo/repo",
+				"https://github.com/octo/other",
 			);
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
-			expect(await remoteLfsUrl(repo)).toBe(
-				"https://lfs.example.com/api/octo/repo",
+			expect(await pushEnvEndpoint(repo, second)).toBe(
+				"https://github.com/octo/other.git/info/lfs (auth=none)",
 			);
 			expect(await lfsUrlConfig(repo)).toBeNull();
 		} finally {
@@ -896,102 +832,117 @@ describe("convergeLfsEndpoint (OTTR-1283)", () => {
 		}
 	});
 
-	test("a bare residue in remote.origin.lfsurl is overwritten in place", async () => {
-		// The bare form lives in the remote-scoped key: convergence must fix that key
-		// itself, because a new lfs.url would sit below it in git-lfs's resolution
-		// order and never take effect.
+	test("an operator-set lfs.url skips the pins, and git-lfs follows it", async () => {
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(repo, "config", "lfs.url", "https://lfs.example.com/api/octo");
+			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
+			expect(pins).toEqual([]);
+			expect(await pushEnvEndpoint(repo, pins)).toBe(
+				"https://lfs.example.com/api/octo (auth=none)",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("an operator-set remote.origin.lfsurl skips the pins too (the mixed-key case)", async () => {
+		// git-lfs 3.6.1 resolves lfs.url above remote.<remote>.lfsurl, but the board's
+		// decision needs no precedence: either key holding a value skips the pins, so
+		// the push follows whatever the operator's config really resolves to.
 		const repo = await repoAt("https://github.com/octo/repo");
 		try {
 			await run(
 				repo,
 				"config",
 				"remote.origin.lfsurl",
+				"https://github.com/octo/repo.git/info/lfs",
+			);
+			await run(
+				repo,
+				"config",
+				"lfs.url",
 				"https://github.com/octo/repo/info/lfs",
 			);
-			await convergeLfsEndpoint(repo, "https://github.com/octo/repo");
-			expect(await remoteLfsUrl(repo)).toBe(
-				"https://github.com/octo/repo.git/info/lfs",
+			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
+			expect(pins).toEqual([]);
+			expect(await pushEnvEndpoint(repo, pins)).toBe(
+				"https://github.com/octo/repo/info/lfs (auth=none)",
 			);
-			expect(await lfsUrlConfig(repo)).toBeNull();
 		} finally {
 			rmSync(join(repo, ".."), { recursive: true, force: true });
 		}
 	});
 
-	test("a stale same-host .git-form endpoint from a moved origin is re-pointed", async () => {
-		// The origin moved from octo/repo to octo/other: the value convergence wrote
-		// for the old origin matches neither the new endpoint nor the bare form, so
-		// the old custom-endpoint guard kept it and git-lfs kept targeting octo/repo.
-		// A .git/info/lfs-form value on the origin's own host is a stale board write:
-		// re-point it. A different host stays (an operator's mirror).
-		const stale = await repoAt("https://github.com/octo/other");
-		try {
-			await run(
-				stale,
-				"config",
-				"lfs.url",
-				"https://github.com/octo/repo.git/info/lfs",
-			);
-			await convergeLfsEndpoint(stale, "https://github.com/octo/other");
-			expect(await lfsUrlConfig(stale)).toBe(
-				"https://github.com/octo/other.git/info/lfs",
-			);
-		} finally {
-			rmSync(join(stale, ".."), { recursive: true, force: true });
-		}
-		const mirror = await repoAt("https://github.com/octo/other");
-		try {
-			await run(
-				mirror,
-				"config",
-				"lfs.url",
-				"https://lfs.example.com/x.git/info/lfs",
-			);
-			await convergeLfsEndpoint(mirror, "https://github.com/octo/other");
-			expect(await lfsUrlConfig(mirror)).toBe(
-				"https://lfs.example.com/x.git/info/lfs",
-			);
-		} finally {
-			rmSync(join(mirror, ".."), { recursive: true, force: true });
-		}
-	});
-
-	test("a non-GitHub host keeps today's behavior: no config write", async () => {
+	test("a non-GitHub host keeps the unconditional pin: today's behavior", async () => {
 		const repo = await repoAt("https://gitlab.com/g/sub");
 		try {
-			await convergeLfsEndpoint(repo, "https://gitlab.com/g/sub");
-			expect(await lfsUrlConfig(repo)).toBeNull();
+			await run(repo, "config", "lfs.url", "https://lfs.example.com/api/g/sub");
+			const pins = await lfsEndpointPin(repo, "https://gitlab.com/g/sub");
+			expect(pins).not.toEqual([]);
+			expect(await pushEnvEndpoint(repo, pins)).toBe(
+				"https://gitlab.com/g/sub.git/info/lfs (auth=none)",
+			);
 		} finally {
 			rmSync(join(repo, ".."), { recursive: true, force: true });
 		}
 	});
 
-	test("an ssh origin is untouched: the board pins no LFS endpoint there", async () => {
+	test("an ssh origin gets no pins", async () => {
 		const repo = await repoAt("git@github.com:octo/repo");
 		try {
-			await convergeLfsEndpoint(repo, "ssh://git@github.com/octo/repo");
-			expect(await lfsUrlConfig(repo)).toBeNull();
+			expect(
+				await lfsEndpointPin(repo, "ssh://git@github.com/octo/repo"),
+			).toEqual([]);
 		} finally {
 			rmSync(join(repo, ".."), { recursive: true, force: true });
 		}
 	});
 
-	test("the persisted endpoint never carries the remote's userinfo", async () => {
-		// An origin URL can embed a token; a config value the board writes must not
-		// copy it into the repo config (and `git lfs env` prints the endpoint).
-		const repo = await repoAt(
-			"https://x-access-token:secret-token@github.com/octo/repo",
-		);
+	test("the upload follows an origin change between two pushes, with nothing stored", async () => {
+		const f = await fixture({ lfs: true, origin: "origin" });
 		try {
-			await convergeLfsEndpoint(
-				repo,
-				"https://x-access-token:secret-token@github.com/octo/repo",
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				f.url,
 			);
-			expect(await lfsUrlConfig(repo)).toBe(
-				"https://github.com/octo/repo.git/info/lfs",
+			expect(r.status).toBe("pushed");
+			// A second sprite so the second push's range carries a pointer again.
+			const props = join(f.wt, "assets", "art", "props", "tree_oak");
+			writeFileSync(join(props, "oak2.png"), "sprite-two-bytes");
+			await run(f.wt, "add", "assets/art/props/tree_oak/oak2.png");
+			await run(f.wt, ...id, "commit", "-q", "-m", "sprite two");
+			await run(f.main, "merge", "-q", "--ff-only", "ott/x");
+			// The fixture origin has no .git suffix ("origin"), so the second origin is
+			// a sibling path on the same path-agnostic server; each push derives its
+			// pin from the origin it is given.
+			const otherUrl = `${f.url}-other`;
+			await run(f.main, "remote", "set-url", "origin", otherUrl);
+			const r2 = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				otherUrl,
+			);
+			expect(r2.status).toBe("pushed");
+			expect(f.requests.filter((p) => p.includes("/objects/batch"))).toEqual([
+				"POST /origin.git/info/lfs/objects/batch",
+				"POST /origin-other.git/info/lfs/objects/batch",
+			]);
+			expect(await run(f.main, "config", "lfs.url").catch(() => "unset")).toBe(
+				"unset",
+			);
+			expect(await run(f.bare, "rev-parse", "main")).toBe(
+				await run(f.main, "rev-parse", "refs/heads/main"),
 			);
 		} finally {
-			rmSync(join(repo, ".."), { recursive: true, force: true });
+			cleanup(f.dir, f.close);
 		}
-	});
+	}, 20_000);
 });

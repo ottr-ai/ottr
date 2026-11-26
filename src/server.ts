@@ -145,7 +145,6 @@ import {
 	cleanMergeTree,
 	commitFileOnBranch,
 	commitsAhead,
-	convergeLfsEndpoint,
 	createWorktree,
 	deleteRemoteBranch,
 	describeVersion,
@@ -741,15 +740,6 @@ for (const p of discoverProjects(
 				if ((await store.getSettings()).originUrl === null)
 					await store.setSettings({ originUrl: pin });
 			});
-		// OTTR-1283: every project the board pushes from converges its LFS endpoint at
-		// boot, beside the pin. A failed write surfaces in the server log but does not
-		// stop the boot: the push pins its own endpoint either way.
-		if (pin !== null)
-			await convergeLfsEndpoint(p, pin).catch((err: unknown) =>
-				console.error(
-					`lfs endpoint convergence failed for ${e.name}: ${errmsg(err)}`,
-				),
-			);
 	}
 
 	await resolveTarget(p, false, null, (await store.getSettings()).targetBranch)
