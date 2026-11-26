@@ -751,6 +751,30 @@ describe("loadConfigs", () => {
 		);
 	});
 
+	// OTTR-1275: the base config keeps the full mutate set as the reference universe,
+	// so a file like src/store.ts matches both stryker.config.mjs and
+	// stryker.store.config.mjs. Discovering the base config made the delta gate run
+	// every changed file's mutants twice.
+	test("skips the base stryker.config.mjs the area configs superseded", async () => {
+		const dir = join(root, "configs-base");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, "stryker.config.mjs"),
+			"export default { mutate: ['src/**/*.ts', '!**/*.test.ts'] };\n",
+		);
+		writeFileSync(
+			join(dir, "stryker.store.config.mjs"),
+			"export default { mutate: ['src/store*.ts'] };\n",
+		);
+		expect(await loadConfigs(dir)).toEqual([
+			{
+				path: join(dir, "stryker.store.config.mjs"),
+				name: "stryker.store",
+				mutate: ["src/store*.ts"],
+			},
+		]);
+	});
+
 	// The delta gate's own deadlock regression (OTTR-366): the real configs took the mutation
 	// lock at import time, so loadConfigs here made this test process hold the lock its
 	// Stryker children then waited for. Reading the configs must leave the lock alone; only a
@@ -758,6 +782,14 @@ describe("loadConfigs", () => {
 	test("reading the real configs takes no mutation lock", async () => {
 		const configs = await loadConfigs(resolve(import.meta.dir, ".."));
 		expect(configs.length).toBeGreaterThan(0);
+		// OTTR-1275: the base config is the reference universe, not a run config —
+		// every file it owns is owned by exactly one area config, so discovering it
+		// would make the delta gate repeat mutation work for every changed file.
+		expect(configs.some((c) => c.name === "stryker")).toBe(false);
+		for (const file of ["src/store.ts", "src/ui/models.ts", "src/types.ts"]) {
+			const owners = configs.filter((c) => owns(c.mutate, file));
+			expect(owners.map((c) => c.name)).toHaveLength(1);
+		}
 		const lock = join(tmpdir(), "ott-stryker.lock");
 		let holder: unknown;
 		try {

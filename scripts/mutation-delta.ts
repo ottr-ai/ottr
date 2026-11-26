@@ -190,10 +190,18 @@ export function verdict(
 	return { tested, survivors };
 }
 
-/** Reads every stryker*.config.mjs at the repo root; throws when one has no mutate array. */
+/**
+ * Reads every run config at the repo root — the ten area configs and the four module
+ * configs. The base config `stryker.config.mjs` is skipped: it holds the full mutate
+ * set as the reference universe (scripts/stryker-areas.ts checks the partition against
+ * it), so every file it owns is also owned by an area config, and discovering it made
+ * the delta gate run each changed file's mutants twice (OTTR-1275). Throws when a run
+ * config has no mutate array.
+ */
 export async function loadConfigs(repoRoot: string): Promise<StrykerConfig[]> {
 	const names = readdirSync(repoRoot)
 		.filter((f) => /^stryker.*\.config\.mjs$/.test(f))
+		.filter((f) => f !== "stryker.config.mjs")
 		.sort();
 	const configs: StrykerConfig[] = [];
 	for (const name of names) {
