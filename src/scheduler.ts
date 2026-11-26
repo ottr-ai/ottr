@@ -1737,34 +1737,38 @@ export function validationOutcomes(
 }
 
 /** Whether a legacy backlog lead row takes the waiting form on convergence
- * (OTTR-1252). Rows that are already decided keep their stage — a confirmed
- * result is normal work, a refuted lead stays cancelled, and the operator's
+ * (OTTR-1252). The deciding outcome is the lead's newest review_findings
+ * record — the ONE source every reader (settle, resetValidatedLeads, the
+ * SQLite convergence and the PostgreSQL step, all through validationOutcomes)
+ * reads, so no reader can drift: a confirmed result is normal work the
+ * operator may park, a refuted lead stays cancelled, and the operator's
  * applies answer rides its own marker in the prompt (`The user answered the
- * review's question`, written by the reply route). Everything undecided waits:
- * never validated, the newest result still blocked, or a deployment result its
- * question card has not settled. The authoritative outcome is the lead's
- * newest review_findings record (`newestFindingOutcome`): the settle writes it
- * for every applied result and no later path wipes it, so it rules even when
- * the details text went — a later grill replaces details with its report.
- * Without a finding, the details segment decides the same way; with neither,
- * a validatedAt means an outcome was recorded through a path that kept no
- * record (the started-lead details-only branch, later wiped) — keep the row
- * rather than re-lock work no route can unlock (batching needs validatedAt
- * null, the reset needs a blocked segment), while a never-validated row
- * waits: for a lead, starting unvalidated work is the failure mode, and the
+ * review's question`, written by the reply route), while a never-validated
+ * lead, a still-blocked result, or an unanswered deployment result waits.
+ * Details segments are deliberately NOT an outcome source here: a reset can
+ * only act on recorded findings, so waiting on a details-only outcome would
+ * lock work Validate now can never unlock (the send-back-7 drift class). A
+ * validatedAt with no finding means the outcome was recorded through a path
+ * that kept no findings (the started-lead details-only branch, later wiped
+ * by a grill's details replacement) — the row stays decided, because
+ * re-locking it would strand work that batching (validatedAt null) and the
+ * reset (a blocked finding) can never unlock; a never-validated row waits:
+ * for a lead, starting unvalidated work is the failure mode, and the
  * validate flows can still decide it later. Pure. */
 export function legacyLeadWaits(
 	prompt: string,
 	validatedAt: number | null,
-	details: string | null,
 	newestFindingOutcome: LeadFindingOutcome | null,
 ): boolean {
 	if (!prompt.startsWith("Needs validation")) return false;
 	if (prompt.includes("\nThe user answered the review's question"))
 		return false;
-	const outcome = newestFindingOutcome ?? leadValidationOutcome(details);
-	if (outcome === "confirmed" || outcome === "refuted") return false;
-	if (outcome !== null) return true;
+	if (
+		newestFindingOutcome === "confirmed" ||
+		newestFindingOutcome === "refuted"
+	)
+		return false;
+	if (newestFindingOutcome !== null) return true;
 	return validatedAt === null;
 }
 

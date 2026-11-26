@@ -4,7 +4,12 @@ import {
 	getPostgresDatabase,
 	type PostgresDatabase,
 } from "./postgresDriver.ts";
-import { legacyLeadWaits, validationOutcomes } from "./scheduler.ts";
+import {
+	type LeadFindingOutcome,
+	legacyLeadWaits,
+	type ValidationOutcomeRow,
+	validationOutcomes,
+} from "./scheduler.ts";
 
 export function projectSchemaName(name: string): string {
 	const stem = name
@@ -297,53 +302,27 @@ export const projectMigrations: readonly PostgresMigration[] = [
 		);
 		// The newest recorded outcome per lead id, from review_findings: the
 		// authoritative record that survives a later grill's details wipe.
-		// validationOutcomes is the ONE selector the settle and
-		// resetValidatedLeads also read: it keeps only the lead's own review's
-		// runs (a foreign review's result never decides the lead), sorts runs
-		// newest first, and takes the first result per lead inside a run. The
-		// legacy rows group by their own review, so each group selects against
-		// its review. The findings table ships in step one, so every schema
-		// that reaches this step has it.
-		const findingRows = await db
-			.query<
-				{
-					prompt: string;
-					finding_order: number;
-					card_id: string;
-					created_at: number | null;
-					kind: string;
-					follow_up_of: string | null;
-				},
-				[]
-			>(
-				`SELECT f.prompt AS prompt, f.id AS finding_order, f.card_id AS card_id,
-					c.created_at AS created_at, c.kind AS kind,
-					c.follow_up_of AS follow_up_of
-				FROM review_findings f
-				JOIN tasks c ON c.id = f.card_id
-				WHERE f.prompt LIKE 'Validation: #%'`,
-			)
-			.all();
-		const outcomeRows = findingRows.map((row) => ({
-			prompt: row.prompt,
-			order: Number(row.finding_order),
-			cardId: row.card_id,
-			cardCreatedAt: row.created_at,
-			cardKind: row.kind,
-			cardFollowUpOf: row.follow_up_of,
-		}));
+		// selectValidationOutcomeRows is the canonical read (one SQL, one row
+		// shape, shared with the SQLite convergence), and validationOutcomes
+		// the ONE selector the settle and resetValidatedLeads also read: it
+		// keeps only the lead's own review's runs (a foreign review's result
+		// never decides the lead), sorts runs newest first, and takes the
+		// first result per lead inside a run. The legacy rows group by their
+		// own review, so each group selects against its review. The findings
+		// table ships in step one, so every schema that reaches this step
+		// has it.
+		const outcomeRows = await selectValidationOutcomeRows(db);
 		const legacy = await db
 			.query<
 				{
 					id: string;
 					prompt: string;
-					details: string | null;
 					validated_at: number | null;
 					follow_up_of: string | null;
 				},
 				[]
 			>(
-				"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+				"SELECT id, prompt, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
 			)
 			.all();
 		const byReview = new Map<string, typeof legacy>();
@@ -360,7 +339,6 @@ export const projectMigrations: readonly PostgresMigration[] = [
 					legacyLeadWaits(
 						row.prompt,
 						row.validated_at,
-						row.details,
 						outcomes.get(row.id)?.outcome ?? null,
 					)
 				)
@@ -374,6 +352,51 @@ export const projectMigrations: readonly PostgresMigration[] = [
  * PostgreSQL step share the statement so both engines converge identically. */
 export const CONVERGE_LEAD_WAIT_SQL =
 	"UPDATE tasks SET stage = 'todo', state = 'queued', waits_validation = 1, queued_at = updated_at WHERE id = ?";
+
+/** The ONE query that reads validation results for the shared outcome
+ * selector: the column aliases are production shape, defined here once so no
+ * reader or fixture can drift (the `finding_order` alias exists because
+ * `order` is a reserved word). Both engines run it verbatim; rows arrive
+ * unordered and validationOutcomes sorts them itself. */
+export const VALIDATION_OUTCOME_ROWS_SQL = `SELECT f.prompt AS prompt, f.id AS finding_order,
+	f.card_id AS card_id, c.created_at AS created_at, c.kind AS kind,
+	c.follow_up_of AS follow_up_of
+FROM review_findings f
+JOIN tasks c ON c.id = f.card_id
+WHERE f.prompt LIKE 'Validation: #%'`;
+
+/** The database surface selectValidationOutcomeRows needs: both the SQLite
+ * driver's Database and the PostgreSQL driver's Database satisfy it. */
+type OutcomeRowsDb = {
+	query<T, U>(sql: string): { all(): Promise<T[]> };
+};
+type ValidationOutcomeRowDb = {
+	prompt: string;
+	finding_order: number;
+	card_id: string;
+	created_at: number | null;
+	kind: string;
+	follow_up_of: string | null;
+};
+
+/** Reads the validation results through the canonical SQL and maps them into
+ * the shared selector's row shape. Both the SQLite convergence and the
+ * PostgreSQL step call this, so their outcome source cannot drift. */
+export async function selectValidationOutcomeRows(
+	db: OutcomeRowsDb,
+): Promise<ValidationOutcomeRow[]> {
+	const rows = (await db
+		.query<ValidationOutcomeRowDb, []>(VALIDATION_OUTCOME_ROWS_SQL)
+		.all()) as ValidationOutcomeRowDb[];
+	return rows.map((row) => ({
+		prompt: row.prompt,
+		order: Number(row.finding_order),
+		cardId: row.card_id,
+		cardCreatedAt: row.created_at,
+		cardKind: row.kind,
+		cardFollowUpOf: row.follow_up_of,
+	}));
+}
 
 /** How many versioned steps the store's own project migrations carry. The PG
  * tests probe rollback behavior on the next free version, so their probe steps

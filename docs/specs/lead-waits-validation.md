@@ -29,38 +29,44 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    then converges per row, idempotent on every open:
 
    ```sql
-   SELECT f.prompt FROM review_findings f
+   -- VALIDATION_OUTCOME_ROWS_SQL (postgresSchema.ts), run by
+   -- selectValidationOutcomeRows for both engines:
+   SELECT f.prompt AS prompt, f.id AS finding_order, f.card_id AS card_id,
+     c.created_at AS created_at, c.kind AS kind,
+     c.follow_up_of AS follow_up_of
+   FROM review_findings f
    JOIN tasks c ON c.id = f.card_id
-   WHERE f.prompt LIKE 'Validation: #%' AND c.kind = 'validation'
-   ORDER BY c.created_at DESC, c.id DESC, f.id ASC;
-   SELECT id, prompt, details, validated_at FROM tasks
+   WHERE f.prompt LIKE 'Validation: #%';
+   -- per legacy row, grouped by its review:
+   SELECT id, prompt, validated_at, follow_up_of FROM tasks
    WHERE stage = 'backlog' AND cancelled_at IS NULL
      AND prompt LIKE 'Needs validation%'
-     AND prompt NOT LIKE '%The user answered the review%'
+     AND prompt NOT LIKE '%The user answered the review%';
    -- per row: UPDATE tasks SET stage = 'todo', state = 'queued',
    --   waits_validation = 1, queued_at = updated_at WHERE id = ?
    ```
 
    Only undecided leads converge (`legacyLeadWaits`, src/scheduler.ts): the
-   newest recorded outcome rules — a confirmed result is normal work the
-   operator may park, a refuted lead stays cancelled, and the operator's
-   applies answer rides its own marker in the prompt — while a never-validated
-   lead, a still-blocked result, or an unanswered deployment result waits.
-   The outcome source, in order: the lead's newest review_findings record
-   (written by every applied result, wiped by nothing) read with the runs'
-   own selection rule — validation cards newest first by created_at then id,
-   and the first result per lead inside a card, the same rule the settle and
-   resetValidatedLeads read, so a blocked result with a later same-run
-   confirmed duplicate still waits and the reverse never locks — then the
-   newest `Validated by ` segment of the details, then — when neither reads
-   an outcome — a validatedAt means an outcome was recorded through a path
-   that kept no record (the started-lead details-only branch, later wiped by
-   a grill's details replacement), and the row stays decided, because
-   re-locking it would strand work that batching (validatedAt null) and the
-   blocked-only reset (a blocked segment) can never unlock. The per-row
-   decision runs in TypeScript because "newest run, first result" needs
-   newest-wins reading that no LIKE can do. (`Needs-validation lead
-   questions...` does not match the pattern: the hyphen.)
+   deciding outcome is the lead's newest review_findings record, read through
+   ONE shared selector (`validationOutcomes`) that the settle,
+   resetValidatedLeads, the SQLite convergence and the PostgreSQL step all
+   call — only results of the lead's own review count, runs newest first,
+   and the first result per lead inside a run — so no reader can drift: a
+   confirmed result is normal work the operator may park, a refuted lead
+   stays cancelled, and the operator's applies answer rides its own marker
+   in the prompt, while a never-validated lead, a still-blocked result, or
+   an unanswered deployment result waits. Details segments are deliberately
+   not an outcome source: a reset can only act on recorded findings, so
+   waiting on a details-only outcome would lock work behind a Validate now
+   that can never unlock it. When neither a finding nor a segment could
+   have decided the row, a validatedAt means an outcome was recorded
+   through a path that kept no findings (the started-lead details-only
+   branch, later wiped by a grill's details replacement), and the row stays
+   decided — re-locking it would strand work that batching (validatedAt
+   null) and the reset can never unlock. The per-row decision runs in
+   TypeScript because "newest run, first result" needs newest-wins reading
+   that no LIKE can do. (`Needs-validation lead questions...` does not
+   match the pattern: the hyphen.)
 3. PostgreSQL: the column lives only in a numbered step, never in
    `projectStepOne` — the steps run on fresh databases too, so a stepOne
    column plus the step's ALTER fails with duplicate_column (the

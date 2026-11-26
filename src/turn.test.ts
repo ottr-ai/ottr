@@ -32038,6 +32038,59 @@ describe("stored review findings", () => {
 			expect(own === "blocked").toBe(waits);
 		},
 	);
+
+	// Send-back 7's regression: a lead the convergence migrated into the
+	// waiting form keeps its old validatedAt (the migration never touches it),
+	// and the real filing path — Validate now's again-and-file call — must
+	// still work on that migrated state: the reset clears the preserved
+	// validatedAt because the lead's recorded finding says blocked, and the
+	// batch files with the lead first. Before the findings-only outcome read,
+	// a details-only blocked lead migrated into a wait whose validatedAt no
+	// reset could clear, and every filing returned 409.
+	test("a migrated blocked lead's preserved validatedAt resets through the real filing path", async () => {
+		const { store, projects, loop, batches } = await validationCase(
+			baseRecord(),
+		);
+		const review = await doneReview(store, "migrated lead review");
+		const lead = await waitingLead(
+			store,
+			review.id,
+			"Needs validation: migrated by convergence\nBlocker: sandbox run: control",
+		);
+		// The state the convergence leaves behind: the pre-migration stamp
+		// survives, and the recorded finding (a done validation run's) says
+		// blocked.
+		await store.updateTask(lead.id, { validatedAt: 900 });
+		const valcard = await store.createTask(
+			"older validation run",
+			null,
+			"validation",
+		);
+		await store.updateTask(valcard.id, {
+			followUpOf: review.id,
+			stage: "done",
+			state: "idle",
+		});
+		await store.appendReviewFinding(
+			valcard.id,
+			mkFinding(`Validation: #${lead.id} blocked\nno retry control`),
+		);
+
+		const filed = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: Date.now() + 1 },
+		);
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error("no validation run filed");
+		// The preserved stamp was reset, and the batch carries the lead first.
+		const after = (await store.getTask(lead.id))!;
+		expect(after.validatedAt).toBeNull();
+		expect(filed.reset).toEqual([lead.id]);
+		const run = (await store.getTask(filed.id))!;
+		expect(run.prompt).toContain(`#${lead.id}`);
+	});
 });
 
 describe("prompt gate", () => {

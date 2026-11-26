@@ -357,9 +357,11 @@ describe("PostgreSQL migration surface", () => {
 		// real-driver suite and the step's outside-projectStepOne placement pin.
 		// OTTR-1252: the shared outcome selector's cases (src/test/
 		// leadOutcomeCases.ts) drive the step through the same table the settle,
-		// the reset and the SQLite convergence use: only the lead's own review's
-		// runs count, runs newest first, the first result per lead inside a run.
-		// The stub's SELECTs read seeded rows; the selector sorts them itself.
+		// the reset and the SQLite convergence use. The seeds carry the query's
+		// production fields (finding_order, card_id, created_at, kind,
+		// follow_up_of) and are SHUFFLED: the step's own selector sorts the runs
+		// newest first and takes the first result per lead, so insertion order
+		// must not matter.
 		const caseRows: unknown[] = [];
 		const caseLeads: { id: string; waits: boolean }[] = [];
 		leadOutcomeCases.forEach((outcomeCase, index) => {
@@ -369,8 +371,8 @@ describe("PostgreSQL migration surface", () => {
 				const cardId = `${leadId}-run-${run.foreign ? "F" : "R"}-${run.createdAt}`;
 				run.results.forEach((outcome, order) => {
 					caseRows.push({
-						prompt: `Validation: #${leadId} ${outcome}`,
-						order,
+						prompt: `Validation: #${leadId} ${outcome}${order > 0 ? ` repeat ${order}` : ""}`,
+						finding_order: (index + 1) * 10 + order,
 						card_id: cardId,
 						created_at: run.createdAt,
 						kind: "validation",
@@ -379,24 +381,29 @@ describe("PostgreSQL migration surface", () => {
 				});
 			}
 		});
+		// Shuffle: a fixture that depends on its own insertion order cannot catch
+		// a selection-order bug (send-back 6's drift).
+		for (let swap = caseRows.length - 1; swap > 0; swap--) {
+			const other = (swap * 7) % (swap + 1);
+			[caseRows[swap], caseRows[other]] = [caseRows[other]!, caseRows[swap]!];
+		}
 		// Two static rows beyond the table: the operator's applies answer (marker
 		// in the prompt, no findings) and a validated row with no readable record
 		// anywhere (recorded through the started-lead branch, which keeps no
-		// findings) — both stay decided.
+		// findings) — both stay decided, because the reset can only act on
+		// recorded findings.
 		const extras = [
 			{
 				id: "X1",
 				prompt:
 					"Needs validation: proxy header\nThe user answered the review's question: Applies",
 				validated_at: null,
-				details: null,
 				follow_up_of: "R",
 			},
 			{
 				id: "X2",
 				prompt: "Needs validation: grilled confirmed lead",
 				validated_at: 900,
-				details: "Grilled definition of ready",
 				follow_up_of: "R",
 			},
 		];
@@ -408,7 +415,6 @@ describe("PostgreSQL migration surface", () => {
 					...caseLeads.map((lead) => ({
 						id: lead.id,
 						prompt: `Needs validation: case ${lead.id}`,
-						details: null,
 						validated_at: 900,
 						follow_up_of: "R",
 					})),
@@ -417,8 +423,9 @@ describe("PostgreSQL migration surface", () => {
 			},
 		];
 		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
-		// The step consults the findings first, and the selection filters by the
-		// lead's own review (the legacy rows carry follow_up_of for the grouping).
+		// The step reads the findings through the one canonical query, and the
+		// selection filters by the lead's own review (the legacy rows carry
+		// follow_up_of for the grouping).
 		expect(
 			db.queried.some((statement) =>
 				statement.includes("FROM review_findings"),

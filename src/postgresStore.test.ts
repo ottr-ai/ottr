@@ -238,13 +238,14 @@ try {
         // Within one run the first result per lead rules: the blocked first
         // result with a later same-run confirmed duplicate still waits.
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-dup-keep', 'duplicate confirmed lead', 'Needs validation: duplicate confirmed result', 'backlog', 'idle', 'work', 850, 960, 'legacy-review', 930, 'Grilled definition of ready')");
-        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-dup-keep confirmed', 940)");
-        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-dup-keep blocked', 950)");
       });
       await applyPostgresMigrations(leadDb, projectMigrations);
-      assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id LIKE 'legacy-%' ORDER BY id").all()), [
+      assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id IN ('legacy-answered', 'legacy-blocked', 'legacy-dup-keep', 'legacy-foreign-keep', 'legacy-foreign-wait', 'legacy-grilled-blocked', 'legacy-grilled-confirmed', 'legacy-lead', 'legacy-parked', 'legacy-plain') ORDER BY id").all()), [
         { id: 'legacy-answered', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
-        { id: 'legacy-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 700, validated_at: 750 },
+        // legacy-blocked carries its blocked outcome only as a details segment
+        // (no recorded finding): the reset can only act on findings, so the
+        // convergence keeps it decided backlog work instead of locking it.
+        { id: 'legacy-blocked', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 750 },
         { id: 'legacy-dup-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 930 },
         { id: 'legacy-foreign-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 945 },
         { id: 'legacy-foreign-wait', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 1000, validated_at: 940 },

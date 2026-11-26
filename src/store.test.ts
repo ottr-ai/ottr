@@ -6860,11 +6860,17 @@ Blocker: sandbox run: header control', 'backlog', 'idle', 'work', 700, 950, 'rev
 					'Unverified lead from review rev1.
 Validated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?'),
 				('grilled1', 'grilled confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 800, 1000, 'rev1', NULL, 900,
-					'Grilled definition of ready')`);
+					'Grilled definition of ready'),
+				('detailsonly1', 'details-only blocked lead', 'Needs validation: details-only blocker', 'backlog', 'idle', 'work', 810, 1010, 'rev1', NULL, 955,
+					'Unverified lead from review rev1.
+Validated by validation run #12 on 2026-11-23: still blocked — no retry control.')`);
 		// A validation card plus the recorded findings: the authoritative outcome
-		// record that survives the grill's details wipe. The blocked finding
-		// turns a grilled, wiped lead back into undecided work; the confirmed
-		// finding keeps its row decided.
+		// record — the only source the convergence reads, because a reset can
+		// only act on recorded findings. The blocked finding turns a grilled,
+		// wiped lead back into undecided work; the confirmed finding keeps its
+		// row decided; blocked1 and deploy1 carry their outcomes only as
+		// details segments, so they stay decided backlog work — waiting on a
+		// details-only outcome would lock them behind a reset that cannot act.
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of)
 			VALUES
@@ -6878,7 +6884,9 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 			('valcard1', 'Validation: #dupkeep1 confirmed', 922),
 			('valcard1', 'Validation: #dupkeep1 blocked', 923),
 			('valcard0', 'Validation: #crossold1 blocked', 930),
-			('valcard1', 'Validation: #crossold1 confirmed', 905)`);
+			('valcard1', 'Validation: #crossold1 confirmed', 905),
+			('valcard1', 'Validation: #blocked1 blocked', 935),
+			('valcard1', 'Validation: #deploy1 deployment', 940)`);
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
 			VALUES
@@ -6944,6 +6952,15 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 		expect(grilled.stage).toBe("backlog");
 		expect(grilled.waitsValidation).toBe(false);
 		expect(grilled.validatedAt).toBe(900);
+		// Send-back 7's drift case: this lead's blocked outcome lives only in
+		// its details segment (the started-lead branch keeps no findings). The
+		// convergence leaves it decided backlog work — a reset can only act on
+		// recorded findings, so locking it here would strand it behind a
+		// Validate now that can never clear its validatedAt.
+		const detailsOnly = (await store.getTask("detailsonly1"))!;
+		expect(detailsOnly.stage).toBe("backlog");
+		expect(detailsOnly.waitsValidation).toBe(false);
+		expect(detailsOnly.validatedAt).toBe(955);
 		// The grill wiped the blocked lead's details too, but its recorded
 		// finding says blocked — undecided work that waits again, so a move to
 		// todo cannot start it unconfirmed (batching and the blocked-only reset
