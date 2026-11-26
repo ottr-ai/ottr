@@ -331,6 +331,7 @@ import {
 } from "./sandboxRun.ts";
 import {
 	archReviewDue,
+	type DepCard,
 	type DepResolution,
 	depProjectOf,
 	depProjectsOf,
@@ -517,12 +518,14 @@ import {
 	isGitRepoWithCommit,
 	originRemoteUrl,
 	remoteUrl,
+	removeWorktree,
 	resolveTarget,
 	serverMergePush,
 	setHostedGitAuth,
 	setNetworkGitAuth,
 	shownVersion,
 	statusFiles,
+	unsavedWork,
 	validateCopyPath,
 } from "./worktree.ts";
 
@@ -12524,6 +12527,122 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}
+	/** OTTR-1318: moves a parked in-progress card back to the todo lane. It runs only when
+	 * the card holds no work: the worktree must be clean and hold no commits past its
+	 * target, else the card keeps its worktree and cancel stays the path. On success the
+	 * clean worktree goes and the card queues as a fresh work turn in a fresh session. */
+	async function inProgressToTodo(e: Entry, task: Task): Promise<Response> {
+		if (task.state !== "needs_you" && task.state !== "idle")
+			return json(
+				{ error: `a ${task.state} task cannot move back to todo` },
+				409,
+			);
+		if (task.pendingPrompt !== null)
+			return json({ error: "a reply or steer is still queued" }, 409);
+		if (task.worktree !== null) {
+			const reason = await unsavedWork(
+				task.worktree,
+				e.target ?? task.base ?? "HEAD",
+			);
+			if (reason !== null)
+				return json(
+					{
+						error: `cannot move back to todo, the worktree holds work: ${reason}`,
+					},
+					409,
+				);
+			try {
+				await removeWorktree({
+					mainPath: e.path,
+					worktreePath: task.worktree,
+					branch: task.branch,
+					log: (line) => appendLog(e.store, task.id, line),
+				});
+			} catch (err) {
+				await appendLog(
+					e.store,
+					task.id,
+					`! back to todo removeWorktree: ${errmsg(err)}`,
+				);
+			}
+		}
+		// A fresh work turn in a fresh session: sessionId null keeps resumePlan from
+		// resuming the parked turn's session.
+		await updateSnapshot(e, task, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			holdUntil: null,
+			needsReason: null,
+			asked: null,
+			sessionId: null,
+			worktree: null,
+			branch: null,
+			keptFiles: [],
+			workCheckSendbacks: 0,
+			workCheckHead: null,
+			workCheckReport: null,
+		});
+		await deps.schedule();
+		return await taskResponse(e, task.id);
+	}
+	/** OTTR-1318: replaces a card's dependsOn list. The edited card stays; only its wait
+	 * graph changes, and the new list must keep the graph acyclic. */
+	async function handlePOSTProjectsTasksDependsOnByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/depends-on">,
+	): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const found = await resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		const { e, task } = found;
+		if (task.cancelledAt !== null)
+			return json({ error: "task is cancelled" }, 404);
+		if (task.stage === "done")
+			return json({ error: "a done task cannot change its dependencies" }, 409);
+		if (task.state === "running" || task.state === "preparing")
+			return json(
+				{
+					error: "a running or preparing task cannot change its dependencies",
+				},
+				409,
+			);
+		const ids = await validateDependsOn(e, r.body.dependsOn);
+		if (ids instanceof Response) {
+			// The edited card exists, so a bad dependency id is bad input (400), not a
+			// missing card: keep validateDependsOn's error text, downgrade its 404.
+			const body = (await ids.json()) as { error: string };
+			return json(body, 400);
+		}
+		if (ids.includes(task.id))
+			return json({ error: "dependsOn cannot include the task itself" }, 400);
+		// Acyclic check: from the new list, following the dependsOn links of every
+		// resolvable card must never reach this card. An id that names no card counts as
+		// satisfied at scheduling, so the walk stops there the same way.
+		const depProjects = await depProjectsOf(deps.projects.values());
+		const ownDep = await depProjectOf(e.store);
+		const ownKey = `${e.store.name}/${task.id}`;
+		const seen = new Set<string>();
+		const frontier = [...ids];
+		while (frontier.length > 0) {
+			const id = frontier.pop();
+			if (id === undefined) break;
+			const dep = resolveDep(id, depProjects, ownDep);
+			if (!("task" in dep)) continue;
+			const key = `${dep.project}/${dep.task.id}`;
+			if (key === ownKey)
+				return json({ error: "dependsOn would form a cycle" }, 400);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			// depProjectOf snapshots full task rows, so each card's own dependsOn is here
+			// even though the DepCard view's type omits it.
+			const card = dep.task as DepCard & Pick<Task, "dependsOn">;
+			frontier.push(...card.dependsOn);
+		}
+		await updateSnapshot(e, task, { dependsOn: ids });
+		await deps.schedule();
+		return await taskResponse(e, task.id);
+	}
 	async function handlePOSTProjectsTasksBacklogByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/backlog">,
 	): Promise<Response> {
@@ -12537,7 +12656,10 @@ export async function createApp(deps: AppDeps) {
 		const to = r.body.to;
 		if (to !== "todo" && to !== "backlog")
 			return json({ error: `to must be "todo" or "backlog"` }, 400);
-		if (to === "todo") return await backlogToTodo(e, task, r.body);
+		if (to === "todo") {
+			if (task.stage === "in_progress") return await inProgressToTodo(e, task);
+			return await backlogToTodo(e, task, r.body);
+		}
 		return await backlogToPark(e, task);
 	}
 
@@ -16802,6 +16924,17 @@ export async function createApp(deps: AppDeps) {
 				await api(
 					req,
 					async () => await handlePOSTProjectsTasksBacklogByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
+		},
+		// OTTR-1318: rewire which cards a card waits for; kicks the scheduler like the backlog move.
+		"/api/projects/:project/tasks/:id/depends-on": {
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksDependsOnByProjectAndId(req),
 					{
 						costly: true,
 					},

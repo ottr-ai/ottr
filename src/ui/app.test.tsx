@@ -14716,6 +14716,358 @@ describe("Drawer start validation run on a queued lead", () => {
 	});
 });
 
+describe("Drawer depends editor and Back to todo", () => {
+	// OTTR-1318: a card's drawer edits the ids it waits for (POST depends-on with
+	// the full new list, server and local errors inline) and moves a parked
+	// in-progress card back to the todo lane (POST backlog { to: "todo" }; the
+	// 409 reason surfaces inline). The save and the move run through act(), so
+	// the base's act must run the fn and tell onError — the no-op default in
+	// drawerBase would swallow both POSTs.
+	const base = {
+		...drawerBase,
+		act: async (
+			fn: () => Promise<void>,
+			onError?: (message: string) => void,
+		) => {
+			try {
+				await fn();
+				return true;
+			} catch (e) {
+				const message = e instanceof Error ? e.message : String(e);
+				onError?.(message);
+				return false;
+			}
+		},
+	};
+	const { window } = installBrowserGlobals([
+		"Event",
+		"HTMLElement",
+		"HTMLInputElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+	]);
+
+	// A React onChange picks up programmatic edits only through the native value
+	// setter, and happy-dom's dispatched input event never reaches React's
+	// ChangeEventPlugin: set the value natively, then call the production onChange.
+	const typeInto = (el: HTMLInputElement, value: string): void => {
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLInputElement.prototype,
+			"value",
+		)?.set;
+		if (setter === undefined) throw new Error("value setter missing");
+		setter.call(el, value);
+		onChangeOf(el)({ target: el, currentTarget: el });
+	};
+
+	const waitingCard = (over: Partial<TaskCard>): TaskCard =>
+		cardFixture({
+			...drawerFields,
+			// The served detail row renders the prompt section (OTTR-965); a row
+			// without prompt text would crash the Markdown body.
+			prompt: "Work the card",
+			stage: "in_progress",
+			state: "needs_you",
+			dependsOn: ["OTTR-2", "OTTR-7"],
+			...over,
+		}) as TaskCard;
+
+	/** Renders a drawer for `card` under a fetch stub; the stub records POSTs to
+	 *  the named route suffixes and answers them with their response, serves the
+	 *  detail row back loaded (OTTR-965), and 404s everything else. One act lets
+	 *  the detail fetch land before `run`. */
+	const withRoot = async (
+		card: TaskCard,
+		routes: Record<string, { status: number; body: unknown }>,
+		run: (args: DrawerRunArgs) => Promise<void>,
+	): Promise<void> => {
+		const posts: { url: string; body: unknown }[] = [];
+		const { restore } = stubFetch(async (url, init) => {
+			const u = String(url);
+			const hit = Object.entries(routes).find(([suffix]) => u.endsWith(suffix));
+			if (hit !== undefined && (init?.method ?? "GET") === "POST") {
+				posts.push({
+					url: u,
+					body: JSON.parse(String(init?.body)) as unknown,
+				});
+				return new Response(JSON.stringify(hit[1].body), {
+					status: hit[1].status,
+				});
+			}
+			if (u.endsWith(`/tasks/${card.id}`))
+				return new Response(JSON.stringify({ ...card, turns: [] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			return new Response("{}", { status: 404 });
+		});
+		const { container, root, unmount } = await mount(
+			<Drawer {...base} task={card} />,
+		);
+		try {
+			await act(async () => {});
+			await run({ posts, container, root });
+		} finally {
+			await unmount();
+			restore();
+		}
+	};
+
+	const addInput = (container: HTMLDivElement): HTMLInputElement => {
+		const node = container.querySelector<HTMLInputElement>("#dep-add-input");
+		if (node === null) throw new Error("no depends add input");
+		return node;
+	};
+
+	/** Adds the field's id through the production onSubmit prop: happy-dom's
+	 *  dispatched submit event never reaches React's event plugin, and the form
+	 *  element is a Proxy that hides own keys, so the props key comes from the
+	 *  input; every node of one root shares it (same gap as FollowUpDialog). */
+	const submitAdd = (container: HTMLDivElement): void => {
+		const form = container.querySelector("form.dep-add");
+		if (form === null) throw new Error("no depends add form");
+		const key = Object.getOwnPropertyNames(addInput(container)).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("no React props key");
+		const props: unknown = Reflect.get(form, key);
+		const fn =
+			typeof props === "object" && props !== null
+				? Reflect.get(props, "onSubmit")
+				: undefined;
+		if (typeof fn !== "function") throw new Error("form has no onSubmit");
+		(fn as (e: unknown) => void)({ preventDefault: () => {} });
+	};
+
+	const saveButton = (container: HTMLDivElement): HTMLButtonElement => {
+		for (const node of container.querySelectorAll("button"))
+			if (node.textContent?.includes("Save dependencies"))
+				return node as HTMLButtonElement;
+		throw new Error("no Save dependencies button");
+	};
+
+	const removeButtonOf = (
+		container: HTMLDivElement,
+		id: string,
+	): HTMLButtonElement => {
+		const node = container.querySelector<HTMLButtonElement>(
+			`button[aria-label="Remove ${id} from this card's dependencies"]`,
+		);
+		if (node === null) throw new Error(`no remove button for ${id}`);
+		return node;
+	};
+
+	const backToTodoButton = (container: HTMLDivElement): Element => {
+		for (const node of container.querySelectorAll(".drawer-actions button"))
+			if (node.textContent?.includes("Back to todo")) return node;
+		throw new Error("no Back to todo button");
+	};
+
+	const alertsOf = (container: HTMLDivElement): string[] =>
+		[...container.querySelectorAll('p[role="alert"]')].map(
+			(a) => a.textContent ?? "",
+		);
+
+	test("the depends section lists the card's ids with a remove control each", async () => {
+		await withRoot(waitingCard({}), {}, async ({ container }) => {
+			const section = container.querySelector("#drawer-depends");
+			expect(section).not.toBeNull();
+			const ids = [...section!.querySelectorAll(".dep-item code")].map(
+				(c) => c.textContent,
+			);
+			expect(ids).toEqual(["OTTR-2", "OTTR-7"]);
+			for (const id of ["OTTR-2", "OTTR-7"]) {
+				const remove = removeButtonOf(container, id);
+				expect(remove.getAttribute("title")).toBe(`Remove ${id}`);
+				expect(remove.querySelector("svg")).not.toBeNull();
+			}
+			// The add field carries a visible label (WCAG 3.3.2), never a bare
+			// placeholder.
+			const label = container.querySelector('label[for="dep-add-input"]');
+			expect(label?.textContent).toContain("Wait for");
+		});
+	});
+
+	test("the depends section hides on done and cancelled cards", async () => {
+		await withRoot(
+			waitingCard({ stage: "done", state: "idle" }),
+			{},
+			async ({ container }) => {
+				expect(container.querySelector("#drawer-depends")).toBeNull();
+			},
+		);
+		await withRoot(
+			waitingCard({ cancelledAt: 1760000000000 }),
+			{},
+			async ({ container }) => {
+				expect(container.querySelector("#drawer-depends")).toBeNull();
+			},
+		);
+	});
+
+	test("removing an id and adding one posts the full new list to the depends-on route", async () => {
+		await withRoot(
+			waitingCard({}),
+			{ "/depends-on": { status: 200, body: { id: "t1", dependsOn: [] } } },
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(removeButtonOf(container, "OTTR-2"))({});
+				});
+				// The removal drops the row from the draft at once.
+				expect(
+					[...container.querySelectorAll(".dep-item code")].map(
+						(c) => c.textContent,
+					),
+				).toEqual(["OTTR-7"]);
+				await act(async () => {
+					typeInto(addInput(container), "OTTR-9");
+				});
+				await act(async () => {
+					submitAdd(container);
+				});
+				// The added id joins the draft and the field clears for the next one.
+				expect(
+					[...container.querySelectorAll(".dep-item code")].map(
+						(c) => c.textContent,
+					),
+				).toEqual(["OTTR-7", "OTTR-9"]);
+				expect(addInput(container).value).toBe("");
+				await act(async () => {
+					onClickOf(saveButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.url.endsWith("/tasks/t1/depends-on")).toBe(true);
+				expect(posts[0]?.body).toEqual({
+					dependsOn: ["OTTR-7", "OTTR-9"],
+				});
+			},
+		);
+	});
+
+	test("adding an empty id renders the local error and typing clears it", async () => {
+		await withRoot(waitingCard({}), {}, async ({ container }) => {
+			expect(container.querySelector("#dep-add-error")).toBeNull();
+			await act(async () => {
+				submitAdd(container);
+			});
+			const error = container.querySelector("#dep-add-error");
+			expect(error?.textContent).toContain("Enter a card id to add");
+			// The field error sits directly under the field, linked to it.
+			expect(addInput(container).getAttribute("aria-invalid")).toBe("true");
+			expect(addInput(container).getAttribute("aria-describedby")).toBe(
+				"dep-add-error",
+			);
+			// A real id clears the error and joins the list.
+			await act(async () => {
+				typeInto(addInput(container), "OTTR-9");
+			});
+			await act(async () => {
+				submitAdd(container);
+			});
+			expect(container.querySelector("#dep-add-error")).toBeNull();
+			expect(addInput(container).getAttribute("aria-invalid")).toBeNull();
+			expect(container.textContent?.includes("OTTR-9")).toBe(true);
+		});
+	});
+
+	test("a server refusal on save renders its text inline", async () => {
+		await withRoot(
+			waitingCard({}),
+			{
+				"/depends-on": {
+					status: 400,
+					body: { error: "OTTR-7 would make a dependency cycle" },
+				},
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(saveButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.body).toEqual({ dependsOn: ["OTTR-2", "OTTR-7"] });
+				expect(
+					alertsOf(container).some((a) =>
+						a.includes("OTTR-7 would make a dependency cycle"),
+					),
+				).toBe(true);
+				// The editor stays: the operator can fix the list and retry.
+				expect(saveButton(container)).not.toBeNull();
+			},
+		);
+	});
+
+	test("Back to todo renders only for a parked in-progress card", async () => {
+		const eligible = waitingCard({});
+		await withRoot(eligible, {}, async ({ container }) => {
+			const button = backToTodoButton(container) as HTMLButtonElement;
+			// The hint names the no-work precondition and what is kept.
+			expect(button.getAttribute("title")).toContain("holds no work");
+			expect(button.getAttribute("title")).toContain("turn history");
+		});
+		const hidden: Partial<TaskCard>[] = [
+			{ state: "running" },
+			{ state: "queued" },
+			{ stage: "todo", state: "queued" },
+			{ stage: "done", state: "idle" },
+			{ cancelledAt: 1760000000000 },
+		];
+		for (const over of hidden) {
+			await withRoot(waitingCard(over), {}, async ({ container }) => {
+				expect(container.textContent).not.toContain("Back to todo");
+			});
+		}
+	});
+
+	test("Back to todo POSTs the backlog route with to todo", async () => {
+		await withRoot(
+			waitingCard({}),
+			{ "/backlog": { status: 200, body: { ok: true } } },
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(backToTodoButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.url.endsWith("/tasks/t1/backlog")).toBe(true);
+				expect(posts[0]?.body).toEqual({ to: "todo" });
+				expect(alertsOf(container)).toEqual([]);
+			},
+		);
+	});
+
+	test("a Back to todo refusal renders the server reason inline", async () => {
+		await withRoot(
+			waitingCard({}),
+			{
+				"/backlog": {
+					status: 409,
+					body: { error: "the card holds 2 commits not on its target" },
+				},
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(backToTodoButton(container))({});
+				});
+				await act(async () => {});
+				expect(posts).toHaveLength(1);
+				expect(posts[0]?.body).toEqual({ to: "todo" });
+				expect(
+					alertsOf(container).some((a) =>
+						a.includes("the card holds 2 commits not on its target"),
+					),
+				).toBe(true);
+				// The card stays parked: the action remains for a retry.
+				expect(backToTodoButton(container)).not.toBeNull();
+			},
+		);
+	});
+});
+
 describe("AddProjectModal Git URL field error", () => {
 	const { window } = installBrowserGlobals([
 		"HTMLElement",

@@ -14578,6 +14578,337 @@ describe("push-main on an empty origin (OTTR-605)", () => {
 	});
 });
 
+describe("dependsOn edit and back to todo (OTTR-1318)", () => {
+	const run = (dir: string, cmd: string): string =>
+		execSync(cmd, { cwd: dir, stdio: "pipe", env: fixtureGitEnv() })
+			.toString()
+			.trim();
+
+	/** One setup() fixture: a real git checkout, its store and the app mount's project map. */
+	interface Dep1318Fixture {
+		origin: string;
+		dir: string;
+		store: ProjectStore;
+		entry: Entry;
+		projects: Map<string, Entry>;
+		worktree: (branch: string) => string;
+		cleanup: () => void;
+	}
+
+	/** One real git repo with a pushed main (origin/main names the entry's target), a
+	 * store and an entry wired for a fresh app mount; the disposal path must run through
+	 * real git, so no stubs here. cleanup removes the folders. */
+	const setup = async (name: string): Promise<Dep1318Fixture> => {
+		const origin = join(root, `${name}-origin`);
+		const dir = join(root, name);
+		run(root, `git init -q --bare -b main ${origin}`);
+		run(root, `git init -q -b main ${dir}`);
+		run(dir, "git config user.email t@t && git config user.name t");
+		writeFileSync(join(dir, "seed.txt"), "x");
+		run(dir, "git add seed.txt && git commit -qm seed");
+		run(dir, `git remote add origin ${origin}`);
+		run(dir, "git push -q origin main");
+		const store = await ProjectStore.open(dir);
+		const entry: Entry = {
+			path: dir,
+			name,
+			store,
+			target: "origin/main",
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: "main",
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		return {
+			origin,
+			dir,
+			store,
+			entry,
+			projects: new Map([[name, entry]]),
+			/** A real worktree on its own branch, the way a work turn leaves one. */
+			worktree: (branch: string): string => {
+				const wt = join(dir, ".worktrees", branch);
+				run(dir, `git worktree add -q "${wt}" -b ${branch}`);
+				return wt;
+			},
+			cleanup: () => {
+				rmSync(dir, { recursive: true, force: true });
+				rmSync(origin, { recursive: true, force: true });
+			},
+		};
+	};
+
+	/** A parked in-progress card the way a finished work turn leaves it. */
+	const parkCard = async (
+		s: Dep1318Fixture,
+		prompt: string,
+		wt: string | null,
+		branch: string | null,
+	): Promise<{ id: string }> => {
+		const card = await s.store.createTask(prompt);
+		await s.store.updateTask(card.id, {
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "asked a question",
+			asked: [
+				{
+					question: "continue?",
+					options: [],
+					multi: false,
+					recommended: null,
+					text: true,
+				},
+			],
+			sessionId: "sess-parked",
+			worktree: wt,
+			branch,
+			queuedAt: 1,
+		});
+		return card;
+	};
+
+	const dependsOnRoute = (name: string, id: string): string =>
+		`/api/projects/${name}/tasks/${id}/depends-on`;
+
+	test("the depends-on route stores a replaced list on a parked in-progress card", async () => {
+		const s = await setup("p-dep1318-edit");
+		try {
+			const m = await mount({ projects: s.projects });
+			const blocker = await s.store.createTask("blocker");
+			const card = await parkCard(s, "parked card", null, null);
+			const res = await m.call(dependsOnRoute(s.entry.name, card.id), {
+				dependsOn: [blocker.id, blocker.id],
+			});
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { dependsOn: string[] };
+			// The list replaces (and dedupes): the card waits for the blocker.
+			expect(body.dependsOn).toEqual([blocker.id]);
+			expect((await s.store.getTask(card.id))?.dependsOn).toEqual([
+				blocker.id,
+			]);
+			// The drawer's read-back sees the stored list too.
+			const got = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}`,
+			);
+			expect(got.status).toBe(200);
+			const view = (await got.json()) as { dependsOn: string[] };
+			expect(view.dependsOn).toEqual([blocker.id]);
+			// An empty list removes every dependency.
+			const empty = await m.call(dependsOnRoute(s.entry.name, card.id), {
+				dependsOn: [],
+			});
+			expect(empty.status).toBe(200);
+			expect((await s.store.getTask(card.id))?.dependsOn).toEqual([]);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a bad dependsOn body answers 400: shape, unknown id, self reference, cycle", async () => {
+		const s = await setup("p-dep1318-bad");
+		try {
+			const m = await mount({ projects: s.projects });
+			const a = await s.store.createTask("a");
+			const b = await s.store.createTask("b");
+			await s.store.updateTask(a.id, { dependsOn: [b.id] });
+			const badShape = await m.call(dependsOnRoute(s.entry.name, a.id), {
+				dependsOn: "nope",
+			});
+			expect(badShape.status).toBe(400);
+			expect(await errorOf(badShape)).toBe(
+				"dependsOn must be an array of task ids",
+			);
+			// The card exists, so an unknown dependency id is bad input (400), not a
+			// missing card: the create route's 404 text, downgraded.
+			const unknown = await m.call(dependsOnRoute(s.entry.name, a.id), {
+				dependsOn: ["NOPE-9"],
+			});
+			expect(unknown.status).toBe(400);
+			expect(await errorOf(unknown)).toBe(
+				"unknown project NOPE in dependsOn task: NOPE-9",
+			);
+			const self = await m.call(dependsOnRoute(s.entry.name, a.id), {
+				dependsOn: [b.id, a.id],
+			});
+			expect(self.status).toBe(400);
+			expect(await errorOf(self)).toBe(
+				"dependsOn cannot include the task itself",
+			);
+			// A direct two-card cycle: b already sits in a's list, so pointing b back at
+			// a would close the loop.
+			const cycle = await m.call(dependsOnRoute(s.entry.name, b.id), {
+				dependsOn: [a.id],
+			});
+			expect(cycle.status).toBe(400);
+			expect(await errorOf(cycle)).toBe("dependsOn would form a cycle");
+			// No refused edit wrote anything.
+			expect((await s.store.getTask(a.id))?.dependsOn).toEqual([b.id]);
+			expect((await s.store.getTask(b.id))?.dependsOn).toEqual([]);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a running card refuses the depends-on edit and writes nothing", async () => {
+		const s = await setup("p-dep1318-running");
+		try {
+			const m = await mount({ projects: s.projects });
+			const b = await s.store.createTask("b");
+			const card = await s.store.createTask("busy");
+			await s.store.updateTask(card.id, { dependsOn: [b.id] });
+			await s.store.updateTask(card.id, { state: "running" });
+			const res = await m.call(dependsOnRoute(s.entry.name, card.id), {
+				dependsOn: [],
+			});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"a running or preparing task cannot change its dependencies",
+			);
+			expect((await s.store.getTask(card.id))?.dependsOn).toEqual([b.id]);
+			// Same refusal while the run is only claiming its slot.
+			await s.store.updateTask(card.id, { state: "preparing" });
+			const prep = await m.call(dependsOnRoute(s.entry.name, card.id), {
+				dependsOn: [],
+			});
+			expect(prep.status).toBe(409);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo on a clean parked card disposes the worktree and queues a fresh turn", async () => {
+		const s = await setup("p-dep1318-back");
+		try {
+			const m = await mount({ projects: s.projects });
+			const blocker = await s.store.createTask("blocker");
+			const wt = s.worktree("card-back");
+			const card = await parkCard(s, "parked card", wt, "card-back");
+			await s.store.updateTask(card.id, { dependsOn: [blocker.id] });
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as {
+				id: string;
+				stage: string;
+				state: string;
+			};
+			expect(body.id).toBe(card.id);
+			expect(body.stage).toBe("todo");
+			expect(body.state).toBe("queued");
+			// A fresh work turn in a fresh session; the kept fields stay.
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.state).toBe("queued");
+			expect(after.worktree).toBeNull();
+			expect(after.branch).toBeNull();
+			expect(after.needsReason).toBeNull();
+			expect(after.asked).toBeNull();
+			expect(after.sessionId).toBeNull();
+			expect(after.dependsOn).toEqual([blocker.id]);
+			// The clean worktree went through real git: folder, registration and branch gone.
+			expect(existsSync(wt)).toBe(false);
+			expect(run(s.dir, "git worktree list --porcelain")).not.toContain(wt);
+			expect(run(s.dir, "git for-each-ref refs/heads/card-back")).toBe("");
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo refuses when the worktree holds a commit past the target", async () => {
+		const s = await setup("p-dep1318-commit");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-commit");
+			const card = await parkCard(s, "card with work", wt, "card-commit");
+			writeFileSync(join(wt, "work.txt"), "wip");
+			run(wt, "git add work.txt && git commit -qm wip");
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"cannot move back to todo, the worktree holds work: 1 commit not on origin/main",
+			);
+			// The card keeps its worktree and its lane: cancel stays the path for work.
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.worktree).toBe(wt);
+			expect(existsSync(wt)).toBe(true);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo refuses when the worktree holds an uncommitted file", async () => {
+		const s = await setup("p-dep1318-dirty");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-dirty");
+			const card = await parkCard(s, "card with drafts", wt, "card-dirty");
+			writeFileSync(join(wt, "draft.txt"), "draft");
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"cannot move back to todo, the worktree holds work: uncommitted changes",
+			);
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.worktree).toBe(wt);
+			expect(existsSync(wt)).toBe(true);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("a card moved back to todo waits for its open dependency, then starts", async () => {
+		const s = await setup("p-dep1318-seq");
+		try {
+			const m = await mount({ projects: s.projects });
+			const blocker = await s.store.createTask("blocker");
+			const dep = await parkCard(s, "dependent", null, null);
+			await s.store.updateTask(dep.id, { dependsOn: [blocker.id] });
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${dep.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(200);
+			const picked = async (): Promise<string[]> =>
+				pickRunnable(await s.store.listTasks(), {
+					maxParallel: 3,
+					hasRules: true,
+				}).map((t) => t.id);
+			// The dependent stays queued and unpicked while the blocker is open; the
+			// blocker itself fills the slot.
+			expect(await picked()).toEqual([blocker.id]);
+			const after = (await s.store.getTask(dep.id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.state).toBe("queued");
+			// The blocker done lifts the hold: the dependent is now pickable.
+			await s.store.updateTask(blocker.id, {
+				stage: "done",
+				state: "idle",
+			});
+			expect(await picked()).toEqual([dep.id]);
+		} finally {
+			s.cleanup();
+		}
+	});
+});
+
 describe("ProjectView main checkout fields", () => {
 	test("the removed pushSyncCommits key from an old tab is ignored; the view carries mainBranch/mainUnpushed", async () => {
 		const res = await post("/api/projects/p1/settings", {

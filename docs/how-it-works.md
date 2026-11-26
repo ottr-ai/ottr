@@ -121,7 +121,7 @@ Notes:
 
 **Cross-project cards.** A card changes another project only by filing a card there: `create_task` with the `project` parameter files the card, and that card's own turns land the change. The work prompt still says that the agent never edits or commits in another project's checkout. After each work turn, the board compares that turn's window (turn start to turn end) with each change in every other project's main checkout. For a commit, the window overlaps the change when the commit time falls in the window. For a change with only files, the board uses the guard window. The board parks the card at `needs_you` only when this turn's window alone overlaps the change. It names the project, the commits and the files. When two or more turns overlap the change, no card parks: the board logs the change and shows one notice in the bell's Advisories section, with the commit and the running cards named.
 
-One exemption exists. A work turn may commit its own project's provisioned copies under `projects/<project>/` in the agent-data main checkout, because the AGENTS.md sync rule names exactly that commit. The guard exempts a change whose files all sit under that path prefix, and it logs the exempt change. Every other change still parks a card or rings the notice. A card can wait for the card it filed: `report_outcome` and `create_task` accept `PROJECT-N` ids of other projects in `dependsOn`, and the scheduler holds the card until those cards are done or cancelled.
+One exemption exists. A work turn may commit its own project's provisioned copies under `projects/<project>/` in the agent-data main checkout, because the AGENTS.md sync rule names exactly that commit. The guard exempts a change whose files all sit under that path prefix, and it logs the exempt change. Every other change still parks a card or rings the notice. A card can wait for the card it filed: `report_outcome` and `create_task` accept `PROJECT-N` ids of other projects in `dependsOn`, and the scheduler holds the card until those cards are done or cancelled. The operator can rewire the list of an open card with `POST /api/projects/<project>/tasks/<id>/depends-on`; the route refuses a self reference and a cycle, so the wait graph stays acyclic.
 
 ## Life cycle
 
@@ -135,6 +135,7 @@ stateDiagram-v2
   [*] --> backlog: createTask with backlog
   backlog --> todo: POST …/backlog (promote)
   todo --> backlog: POST …/backlog (park)
+  in_progress --> todo: POST …/backlog (back to todo, clean worktree)
   todo --> in_progress: work session starts
   in_progress --> in_progress: work check blocker, user reply
   in_progress --> merging: ready with commits ahead
@@ -147,7 +148,8 @@ stateDiagram-v2
 
 - **todo**, **in_progress**, **merging**, **done**, **backlog** — `Stage` in `src/types.ts`
 - `createTask` — `src/store.ts`
-- `POST /api/projects/<project>/tasks/<id>/backlog` — `src/app.ts`
+- `POST /api/projects/<project>/tasks/<id>/backlog` — promote, park, back to todo — `src/app.ts`
+- `POST /api/projects/<project>/tasks/<id>/depends-on` — replace a card's `dependsOn` — `src/app.ts`
 - Work session starts — `runTurn` `onSession` in `src/turn.ts`
 - Report checks (`ready`, `answered`, `integrated`, `superseded`) — `classify` in `src/runner.ts`
 - Work check blockers — `runTurn` in `src/turn.ts`
@@ -165,12 +167,13 @@ stateDiagram-v2
   running --> needs_you: needs_you report, failed proof, stopTurn
   running --> idle: done, or review waits for findings
   needs_you --> queued: user reply, restart session, auto-tend
+  needs_you --> queued: back to todo
   needs_you --> idle: finishKept, hygienePass
   preparing --> idle: duplicate-work gate closes the card
   queued --> idle: cancel
   running --> idle: cancel
   needs_you --> idle: cancel
-  idle --> queued: grill or promote a backlog card
+  idle --> queued: grill, promote a backlog card, back to todo
 ```
 
 - **queued**, **preparing**, **running**, **needs_you**, **idle** — `RunState` in `src/types.ts`
@@ -178,7 +181,7 @@ stateDiagram-v2
 - **Duplicate-work gate** — before the prompt gate, on the first work turn of a new card (a todo card with no session, branch, worktree, or earlier turn; `src/duplicateGate.ts`, spec `docs/specs/duplicate-gate.md`), one tool-free model call picks search terms from the prompt, `git grep` searches the turn's target ref in the main checkout, and a second tool-free call judges the prompt against those hits and the project's in-progress, merging, and done research cards without a follow-up. A full match cancels the card and names the reason with the matched task ids or paths in its needs-you reason. A partial match continues with an overlap note in the work prompt. A gate error lets the card through (fail open).
 - **Prompt gate** — before the omp session of a gate-scoped work turn starts (`runTurn` after the claim, before the worktree; `src/promptGate.ts`, spec `docs/specs/prompt-gate.md`), one tool-free model call on the `@plan` role gets the card's effective prompt (prompt plus queued replies and steers) and, when the prompt names a handoff file in the project's handoffs folder, that file's text as an extra untrusted block, and answers strict JSON: what it would build, how it would check it, the five deepen points coverage, and each open question with a `default` — the answer the builder would take when the user stays silent, or `null` (OTTR-904). A question with a default never parks; only a blocking question (default `null`) or a missing outside check parks the card `needs_you`, with only the blocking questions as clickable asks, and a concrete `checks` answer is adopted as the check when point five is uncovered; no omp session spawns and no file changes. A pass stamps the assumptions and the adopted check in the gate state, the restatement lands in the card log, and the work turn prompt carries them as the untrusted **Gate assumptions** block; the agent's ready report lists the assumptions it used. A gateway failure, timeout, or malformed JSON parks with the reason and a **Start anyway** action after one retry; the same blocking questions twice carry that action in the ask itself. The gate re-runs whenever the effective prompt changes (edit, reply, steer) or the named handoff file's text changes, and skips merge, retro, review, release, board-check, grill, interview, scout, research, PR-adopt (Dependabot) and pr_review turns. Board-written prompts (the card a template or an agent filed; OTTR-850, `docs/specs/prompt-gate-board-prompts.md`) skip the readiness call: the row's `prompt_author` column decides, the deterministic Open questions park still runs (it parses the section into questions and context, inline choices become the options, and one options-only model call builds the rest), a user edit writes `user` and brings the model call back, and every board template and the filing tools name their outside check. After a deploy, one board-wide replay pass (`replayGateParks`, stamped in the global store's kv) re-queues each old gate park with no queued answer so the new park rule judges it once (OTTR-904). The composer's Deepen review shows the matching five-point proof next to its diff (`checkDeepened`, `src/deepen.ts`).
 - Next stage and retries — `classify` in `src/runner.ts`
-- User reply, restart session, grill, promote — `reply`, `restart-session`, `grill`, `backlog` under `POST /api/projects/<project>/tasks/<id>/` in `src/app.ts`
+- User reply, restart session, grill, promote, back to todo — `reply`, `restart-session`, `grill`, `backlog` under `POST /api/projects/<project>/tasks/<id>/` in `src/app.ts`
 - Auto-tend, `hygienePass`, `reclassifyPass` — `src/supervisor.ts`
 - `needs_you` shows as the `!` badge on the card — `src/ui/status.ts`
 
@@ -197,7 +200,7 @@ One card skips the requeue. A tracker death can land between the server merge pu
 | Column | What happens |
 |---|---|
 | Todo | Waits for a free slot: 20 total runs, no per-project cap by default (`OMP_TRACKER_MAX_TOTAL`). Cards can declare dependencies and split into sub-task cards. |
-| In progress | Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it. The agent finishes with the `report_outcome` tool. |
+| In progress | Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it. The agent finishes with the `report_outcome` tool. A card that only waits for you moves back to Todo with **Back to todo** in its drawer — the route keeps the card, its prompt and its history, and refuses while the worktree holds work (spec `docs/specs/card-depends-and-back-to-todo.md`). |
 | Merging | A second turn rebases, re-runs the project's checks, and integrates the work the way `AGENTS.md` says. When the server push races a moved origin, the server first retries the rebase, checks and push itself, and only turns to a recovery merge turn when that cannot converge. One merge turn per project at a time. While main holds commits origin lacks, the project's other merges wait — `waiting for main to reach origin/main` — until a repairing merge pushes: the automatic server-side retry, or the parked card itself after you reply to it. |
 | Done | The report passed the git checks. Worktree and branch are gone. The lane shows the newest 20 cards and every unread card (an answer or a PR review not opened yet). **Show more** loads 20 more. A star on a done research card pins its report in a collapsible **Starred** section above the normal done cards. A cancelled card also shows here, with a **Cancelled** chip that names the cancel time; its drawer opens read-only, with no action buttons. A project with a task that finished and whose drawer you have not opened yet shows a steel-blue dot in the left project list, ranked below needs action, asked and running; opening that task's drawer, by a click or a pasted link, clears it, and a task that lands in Done again shows the dot again. The read mark is kept on the server, so it holds across reloads and devices; tasks done before this dot shipped count as read. |
 | Backlog | Parks ideas that are not ready to run. The list sits under Todo below a divider. A grill session refines an idea; a grilled card moves to Todo. While the grill session runs, the card leaves the backlog row and shows as a normal card in the Todo lane. |

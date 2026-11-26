@@ -4803,6 +4803,62 @@ a.pr-link:hover {
 	color: var(--dim);
 	white-space: nowrap;
 }
+/* Drawer depends editor (OTTR-1318): the wait-for id list, its remove squares
+   and the add field. The captions reuse the triage caption's 13px dim face and
+   its 92px column, so the section's fields line up with the Triage ones. */
+.dep-empty {
+	margin: 0 0 8px;
+	font-size: 13px;
+	color: var(--dim);
+}
+.dep-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin: 0 0 8px;
+	padding: 0;
+	list-style: none;
+}
+.dep-item {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+}
+.dep-item code {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.dep-item .dep-remove {
+	flex: none;
+	margin-left: auto;
+}
+.dep-add {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	margin-top: 4px;
+}
+.dep-add > label {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1;
+	min-width: 0;
+}
+.dep-add > label > span {
+	font-size: 13px;
+	color: var(--dim);
+	white-space: nowrap;
+}
+.dep-add input {
+	flex: 1;
+	min-width: 0;
+}
 .triage-set {
 	display: inline-flex;
 	flex: 1;

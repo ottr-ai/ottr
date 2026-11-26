@@ -13059,6 +13059,108 @@ function DrawerTriage(p: {
 	);
 }
 
+/** Drawer Depends section (OTTR-1318): the ids this card waits for, each one
+ *  removable, an add field and a save that posts the whole list to the
+ *  depends-on route. Done and cancelled cards hide it: the route refuses both
+ *  and their drawers are read-only. Like the triage section it collapses by
+ *  default: dependencies are controls, not the card's story. */
+function DrawerDepends(p: {
+	task: TaskView;
+	cancelled: boolean;
+	draft: string[];
+	add: string;
+	setAdd: (v: string) => void;
+	busy: boolean;
+	addDep: () => void;
+	removeDep: (id: string) => void;
+	saveDepends: () => void;
+	error: string | null;
+}) {
+	const {
+		task,
+		cancelled,
+		draft,
+		add,
+		setAdd,
+		busy,
+		addDep,
+		removeDep,
+		saveDepends,
+		error,
+	} = p;
+	return (
+		<>
+			{" "}
+			{task.stage !== "done" && !cancelled && (
+				<DrawerSec id="drawer-depends" label="Depends on" defaultOpen={false}>
+					{draft.length === 0 ? (
+						<p className="dep-empty">This card waits for no other card.</p>
+					) : (
+						<ul className="dep-list">
+							{draft.map((id) => (
+								<li key={id} className="dep-item">
+									<code>{id}</code>
+									<button
+										type="button"
+										className="icon dep-remove"
+										aria-label={`Remove ${id} from this card's dependencies`}
+										title={`Remove ${id}`}
+										disabled={busy}
+										onClick={() => removeDep(id)}
+									>
+										<Icon name="x" size={11} />
+									</button>
+								</li>
+							))}
+						</ul>
+					)}
+					<form
+						className="dep-add"
+						onSubmit={(e) => {
+							e.preventDefault();
+							addDep();
+						}}
+					>
+						<label htmlFor="dep-add-input">
+							<span>Wait for</span>
+							<input
+								id="dep-add-input"
+								value={add}
+								placeholder="OTTR-640"
+								autoComplete="off"
+								spellCheck={false}
+								disabled={busy}
+								aria-invalid={error !== null || undefined}
+								aria-describedby={error !== null ? "dep-add-error" : undefined}
+								onChange={(e) => setAdd(e.target.value)}
+							/>
+						</label>
+						<button type="submit" disabled={busy} aria-busy={busy || undefined}>
+							Add
+						</button>
+					</form>
+					<div className="reply-actions">
+						<button
+							type="button"
+							disabled={busy}
+							aria-busy={busy || undefined}
+							onClick={saveDepends}
+						>
+							{busy && <span className="spinner" aria-hidden="true" />}
+							Save dependencies
+						</button>
+					</div>
+					{error !== null && (
+						<p id="dep-add-error" className="auth-error" role="alert">
+							{error}
+						</p>
+					)}
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
 /** Drawer HoldBar section: extracted verbatim from the drawer body. */
 function DrawerHoldBar(p: {
 	task: TaskView;
@@ -13801,6 +13903,8 @@ function DrawerActions(p: {
 	runCancel: () => Promise<boolean>;
 	/** A proposal's decision card carries Cancel task in its footer; the row drops it. */
 	cancelInPanel: boolean;
+	runBackToTodo: () => Promise<boolean>;
+	backToTodoError: string | null;
 }) {
 	const {
 		task,
@@ -13833,6 +13937,8 @@ function DrawerActions(p: {
 		leadValidateDone,
 		runCancel,
 		cancelInPanel,
+		runBackToTodo,
+		backToTodoError,
 	} = p;
 	return (
 		<>
@@ -13886,6 +13992,23 @@ function DrawerActions(p: {
 						>
 							<Icon name="x" />
 							Not ready — park in backlog
+						</BusyButton>
+					)}
+				{/* OTTR-1318: a parked in-progress card (needs_you or idle) returns to the
+						    todo lane. The route moves it only while it holds no work — a clean
+						    worktree with no commits past its base — and refuses with the reason
+						    otherwise, so the button never guards on stale client facts and the
+						    refusal surfaces inline below the row. Prompt and turn history are
+						    kept across the move. */}
+				{task.stage === "in_progress" &&
+					(task.state === "needs_you" || task.state === "idle") &&
+					!cancelled && (
+						<BusyButton
+							title="Moves the parked card back to the todo lane; it succeeds only while the card holds no work — a clean worktree with no commits past its base — and keeps the prompt and turn history"
+							run={runBackToTodo}
+						>
+							<Icon name="corner-up-left" />
+							Back to todo
 						</BusyButton>
 					)}
 				{task.stage === "done" && read && !cancelled && (
@@ -13949,6 +14072,14 @@ function DrawerActions(p: {
 					</BusyButton>
 				)}
 			</div>
+			{/* The refusal renders as a full-width line below the actions row, like
+				    the other inline drawer errors: it aligns with the drawer's content
+				    margin and announces through role="alert". */}
+			{backToTodoError !== null && (
+				<p className="auth-error" role="alert">
+					{backToTodoError}
+				</p>
+			)}
 			{/* OTTR-1247: a queued pending sandbox lead offers the manual start of its
 				    review's batch validation run; the lead's status line already names the
 				    wait. The shared predicate (the route's own gate) disables the button
@@ -15267,6 +15398,78 @@ export function Drawer({
 			return false;
 		}
 	};
+	// OTTR-1318: the dependsOn editor — a draft of the ids this card waits for,
+	// an add field and one save that posts the whole list. The draft re-syncs
+	// whenever the stored list changes (the save itself, another operator's
+	// save), so the drawer never edits from a stale list; typing in the add
+	// field survives the re-sync. A new card's drawer starts without the last
+	// card's draft or error.
+	const depends = task.dependsOn;
+	const [depDraft, setDepDraft] = useState<string[]>(depends);
+	const [depAdd, setDepAdd] = useState("");
+	const [dependsError, setDependsError] = useState<string | null>(null);
+	const dependsSave = useBusy();
+	const storedDepends = depends.join("\n");
+	useEffect(() => {
+		setDepDraft(depends);
+	}, [rerunTaskId, storedDepends]);
+	useEffect(() => {
+		setDepAdd("");
+		setDependsError(null);
+	}, [rerunTaskId]);
+	const addDep = (): void => {
+		const id = depAdd.trim();
+		if (id === "") {
+			setDependsError("Enter a card id to add, for example OTTR-640.");
+			return;
+		}
+		setDependsError(null);
+		// A duplicate stays off the draft: the server dedupes the posted list, so
+		// the draft must not show a row the save would silently drop.
+		setDepDraft((d) => (d.includes(id) ? d : [...d, id]));
+		setDepAdd("");
+	};
+	const removeDep = (id: string): void => {
+		setDependsError(null);
+		setDepDraft((d) => d.filter((x) => x !== id));
+	};
+	const saveDepends = (): void => {
+		// The typed id must land in the list or nowhere: saving past it would
+		// silently drop it.
+		if (depAdd.trim() !== "") {
+			setDependsError(
+				"Add the typed id to the list first, or clear the field.",
+			);
+			return;
+		}
+		dependsSave.start(() => {
+			setDependsError(null);
+			return act(async () => {
+				await post(
+					`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/depends-on`,
+					{ dependsOn: depDraft },
+				);
+			}, setDependsError);
+		});
+	};
+	// OTTR-1318: Back to todo moves a parked in-progress card (needs_you or idle)
+	// back to the todo lane. The route refuses with the reason while the card
+	// holds work (uncommitted files, commits past its base) or a reply is still
+	// queued; the reason surfaces inline below the actions row and the card
+	// stays untouched. Prompt and turn history survive the move.
+	const [backToTodoError, setBackToTodoError] = useState<string | null>(null);
+	useEffect(() => {
+		setBackToTodoError(null);
+	}, [rerunTaskId]);
+	const runBackToTodo = async (): Promise<boolean> => {
+		setBackToTodoError(null);
+		return act(async () => {
+			await post(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${encodeURIComponent(task.id)}/backlog`,
+				{ to: "todo" },
+			);
+		}, setBackToTodoError);
+	};
 	// OTTR-1129: a done review card can clear the blocked results its leads got
 	// before a chosen time and file a fresh validation run for them (OTTR-1166:
 	// a done release card offers the same control through isReview). The datetime
@@ -15909,6 +16112,18 @@ export function Drawer({
 						clearCandidate={clearCandidate}
 						triageError={triageError}
 					/>
+					<DrawerDepends
+						task={task}
+						cancelled={cancelled}
+						draft={depDraft}
+						add={depAdd}
+						setAdd={setDepAdd}
+						busy={dependsSave.busy}
+						addDep={addDep}
+						removeDep={removeDep}
+						saveDepends={saveDepends}
+						error={dependsError}
+					/>
 					<DrawerHoldBar
 						task={task}
 						askedNow={askedNow}
@@ -15978,6 +16193,8 @@ export function Drawer({
 						leadValidateDone={leadValidateDone}
 						runCancel={runCancel}
 						cancelInPanel={proposal && task.state === "needs_you"}
+						runBackToTodo={runBackToTodo}
+						backToTodoError={backToTodoError}
 					/>
 					<DrawerMeta
 						task={task}
