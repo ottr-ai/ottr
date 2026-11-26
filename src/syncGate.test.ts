@@ -6,6 +6,7 @@ import {
 	chmodSync,
 	chownSync,
 	constants,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -14,7 +15,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import {
 	appendSyncGateRun,
@@ -40,12 +41,18 @@ const realReadable = (() => {
 	}
 })();
 
-/** Copies the real sync.mjs into a fixture alate dir: the actual installer runs,
- *  while ALATE_HOME (its config source) and every install target stay isolated
- *  temp dirs the test owns. */
+/** Copies the real sync.mjs into a fixture alate dir, together with its support
+ *  tree (the deployed script imports ./lib/data.mjs beside itself, so a
+ *  sync.mjs-only copy would die on the missing import before any sync runs).
+ *  ALATE_HOME (the fixture dir) and every install target stay isolated temp
+ *  dirs the test owns. */
 function useRealSync(fixtureAlateDir: string): void {
 	mkdirSync(fixtureAlateDir, { recursive: true });
 	writeFileSync(join(fixtureAlateDir, "sync.mjs"), readFileSync(REAL_SYNC));
+	const lib = join(dirname(REAL_SYNC), "lib");
+	if (existsSync(lib)) {
+		cpSync(lib, join(fixtureAlateDir, "lib"), { recursive: true });
+	}
 }
 
 const dirs: string[] = [];
@@ -496,17 +503,18 @@ describe("real sync.mjs acceptance", () => {
 			expect(existsSync(join(home, ".omp/agent/rules/rule-bad.md"))).toBe(
 				false,
 			);
-			// Whatever the real script installed for the valid rule, the record's
-			// comparison is honest: an existing twin must hash-match HEAD's bytes.
+			// The deployed script processes root rules with frontmatter: the valid
+			// rule's twin exists, carries the committed bytes, and the record's
+			// hash comparison says so — unconditionally, so a regression in the
+			// launcher, the snapshot, or the hashing cannot pass vacuously.
 			const ok = byPath.get("rule-ok.md");
-			if (ok?.installedSha256 !== null && ok?.installedSha256 !== undefined) {
-				expect(ok.match).toBe(true);
-				expect(
-					readFileSync(join(home, ".omp/agent/rules/rule-ok.md"), "utf8"),
-				).toBe(
-					"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
-				);
-			}
+			expect(ok?.installedSha256).not.toBeNull();
+			expect(ok?.match).toBe(true);
+			expect(
+				readFileSync(join(home, ".omp/agent/rules/rule-ok.md"), "utf8"),
+			).toBe(
+				"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
+			);
 		},
 	);
 });

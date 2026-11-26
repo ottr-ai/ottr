@@ -19,6 +19,7 @@ import {
 	accessSync,
 	appendFileSync,
 	constants,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -12818,12 +12819,16 @@ describe("sync-gate endpoint", () => {
 			// isolated targets; a uid without alate-checkout access cannot, and the
 			// test skips visibly instead of proving a replacement.
 			const { id, runToken, worktree } = await seedCard();
-			// The registered alate entry carries the real script; ALATE_HOME (the
-			// registered checkout) and every install target stay as the fixtures are.
-			writeFileSync(
-				join(projects.get("alate")!.path, "sync.mjs"),
-				readFileSync(REAL_SYNC),
-			);
+			// The registered alate entry carries the real script plus its support
+			// tree (the deployed script imports ./lib/data.mjs beside itself);
+			// ALATE_HOME (the registered checkout) and every install target stay
+			// as the fixtures are.
+			const alateEntryPath = projects.get("alate")!.path;
+			writeFileSync(join(alateEntryPath, "sync.mjs"), readFileSync(REAL_SYNC));
+			const realLib = join(dirname(REAL_SYNC), "lib");
+			if (existsSync(realLib)) {
+				cpSync(realLib, join(alateEntryPath, "lib"), { recursive: true });
+			}
 			// A committed root rule is what the deployed script processes.
 			writeFileSync(
 				join(worktree, "rule-ok.md"),
@@ -12854,11 +12859,12 @@ describe("sync-gate endpoint", () => {
 					)
 					.digest("hex"),
 			);
-			// Whatever the real script installed, the record's comparison is honest.
+			// The deployed script processes root rules with frontmatter: the valid
+			// rule's twin is installed and hash-matched — unconditionally, so a
+			// regression cannot pass vacuously.
 			const ok = byPath.get("rule-ok.md");
-			if (ok?.installedSha256 !== null && ok?.installedSha256 !== undefined) {
-				expect(ok.match).toBe(true);
-			}
+			expect(ok?.installedSha256).not.toBeNull();
+			expect(ok?.match).toBe(true);
 			await agentStore!.updateTask(id, { cancelledAt: Date.now() });
 		},
 	);
