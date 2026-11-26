@@ -45,6 +45,7 @@ import {
 	type CreditBalance,
 	controlPlaneHooks,
 	type Hosted,
+	scrubProcEnviron,
 	takeHostedConfig,
 } from "./hosted.ts";
 import { startLlmGateway } from "./llmGateway.ts";
@@ -313,6 +314,11 @@ try {
 } catch (err) {
 	console.error(`jira: secret key: ${errmsg(err)}; Jira routes are off`);
 }
+// The catch above is for key-resolution failures only. A scrub refusal (the key
+// is still readable in /proc/<pid>/environ) escapes loadSecretBox's finally into
+// that catch, so it must refuse the boot here: a no-op when the scrub succeeded,
+// a module-level throw when the entry survives.
+scrubProcEnviron("OTTR_SECRET_KEY");
 
 // Mutable settings shared with createApp: /api/settings writes them, the scheduler and
 // discovery read them. The persisted project lists load here, before boot discovery: a
