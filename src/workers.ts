@@ -1836,8 +1836,10 @@ async function sweepLeftovers(opts?: {
 /** Cap of a process's argv on the wire, and of the session text a fix compares. */
 const SESSION_TAIL_BYTES = 64 * 1024;
 
-/** The temp roots a lock may live in when the card-number segment rule passes. */
-const STALE_TEMP_ROOTS = ["/tmp", "/var/tmp"];
+/** The temp roots a lock may live in when the card-number segment rule passes. The
+ *  process tmpdir rides the list (OTTR-1306): a redirected TMPDIR (the fast-scratch
+ *  rule for full runs) is still a known temp root. */
+const STALE_TEMP_ROOTS = [...new Set(["/tmp", "/var/tmp", tmpdir()])];
 
 /** Reads at most `len` bytes at absolute offset `from` of an open file and decodes them
  * tolerantly (a byte cut mid code point never throws). */

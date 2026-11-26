@@ -22,6 +22,7 @@ import {
 	statSync,
 	unlinkSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename } from "node:path";
 import { pidAlive } from "./dblock.ts";
 
@@ -197,17 +198,22 @@ export function cardNumOf(worktreeBasename: string): string | null {
 /**
  * String-level confinement pre-check for lock reads and fixes (the act-time fix
  * re-checks with realpath). Allowed: the card's own worktree, or a worker temp root
- * (/tmp, /var/tmp) whose one segment carries the card number as a -/_/.-delimited
- * token — "gate-1191" carries "1191", "gate-11912" and "gate-1244" do not, and
- * without a card number nothing under a temp root is allowed.
+ * (/tmp, /var/tmp, or the process tmpdir) whose one segment carries the card number
+ * as a -/_/.-delimited token — "gate-1191" carries "1191", "gate-11912" and
+ * "gate-1244" do not, and without a card number nothing under a temp root is
+ * allowed. The process tmpdir rides the list (OTTR-1306): a redirected TMPDIR (the
+ * fast-scratch rule for full runs) is still a known temp root, so a lock the card
+ * wrote there stays unlockable.
  */
+const STALE_TEMP_ROOTS = [...new Set(["/tmp", "/var/tmp", tmpdir()])];
+
 export function lockPathAllowed(
 	path: string,
 	worktree: string,
 	cardNum: string | null,
 ): boolean {
 	if (path === worktree || path.startsWith(`${worktree}/`)) return true;
-	if (!path.startsWith("/tmp/") && !path.startsWith("/var/tmp/")) return false;
+	if (!STALE_TEMP_ROOTS.some((r) => path.startsWith(`${r}/`))) return false;
 	if (cardNum === null) return false;
 	return path.split("/").some((seg) => seg.split(/[-_.]/).includes(cardNum));
 }
