@@ -151,6 +151,7 @@ import {
 	unsavedWork as realUnsavedWork,
 	worktreeHusk as realWorktreeHusk,
 	setNetworkGitAuth,
+	setWorkerRoots,
 	slugify,
 } from "./worktree.ts";
 import { publishRelease as realPublishRelease } from "./release.ts";
@@ -18597,6 +18598,32 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("Release failed: refusing to publish:");
 		expect(after.needsReason).toContain("cannot lock ref");
+	});
+
+	test("a parked release refuses to publish when the pinned origin sits in a worker root", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		const dir = store.path;
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({ originUrl: dir, targetBranch: "main" });
+		const task = await parkedRelease(store);
+		setWorkerRoots([dir]);
+		try {
+			await loop.schedule();
+			// The guard refusal is a store write away: settled() awaits the card's
+			// landed state instead of a guessed flush count.
+			await settled(store, task.id);
+		} finally {
+			setWorkerRoots([]);
+		}
+
+		// The publish never ran: the pinned read refused before git ran.
+		expect(record.publishRelease).toHaveLength(0);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("sits under worker-writable");
 	});
 
 	test("a parked release tags the pinned origin's tip, not the local tracking ref", async () => {

@@ -264,6 +264,7 @@ import type {
 	worktreeLinked,
 } from "./worktree.ts";
 import {
+	checkPinnedRemote,
 	commitMeta,
 	commitSubjects,
 	git,
@@ -3513,11 +3514,18 @@ export function createTurnLoop(
 		target: string,
 	): Promise<string | null> {
 		if (originUrl === null || !target.startsWith("origin/")) return null;
+		// The guard every pinned call runs, adjacent to the call: the checkout's config
+		// is worker-writable, and an insteadOf rewrite planted after the resolver's
+		// fetch would steer this read to a repo the pin never named.
+		const guard = await checkPinnedRemote(mainPath, originUrl);
+		if (guard !== null) throw new Error(guard);
 		const ref = `refs/heads/${target.slice("origin/".length)}`;
 		const ls = await git(["ls-remote", originUrl, ref], mainPath);
 		if (ls.code !== 0)
 			throw new Error(
-				`cannot read ${target} from the pinned origin: ${ls.stderr.trim()}`,
+				redactUrlCredentials(
+					`cannot read ${target} from the pinned origin: ${ls.stderr.trim()}`,
+				),
 			);
 		const tip = ls.stdout.trim().split("\t")[0] ?? "";
 		if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip))
