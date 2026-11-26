@@ -527,7 +527,7 @@ describe("receiveCommands", () => {
 		// the stdin handed to http-backend must carry both commands and the flush byte for
 		// byte, or a valid fragmented push would lose its ref updates.
 		const first = pkt(`${a} ${b} refs/heads/x\n`);
-		const rest = pkt(`${b} ${a} refs/heads/y\n`) + "0000PACK....";
+		const rest = `${pkt(`${b} ${a} refs/heads/y\n`)}0000PACK....`;
 		const r = await receiveCommands(
 			new Request("http://board.invalid/git/alpha.git/git-receive-pack", {
 				method: "POST",
