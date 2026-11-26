@@ -1471,10 +1471,13 @@ derives the endpoint from the origin it is given, in git-lfs's own derivation
 on the upload's command line only — nothing lands in the project's git config,
 so an origin change re-derives at the next push and nothing can go stale. On a
 GitHub host (github.com, a `*.ghe.com` tenant, or the configured host) the pin
-is skipped when the repo config already holds `lfs.url` or
-`remote.<remote>.lfsurl`: the operator's own endpoint wins, its lock behavior
-included. A config a work turn planted would win with it; that trade is the
-operator's call. Non-GitHub hosts keep the unconditional pin: today's
+is skipped when the repo config already holds `lfs.url`: the operator's own
+endpoint wins, its lock behavior included. A `remote.<remote>.lfsurl` value
+without `lfs.url` is pinned for the call instead, because a URL-based
+`git lfs push` ignores the remote-scoped key and would derive the origin's
+own endpoint. Nothing is stored either way. A config a work turn planted
+would win with the operator's rule; that trade is the operator's call.
+Non-GitHub hosts keep the unconditional pin: today's
 behavior. The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
 verified against git-lfs 3.6.1), the URL argument means `remote.<name>.lfsurl`
 is never read, and the lock pin turns the locking API off: the board never uses

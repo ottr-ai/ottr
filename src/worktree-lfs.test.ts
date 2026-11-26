@@ -860,9 +860,8 @@ describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
 	});
 
 	test("an operator-set remote.origin.lfsurl skips the pins too (the mixed-key case)", async () => {
-		// git-lfs 3.6.1 resolves lfs.url above remote.<remote>.lfsurl, but the board's
-		// decision needs no precedence: either key holding a value skips the pins, so
-		// the push follows whatever the operator's config really resolves to.
+		// git-lfs 3.6.1 resolves lfs.url above remote.<remote>.lfsurl, so with both set
+		// the push follows lfs.url: no pins at all, whatever they would have said.
 		const repo = await repoAt("https://github.com/octo/repo");
 		try {
 			await run(
@@ -881,6 +880,35 @@ describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
 			expect(pins).toEqual([]);
 			expect(await pushEnvEndpoint(repo, pins)).toBe(
 				"https://github.com/octo/repo/info/lfs (auth=none)",
+			);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
+	test("a remote-scoped lfsurl without lfs.url is pinned for the call", async () => {
+		// A URL-based git lfs push (the upload's first argument is the pinned URL, not
+		// the remote name) ignores remote.<remote>.lfsurl entirely, so skipping the
+		// pins for a remote-only value would leave the upload on the derived endpoint.
+		// The board therefore carries the operator's remote-scoped value on the
+		// command line for that call and stores nothing.
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(
+				repo,
+				"config",
+				"remote.origin.lfsurl",
+				"https://lfs.example.com/api/octo/repo",
+			);
+			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
+			expect(pins).toEqual([
+				"-c",
+				"lfs.url=https://lfs.example.com/api/octo/repo",
+				"-c",
+				"lfs.https://lfs.example.com/api/octo/repo.locksverify=false",
+			]);
+			expect(await pushEnvEndpoint(repo, pins)).toBe(
+				"https://lfs.example.com/api/octo/repo (auth=none)",
 			);
 		} finally {
 			rmSync(join(repo, ".."), { recursive: true, force: true });
@@ -956,6 +984,61 @@ describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
 			);
 		} finally {
 			cleanup(f.dir, f.close);
+		}
+	}, 20_000);
+
+	test("a remote-scoped lfsurl wins a URL-arg push without any stored config", async () => {
+		// The blocker's probe, as a regression: a push whose first argument is the
+		// pinned URL ignores remote.<remote>.lfsurl entirely and contacted the derived
+		// <originUrl>.git/info/lfs instead of the mirror. The board therefore carries
+		// the remote-scoped value on the upload's command line: the mirror receives the
+		// object, the origin's own LFS API sees no batch, and nothing is stored. The
+		// repo insteadOf entry keeps git-lfs's ref read of the github URL on the local
+		// fixture, and the URL-scoped dead proxy turns a pre-fix batch to the real
+		// github.com into an instant local refusal instead of a network contact.
+		const f = await fixture({ lfs: true });
+		const f2dir = mkdtempSync(join(tmpdir(), "ottr-lfs-mirror2-"));
+		const f2bare = join(f2dir, "bare.git");
+		await run(f2dir, "init", "-q", "--bare", "-b", "main", f2bare);
+		const f2 = serveGitLfs(f2dir, f2bare);
+		const dead = Bun.serve({ port: 0, fetch: () => new Response(null) });
+		const deadPort = dead.port;
+		dead.stop(true);
+		try {
+			await run(
+				f.main,
+				"config",
+				`url.${f.url}.insteadOf`,
+				"https://github.com/octo",
+			);
+			await run(f.main, "config", "remote.origin.lfsurl", `${f2.url}/info/lfs`);
+			await run(
+				f.main,
+				"config",
+				"http.https://github.com/.proxy",
+				`http://127.0.0.1:${deadPort}`,
+			);
+			const tip = await run(f.main, "rev-parse", "refs/heads/main");
+			const base = await run(f.main, "rev-parse", "origin/main");
+			expect(
+				await pushLfsObjects(
+					f.main,
+					"https://github.com/octo/repo",
+					"main",
+					tip,
+					base,
+				),
+			).toBeNull();
+			expect(readFileSync(f2.storeFile, "utf8")).toContain(f.oid);
+			expect(f.requests.filter((p) => p.includes("/objects/batch"))).toEqual(
+				[],
+			);
+			expect(await run(f.main, "config", "lfs.url").catch(() => "unset")).toBe(
+				"unset",
+			);
+		} finally {
+			cleanup(f.dir, f.close);
+			cleanup(f2dir, f2.close);
 		}
 	}, 20_000);
 });

@@ -2501,10 +2501,15 @@ async function catFileBatch(
  *
  * OTTR-1283 (operator decision): an operator's own `lfs.url` or
  * `remote.origin.lfsurl` in the repo config must win. On a GitHub-host origin (the
- * board's isGithubRepoHost rule), either key holding a value skips both pins — the
- * upload then follows the repo config endpoint, its lock behavior included, and a
- * config a work turn planted would win with it; that trade is the operator's call.
- * Non-GitHub http(s) hosts keep the unconditional pin: today's behavior.
+ * board's isGithubRepoHost rule), a `lfs.url` value skips both pins — git-lfs resolves
+ * it above every other source, so the upload follows it, lock behavior included. A
+ * `remote.origin.lfsurl` value without `lfs.url` is carried on the command line as
+ * `lfs.url` for this call: a URL-based `git lfs push` (the upload's first argument is
+ * the pinned URL, not the remote name) ignores the remote-scoped key entirely and
+ * would derive the origin's own endpoint instead of the operator's. Either way
+ * nothing is stored, and a config a work turn planted in the shared workspace would
+ * win with the operator's rule; that trade is the operator's call. Non-GitHub
+ * http(s) hosts keep the unconditional pin: today's behavior.
  */
 export async function lfsEndpointPin(
 	mainPath: string,
@@ -2513,9 +2518,21 @@ export async function lfsEndpointPin(
 	if (!/^https?:\/\//i.test(originUrl)) return [];
 	const u = new URL(originUrl);
 	if (isGithubRepoHost(u.host, githubHost().host)) {
-		for (const key of ["lfs.url", "remote.origin.lfsurl"]) {
-			const r = await git(["config", key], mainPath).catch(() => null);
-			if (r !== null && r.code === 0 && r.stdout.trim() !== "") return [];
+		const lfsUrl = await git(["config", "lfs.url"], mainPath).catch(() => null);
+		if (lfsUrl !== null && lfsUrl.code === 0 && lfsUrl.stdout.trim() !== "")
+			return [];
+		const remote = await git(
+			["config", "remote.origin.lfsurl"],
+			mainPath,
+		).catch(() => null);
+		if (remote !== null && remote.code === 0 && remote.stdout.trim() !== "") {
+			const endpoint = remote.stdout.trim();
+			return [
+				"-c",
+				`lfs.url=${endpoint}`,
+				"-c",
+				`lfs.${endpoint}.locksverify=false`,
+			];
 		}
 	}
 	const endpoint = lfsEndpointFor(originUrl);
