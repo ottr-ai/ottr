@@ -18,8 +18,8 @@ import { dirname, join } from "node:path";
 import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
-import { SWEEP_CLOCK_SKEW_MS, sweepTmpDirs } from "./tmpsweep.ts";
 import type { KillExpect } from "./staleTurn.ts";
+import { SWEEP_CLOCK_SKEW_MS, sweepTmpDirs } from "./tmpsweep.ts";
 import { projectTurnUid } from "./turnUid.ts";
 import {
 	detachedRuns,
