@@ -66,6 +66,7 @@ import {
 	workCheckSendBack,
 } from "./prompts.ts";
 import { openPullRequest } from "./prs.ts";
+import { publishRelease as realPublishRelease } from "./release.ts";
 import {
 	hitUsageLimit,
 	startRun as realStartRun,
@@ -135,11 +136,11 @@ import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
 	isClean as gitIsClean,
-	commitsAhead as realCommitsAhead,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
 	cleanMergeTree as realCleanMergeTree,
+	commitsAhead as realCommitsAhead,
 	fetchOriginBranch as realFetchOriginBranch,
 	fetchPrHead as realFetchPrHead,
 	prIntegrated as realPrIntegrated,
@@ -159,7 +160,6 @@ import {
 	setWorkerRoots,
 	slugify,
 } from "./worktree.ts";
-import { publishRelease as realPublishRelease } from "./release.ts";
 
 // ---- fakes -----------------------------------------------------------------
 
@@ -2014,7 +2014,11 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 // origin" button — the real resolveTarget runs against real git here.
 test("a merge turn on an origin without the target branch parks naming Push to origin", async () => {
 	const run = (cwd: string, ...args: string[]): void => {
-		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore", env: fixtureGitEnv() });
+		execSync(`git ${args.join(" ")}`, {
+			cwd,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
 	};
 	const { store, loop } = await setup({ resolveTarget: realResolveTarget });
 	// The main checkout holds a commit; origin is an empty bare repo.
@@ -3304,7 +3308,10 @@ describe("turn sessions, steering and images", () => {
 		writeFileSync(join(wt, "shots", "fresh.png"), Uint8Array.from([...png, 1]));
 		execSync("git init -q -b main", { cwd: wt, env: fixtureGitEnv() });
 		execSync("git add shots/committed.png", { cwd: wt, env: fixtureGitEnv() });
-		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git -c user.name=t -c user.email=t@t commit -qm c", {
+			cwd: wt,
+			env: fixtureGitEnv(),
+		});
 		await loop.runTurn(store.name, task.id);
 		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toEqual(["1.png"]); // the tracked shot never arrives
@@ -3358,7 +3365,10 @@ describe("turn sessions, steering and images", () => {
 		);
 		execSync("git init -q -b main", { cwd: wt, env: fixtureGitEnv() });
 		execSync("git add .", { cwd: wt, env: fixtureGitEnv() });
-		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt, env: fixtureGitEnv() });
+		execSync("git -c user.name=t -c user.email=t@t commit -qm c", {
+			cwd: wt,
+			env: fixtureGitEnv(),
+		});
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
@@ -5000,9 +5010,7 @@ describe("turn release cards", () => {
 
 	test("commit-push landing pushes the changes and files no card", async () => {
 		const record = baseRecord();
-		let landed:
-			| Parameters<TurnOps["landPostReleaseCommand"]>[0]
-			| undefined;
+		let landed: Parameters<TurnOps["landPostReleaseCommand"]>[0] | undefined;
 		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
@@ -5562,10 +5570,7 @@ describe("turn merge outcomes", () => {
 	/** A superseded report whose claims hold: follow-up card linked, target tips equal.
 	 * `gapId` is a getter: the gap card is created after setup, before the turn runs. */
 	function supersededRun(record: Recorded, gapId: () => string) {
-		return async (o: {
-			prompt: string;
-			onSession?: (sid: string) => void;
-		}) => {
+		return async (o: { prompt: string; onSession?: (sid: string) => void }) => {
 			record.runs.push(o as never);
 			await o.onSession?.("sess-1");
 			return {
@@ -5705,12 +5710,22 @@ describe("turn merge outcomes", () => {
 			followUpOfProject: other.name,
 		});
 		// Foreign cards: the same id, right parent id, every board but this one.
-		const inOther = await other.createTask("foreign shadow", null, "work", "ZZ-1");
+		const inOther = await other.createTask(
+			"foreign shadow",
+			null,
+			"work",
+			"ZZ-1",
+		);
 		await other.updateTask(inOther.id, {
 			followUpOf: task.id,
 			followUpOfProject: third.name,
 		});
-		const inThird = await third.createTask("third shadow", null, "work", "ZZ-1");
+		const inThird = await third.createTask(
+			"third shadow",
+			null,
+			"work",
+			"ZZ-1",
+		);
 		await third.updateTask(inThird.id, {
 			followUpOf: task.id,
 			followUpOfProject: other.name,
@@ -5752,7 +5767,12 @@ describe("turn merge outcomes", () => {
 			branch: "ott/m",
 		});
 		// This board: same id, points elsewhere.
-		const noise = await store.createTask("unrelated card", null, "work", "ZZ-1");
+		const noise = await store.createTask(
+			"unrelated card",
+			null,
+			"work",
+			"ZZ-1",
+		);
 		await store.updateTask(noise.id, { followUpOf: noise.id });
 		// Scanned before the linked one: same id, wrong board named.
 		const mismatch = await third.createTask("mismatch", null, "work", "ZZ-1");
@@ -5811,9 +5831,7 @@ describe("turn merge outcomes", () => {
 				statusFiles: realStatusFiles,
 				targetCommits: realTargetCommits,
 				targetContains: realTargetContains,
-				removeWorktree: async (
-					o: Parameters<TurnOps["removeWorktree"]>[0],
-				) => {
+				removeWorktree: async (o: Parameters<TurnOps["removeWorktree"]>[0]) => {
 					await realRemoveWorktree(o);
 					record.removeWorktree.push(o);
 				},
@@ -8112,7 +8130,10 @@ describe("turn research cards", () => {
 					wtPath = o.worktreePath;
 					mkdirSync(o.worktreePath, { recursive: true });
 					// The real saveDoneFiles runs git ls-files/status: a repo, not a plain dir.
-					execSync(`git init -q "${o.worktreePath}"`, { stdio: "ignore", env: fixtureGitEnv() });
+					execSync(`git init -q "${o.worktreePath}"`, {
+						stdio: "ignore",
+						env: fixtureGitEnv(),
+					});
 					writeFileSync(
 						join(o.worktreePath, RESEARCH_REPORT),
 						"# findings\n\nthe body",
@@ -10685,7 +10706,12 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				targetSha: async (mainPath: string, ref: string) => {
 					const r = Bun.spawnSync(
 						["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
-						{ cwd: mainPath, stdout: "pipe", stderr: "pipe", env: fixtureGitEnv() },
+						{
+							cwd: mainPath,
+							stdout: "pipe",
+							stderr: "pipe",
+							env: fixtureGitEnv(),
+						},
 					);
 					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
 				},
@@ -10845,7 +10871,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	test("cancel keeps a real dirty worktree under the Cancel prefix (R5-2)", async () => {
 		const repoDir = mkdtempSync(join(tmpdir(), "turn-cancel-repo-"));
 		dirs.push(repoDir);
-		const run = (cmd: string) => execSync(cmd, { stdio: "ignore", env: fixtureGitEnv() });
+		const run = (cmd: string) =>
+			execSync(cmd, { stdio: "ignore", env: fixtureGitEnv() });
 		run(`git init -q ${repoDir}`);
 		run(`git -C ${repoDir} config user.email t@t`);
 		run(`git -C ${repoDir} config user.name t`);
@@ -17126,7 +17153,11 @@ describe("turn release line hold (dependabot gate park)", () => {
 		// Base commit: the unbumped lock, so origin/main:bun.lock is the scan's
 		// base. No remote: the ref alone answers rev-parse and cat-file.
 		const git = (...args: string[]): void => {
-			execSync(`git ${args.join(" ")}`, { cwd: wt, stdio: "ignore", env: fixtureGitEnv() });
+			execSync(`git ${args.join(" ")}`, {
+				cwd: wt,
+				stdio: "ignore",
+				env: fixtureGitEnv(),
+			});
 		};
 		writeFileSync(join(wt, "bun.lock"), realLock);
 		writeFileSync(
@@ -18687,9 +18718,7 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		};
 		const { store, projects, loop } = await setupWith(record, {
 			resolveTarget: realResolveTarget,
-			publishRelease: async (
-				o: Parameters<TurnOps["publishRelease"]>[0],
-			) => {
+			publishRelease: async (o: Parameters<TurnOps["publishRelease"]>[0]) => {
 				record.publishRelease.push(o);
 				return await realPublishRelease(o);
 			},
@@ -18790,9 +18819,7 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 				sha: "planted0",
 				warning: null,
 			}),
-			publishRelease: async (
-				o: Parameters<TurnOps["publishRelease"]>[0],
-			) => {
+			publishRelease: async (o: Parameters<TurnOps["publishRelease"]>[0]) => {
 				record.publishRelease.push(o);
 				return await realPublishRelease(o);
 			},
@@ -28628,7 +28655,10 @@ describe("turn checkout guard (other projects)", () => {
 						cwd: repo,
 						stdout: "pipe",
 						stderr: "pipe",
-						env: env === undefined ? fixtureGitEnv() : { ...fixtureGitEnv(), ...env },
+						env:
+							env === undefined
+								? fixtureGitEnv()
+								: { ...fixtureGitEnv(), ...env },
 					});
 					if (r.exitCode !== 0)
 						throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
@@ -30262,9 +30292,7 @@ describe("stored review findings", () => {
 			`Refuted by validation run #${v1.id} on ${date}: the cache names are content hashes`,
 		);
 		expect(after.worktree).toBe("/wt/ottr-refuted-lead");
-		expect(after.details).toContain(
-			"the cancel kept the worktree: M lead.ts",
-		);
+		expect(after.details).toContain("the cancel kept the worktree: M lead.ts");
 		expect(record.removeWorktree).toHaveLength(0);
 		expect(await logText(store, v1.id)).toContain(
 			`refuted lead #${refuted.id} was started; the cancel kept its worktree and the verdict still cancelled it`,
@@ -32493,9 +32521,7 @@ describe("prompt gate", () => {
 			},
 		]);
 		for (const q of after.asked ?? []) {
-			expect(q.question.includes("Ask the user with the ask tool")).toBe(
-				false,
-			);
+			expect(q.question.includes("Ask the user with the ask tool")).toBe(false);
 			expect(/^(?:[-*+]|\d+[.)])\s/.test(q.question)).toBe(false);
 		}
 		expect(calls).toBe(0);
@@ -33599,10 +33625,7 @@ describe("turn code scanning fallback file", () => {
 		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
-				createWorktree: async (o: {
-					worktreePath: string;
-					branch: string;
-				}) => {
+				createWorktree: async (o: { worktreePath: string; branch: string }) => {
 					record.createWorktree.push(o);
 					execSync(`git worktree add -q "${o.worktreePath}" -b ${o.branch}`, {
 						cwd: store.path,

@@ -2,10 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
 import { modelFallbacks, modelRoles } from "./models.ts";
-import {
-	keepSummaryCard,
-	nonProductGlobs,
-} from "./nonProductPaths.ts";
+import { keepSummaryCard, nonProductGlobs } from "./nonProductPaths.ts";
 import {
 	RELEASE_SUMMARY_CHUNK_INSTRUCTIONS,
 	RELEASE_SUMMARY_INSTRUCTIONS,
