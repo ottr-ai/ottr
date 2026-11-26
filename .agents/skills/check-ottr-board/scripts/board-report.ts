@@ -320,7 +320,7 @@ function mergeHoldFor(
 	}
 }
 
-/** leadValidationHold's hold for the card c (OTTR-1247), null when the loader
+/** leadValidationHold's hold for the card c, null when the loader
  * found no scheduler, an error note in place of the hold when it throws. */
 function leadHoldFor(c: Card, leadHold: LeadHold | null): string | null {
 	if (leadHold === null) return null;
