@@ -482,8 +482,14 @@ export function chownTree(root: string, ids: TurnIdentity): void {
 /** chown every entry below an already-pinned directory fd, race-free by the
  * same /proc/self/fd anchoring; the pinned inode itself is the caller's (the
  * test seam for the rename race: the caller can rename the root mid-flight
- * and prove the walk follows the inode, not the path). */
-export function chownTreeFd(rootFd: number, ids: TurnIdentity): void {
+ * and prove the walk follows the inode, not the path). `listDir` is the test
+ * seam for a directory unlinked mid-walk; the default lists the pinned fd's
+ * magic link exactly as production does. */
+export function chownTreeFd(
+	rootFd: number,
+	ids: TurnIdentity,
+	listDir: (viaDir: string) => string[] = (p) => readdirSync(p),
+): void {
 	// A dir fd stays open until its listing pass is done: each child path is
 	// `/proc/self/fd/<parentFd>/<entry>`, so the parent must live until every
 	// child is opened. Child dir fds are closed after their own pass.
@@ -492,7 +498,19 @@ export function chownTreeFd(rootFd: number, ids: TurnIdentity): void {
 		const dirFd = dirs.pop();
 		if (dirFd === undefined) break;
 		const viaDir = `/proc/self/fd/${dirFd}`;
-		for (const entry of readdirSync(viaDir)) {
+		let entries: string[];
+		try {
+			entries = listDir(viaDir);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			// A directory unlinked mid-walk reads ENOENT on its magic link: the
+			// listing is gone and with it everything below, like the child-open
+			// ENOENT branch. The walk goes on; the caller's root fd stays open
+			// (chownTree closes it), and only fds this walk opened close here.
+			if (dirFd !== rootFd) closeSync(dirFd);
+			continue;
+		}
+		for (const entry of entries) {
 			const child = `${viaDir}/${entry}`;
 			let fd: number;
 			try {

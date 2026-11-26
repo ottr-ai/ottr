@@ -5,6 +5,7 @@ import {
 	chownSync,
 	closeSync,
 	existsSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
@@ -866,6 +867,106 @@ rootTest(
 		}
 	},
 );
+
+test("chownTreeFd finishes when a pinned directory is removed mid-walk", async () => {
+	const ws = freshDir("removed-ws");
+	const ids = selfIds();
+	const root = join(ws, "root");
+	mkdirSync(join(root, "gone"), { recursive: true });
+	mkdirSync(join(root, "stay"), { recursive: true });
+	const survivor = join(root, "stay", "s.txt");
+	writeFileSync(survivor, "x\n");
+	// The walk's chowns must land on a later clock tick than the fixture's
+	// creation, so the ctime comparison below proves the chown happened.
+	// Fake timers cannot order these stamps: the kernel writes inode ctimes
+	// from the platform clock, so crossing the tick needs a real delay.
+	await Bun.sleep(15);
+	const before = statSync(survivor).ctimeMs;
+	const goneIno = statSync(join(root, "gone")).ino;
+
+	// The removed-mid-walk seam: real listings everywhere, except the pinned
+	// 'gone' fd — the test removes that subdirectory after the walk pinned it
+	// and its listing then reports the unlink exactly as the kernel's scandir
+	// does on a magic link of an unlinked directory.
+	let goneFd = -1;
+	const listDir = (viaDir: string): string[] => {
+		const m = /^\/proc\/self\/fd\/(\d+)$/.exec(viaDir);
+		if (m && statSync(viaDir).ino === goneIno) {
+			goneFd = Number(m[1]);
+			rmSync(join(root, "gone"), { recursive: true, force: true });
+			throw Object.assign(
+				new Error(`ENOENT: no such file or directory, scandir '${viaDir}'`),
+				{ code: "ENOENT", errno: -2, syscall: "scandir", path: viaDir },
+			);
+		}
+		return readdirSync(viaDir);
+	};
+
+	const rootFd = openPinned(root);
+	try {
+		chownTreeFd(rootFd, ids, listDir);
+		// The walk finished: the surviving subtree was chowned (its ctime
+		// moved), the walk closed the removed dir's own fd instead of leaking
+		// it, and the caller's root fd is still open.
+		expect(statSync(survivor).ctimeMs).toBeGreaterThan(before);
+		expect(statSync(join(root, "stay")).ctimeMs).toBeGreaterThan(before);
+		expect(goneFd).toBeGreaterThan(0);
+		expect(() => fstatSync(goneFd)).toThrow();
+		expect(fstatSync(rootFd).isDirectory()).toBe(true);
+	} finally {
+		closeSync(rootFd);
+	}
+});
+
+test("chownTreeFd keeps the caller's root fd when the root listing ENOENTs", () => {
+	const ws = freshDir("root-gone-ws");
+	const ids = selfIds();
+	const root = join(ws, "root");
+	mkdirSync(root, { recursive: true });
+	const rootFd = openPinned(root);
+	try {
+		const enoent = Object.assign(new Error("scandir enoent"), {
+			code: "ENOENT",
+			errno: -2,
+			syscall: "scandir",
+			path: `/proc/self/fd/${rootFd}`,
+		});
+		// The root itself unlinked mid-walk: the walk continues and leaves the
+		// caller's fd open (the caller closes it, as chownTree's finally does).
+		chownTreeFd(rootFd, ids, () => {
+			throw enoent;
+		});
+		expect(fstatSync(rootFd).isDirectory()).toBe(true);
+	} finally {
+		closeSync(rootFd);
+	}
+});
+
+test("chownTreeFd still throws on a readdir failure that is not ENOENT", () => {
+	const ws = freshDir("readdir-eacces-ws");
+	const ids = selfIds();
+	const root = join(ws, "root");
+	mkdirSync(join(root, "sub"), { recursive: true });
+	const rootFd = openPinned(root);
+	try {
+		const eacces = Object.assign(new Error("permission denied, scandir"), {
+			code: "EACCES",
+			errno: -13,
+			syscall: "scandir",
+		});
+		let err: unknown;
+		try {
+			chownTreeFd(rootFd, ids, () => {
+				throw eacces;
+			});
+		} catch (e) {
+			err = e;
+		}
+		expect((err as NodeJS.ErrnoException).code).toBe("EACCES");
+	} finally {
+		closeSync(rootFd);
+	}
+});
 
 rootTest("closeProjectDir chowns the whole project data tree", () => {
 	const root = freshDir("close-root");
