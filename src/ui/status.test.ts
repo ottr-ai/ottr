@@ -10,6 +10,7 @@ import type { TaskCard } from "../types.ts";
 import {
 	alarmLabel,
 	cardMark,
+	type DepHoldContext,
 	etaLeft,
 	holdFor,
 	holdLeft,
@@ -99,9 +100,9 @@ test("statusLine: a cross-project dependency id resolves to its title", () => {
 	);
 });
 
-test("statusLine: a foreign dependency's own hold rides the dep line", () => {
-	// The board's foreign index hands back the full wire card, so the hold facts
-	// ride the same lookup (depIndexOf keeps every project's TaskCard).
+test("statusLine: a foreign dependency's hold reads its own project", () => {
+	// The board's foreign index hands back the full wire card, and the hold reads
+	// the foreign project's context — never the follower's cards or resolver.
 	const foreign: DepIndex = (id) =>
 		id === "AGEN-162"
 			? {
@@ -117,9 +118,90 @@ test("statusLine: a foreign dependency's own hold rides the dep line", () => {
 		needsReason: "waiting for #AGEN-162 Sync the alate gate rule",
 		dependsOn: ["AGEN-162"],
 	});
-	expect(statusLine(parked, true, undefined, false, [], foreign)).toBe(
-		`waiting for #AGEN-162 Sync the alate gate rule (${PUSH_HOLD})`,
+	const foreignHolds: (id: string) => DepHoldContext | null = (id) =>
+		id === "AGEN-162" ? { cards: [] } : null;
+	// An unrelated review runs in the follower's project: the foreign merge gate
+	// must not see it (send-back 2, blocker 1).
+	const localReview = review({
+		stage: "in_progress",
+		state: "running",
+		createdAt: Date.now() - 60_000,
+	});
+	expect(
+		statusLine(
+			parked,
+			true,
+			undefined,
+			false,
+			[localReview],
+			foreign,
+			foreignHolds,
+		),
+	).toBe(`waiting for #AGEN-162 Sync the alate gate rule (${PUSH_HOLD})`);
+	// A live review in the foreign project IS the dependency's hold (blocker 2).
+	const foreignReview = review({
+		id: "r9",
+		title: "Agent-data review",
+		stage: "in_progress",
+		state: "running",
+		createdAt: Date.now() - 60_000,
+	});
+	expect(
+		statusLine(parked, true, undefined, false, [], foreign, (id) =>
+			id === "AGEN-162" ? { cards: [foreignReview] } : null,
+		),
+	).toBe(
+		"waiting for #AGEN-162 Sync the alate gate rule (waiting for the review to finish)",
 	);
+	// A nested dependsOn id resolves relative to the foreign project (blocker 3).
+	const nestedForeign: DepIndex = (id) =>
+		id === "AGEN-162"
+			? {
+					id,
+					title: "Sync rules",
+					stage: "todo",
+					cancelledAt: null,
+					dependsOn: ["c0ffee00"],
+				}
+			: null;
+	const legacy = card({
+		id: "c0ffee00",
+		title: "Legacy prerequisite",
+		stage: "todo",
+	});
+	const nestedIndex: DepIndex = (id) =>
+		id === "c0ffee00"
+			? { id, title: "Legacy prerequisite", stage: "todo", cancelledAt: null }
+			: null;
+	expect(
+		statusLine(parked, true, undefined, false, [], nestedForeign, (id) =>
+			id === "AGEN-162" ? { cards: [legacy], index: nestedIndex } : null,
+		),
+	).toBe(
+		"waiting for #AGEN-162 Sync rules (waiting for #c0ffee00 Legacy prerequisite)",
+	);
+	// No foreign context: the plain wording stays.
+	expect(statusLine(parked, true, undefined, false, [], foreign)).toBe(
+		"waiting for #AGEN-162 Sync the alate gate rule",
+	);
+	// A dependency whose turn already runs names no gate (blocker 4): a review
+	// can start after its merge starts, and the running card shows its own words.
+	const runningDep = card({
+		id: "d1",
+		title: "Schema",
+		stage: "merging",
+		state: "running",
+		pushHold: true,
+	});
+	expect(
+		statusLine(
+			t({ stage: "in_progress", dependsOn: ["d1"] }),
+			true,
+			undefined,
+			false,
+			[runningDep],
+		),
+	).toBe("waiting for #d1 Schema");
 });
 
 test("statusLine: every held dependency names its hold, not only one", () => {

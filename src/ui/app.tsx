@@ -269,6 +269,7 @@ import {
 	alarmLabel,
 	bellAlarms,
 	cardMark,
+	type DepHoldContext,
 	holdFor,
 	holdLeft,
 	isProposal,
@@ -4547,6 +4548,42 @@ function depIndexOf(
 	return own === undefined ? undefined : (id) => findDep(id, deps, own);
 }
 
+/** OTTR-1321: the project context each dependency's own hold reads — the dependency
+ * project's own cards (its merge gate scans its own open reviews, never the follower
+ * project's) and its project's resolver (nested dependsOn ids resolve relative to it).
+ * null when no card names the id, so the line keeps the plain wording. */
+function depHoldContexts(
+	projects: ProjectView[],
+	tasks: TaskCard[],
+): (id: string) => DepHoldContext | null {
+	const cards = new Map<string, TaskCard>();
+	const byProject = new Map<string, TaskCard[]>();
+	for (const t of tasks) {
+		cards.set(t.id, t);
+		const list = byProject.get(t.project);
+		if (list === undefined) byProject.set(t.project, [t]);
+		else list.push(t);
+	}
+	const indexes = new Map<string, DepIndex | undefined>();
+	const indexOf = (name: string): DepIndex | undefined => {
+		const hit = indexes.get(name);
+		if (hit !== undefined) return hit;
+		const project = projects.find((p) => p.name === name);
+		const index =
+			project === undefined ? undefined : depIndexOf(projects, tasks, project);
+		indexes.set(name, index);
+		return index;
+	};
+	return (id: string): DepHoldContext | null => {
+		const card = cards.get(id);
+		if (card === undefined) return null;
+		return {
+			cards: byProject.get(card.project) ?? [],
+			index: indexOf(card.project),
+		};
+	};
+}
+
 export function ProjectBoard({
 	project,
 	tasks,
@@ -4561,6 +4598,7 @@ export function ProjectBoard({
 	draining,
 	tick,
 	foreignDeps,
+	foreignHolds,
 	userLayer,
 	navigate,
 }: {
@@ -4582,6 +4620,10 @@ export function ProjectBoard({
 	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
 	 * foreign card; absent before the first state frame or for an unknown project. */
 	foreignDeps?: DepIndex;
+	/** OTTR-1321: the dependency project's context per foreign id, so a foreign
+	 * dependency's hold reads its own project's reviews and resolver; absent keeps
+	 * the plain wording. */
+	foreignHolds?: (id: string) => DepHoldContext | null;
 	/** The provisioned user layer; absent before the first provisioning answer, and absent
 	 *  in hosted mode (the operator owns the workers' layer), so the markers stay out. */
 	userLayer?: ProvisioningResponse["userLayer"] | null;
@@ -5201,6 +5243,7 @@ export function ProjectBoard({
 								}
 								projectTasks={tasks}
 								foreignDeps={foreignDeps}
+								foreignHolds={foreignHolds}
 								onRerelease={rerelease}
 								hasRules={project.hasRules}
 								github={project.github}
@@ -6600,6 +6643,7 @@ export function LaneCol({
 	tasks,
 	projectTasks,
 	foreignDeps,
+	foreignHolds,
 	hasRules,
 	github,
 	deltas,
@@ -6647,6 +6691,10 @@ export function LaneCol({
 	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
 	 * foreign card; absent before the first state frame or for an unknown project. */
 	foreignDeps?: DepIndex;
+	/** OTTR-1321: the dependency project's context per foreign id, so a foreign
+	 * dependency's hold reads its own project's reviews and resolver; absent keeps
+	 * the plain wording. */
+	foreignHolds?: (id: string) => DepHoldContext | null;
 	/** Cancels the stalled release card this id names and opens Create release; set only for
 	 * the release flow. */
 	onRerelease?: (id: string) => void;
@@ -6729,7 +6777,15 @@ export function LaneCol({
 				holds.set(t.id, hold);
 				statuses.set(
 					t.id,
-					statusLine(t, hasRules, hold, draining, projectTasks, foreignDeps),
+					statusLine(
+						t,
+						hasRules,
+						hold,
+						draining,
+						projectTasks,
+						foreignDeps,
+						foreignHolds,
+					),
 				);
 				rereleases.set(t.id, reReleaseOf(t, projectTasks));
 			}
@@ -6738,7 +6794,15 @@ export function LaneCol({
 		scan(tasks);
 		if (parked !== undefined) scan(parked);
 		return { holds, statuses, rereleases };
-	}, [projectTasks, tasks, parked, hasRules, draining, foreignDeps]);
+	}, [
+		projectTasks,
+		tasks,
+		parked,
+		hasRules,
+		draining,
+		foreignDeps,
+		foreignHolds,
+	]);
 	// One drag wiring per queued card, rebuilt only when the drag state or the queued order
 	// changes: a fresh object on every frame would break the memoized Card's shallow compare.
 	// The handlers capture the id, never the card object, so a changed card elsewhere in the
@@ -17892,6 +17956,7 @@ function AppMainContent(p: {
 			navigate={navigate}
 			tasks={tasks.filter((t) => t.project === project.name)}
 			foreignDeps={depIndexOf(projects, tasks, project)}
+			foreignHolds={depHoldContexts(projects, tasks)}
 			deltas={deltas}
 			open={openTask}
 			seenAnswers={seenAnswers}

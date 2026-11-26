@@ -124,7 +124,7 @@ export function holdLeft(
 /** The project cards the queued dependency line reads: a lane list carries the wire
  * card, so the fields a dependency's own hold needs ride along when the caller passes
  * full cards; a list without them keeps the plain dependency wording. */
-type StatusTasks = ReviewTask &
+export type StatusTasks = ReviewTask &
 	Pick<
 		Task,
 		| "title"
@@ -138,6 +138,16 @@ type StatusTasks = ReviewTask &
 	> &
 	Partial<Pick<TaskCard, "pushHold" | "vmHold" | "sandboxLead">>;
 
+/** The project context a dependency's own hold reads (OTTR-1321 send-back 2): the
+ * dependency project's own cards — its merge gate scans its own open reviews, never
+ * the follower project's — and its project's resolver, whose `own` is that project,
+ * so nested dependsOn ids resolve relative to it. A foreign dependency without a
+ * context keeps the plain wording. */
+export type DepHoldContext = {
+	cards: readonly StatusTasks[];
+	index?: DepIndex;
+};
+
 /** A dependency card the status line may name: the board's cross-project index hands
  * back the full wire card (depIndexOf keeps every project's TaskCard), so the hold
  * fields may ride along; a narrower index (the scheduler's store lookups) omits them
@@ -145,16 +155,19 @@ type StatusTasks = ReviewTask &
 type IndexedDep = DepCard & Partial<TaskCard>;
 
 /** The dependency's own hold, in the order its own card shows it: a live usage-limit
- * countdown first, then holdFor (merge gate, push hold, its own dependencies). The
- * bridge fills only the fields a narrow index card lacks, and every fallback is inert
- * (no retries, no pending merge, no validation wait), so a full wire card reads exactly
- * as its own card would. null with no hold. */
+ * countdown first, then holdFor over the dependency's own project context (merge gate,
+ * push hold, its own dependencies). The bridge fills only the fields a narrow index
+ * card lacks, and every fallback is inert (no retries, no pending merge, no validation
+ * wait), so a full wire card reads exactly as its own card would. null with no hold. */
 function depOwnHold(
 	dep: IndexedDep,
-	tasks: readonly StatusTasks[],
-	foreign: DepIndex | undefined,
+	ctx: DepHoldContext,
 	now: number,
 ): string | null {
+	// A dependency names a hold only while it sits queued: a running turn is
+	// active — a review can start after its merge starts — and every other
+	// state shows its own words, never a hold (OTTR-1321 send-back 2).
+	if (dep.state !== undefined && dep.state !== "queued") return null;
 	if (dep.holdUntil != null && dep.holdUntil > now) {
 		return (
 			holdLeft(dep.holdUntil, now, dep.needsReason ?? null) ??
@@ -177,8 +190,8 @@ function depOwnHold(
 			vmHold: dep.vmHold,
 			sandboxLead: dep.sandboxLead,
 		},
-		tasks,
-		foreign,
+		ctx.cards,
+		ctx.index,
 		now,
 	);
 }
@@ -186,13 +199,15 @@ function depOwnHold(
 /** The queued card's dependency line (OTTR-1321): "waiting for #<id> <title>" per open
  * dependency, cross-project ids through foreign — an open dependency blocks the
  * dispatch at every stage, so the line outranks the resume words. Each open dependency
- * whose own hold the cards carry names that hold the way its own card would:
- * "waiting for #d1 schema (held · zai limit · 12m left), #d2 notes". null with none
- * open. */
+ * whose own hold its project's context carries names that hold the way its own card
+ * would: "waiting for #d1 schema (held · zai limit · 12m left), #d2 notes". A foreign
+ * dependency resolves its hold only through foreignHolds (its project's cards and
+ * resolver); without one it keeps the plain wording. null with none open. */
 function depHoldLine(
 	t: Pick<Task, "dependsOn">,
 	tasks: readonly StatusTasks[] | undefined,
 	foreign?: DepIndex,
+	foreignHolds?: (id: string) => DepHoldContext | null,
 	now: number = Date.now(),
 ): string | null {
 	const list = tasks ?? [];
@@ -200,12 +215,19 @@ function depHoldLine(
 	if (waiting.length === 0) return null;
 	const segments = waiting.map((d) => {
 		const base = `#${d.id} ${d.title}`;
-		// The board's own list and its foreign index both hand back full wire cards,
-		// so the dep's hold facts may ride on either; a narrower lookup omits them.
-		const dep: IndexedDep | undefined =
-			list.find((c) => c.id === d.id) ?? foreign?.(d.id) ?? undefined;
+		const local = list.find((c) => c.id === d.id);
+		// The board's own list and its foreign index both hand back full wire
+		// cards, so the dep's hold facts may ride on either; a narrower lookup
+		// omits them.
+		const dep: IndexedDep | undefined = local ?? foreign?.(d.id) ?? undefined;
 		if (dep === undefined) return base;
-		const own = depOwnHold(dep, list, foreign, now);
+		// A local dependency shares the follower's context; a foreign one reads
+		// its own project's, so its merge gate and nested ids stay in its project.
+		const ctx: DepHoldContext | null = local
+			? { cards: list, index: foreign }
+			: (foreignHolds?.(d.id) ?? null);
+		if (ctx === null) return base;
+		const own = depOwnHold(dep, ctx, now);
 		return own === null ? base : `${base} (${own})`;
 	});
 	return `waiting for ${segments.join(", ")}`;
@@ -239,6 +261,8 @@ function queuedLine(
 	drain: boolean,
 	tasks: readonly StatusTasks[] | undefined,
 	foreign: DepIndex | undefined,
+	/** The dependency project's context per foreign id; absent keeps the plain wording. */
+	foreignHolds?: (id: string) => DepHoldContext | null,
 ): string {
 	if (t.stage === "backlog") return "grill queued";
 	const leadHold = leadValidationHold(t);
@@ -253,7 +277,7 @@ function queuedLine(
 		return holdLeft(t.holdUntil, Date.now(), t.needsReason) ?? t.needsReason;
 	// An open dependency keeps the card parked even with a free slot, so its line
 	// names the real blocker before the resume words (OTTR-1321).
-	const dep = depHoldLine(t, tasks, foreign);
+	const dep = depHoldLine(t, tasks, foreign, foreignHolds);
 	if (dep !== null) return dep;
 	// No open dependency and no future hold: the card resumes, the reason on record.
 	if (t.needsReason !== null) return "resuming";
@@ -327,12 +351,16 @@ export function statusLine(
 	/** OTTR-708's cross-project dependency lookup, when the caller has it: an open
 	 * foreign dependency keeps the dep line instead of the resume words. */
 	foreign?: DepIndex,
+	/** OTTR-1321: the dependency project's context per foreign id — its own cards and
+	 * resolver — so a foreign dependency's hold reads its own project. Absent keeps
+	 * the plain wording for foreign dependencies. */
+	foreignHolds?: (id: string) => DepHoldContext | null,
 ): string {
 	// A cancelled card is final; the card's "Cancelled" chip carries the time.
 	if (t.cancelledAt !== null) return "cancelled";
 	// A queued card that keeps a reason was queued again by the tracker (restart, background-job exit).
 	if (t.state === "queued")
-		return queuedLine(t, hasRules, hold, drain, tasks, foreign);
+		return queuedLine(t, hasRules, hold, drain, tasks, foreign, foreignHolds);
 	if (t.state === "preparing") return "preparing";
 	if (t.state === "running")
 		return t.progress ?? reviewProgress(tasks ?? [], t) ?? "running";
