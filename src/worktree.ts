@@ -1822,12 +1822,14 @@ export async function checkPinnedRemote(
 	const r = await git(["config", "--list", "-z"], mainPath);
 	for (const entry of r.stdout.split("\0")) {
 		const nl = entry.indexOf("\n");
-		if (nl === -1) continue;
-		const key = entry.slice(0, nl);
+		// A valueless entry (an implicit boolean such as remote."<pin>".promisor,
+		// planted as a bare key line in the file) serializes as the key alone,
+		// no newline: the record must reach the scans below all the same.
+		const key = nl === -1 ? entry : entry.slice(0, nl);
 		// Both rewrite keys: insteadOf bends fetches, pushInsteadOf bends pushes only —
 		// either would send the pinned call to a repo the pin never named.
 		if (/^url\..*\.(?:push)?insteadof$/i.test(key)) {
-			if (pinned.startsWith(entry.slice(nl + 1)))
+			if (nl !== -1 && pinned.startsWith(entry.slice(nl + 1)))
 				return `repo config rewrites the pinned origin: an url.<…>.(push)insteadOf entry matches it; remove that entry, the board pushes and fetches only the pinned URL`;
 			continue;
 		}

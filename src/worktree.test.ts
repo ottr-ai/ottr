@@ -2076,6 +2076,30 @@ describe("pinned origin URL (OTTR-348)", () => {
 		}
 	}, 60_000);
 
+	test("a valueless key under a remote section named like the pin refuses too (OTTR-1300)", async () => {
+		const f = fixture();
+		try {
+			// An implicit boolean is planted as a bare key line in the config file
+			// (the config CLI has no valueless form). Git reads it as true, and
+			// `git config --list -z` serializes it as the key alone, no newline —
+			// the record shape a newline-only parser skips.
+			const pin = `file://${f.bare}`;
+			const cfg = join(f.main, ".git", "config");
+			writeFileSync(
+				cfg,
+				`${readFileSync(cfg, "utf8")}[remote "${pin}"]\n\tpromisor\n`,
+			);
+			expect(
+				run(f.main, "config", "--get", "--bool", `remote.${pin}.promisor`),
+			).toBe("true");
+			expect(await checkPinnedRemote(f.main, pin)).toContain(
+				"a remote.<…> section key would apply to the pinned call",
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	test("a pin that is a git option, not a URL, fails closed", async () => {
 		const f = fixture();
 		try {
