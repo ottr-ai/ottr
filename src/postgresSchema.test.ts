@@ -360,6 +360,10 @@ describe("PostgreSQL migration surface", () => {
 				rows: [
 					{ prompt: "Validation: #L6 blocked" },
 					{ prompt: "Validation: #L4 confirmed" },
+					// The newest card's duplicate results: the first per lead rules.
+					{ prompt: "Validation: #L7 blocked" },
+					{ prompt: "Validation: #L7 confirmed" },
+					{ prompt: "Validation: #L8 confirmed" },
 				],
 			},
 			{
@@ -408,20 +412,41 @@ describe("PostgreSQL migration surface", () => {
 						validated_at: 900,
 						details: "Grilled definition of ready",
 					},
+					{
+						// The newest card's first result for L7 is blocked; its later
+						// same-run confirmed duplicate loses (the settle's rule), so
+						// L7 waits. L8's finding is confirmed: decided work.
+						id: "L7",
+						prompt: "Needs validation: grilled blocked lead",
+						validated_at: 900,
+						details: "Grilled definition of ready",
+					},
+					{
+						id: "L8",
+						prompt: "Needs validation: confirmed duplicate lead",
+						validated_at: 910,
+						details: "Grilled definition of ready",
+					},
 				],
 			},
 		];
 		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
 		// The step consults the findings first: the authoritative outcome source
-		// that a details wipe cannot erase.
+		// that a details wipe cannot erase, in the runs' own order (validation
+		// cards newest first, arrival order inside a card).
 		expect(
 			db.queried.some((statement) =>
 				statement.includes("FROM review_findings"),
 			),
 		).toBe(true);
+		expect(
+			db.queried.some((statement) =>
+				statement.includes("ORDER BY c.created_at DESC, c.id DESC, f.id ASC"),
+			),
+		).toBe(true);
 		const converged = db.runArgs
 			.filter(([statement]) => statement === CONVERGE_LEAD_WAIT_SQL)
 			.map(([, args]) => (args as unknown[])[0]);
-		expect(converged).toEqual(["L1", "L2", "L3", "L6"]);
+		expect(converged).toEqual(["L1", "L2", "L3", "L6", "L7"]);
 	});
 });

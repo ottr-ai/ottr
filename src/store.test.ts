@@ -6867,15 +6867,28 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of)
 			VALUES
-				('valcard1', 'validation run', 'Batch validation of 2 lead(s) of review.', 'done', 'idle', 'validation', 900, 950, 'rev1')`);
+				('valcard1', 'validation run', 'Batch validation of 2 lead(s) of review.', 'done', 'idle', 'validation', 900, 950, 'rev1'),
+				('valcard0', 'older validation run', 'Batch validation of 1 lead(s) of review.', 'done', 'idle', 'validation', 880, 885, 'rev1')`);
 		raw.exec(`INSERT INTO review_findings (card_id, prompt, created_at) VALUES
 			('valcard1', 'Validation: #grilled2 blocked', 900),
-			('valcard1', 'Validation: #grilled1 confirmed', 910)`);
+			('valcard1', 'Validation: #grilled1 confirmed', 910),
+			('valcard1', 'Validation: #dupwait1 blocked', 920),
+			('valcard1', 'Validation: #dupwait1 confirmed', 921),
+			('valcard1', 'Validation: #dupkeep1 confirmed', 922),
+			('valcard1', 'Validation: #dupkeep1 blocked', 923),
+			('valcard0', 'Validation: #crossold1 blocked', 930),
+			('valcard1', 'Validation: #crossold1 confirmed', 905)`);
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
 			VALUES
 				('grilled2', 'grilled blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 850, 1100, 'rev1', NULL, 920,
-					'Grilled definition of ready')`);
+					'Grilled definition of ready'),
+				('dupwait1', 'duplicate blocked lead', 'Needs validation: duplicate first result', 'backlog', 'idle', 'work', 900, 1200, 'rev1', NULL, 930,
+					'Grilled definition of ready'),
+				('dupkeep1', 'duplicate confirmed lead', 'Needs validation: duplicate confirmed result', 'backlog', 'idle', 'work', 910, 1210, 'rev1', NULL, 931,
+					'Grilled definition of ready'),
+				('crossold1', 'cross-run confirmed lead', 'Needs validation: cross-run result', 'backlog', 'idle', 'work', 920, 1220, 'rev1', NULL, NULL,
+					NULL)`);
 		raw.close();
 
 		const store = await open(dir);
@@ -6939,6 +6952,26 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 		expect(grilledBlocked.waitsValidation).toBe(true);
 		expect(grilledBlocked.queuedAt).toBe(1100);
 		expect(grilledBlocked.validatedAt).toBe(920);
+		// Within one run the first result per lead rules (the settle's own
+		// rule): a blocked first result with a later same-run confirmed
+		// duplicate still waits, and a confirmed first result with a later
+		// blocked duplicate still keeps its decided stage — a last-finding
+		// read would flip both and either strand or start the work.
+		const dupwait = (await store.getTask("dupwait1"))!;
+		expect(dupwait.stage).toBe("todo");
+		expect(dupwait.waitsValidation).toBe(true);
+		expect(dupwait.validatedAt).toBe(930);
+		const dupkeep = (await store.getTask("dupkeep1"))!;
+		expect(dupkeep.stage).toBe("backlog");
+		expect(dupkeep.waitsValidation).toBe(false);
+		expect(dupkeep.validatedAt).toBe(931);
+		// Across runs the newest run rules, by the card's created_at and not by
+		// when its finding was recorded: the older run's later-recorded blocked
+		// result cannot lock the newer run's confirmed lead.
+		const crossold = (await store.getTask("crossold1"))!;
+		expect(crossold.stage).toBe("backlog");
+		expect(crossold.waitsValidation).toBe(false);
+		expect(crossold.validatedAt).toBeNull();
 
 		// The marker is caller-settable (unlike lead_at_done): the patch round-trips
 		// on getTask and on the list rows.

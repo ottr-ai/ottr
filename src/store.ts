@@ -9,11 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import {
-	leadCardTitle,
-	retitleBareLeadTitles,
-	validationResult,
-} from "./auditLeads.ts";
+import { leadCardTitle, retitleBareLeadTitles } from "./auditLeads.ts";
 import { mkdirBelow, writeBelow } from "./confine.ts";
 import {
 	closeLocked,
@@ -50,8 +46,8 @@ import {
 import { sumUsageIn, type UsageSum } from "./retro.ts";
 import {
 	isReview,
-	type LeadFindingOutcome,
 	legacyLeadWaits,
+	newestFindingOutcomes,
 	queueOrder,
 } from "./scheduler.ts";
 import {
@@ -2838,19 +2834,23 @@ export class ProjectStore {
 				) {
 					// The newest recorded outcome per lead id, from review_findings:
 					// the authoritative record that survives a later grill's details
-					// wipe. Ascending order, so the newest row wins the map. The table
-					// predates validated_at, which this block already requires, so it
-					// exists in every database that reaches this pass.
-					const newestOutcome = new Map<string, string>();
-					for (const finding of await db
-						.query<{ prompt: string }, []>(
-							"SELECT prompt FROM review_findings WHERE prompt LIKE 'Validation: #%' ORDER BY created_at ASC, id ASC",
-						)
-						.all()) {
-						const parsed = validationResult(finding.prompt);
-						if (parsed !== null)
-							newestOutcome.set(parsed.leadId, parsed.outcome);
-					}
+					// wipe. The rows arrive in the runs' own order - validation cards
+					// newest first, each card's findings in arrival order - so the
+					// first result per lead inside a card rules, the same rule the
+					// settle and resetValidatedLeads read. The findings table
+					// predates validated_at, which this block already requires, so
+					// it exists in every database that reaches this pass.
+					const outcomes = newestFindingOutcomes(
+						await db
+							.query<{ prompt: string }, []>(
+								`SELECT f.prompt AS prompt
+									FROM review_findings f
+									JOIN tasks c ON c.id = f.card_id
+									WHERE f.prompt LIKE 'Validation: #%' AND c.kind = 'validation'
+									ORDER BY c.created_at DESC, c.id DESC, f.id ASC`,
+							)
+							.all(),
+					);
 					const legacy = await db
 						.query<
 							{
@@ -2870,8 +2870,7 @@ export class ProjectStore {
 								row.prompt,
 								row.validated_at,
 								row.details,
-								(newestOutcome.get(row.id) as LeadFindingOutcome | undefined) ??
-									null,
+								outcomes.get(row.id) ?? null,
 							)
 						)
 							await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);

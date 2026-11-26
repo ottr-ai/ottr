@@ -219,12 +219,19 @@ try {
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-grilled-blocked', 'grilled blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 700, 900, 'legacy-review', 910, 'Grilled definition of ready')");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-grilled-confirmed', 'grilled confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 800, 950, 'legacy-review', 920, 'Grilled definition of ready')");
         await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-blocked blocked', 900)");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-blocked confirmed', 915)");
         await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-confirmed confirmed', 910)");
+        // Within one run the first result per lead rules: the blocked first
+        // result with a later same-run confirmed duplicate still waits.
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-dup-keep', 'duplicate confirmed lead', 'Needs validation: duplicate confirmed result', 'backlog', 'idle', 'work', 850, 960, 'legacy-review', 930, 'Grilled definition of ready')");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-dup-keep confirmed', 940)");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-dup-keep blocked', 950)");
       });
       await applyPostgresMigrations(leadDb, projectMigrations);
       assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id LIKE 'legacy-%' ORDER BY id").all()), [
         { id: 'legacy-answered', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
         { id: 'legacy-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 700, validated_at: 750 },
+        { id: 'legacy-dup-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 930 },
         { id: 'legacy-grilled-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 900, validated_at: 910 },
         { id: 'legacy-grilled-confirmed', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 920 },
         { id: 'legacy-lead', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 500, validated_at: null },

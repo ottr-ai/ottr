@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { retitleBareLeadTitles, validationResult } from "./auditLeads.ts";
+import { retitleBareLeadTitles } from "./auditLeads.ts";
 import {
 	getPostgresDatabase,
 	type PostgresDatabase,
 } from "./postgresDriver.ts";
-import { type LeadFindingOutcome, legacyLeadWaits } from "./scheduler.ts";
+import { legacyLeadWaits, newestFindingOutcomes } from "./scheduler.ts";
 
 export function projectSchemaName(name: string): string {
 	const stem = name
@@ -297,17 +297,22 @@ export const projectMigrations: readonly PostgresMigration[] = [
 		);
 		// The newest recorded outcome per lead id, from review_findings: the
 		// authoritative record that survives a later grill's details wipe.
-		// Ascending order, so the newest row wins the map. The table ships in
-		// step one, so every schema that reaches this step has it.
-		const newestOutcome = new Map<string, string>();
-		for (const finding of await db
-			.query<{ prompt: string }, []>(
-				"SELECT prompt FROM review_findings WHERE prompt LIKE 'Validation: #%' ORDER BY created_at ASC, id ASC",
-			)
-			.all()) {
-			const parsed = validationResult(finding.prompt);
-			if (parsed !== null) newestOutcome.set(parsed.leadId, parsed.outcome);
-		}
+		// The rows arrive in the runs' own order - validation cards newest
+		// first, each card's findings in arrival order - so the first result
+		// per lead inside a card rules, the same rule the settle and
+		// resetValidatedLeads read. The findings table ships in step one, so
+		// every schema that reaches this step has it.
+		const outcomes = newestFindingOutcomes(
+			await db
+				.query<{ prompt: string }, []>(
+					`SELECT f.prompt AS prompt
+					FROM review_findings f
+					JOIN tasks c ON c.id = f.card_id
+					WHERE f.prompt LIKE 'Validation: #%' AND c.kind = 'validation'
+					ORDER BY c.created_at DESC, c.id DESC, f.id ASC`,
+				)
+				.all(),
+		);
 		const legacy = await db
 			.query<
 				{
@@ -327,7 +332,7 @@ export const projectMigrations: readonly PostgresMigration[] = [
 					row.prompt,
 					row.validated_at,
 					row.details,
-					(newestOutcome.get(row.id) as LeadFindingOutcome | undefined) ?? null,
+					outcomes.get(row.id) ?? null,
 				)
 			)
 				await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);

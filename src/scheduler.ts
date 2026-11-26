@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { validationResult } from "./auditLeads.ts";
 import { splitLevel } from "./levels.ts";
 import { WORK_CHECK_MAX_SENDBACKS } from "./prompts.ts";
 import type {
@@ -1676,6 +1677,28 @@ export type LeadFindingOutcome =
 	| "refuted"
 	| "blocked"
 	| "deployment";
+
+/** The newest recorded outcome per lead id from validation findings, given the
+ * rows in the order the runs wrote them: validation cards newest first
+ * (created_at desc, id desc), each card's findings in arrival order (id asc).
+ * The first result per lead inside a card rules, and the newest card that
+ * carries any result for the lead decides — the same first-result-per-run and
+ * newest-run rules the settle (first parsed result per lead) and
+ * resetValidatedLeads (newest validation card, first parsed result) read, so
+ * convergence can never disagree with them about a lead: a blocked result
+ * whose later same-run duplicate says confirmed still waits, and a confirmed
+ * result whose later duplicate says blocked still does not lock. Pure. */
+export function newestFindingOutcomes(
+	rows: readonly { prompt: string }[],
+): Map<string, LeadFindingOutcome> {
+	const map = new Map<string, LeadFindingOutcome>();
+	for (const row of rows) {
+		const parsed = validationResult(row.prompt);
+		if (parsed !== null && !map.has(parsed.leadId))
+			map.set(parsed.leadId, parsed.outcome);
+	}
+	return map;
+}
 
 /** Whether a legacy backlog lead row takes the waiting form on convergence
  * (OTTR-1252). Rows that are already decided keep their stage — a confirmed
