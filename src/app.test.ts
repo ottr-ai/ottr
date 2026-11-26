@@ -18828,22 +18828,18 @@ describe("hosted owner-URL wall (OTTR-1012)", () => {
 		expect(selfHost?.agent).toBeUndefined();
 	});
 
-	test("hosted mode refuses an Alate URL at a private address; a public literal IP saves", async () => {
+	// Main's a8538e01 went further than the save-time wall: hosted mode answers 404 on
+	// the Alate routes outright, so no owner URL can land at all. The save-time wall
+	// stays as the second belt behind the route refusal.
+	test("hosted mode answers 404 on the Alate save route", async () => {
 		const { m, owner } = await hostedBoard();
 		const bad = await m.call(
 			"/api/alate",
 			{ url: "http://169.254.169.254:8787" },
 			owner(),
 		);
-		expect(bad.status).toBe(400);
-		const body = (await bad.json()) as { error: string };
-		expect(body.error).toContain("hosted mode blocks it");
-		const good = await m.call(
-			"/api/alate",
-			{ url: "https://93.184.216.34" },
-			owner(),
-		);
-		expect(good.status).toBe(200);
+		expect(bad.status).toBe(404);
+		expect(await bad.json()).toEqual({ error: "not found" });
 	});
 });
 

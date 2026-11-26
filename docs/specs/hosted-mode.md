@@ -80,9 +80,10 @@ endpoint or a saved Alate URL cannot point at a private, loopback or link-local 
 DNS name that resolves there is also refused. This is the same rule as a Jira site save. A
 push send checks the endpoint again and pins the checked address into the connection, so a
 DNS answer that flips between check and connect cannot re-route it. A stored endpoint that
-fails the wall counts as one failed send, and the board opens no connection. The wall gates
-the owner's Alate save; an already stored URL stays usable, and the `ALATE_URL` env seed
-stays an operator choice with the self-host rule.
+fails the wall counts as one failed send, and the board opens no connection. Hosted mode also
+answers 404 on the Alate routes themselves (save, health, provision), so the owner cannot
+reach the save at all; the save-time wall stays as the second belt, and the operator's
+`ALATE_URL` env seed keeps the self-host rule.
 
 The state payload carries `hosted: true`, and `onboarding` is always false. It also carries
 `credits` (`{ balance, accountUrl }`), and `balance` is null until a `/credit` answer carried
