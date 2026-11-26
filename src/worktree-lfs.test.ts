@@ -374,16 +374,26 @@ describe("serverMergePush with Git LFS", () => {
 		// skips the command-line pin, so the upload resolves the config's endpoint — here
 		// a bare LFS-only server that receives the object while the origin's own LFS API
 		// sees no batch at all. The board stores nothing either way. The origin argument
-		// names github.com (the skip rule's scope); only lfs.url is reachable.
+		// names github.com (the skip rule's scope); only lfs.url is reachable. A repo
+		// insteadOf entry keeps git-lfs's own ref read of that URL on the local fixture
+		// server, so the test stays off the network.
 		const f = await fixture({ lfs: true });
 		const f2dir = mkdtempSync(join(tmpdir(), "ottr-lfs-mirror-"));
 		const f2bare = join(f2dir, "bare.git");
 		await run(f2dir, "init", "-q", "--bare", "-b", "main", f2bare);
 		const f2 = serveGitLfs(f2dir, f2bare);
 		try {
+			await run(
+				f.main,
+				"config",
+				`url.${f.url}.insteadOf`,
+				"https://github.com/octo",
+			);
 			await run(f.main, "config", "lfs.url", `${f2.url}/info/lfs`);
 			const tip = await run(f.main, "rev-parse", "refs/heads/main");
 			const base = await run(f.main, "rev-parse", "origin/main");
+			const oids = await lfsPointerOids(f.main, tip, base);
+			expect(oids.length).toBe(1);
 			expect(
 				await pushLfsObjects(
 					f.main,
