@@ -3498,12 +3498,9 @@ describe("describeVersion", () => {
 	test("release tag at HEAD, tag-plus-commits form past it, short sha on dev, timestamp without commits", async () => {
 		// Workers run with the image's OTTR_VERSION in their env; the stamp would win over
 		// git at every assert below, so the test pins the no-stamp shape itself.
-		const oldStamp = process.env.OTTR_VERSION;
-		delete process.env.OTTR_VERSION;
-		const dir = mkdtempSync(join(tmpdir(), "ottr-desc-"));
-		// A worker's image stamp would win over the fixture's repo state.
 		const old = process.env.OTTR_VERSION;
 		delete process.env.OTTR_VERSION;
+		const dir = mkdtempSync(join(tmpdir(), "ottr-desc-"));
 		try {
 			await must(dir, "init", "-q", "-b", "main");
 			expect(await describeVersion(dir)).toMatch(/^\d+$/); // no commits yet: boot-time fallback
