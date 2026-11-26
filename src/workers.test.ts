@@ -3074,6 +3074,12 @@ describe("serveWorker turn identity", () => {
 			const dbTarget = join(workerHome, ".omp", "agent", "agent.db");
 			symlinkSync(dbTarget, join(layerDir, ".omp", "agent", "agent.db"));
 			symlinkSync(join(workerHome, ".cache"), join(layerDir, ".cache"));
+			// The per-turn store check verifies the shared chain before spawn
+			// (OTTR-1291): the fixture carries the healthy boot state, or the
+			// drift note would precede the stub's JSON line in the stream.
+			chmodSync(join(workerHome, ".omp", "agent"), 0o1777);
+			writeFileSync(dbTarget, "store");
+			chmodSync(dbTarget, 0o666);
 
 			const url = start({
 				ompPath: identPath,
@@ -3242,81 +3248,94 @@ describe("serveWorker turn identity", () => {
 		30_000,
 	);
 
-	rootTest(
-		"a run provisions the project identity and pins its git identity env",
-		async () => {
-			const workerHome = freshWorkerHome();
-			const homesRoot = freshWorkerHome();
-			const ws = freshWorkerHome();
-			const passwd = join(homesRoot, "passwd");
-			const group = join(homesRoot, "group");
-			writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
-			writeFileSync(group, "root:x:0:\n");
-			const repo = join(ws, "git-env-proj");
-			mkdirSync(repo, { recursive: true });
-			Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
-				stdout: "ignore",
-				stderr: "ignore",
-			});
-			// Identity stub: dumps the env keys the git-identity rewrite must touch.
-			const identPath = join(workerHome, "gitenv-omp.js");
-			writeFileSync(
-				identPath,
-				`#!${process.execPath}\nprocess.stdout.write(JSON.stringify({ GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL, A_NAME: process.env.GIT_AUTHOR_NAME, A_EMAIL: process.env.GIT_AUTHOR_EMAIL, C_NAME: process.env.GIT_COMMITTER_NAME, C_EMAIL: process.env.GIT_COMMITTER_EMAIL }) + "\\n");`,
-			);
-			chmodSync(identPath, 0o755);
-			chmodSync(workerHome, 0o755);
+	// Self identity: chown-to-self and setuid-to-self need no privilege, so
+	// the identity tests run on every gate (the cross-uid drop stays covered
+	// by the root-gated test above).
+	const selfIds = (): { uid: number; gid: number } => ({
+		uid: typeof process.getuid === "function" ? process.getuid() : 0,
+		gid: typeof process.getgid === "function" ? process.getgid() : 0,
+	});
 
-			const url = start({
-				ompPath: identPath,
-				home: workerHome,
-				turnUid: {
-					homesRoot,
-					workerHome,
-					dataRoots: [],
-					workspaceRoot: ws,
-					provisionPaths: { passwd, group },
-				},
-			});
-			const res = await post(url, {
-				id: "ti-git-env",
-				argv: ["-p"],
-				cwd: repo,
-				stdin: "",
-				project: "git-env-proj",
-				env: {
-					GIT_AUTHOR_NAME: "junk",
-					GIT_AUTHOR_EMAIL: "junk@junk",
-				},
-			});
-			expect(res.status).toBe(200);
-			const dumped = JSON.parse((await readLines(res))[0] ?? "") as Record<
-				string,
-				string | undefined
-			>;
-			const ids = projectTurnUid("git-env-proj");
-			const gitconfig = join(homesRoot, "git-env-proj", "ottr", "gitconfig");
-			expect(dumped.GIT_CONFIG_GLOBAL).toBe(gitconfig);
-			expect(dumped.A_NAME).toBeUndefined();
-			expect(dumped.A_EMAIL).toBeUndefined();
-			expect(dumped.C_NAME).toBeUndefined();
-			expect(dumped.C_EMAIL).toBeUndefined();
+	test("a run provisions the project identity and pins its git identity env", async () => {
+		const ids = selfIds();
+		const workerHome = freshWorkerHome();
+		const homesRoot = freshWorkerHome();
+		const ws = freshWorkerHome();
+		const passwd = join(homesRoot, "passwd");
+		const group = join(homesRoot, "group");
+		writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
+		writeFileSync(group, "root:x:0:\n");
+		const repo = join(ws, "git-env-proj");
+		mkdirSync(repo, { recursive: true });
+		Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		// Identity stub: dumps the env keys the git-identity rewrite must touch.
+		const identPath = join(workerHome, "gitenv-omp.js");
+		writeFileSync(
+			identPath,
+			`#!${process.execPath}\nprocess.stdout.write(JSON.stringify({ GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL, A_NAME: process.env.GIT_AUTHOR_NAME, A_EMAIL: process.env.GIT_AUTHOR_EMAIL, C_NAME: process.env.GIT_COMMITTER_NAME, C_EMAIL: process.env.GIT_COMMITTER_EMAIL }) + "\\n");`,
+		);
+		chmodSync(identPath, 0o755);
+		chmodSync(workerHome, 0o755);
+		// The per-turn store check verifies the shared chain before spawn
+		// (OTTR-1291): without the healthy store the guard refuses the run
+		// and the run never reaches the identity stub.
+		const sharedAgent = join(workerHome, ".omp", "agent");
+		mkdirSync(sharedAgent, { recursive: true });
+		chmodSync(sharedAgent, 0o1777);
+		writeFileSync(join(sharedAgent, "agent.db"), "store");
+		chmodSync(join(sharedAgent, "agent.db"), 0o666);
 
-			// The passwd and group files gained one entry each for the project uid.
-			const passwdLine = readFileSync(passwd, "utf8")
-				.split("\n")
-				.find((l) => l.split(":")[2] === String(ids.uid));
-			expect(passwdLine).toBeDefined();
-			const groupLine = readFileSync(group, "utf8")
-				.split("\n")
-				.find((l) => l.split(":")[2] === String(ids.uid));
-			expect(groupLine).toBeDefined();
-			// The daemon-owned gitconfig pins the project identity.
-			const gitconfigText = readFileSync(gitconfig, "utf8");
-			expect(gitconfigText).toContain("[user]");
-		},
-		30_000,
-	);
+		const url = start({
+			ompPath: identPath,
+			home: workerHome,
+			turnUid: {
+				homesRoot,
+				workerHome,
+				dataRoots: [],
+				workspaceRoot: ws,
+				ids,
+				provisionPaths: { passwd, group },
+			},
+		});
+		const res = await post(url, {
+			id: "ti-git-env",
+			argv: ["-p"],
+			cwd: repo,
+			stdin: "",
+			project: "git-env-proj",
+			env: {
+				GIT_AUTHOR_NAME: "junk",
+				GIT_AUTHOR_EMAIL: "junk@junk",
+			},
+		});
+		expect(res.status).toBe(200);
+		const dumped = JSON.parse((await readLines(res))[0] ?? "") as Record<
+			string,
+			string | undefined
+		>;
+		const gitconfig = join(homesRoot, "git-env-proj", "ottr", "gitconfig");
+		expect(dumped.GIT_CONFIG_GLOBAL).toBe(gitconfig);
+		expect(dumped.A_NAME).toBeUndefined();
+		expect(dumped.A_EMAIL).toBeUndefined();
+		expect(dumped.C_NAME).toBeUndefined();
+		expect(dumped.C_EMAIL).toBeUndefined();
+
+		// The passwd and group files gained one entry each for the project uid.
+		const passwdLine = readFileSync(passwd, "utf8")
+			.split("\n")
+			.find((l) => l.split(":")[2] === String(ids.uid));
+		expect(passwdLine).toBeDefined();
+		const groupLine = readFileSync(group, "utf8")
+			.split("\n")
+			.find((l) => l.split(":")[2] === String(ids.uid));
+		expect(groupLine).toBeDefined();
+		// The daemon-owned gitconfig pins the project identity.
+		const gitconfigText = readFileSync(gitconfig, "utf8");
+		expect(gitconfigText).toContain("[user]");
+	}, 30_000);
 
 	// The pinned-layer fixture both store tests share: passwd/group snapshots,
 	// one git repo, a pinned layer whose db link targets the flat shared home,
@@ -3364,10 +3383,6 @@ describe("serveWorker turn identity", () => {
 	// uid (chown-to-self and setuid-to-self need no privilege), so the two
 	// acceptance scenarios execute on every gate. The root-gated test above
 	// covers the real cross-uid drop.
-	const selfIds = (): { uid: number; gid: number } => ({
-		uid: typeof process.getuid === "function" ? process.getuid() : 0,
-		gid: typeof process.getgid === "function" ? process.getgid() : 0,
-	});
 
 	test("a root omp reset of the store modes is restored before each turn", async () => {
 		const project = "store-restore-proj";
@@ -3434,8 +3449,12 @@ process.stdout.write(JSON.stringify({ uid: process.getuid(), opened }) + "\\n");
 		};
 		expect(dumped.opened).toBe("ok");
 		expect(dumped.uid).toBe(ids.uid);
-		// Exactly one drift line rode the stream.
-		const driftLines = lines.filter((l) => l.startsWith("turn-uid:"));
+		// Exactly one drift line rode the stream. A shared test uid can add a
+		// collision note (the uid-owners map is per process); it names no
+		// drift, so only the drift prefix counts.
+		const driftLines = lines.filter((l) =>
+			l.startsWith("turn-uid: shared store modes drifted"),
+		);
 		expect(driftLines.length).toBe(1);
 		expect(driftLines[0]).toContain("shared store modes drifted");
 		// The shared home carries the boot modes again.

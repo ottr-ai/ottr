@@ -777,7 +777,12 @@ const STORE_FILE_MODE = 0o666;
 export function bootTurnIsolation(
 	workerHome: string,
 	roots: string[],
-	deps: { isMounted?: (path: string) => boolean } = {},
+	deps: {
+		isMounted?: (path: string) => boolean;
+		/** Only for tests: fires before each store chmod, so a test can swap
+		 * the entry mid-check (the stat-to-open race) deterministically. */
+		beforeChmod?: () => void;
+	} = {},
 ): string[] {
 	if (!isolationEnabled())
 		return [
@@ -806,32 +811,32 @@ export function bootTurnIsolation(
 	const db = join(workerHome, ".omp", "agent", "agent.db");
 	const mounted = deps.isMounted ?? pathIsMounted;
 	if (existsSync(db)) {
-		try {
-			if (mounted(db)) {
-				// The compose store is a host bind mount: a chmod here would change
-				// the host file's mode. Skip it; the turn-side store write degrades
-				// to the cause omp reports (docs/specs/worker-turn-uid-isolation.md).
-				notes.push("agent.db is a mount; store mode left to the host");
-			} else {
-				// The store and the journal siblings sqlite creates beside it all
-				// need the turn uids' write bit. The siblings live in the sticky
-				// 1777 store dir, so a turn can plant its own entry there: only a
-				// plain file is chmodded, and through a pinned inode (chmodPinned),
-				// never through a planted link (OTTR-1291 review).
-				for (const file of [db, `${db}-wal`, `${db}-shm`]) {
-					const st = statOf(file);
-					if (st === null) continue;
-					if (!st.isFile()) {
-						notes.push(
-							`${basename(file)} is not a plain file; store mode left as it is`,
-						);
-						continue;
-					}
-					chmodPinned(file, STORE_FILE_MODE, false);
-				}
+		// The store and the journal siblings sqlite creates beside it all need
+		// the turn uids' write bit. Each entry carries its own checks: any of
+		// the three can be its own bind mount, and a chmod through one would
+		// change that host file's mode (the compose store mounts agent.db).
+		// The sticky 1777 dir lets a turn plant a non-plain entry, and the
+		// pinned open validates the descriptor, so a FIFO swapped in between
+		// the stat and the open cannot block boot (OTTR-1291 review).
+		for (const file of [db, `${db}-wal`, `${db}-shm`]) {
+			const st = statOf(file);
+			if (st === null) continue;
+			if (!st.isFile()) {
+				notes.push(
+					`${basename(file)} is not a plain file; store mode left as it is`,
+				);
+				continue;
 			}
-		} catch (err) {
-			notes.push(`agent.db chmod failed: ${String(err)}`);
+			if (mounted(file)) {
+				notes.push(`${basename(file)} is a mount; store mode left to the host`);
+				continue;
+			}
+			try {
+				deps.beforeChmod?.();
+				chmodPinned(file, STORE_FILE_MODE, false);
+			} catch (err) {
+				notes.push(`${basename(file)} chmod failed: ${String(err)}`);
+			}
 		}
 	}
 	// BuildKit client material is root-0400 in the image ("workers run as
@@ -883,13 +888,28 @@ export const STORE_MOUNT_BLOCKED =
  * inode. `open` with O_NOFOLLOW (plus O_DIRECTORY for dirs) binds the fd to
  * the exact inode the stat saw, and `fchmodSync` through the fd can never
  * follow a link planted afterwards (OTTR-1291 review).
+ *
+ * O_NONBLOCK keeps the open itself from blocking: the swap can also land a
+ * FIFO on the entry, and a plain O_RDONLY open of a FIFO would hang the
+ * daemon. The pinned descriptor is then the truth, not the path: fstat it
+ * and refuse anything the stat-based checks never approved (OTTR-1291
+ * review, race blockers).
  */
 function chmodPinned(path: string, mode: number, dir: boolean): void {
 	const fd = openSync(
 		path,
-		fsConstants.O_RDONLY | oNoFollow | (dir ? fsConstants.O_DIRECTORY : 0),
+		fsConstants.O_RDONLY |
+			fsConstants.O_NONBLOCK |
+			oNoFollow |
+			(dir ? fsConstants.O_DIRECTORY : 0),
 	);
 	try {
+		const st = fstatSync(fd);
+		const plain = dir ? st.isDirectory() : st.isFile();
+		if (!plain)
+			throw new Error(
+				`turn-uid: refusing store chmod of ${path} (pinned entry is not a plain ${dir ? "directory" : "file"})`,
+			);
 		fchmodSync(fd, mode);
 	} finally {
 		closeSync(fd);
@@ -961,7 +981,12 @@ export function ensureTurnStoreAccess(
 	workerHome: string,
 	storePath: string,
 	ids: TurnIdentity,
-	deps: { isMounted?: (path: string) => boolean } = {},
+	deps: {
+		isMounted?: (path: string) => boolean;
+		/** Only for tests: fires before each store chmod, so a test can swap
+		 * the entry mid-check (the stat-to-open race) deterministically. */
+		beforeChmod?: () => void;
+	} = {},
 ): string | null {
 	const agentDir = join(workerHome, ".omp", "agent");
 	const dbFile = join(agentDir, "agent.db");
@@ -1066,7 +1091,10 @@ export function ensureTurnStoreAccess(
 		);
 	}
 	if (drifted.length === 0) return null;
-	for (const entry of drifted) chmodPinned(entry.path, entry.mode, entry.dir);
+	for (const entry of drifted) {
+		deps.beforeChmod?.();
+		chmodPinned(entry.path, entry.mode, entry.dir);
+	}
 	const restored = drifted
 		.map(
 			(entry) =>

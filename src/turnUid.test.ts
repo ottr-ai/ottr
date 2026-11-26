@@ -963,6 +963,64 @@ rootTest("bootTurnIsolation leaves a planted store sibling untouched", () => {
 	expect(statSync(db).mode & 0o777).toBe(0o666);
 });
 
+rootTest(
+	"bootTurnIsolation survives a journal swapped to a FIFO mid-check",
+	() => {
+		// The stat-to-open race from another worker's turn: the hook swaps the wal
+		// before its chmod, so the pinned open meets a FIFO. O_NONBLOCK keeps boot
+		// from hanging; the descriptor check turns the chmod into a note, and the
+		// plain db still gets restored.
+		const workerHome = freshDir("boot-home-fifo");
+		const agentDir = join(workerHome, ".omp", "agent");
+		mkdirSync(agentDir, { recursive: true });
+		const db = join(agentDir, "agent.db");
+		const wal = join(agentDir, "agent.db-wal");
+		writeFileSync(db, "store");
+		chmodSync(db, 0o600);
+		writeFileSync(wal, "wal");
+		chmodSync(wal, 0o600);
+		let calls = 0;
+		const notes = bootTurnIsolation(workerHome, [], {
+			beforeChmod: () => {
+				calls += 1;
+				if (calls === 2) {
+					rmSync(wal);
+					Bun.spawnSync(["mkfifo", wal]);
+				}
+			},
+		});
+		expect(calls).toBe(2);
+		expect(notes.some((n) => n.includes("agent.db-wal chmod failed"))).toBe(
+			true,
+		);
+		expect(statSync(wal).isFIFO()).toBe(true);
+		expect(statSync(db).mode & 0o777).toBe(0o666);
+	},
+);
+
+rootTest(
+	"bootTurnIsolation leaves a journal that is itself a mount to the host",
+	() => {
+		// Any one of the three store entries can be its own bind mount: the wal
+		// mount keeps the host's mode while the plain db gets restored.
+		const workerHome = freshDir("boot-home-wal-mount");
+		const agentDir = join(workerHome, ".omp", "agent");
+		mkdirSync(agentDir, { recursive: true });
+		const db = join(agentDir, "agent.db");
+		const wal = join(agentDir, "agent.db-wal");
+		writeFileSync(db, "store");
+		chmodSync(db, 0o600);
+		writeFileSync(wal, "wal");
+		chmodSync(wal, 0o600);
+		const notes = bootTurnIsolation(workerHome, [], {
+			isMounted: (p) => p === wal,
+		});
+		expect(statSync(db).mode & 0o777).toBe(0o666);
+		expect(statSync(wal).mode & 0o777).toBe(0o600);
+		expect(notes.some((n) => n.includes("agent.db-wal is a mount"))).toBe(true);
+	},
+);
+
 test("isolationEnabled matches the process uid", () => {
 	expect(isolationEnabled()).toBe(
 		typeof process.getuid === "function" && process.getuid() === 0,
@@ -1195,6 +1253,28 @@ describe("ensureTurnStoreAccess", () => {
 		expect(() => ensureTurnStoreAccess(workerHome, storePath, ids)).toThrow(
 			/refusing planted store entry .*not a plain file/,
 		);
+	});
+
+	test("a journal swapped to a FIFO in the race window refuses without blocking", () => {
+		// The stat-to-open race: the swap fires before the first chmod, so the
+		// pinned open meets a FIFO where lstat saw a plain file. O_NONBLOCK
+		// keeps the open from hanging and the descriptor check refuses it.
+		const { workerHome, storePath, dbTarget } = freshStore();
+		healthy(workerHome, dbTarget);
+		chmodSync(dbTarget, 0o600); // Only the db drifts, so only its chmod fires.
+		const ids = projectTurnUid("store-fifo-proj");
+		let swaps = 0;
+		expect(() =>
+			ensureTurnStoreAccess(workerHome, storePath, ids, {
+				beforeChmod: () => {
+					swaps += 1;
+					rmSync(dbTarget);
+					Bun.spawnSync(["mkfifo", dbTarget]);
+				},
+			}),
+		).toThrow(/refusing store chmod .*not a plain file/);
+		expect(swaps).toBe(1);
+		expect(statSync(dbTarget).isFIFO()).toBe(true);
 	});
 });
 

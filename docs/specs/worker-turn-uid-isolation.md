@@ -185,17 +185,20 @@ daemon prepares it once per boot, root-only:
   files.
 - `.omp/agent/agent.db` gets `a+rw`, but only when it is not a mount point
   (the daemon reads `/proc/self/mountinfo`). The boot also gives `a+rw` to
-  the existing `agent.db-wal` and `agent.db-shm` siblings, under the same
-  mounted-skip rule. Each of these chmods runs through a pinned fd: the
-  boot opens the entry with `O_NOFOLLOW` and runs `fchmodSync` through it,
-  so a swap between the check and the chmod cannot redirect the chmod. A
-  store sibling that is not a plain file gets no chmod: the boot logs a
-  note and leaves the mode. The compose store is a host
-  bind mount, and a chmod through it would change the host file's mode; the
-  boot logs a note instead and leaves the mode to the host. The residual:
-  a turn-side store write (a credential refresh of a non-lent provider)
-  fails on such a deployment with the cause omp reports; lent providers and
-  env keys are unaffected.
+  the existing `agent.db-wal` and `agent.db-shm` siblings. Each of the
+  three entries carries its own checks: any one of them can be its own
+  bind mount, and a chmod through one would change that host file's mode.
+  Each of these chmods runs through a pinned fd: the boot opens the entry
+  with `O_NOFOLLOW|O_NONBLOCK` and runs `fchmodSync` through it, so a swap
+  between the check and the chmod cannot redirect the chmod, and a FIFO
+  swapped into the entry cannot block the open. The boot fstats the pinned
+  descriptor and chmods only a plain file. A store sibling that is not a
+  plain file gets no chmod: the boot logs a note and leaves the mode. The
+  compose store is a host bind mount, and a chmod through it would change
+  the host file's mode; the boot logs a note per mounted entry instead and
+  leaves the mode to the host. The residual: a turn-side store write (a
+  credential refresh of a non-lent provider) fails on such a deployment
+  with the cause omp reports; lent providers and env keys are unaffected.
 - Before each turn spawns as the turn uid, the daemon restores the
   shared-store modes (`src/turnUid.ts`). It resolves the turn's store path
   through the layer links. A planted pointer whose resolution does not
@@ -206,15 +209,18 @@ daemon prepares it once per boot, root-only:
   `agent.db-shm` siblings. A store entry that is a symlink or not a plain
   file fails the run: a turn can plant `agent.db-wal` or `agent.db-shm`
   in the sticky `1777` dir. Before each chmod the daemon pins the entry's
-  inode: it opens the entry with `O_NOFOLLOW` (plus `O_DIRECTORY` for a
-  dir) and runs `fchmodSync` through the fd, so a same-uid swap between
-  the stat and the chmod cannot redirect the chmod. A drifted entry gets
-  the boot table's mode (home `0711`, agent dir `1777`, store files
-  `0666`), and the run logs one `turn-uid:` drift line. The daemon chmods
-  only entries of the trusted chain. It never chmods a mounted entry that
-  blocks the uid, because a chmod through the mount would change the host
-  file. The run refuses to start, and the board parks the card
-  `needs_you` with a reason that names the file and the host fix.
+  inode: it opens the entry with `O_NOFOLLOW|O_NONBLOCK` (plus
+  `O_DIRECTORY` for a dir), fstats the descriptor, and runs `fchmodSync`
+  through the fd only when the pinned inode is a plain file or dir. A
+  FIFO swapped into the entry between the stat and the open cannot block
+  the open, and a same-uid swap cannot redirect the chmod. A drifted
+  entry gets the boot table's mode (home `0711`, agent dir `1777`, store
+  files `0666`), and the run logs one `turn-uid:` drift line. The daemon
+  chmods only entries of the trusted chain. It never chmods a mounted
+  entry that blocks the uid, because a chmod through the mount would
+  change the host file. The run refuses to start, and the board parks
+  the card `needs_you` with a reason that names the file and the host
+  fix.
 - BuildKit client material (`/certs/buildkit/client/*`, the CA) is root-only
   `0400` in the image ("workers run as root"); the boot gives the turn uids
   a read (`0644`), because a build turn needs the client key when the build
