@@ -1,4 +1,11 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	test,
+} from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,10 +43,42 @@ beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-trending-"));
 });
 
-// Closing ~26 stores measured 6.4s under load >=32; bun's hook budget is 5s.
+/** Closes one store with its identity on the log. The "closing" line prints
+ * before the synchronous bun:sqlite close starts, so even a close that stalls
+ * the main thread names its store — the line is the last output before the
+ * hook timeout, on every hook that closes stores. */
+async function closeNamed(store: ProjectStore, index: number): Promise<void> {
+	const label = `store ${index} (${store.serverDir})`;
+	console.log(`[teardown] ${label} closing`);
+	const at = performance.now();
+	try {
+		await store.close();
+	} catch (error) {
+		throw new Error(`${label} failed to close`, { cause: error });
+	}
+	const ms = Math.round(performance.now() - at);
+	if (ms > 500) console.log(`[teardown] ${label} closed in ${ms}ms`);
+}
+
+afterEach(async () => {
+	// Close what accumulated since the last afterEach, inside this test's own
+	// hook budget: one close is ~60-660 ms of synchronous bun:sqlite work
+	// (WAL-checkpoint fsyncs, load-dependent), and the file's 26 stores
+	// together in one hook measured 16.4 s under machine load against the
+	// 5 s hook default there (OTTR-1027).
+	for (const [i, store] of stores.splice(0).entries())
+		await closeNamed(store, i);
+}, 20_000);
+
 afterAll(async () => {
-	for (const s of stores) await s.close();
+	// afterEach closed every store inside its test's own hook budget; only a
+	// test that timed out can leave one behind, so close the rest here. Every
+	// close goes through closeNamed, so this fallback path keeps the same
+	// naming on a hang or a failure.
+	for (const [i, store] of stores.splice(0).entries())
+		await closeNamed(store, i);
 	rmSync(root, { recursive: true, force: true });
+	// Closing ~26 stores measured 6.4s under load >=32; bun's hook budget is 5s.
 }, 60_000);
 
 let seq = 0;
