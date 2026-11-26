@@ -7,6 +7,7 @@ import {
 	type AreaConfig,
 	collectFindings,
 	loadConfigs,
+	THRESHOLD_BASIS,
 	walkSourceFiles,
 } from "./stryker-areas.ts";
 
@@ -95,5 +96,26 @@ describe("loadConfigs and walkSourceFiles on the real tree", () => {
 		]);
 		expect(universe.length).toBeGreaterThan(0);
 		expect(collectFindings(walkSourceFiles(repoRoot), areas)).toEqual([]);
+	});
+});
+
+describe("area thresholds", () => {
+	// OTTR-1275 work-check blockers 2-11: a break with no recorded basis is a guess.
+	// Each area's break must match its recorded basis, rounded down, capped at 90
+	// (AGENTS.md's measured-score rule; docs/specs/stryker-area-configs.md). Today the
+	// basis is the user-approved base score; a measured score replaces it per area
+	// when the post-merge full run measures the area.
+	test("each area's break matches its recorded basis", async () => {
+		const repoRoot = join(import.meta.dir, "..");
+		const { areas } = await loadConfigs(repoRoot);
+		expect(Object.keys(THRESHOLD_BASIS).sort()).toEqual(
+			areas.map((area) => area.name).sort(),
+		);
+		for (const area of areas) {
+			const basis = THRESHOLD_BASIS[area.name];
+			if (!basis) throw new Error(`${area.name}: no threshold basis recorded`);
+			const expected = Math.min(90, Math.floor(basis.score));
+			expect(`${area.name}: ${area.break}`).toBe(`${area.name}: ${expected}`);
+		}
 	});
 });

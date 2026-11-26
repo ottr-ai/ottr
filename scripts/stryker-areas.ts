@@ -12,7 +12,39 @@ export interface AreaConfig {
 	name: string;
 	file: string;
 	mutate: string[];
+	/** The config's thresholds.break, or undefined when it ships no break. */
+	break?: number | null;
 }
+
+/**
+ * The recorded basis for each area config's break threshold. Every area needs one:
+ * a threshold with no recorded basis is a guess (OTTR-1275 work-check blockers 2-11).
+ * Each area's break is Math.min(90, Math.floor(score)) — AGENTS.md's measured-score
+ * rule — and the area-threshold test enforces the pair against the real configs.
+ * Today every entry carries the user-approved floor: the base config's measured full
+ * score (76.48, 2026-10-31 at 16b3326, recorded in scripts/stryker-base.mjs),
+ * approved for all ten areas on 2026-11-26 so no threshold drops. The full run after
+ * the merge queue drains measures each area and replaces its entry with
+ * { kind: "measured", score } and the config's break with its own measured score.
+ */
+export interface ThresholdBasis {
+	kind: "measured" | "approved";
+	/** The score the break derives from. */
+	score: number;
+}
+
+export const THRESHOLD_BASIS: Record<string, ThresholdBasis> = {
+	git: { kind: "approved", score: 76.48 },
+	insights: { kind: "approved", score: 76.48 },
+	integrations: { kind: "approved", score: 76.48 },
+	ops: { kind: "approved", score: 76.48 },
+	rest: { kind: "approved", score: 76.48 },
+	store: { kind: "approved", score: 76.48 },
+	supervisor: { kind: "approved", score: 76.48 },
+	ui: { kind: "approved", score: 76.48 },
+	vm: { kind: "approved", score: 76.48 },
+	workers: { kind: "approved", score: 76.48 },
+};
 
 // The universe's patterns: the mutate array of the base config, read live so this check
 // can never drift from it. A plain import takes no lock and wipes no sandbox: both are
@@ -60,6 +92,64 @@ export function collectFindings(
 	return findings.sort();
 }
 
+/** One loaded config file: its file name and the default-export pieces the check reads. */
+interface ConfigModule {
+	name: string;
+	mutate: unknown;
+	areaName: unknown;
+	break: unknown;
+}
+
+async function readConfigModule(
+	repoRoot: string,
+	name: string,
+): Promise<ConfigModule> {
+	const path = join(repoRoot, name);
+	// Dynamic import: the config files exist only after readdirSync, so a static
+	// import cannot name them at author time (runtime registry exception).
+	const mod = (await import(path)) as {
+		default?: { mutate?: unknown; thresholds?: { break?: unknown } };
+		areaName?: unknown;
+	};
+	return {
+		name,
+		mutate: mod.default?.mutate,
+		areaName: mod.areaName,
+		break: mod.default?.thresholds?.break,
+	};
+}
+
+/** Classifies one module as an area config: registers it (throwing on a duplicate
+ * areaName) and returns it, or returns null when the module has no string areaName. */
+function areaFromModule(
+	mod: ConfigModule,
+	byName: Map<string, AreaConfig>,
+): AreaConfig | null {
+	if (typeof mod.areaName !== "string") return null;
+	const area: AreaConfig = {
+		name: mod.areaName,
+		file: mod.name,
+		mutate: Array.isArray(mod.mutate) ? mod.mutate.map(String) : [],
+		break: typeof mod.break === "number" ? mod.break : null,
+	};
+	const dup = byName.get(area.name);
+	if (dup)
+		throw new Error(
+			`${dup.file} and ${mod.name}: duplicate areaName "${area.name}"`,
+		);
+	byName.set(area.name, area);
+	return area;
+}
+
+/** The universe mutate patterns from the base config module, or null for any other
+ * module. Throws when the base config ships no mutate array. */
+function universeFromModule(mod: ConfigModule): string[] | null {
+	if (mod.name !== "stryker.config.mjs") return null;
+	if (!Array.isArray(mod.mutate))
+		throw new Error(`${mod.name}: default export has no mutate array`);
+	return mod.mutate.map(String);
+}
+
 /** Reads every stryker*.config.mjs at the repo root. A module exporting a string
  * areaName is an area config; stryker.config.mjs is the universe source. Throws on a
  * duplicate areaName and when the universe source is missing or ships no mutate array. */
@@ -74,33 +164,14 @@ export async function loadConfigs(repoRoot: string): Promise<{
 	const byName = new Map<string, AreaConfig>();
 	let universe: string[] | null = null;
 	for (const name of names) {
-		const path = join(repoRoot, name);
-		// Dynamic import: the config files exist only after readdirSync, so a static
-		// import cannot name them at author time (runtime registry exception).
-		const mod = (await import(path)) as {
-			default?: { mutate?: unknown };
-			areaName?: unknown;
-		};
-		if (typeof mod.areaName === "string") {
-			const mutate = mod.default?.mutate;
-			const area: AreaConfig = {
-				name: mod.areaName,
-				file: name,
-				mutate: Array.isArray(mutate) ? mutate.map(String) : [],
-			};
-			const dup = byName.get(area.name);
-			if (dup)
-				throw new Error(
-					`${dup.file} and ${name}: duplicate areaName "${area.name}"`,
-				);
-			byName.set(area.name, area);
+		const mod = await readConfigModule(repoRoot, name);
+		const area = areaFromModule(mod, byName);
+		if (area) {
 			areas.push(area);
-		} else if (name === "stryker.config.mjs") {
-			const mutate = mod.default?.mutate;
-			if (!Array.isArray(mutate))
-				throw new Error(`${name}: default export has no mutate array`);
-			universe = mutate.map(String);
+			continue;
 		}
+		const moduleUniverse = universeFromModule(mod);
+		if (moduleUniverse) universe = moduleUniverse;
 		// The other areaName-less configs (release, turn, worktree, update-image) are
 		// module configs; the delta gate reads them, not this check.
 	}

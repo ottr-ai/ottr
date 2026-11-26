@@ -74,14 +74,27 @@ exactly one area config (or by its module config for the four overlay files), so
 
 ## Thresholds
 
-No per-file score data exists on this machine: the only incremental cache is the
-release cache, whose file (`src/release.ts`) is outside the area partition; the
-2026-10-31 full run (76.48%, recorded in `scripts/stryker-base.mjs`) never wrote a
-cache. Each new config starts at `break: 76`, the standing measured floor, and keeps
-the base `high: 80`, `low: 60`. Each config's threshold rises to its own measured
-score (rounded down, capped at 90) at its first real run, per AGENTS.md. The split
-keeps the overall mutate set identical to the old base set, so the overall measured
-score carries over.
+Each area config starts at `break: 76` — the base config's measured score (76.48%,
+2026-10-31 at 16b3326, recorded in `scripts/stryker-base.mjs`) rounded down — and
+keeps the base `high: 80`, `low: 60`. The user approved this floor for all ten areas
+on 2026-11-26 (OTTR-1275 work-check blockers 2-11): no threshold drops below the
+base's measured break, and no area has a measured score yet. The basis lives in
+`THRESHOLD_BASIS` (`scripts/stryker-areas.ts`), and the area-threshold test pins each
+config's break to its recorded basis.
+
+The full run after the merge queue drains measures each area and sets its own break:
+the measured score rounded down, at most 90 (AGENTS.md). That run replaces the
+area's `THRESHOLD_BASIS` entry with `{ kind: "measured", score }` and raises the
+config's break to match.
+
+Measurement attempt, recorded for the next try: on 2026-11-25 and 2026-11-26 the
+container sat at about 96 percent of its 12 GiB cgroup (71 MiB free), so Stryker's
+memory rule forced 1 slot and the dry run passed its 20-minute budget. Forcing
+concurrency past the memory rule was rejected: the rule protects the shared worker
+from OOM kills. Measure on a host with cgroup headroom.
+
+The split keeps the overall mutate set identical to the old base set, so the overall
+measured score carries over.
 
 ## Concurrency and budgets
 
