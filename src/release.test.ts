@@ -1361,6 +1361,7 @@ describe("runReleaseCommand against real repos", () => {
 			target?: string;
 			log?: (l: string) => void | Promise<void>;
 			archReview?: { delta: number } | null;
+			allowEnv?: string | null;
 		} = {},
 	) =>
 		runReleaseCommand({
@@ -1373,6 +1374,7 @@ describe("runReleaseCommand against real repos", () => {
 			version,
 			notesFile,
 			archReview: extra.archReview,
+			...(extra.allowEnv !== undefined && { allowEnv: extra.allowEnv }),
 			log: extra.log ?? (() => {}),
 		});
 
@@ -1411,9 +1413,10 @@ describe("runReleaseCommand against real repos", () => {
 		);
 	}, 60_000);
 
-	// OTTR-1019: the command runs with the server's env (releaseEnv), so an echoed
-	// GH_TOKEN must not reach the log lines or the thrown error raw. The log callback
-	// here mirrors the board's `| ${l}` -> appendLog path, which has no redaction.
+	// OTTR-1019: the base release env holds no server secrets any more, but an operator
+	// can allowlist a credential-bearing name (releaseEnv setting), so an echoed GH_TOKEN
+	// must not reach the log lines or the thrown error raw. The log callback here
+	// mirrors the board's `| ${l}` -> appendLog path, which has no redaction.
 	test("a leaked GH_TOKEN redacts out of the log lines and the error", async () => {
 		const { sha, wt } = reviewed();
 		const dummy = "ott-dummy-gh-token-0123456789abcdef";
@@ -1425,6 +1428,7 @@ describe("runReleaseCommand against real repos", () => {
 		try {
 			await expect(
 				run("leak", sha, wt, "v1.0.6", {
+					allowEnv: "GH_TOKEN",
 					log: (l) => {
 						lines.push(l);
 					},
@@ -1435,8 +1439,8 @@ describe("runReleaseCommand against real repos", () => {
 			if (savedToken === undefined) delete process.env.GH_TOKEN;
 			else process.env.GH_TOKEN = savedToken;
 		}
-		// The child really received the token (releaseEnv forwards GH_TOKEN), so the
-		// assertion is not vacuous: the line carries only [REDACTED], never the raw value.
+		// The child really received the token (releaseEnv forwards the allowlisted name),
+		// so the assertion is not vacuous: the line carries only [REDACTED], never the raw.
 		expect(lines).toEqual(["gh=[REDACTED]"]);
 	}, 60_000);
 
