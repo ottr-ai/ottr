@@ -218,9 +218,23 @@ try {
         // survive — blocked waits again, confirmed stays decided work.
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-grilled-blocked', 'grilled blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 700, 900, 'legacy-review', 910, 'Grilled definition of ready')");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-grilled-confirmed', 'grilled confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 800, 950, 'legacy-review', 920, 'Grilled definition of ready')");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-dup-keep confirmed', 940)");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-dup-keep blocked', 950)");
         await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-blocked blocked', 900)");
         await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-blocked confirmed', 915)");
         await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-grilled-confirmed confirmed', 910)");
+        // A foreign review's run never decides a lead: its newer confirmation
+        // cannot unlock the blocked lead, its newer blocked result cannot lock
+        // the confirmed one.
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-foreign-review', 'foreign review', 'Foreign review of the case.', 'done', 'idle', 'review', 600, 600, NULL)");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-foreign-run', 'foreign validation run', 'Batch validation of 2 lead(s).', 'done', 'idle', 'validation', 600, 610, 'legacy-foreign-review')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-foreign-wait', 'foreign confirmed lead', 'Needs validation: foreign confirmation case', 'backlog', 'idle', 'work', 700, 1000, 'legacy-review', 940, 'Grilled definition of ready')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-foreign-keep', 'foreign blocked lead', 'Needs validation: foreign blocked case', 'backlog', 'idle', 'work', 750, 1010, 'legacy-review', 945, 'Grilled definition of ready')");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-foreign-run', 'Validation: #legacy-foreign-wait confirmed', 960)");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-foreign-run', 'Validation: #legacy-foreign-keep blocked', 970)");
+        // The lead's own review still records the deciding results.
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-foreign-wait blocked', 640)");
+        await leadDb.run("INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('legacy-valcard', 'Validation: #legacy-foreign-keep confirmed', 650)");
         // Within one run the first result per lead rules: the blocked first
         // result with a later same-run confirmed duplicate still waits.
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-dup-keep', 'duplicate confirmed lead', 'Needs validation: duplicate confirmed result', 'backlog', 'idle', 'work', 850, 960, 'legacy-review', 930, 'Grilled definition of ready')");
@@ -232,6 +246,8 @@ try {
         { id: 'legacy-answered', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
         { id: 'legacy-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 700, validated_at: 750 },
         { id: 'legacy-dup-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 930 },
+        { id: 'legacy-foreign-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 945 },
+        { id: 'legacy-foreign-wait', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 1000, validated_at: 940 },
         { id: 'legacy-grilled-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 900, validated_at: 910 },
         { id: 'legacy-grilled-confirmed', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 920 },
         { id: 'legacy-lead', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 500, validated_at: null },

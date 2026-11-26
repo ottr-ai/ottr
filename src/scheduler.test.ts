@@ -34,6 +34,7 @@ import {
 	LEAD_NOT_APPLY_OPTION_LEGACY,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	LEAD_UNSURE_OPTION,
+	type LeadFindingOutcome,
 	lastFullReview,
 	lastFullReviewBase,
 	lastReviewBase,
@@ -66,7 +67,9 @@ import {
 	SILENT_LOG_MS,
 	selectFindings,
 	silentSince,
+	type ValidationOutcomeRow,
 	validatableReview,
+	validationOutcomes,
 	waitingOn,
 	workCheckAccountingError,
 	workCheckBlockerCounts,
@@ -76,6 +79,7 @@ import {
 	workCheckDivergeReason,
 } from "./scheduler.ts";
 import { type NewCodeScanAlert, ProjectStore } from "./store.ts";
+import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
 import fc from "./test/properties.ts";
 import type { CardRef, Task, WorkCheckRun } from "./types.ts";
 import { buildCardIndex } from "./ui/cardIndex.ts";
@@ -3658,5 +3662,55 @@ describe("OTTR-1252: the legacy-lead convergence decision reads the newest outco
 				null,
 			),
 		).toBe(false);
+	});
+});
+
+describe("OTTR-1252: one outcome selector for every validation reader", () => {
+	// The shared case table drives the selector directly: only the lead's own
+	// review's runs count, runs newest first, the first result per lead inside
+	// a run — and the selector's outcome must equal the table's `own` with the
+	// table's `waits` following from it, for every caller's sake.
+	test.each(leadOutcomeCases)(
+		"$name decides $own, waiting: $waits",
+		({ name, runs, own, waits }) => {
+			const rows: ValidationOutcomeRow[] = [];
+			for (const run of runs) {
+				const cardId = run.foreign ? "F-run" : "R-run";
+				run.results.forEach((outcome, order) => {
+					rows.push({
+						prompt: `Validation: #L ${outcome}`,
+						order,
+						cardId,
+						cardCreatedAt: run.createdAt,
+						cardKind: "validation",
+						cardFollowUpOf: run.foreign ? "F" : "R",
+					});
+				});
+			}
+			const outcomes = validationOutcomes("R", rows);
+			// The table's own outcome is the newest own run's first result.
+			expect(own).not.toBeNull();
+			expect(outcomes.get("L")?.outcome).toBe(own as LeadFindingOutcome);
+			// waits follows from own: blocked and deployment keep waiting.
+			expect(
+				outcomes.get("L")?.outcome === "blocked" ||
+					outcomes.get("L")?.outcome === "deployment",
+			).toBe(waits);
+			expect(name.length).toBeGreaterThan(0);
+		},
+	);
+
+	test("a foreign review's run never appears in the lead's outcomes", () => {
+		const rows: ValidationOutcomeRow[] = [
+			{
+				prompt: "Validation: #L confirmed",
+				order: 0,
+				cardId: "F-run",
+				cardCreatedAt: 200,
+				cardKind: "validation",
+				cardFollowUpOf: "F",
+			},
+		];
+		expect(validationOutcomes("R", rows).size).toBe(0);
 	});
 });

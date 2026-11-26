@@ -42,6 +42,7 @@ import {
 } from "./store.ts";
 import { prConflictReason } from "./supervisor.ts";
 import { type StoreChildHandle, spawnStoreChild } from "./test/storeChild.ts";
+import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
 import {
 	answeredCard,
 	PR_REVIEW_POSTED,
@@ -6992,6 +6993,66 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 		expect(relead.waitsValidation).toBe(true);
 		expect(relead.queuedAt).toBe(500);
 	}, 15_000);
+
+	// OTTR-1252: the shared outcome selector's rule, run through the SQLite
+	// convergence over the same case table the settle, the reset and the
+	// PostgreSQL step use (src/test/leadOutcomeCases.ts): only the lead's own
+	// review's runs count, runs newest first, the first result per lead inside
+	// a run.
+	for (const outcomeCase of leadOutcomeCases) {
+		test(`SQLite convergence decides ${outcomeCase.name} -> waits: ${outcomeCase.waits}`, async () => {
+			const dir = join(
+				root,
+				`lead-outcome-${outcomeCase.own}-${outcomeCase.name.replace(/\W+/g, "-")}`,
+			);
+			mkdirSync(join(dir, ".tasks"), { recursive: true });
+			const raw = new Database(join(dir, ".tasks", "tasks.db"));
+			raw.exec(PRE_WAITS_TASKS_DDL);
+			raw.exec(EVENTS_DDL);
+			raw.exec(`CREATE TABLE IF NOT EXISTS review_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  model TEXT,
+  rank INTEGER,
+  security TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(card_id, prompt)
+)`);
+			raw.exec(`INSERT INTO tasks
+					(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of)
+					VALUES
+						('R', 'own review', 'review of the case', 'done', 'idle', 'review', 10, 10, NULL),
+						('F', 'foreign review', 'foreign review of the case', 'done', 'idle', 'review', 20, 20, NULL)`);
+			raw.exec(`INSERT INTO tasks
+					(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
+					VALUES
+						('lead1', 'lead card', 'Needs validation: table case', 'backlog', 'idle', 'work', 100, 100, 'R', NULL, 900, NULL)`);
+			let seq = 0;
+			for (const run of outcomeCase.runs) {
+				seq += 1;
+				const cardId = `run-${seq}`;
+				raw.exec(
+					`INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of)
+						VALUES ('${cardId}', 'run ${seq}', 'Batch validation.', 'done', 'idle', 'validation', ${run.createdAt}, ${run.createdAt}, '${run.foreign ? "F" : "R"}')`,
+				);
+				for (const [resultIndex, outcome] of run.results.entries())
+					raw.exec(
+						`INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('${cardId}', 'Validation: #lead1 ${outcome}${resultIndex > 0 ? ` — repeat ${resultIndex}` : ""}', ${run.createdAt + resultIndex})`,
+					);
+			}
+			raw.close();
+
+			const store = await open(dir);
+			const lead = (await store.getTask("lead1"))!;
+			// waits: the lead took the waiting form (todo/queued, marker set,
+			// validatedAt kept); keeps: it stays decided backlog work.
+			expect(lead.stage).toBe(outcomeCase.waits ? "todo" : "backlog");
+			expect(lead.waitsValidation).toBe(outcomeCase.waits);
+			expect(lead.validatedAt).toBe(900);
+			await store.close();
+		}, 15_000);
+	}
 
 	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", async () => {
 		const dir = join(root, "review-findings-roundtrip");

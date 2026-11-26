@@ -6,11 +6,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import type { ensureProjectPackages } from "./apt.ts";
-import {
-	leadFingerprint,
-	leadTitleKey,
-	validationResult,
-} from "./auditLeads.ts";
+import { leadFingerprint, leadTitleKey } from "./auditLeads.ts";
 import { ensureCheckGuardOverlay } from "./checkGuard.ts";
 import {
 	CODE_SCAN_ALERTS_FILE,
@@ -173,7 +169,9 @@ import {
 	reviewFindings,
 	selectFindings,
 	UNCHECKED_FINDINGS_HOLD,
+	type ValidationOutcomeRow,
 	validatableReview,
+	validationOutcomes,
 	WORK_CHECK_ASK_BLOCK,
 	withDepWriteLock,
 	workCheckAccountingError,
@@ -1750,16 +1748,6 @@ type TurnIdentityFlags = {
 	grill: boolean;
 	scout: boolean;
 	validation: boolean;
-};
-
-/** One lead result a validation run recorded with propose_task; the shape
- * `validationResult` (auditLeads.ts) parses a recorded prompt into. */
-type LeadValidationResult = {
-	/** The lead card the result names (`#<id>` on the prompt's first line). */
-	leadId: string;
-	outcome: "confirmed" | "refuted" | "blocked" | "deployment";
-	/** The prompt text after the first line, trimmed. */
-	evidence: string;
 };
 
 /** The flags plus the session name resolveTurnIdentity fixed before the run. */
@@ -9845,16 +9833,29 @@ export function createTurnLoop(
 		const reviewId = st.task.followUpOf;
 		const stored = await st.store.listReviewFindings(st.id);
 		const seen = new Set(stored.map((f) => f.prompt));
-		const all = [...stored];
-		for (const finding of st.result.recorded) {
-			if (seen.has(finding.prompt)) continue;
-			seen.add(finding.prompt);
-			all.push(finding);
-		}
-		const results = all
-			.map((finding) => validationResult(finding.prompt))
-			.filter((r) => r !== null);
-		if (results.length === 0)
+		const recorded = st.result.recorded.filter((f) => !seen.has(f.prompt));
+		// OTTR-1252: the run's own per-lead results come through the one shared
+		// outcome selector: this card's findings in arrival order, then this
+		// turn's recorded results after them — the first result per lead rules.
+		const first = validationOutcomes(reviewId ?? "", [
+			...stored.map((f, index) => ({
+				prompt: f.prompt,
+				order: index,
+				cardId: st.id,
+				cardCreatedAt: st.task.createdAt,
+				cardKind: st.task.kind,
+				cardFollowUpOf: reviewId,
+			})),
+			...recorded.map((f, index) => ({
+				prompt: f.prompt,
+				order: stored.length + index,
+				cardId: st.id,
+				cardCreatedAt: st.task.createdAt,
+				cardKind: st.task.kind,
+				cardFollowUpOf: reviewId,
+			})),
+		]);
+		if (first.size === 0)
 			return {
 				stage: "in_progress",
 				state: "needs_you",
@@ -9863,9 +9864,6 @@ export function createTurnLoop(
 		if (reviewId === null) return next;
 		const now = Date.now();
 		const date = new Date(now).toISOString().slice(0, 10);
-		const first = new Map<string, LeadValidationResult>();
-		for (const result of results)
-			if (!first.has(result.leadId)) first.set(result.leadId, result);
 		const deployment: string[] = [];
 		let applied = 0;
 		const tasks = await st.store.listTasks();
@@ -10065,24 +10063,26 @@ export function createTurnLoop(
 		lead?: string,
 	): Promise<string[]> {
 		const tasks = await store.listTasks();
-		const newest = new Map<string, { outcome: string; runId: string }>();
-		const cards = tasks
-			.filter((t) => t.followUpOf === reviewId && t.kind === "validation")
-			.sort((a, b) =>
-				a.createdAt !== b.createdAt
-					? a.createdAt > b.createdAt
-						? -1
-						: 1
-					: a.id > b.id
-						? -1
-						: 1,
-			);
-		for (const card of cards)
-			for (const finding of await store.listReviewFindings(card.id)) {
-				const r = validationResult(finding.prompt);
-				if (r !== null && !newest.has(r.leadId))
-					newest.set(r.leadId, { outcome: r.outcome, runId: card.id });
-			}
+		// OTTR-1252: the newest outcome per lead comes through the one shared
+		// outcome selector — this review's validation runs newest first, the
+		// first result per lead inside a run — so the reset can never disagree
+		// with the settle or the convergence about what the lead's outcome is.
+		const rows: ValidationOutcomeRow[] = [];
+		for (const card of tasks) {
+			if (card.kind !== "validation") continue;
+			const findings = await store.listReviewFindings(card.id);
+			findings.forEach((finding, order) => {
+				rows.push({
+					prompt: finding.prompt,
+					order,
+					cardId: card.id,
+					cardCreatedAt: card.createdAt,
+					cardKind: card.kind,
+					cardFollowUpOf: card.followUpOf,
+				});
+			});
+		}
+		const newest = validationOutcomes(reviewId, rows);
 		const reset: string[] = [];
 		for (const t of tasks) {
 			if (lead !== undefined && t.id !== lead) continue;
@@ -10105,7 +10105,7 @@ export function createTurnLoop(
 			// marker leaves the details unchanged; an empty remainder stores null.
 			const text = full.details ?? "";
 			const start = text.lastIndexOf(
-				`\nValidated by validation run #${last.runId}`,
+				`\nValidated by validation run #${last.cardId}`,
 			);
 			const patch: TaskPatch = { validatedAt: null };
 			if (start !== -1) {
@@ -10119,7 +10119,7 @@ export function createTurnLoop(
 			await appendLog(
 				store,
 				t.id,
-				`- validation result cleared for re-validation: was "still blocked" (validation run #${last.runId})`,
+				`- validation result cleared for re-validation: was "still blocked" (validation run #${last.cardId})`,
 			);
 			reset.push(t.id);
 		}

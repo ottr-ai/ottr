@@ -95,6 +95,7 @@ import {
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
 import fc from "./test/properties.ts";
+import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
 import { turnEnv } from "./tokens.ts";
 import type { TurnLoop, TurnOps, TurnProject } from "./turn.ts";
 import {
@@ -31938,6 +31939,105 @@ describe("stored review findings", () => {
 			(await store.listTasks()).filter((t) => t.kind === "validation"),
 		).toHaveLength(0);
 	});
+
+	// OTTR-1252: the shared outcome selector's rule, run through the settle and
+	// the reset caller over the same case table the convergence engines use
+	// (src/test/leadOutcomeCases.ts): only the lead's own review's runs count,
+	// runs newest first, the first result per lead inside a run.
+	test.each(leadOutcomeCases)(
+		"settle applies $name -> $own (waits: $waits)",
+		async ({ runs, own, waits }) => {
+			const { store, projects, loop, batches } = await validationCase(
+				baseRecord(),
+			);
+			const review = await doneReview(store, `own review`);
+			const foreign = await doneReview(store, `foreign review`);
+			const lead = await waitingLead(
+				store,
+				review.id,
+				"Needs validation: table case\nBlocker: sandbox run: control",
+			);
+			// The case's runs as done validation cards, seeded oldest first: the
+			// id tiebreak then reads them newest last, matching createdAt.
+			let seq = 0;
+			for (const run of runs) {
+				const card = await store.createTask(
+					`case run ${seq}`,
+					null,
+					"validation",
+				);
+				await store.updateTask(card.id, {
+					followUpOf: run.foreign ? foreign.id : review.id,
+					stage: "done",
+					state: "idle",
+				});
+				for (const outcome of run.results)
+					await store.appendReviewFinding(
+						card.id,
+						mkFinding(`Validation: #${lead.id} ${outcome}`),
+					);
+				seq += 1;
+			}
+			const filed = await loop.filePendingValidationRun(
+				entryOf(projects, store),
+				review.id,
+				true,
+			);
+			expect("error" in filed).toBe(false);
+			if ("error" in filed) throw new Error("no validation run filed");
+			batches.push([mkFinding(`Validation: #${lead.id} ${own}`)]);
+			await loop.runTurn(store.name, filed.id);
+			const after = (await store.getTask(lead.id))!;
+			expect(after.waitsValidation).toBe(waits);
+			if (waits) expect(after.validatedAt).not.toBeNull();
+		},
+	);
+
+	test.each(leadOutcomeCases)(
+		"reset decides $name -> clears: $waits",
+		async ({ runs, own, waits }) => {
+			const { store, projects, loop } = await validationCase(baseRecord());
+			const review = await doneReview(store, `own review`);
+			const foreign = await doneReview(store, `foreign review`);
+			const lead = await waitingLead(
+				store,
+				review.id,
+				"Needs validation: table case\nBlocker: sandbox run: control",
+			);
+			let seq = 0;
+			for (const run of runs) {
+				const card = await store.createTask(
+					`case run ${seq}`,
+					null,
+					"validation",
+				);
+				await store.updateTask(card.id, {
+					followUpOf: run.foreign ? foreign.id : review.id,
+					stage: "done",
+					state: "idle",
+				});
+				for (const outcome of run.results)
+					await store.appendReviewFinding(
+						card.id,
+						mkFinding(`Validation: #${lead.id} ${outcome}`),
+					);
+				seq += 1;
+			}
+			await store.updateTask(lead.id, { validatedAt: 900 });
+			await loop.filePendingValidationRun(
+				entryOf(projects, store),
+				review.id,
+				true,
+				{ before: Date.now() + 1 },
+			);
+			// The reset clears the lead exactly when its own newest outcome is
+			// blocked — a foreign run never decides it.
+			expect((await store.getTask(lead.id))!.validatedAt === null).toBe(
+				own === "blocked",
+			);
+			expect(own === "blocked").toBe(waits);
+		},
+	);
 });
 
 describe("prompt gate", () => {

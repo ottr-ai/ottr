@@ -1635,8 +1635,9 @@ export function validatableReview(
 	);
 }
 
-/** The per-lead outcome vocabulary the validation settle records. */
-export type LeadValidationOutcome =
+/** The per-lead outcome vocabulary a details `Validated by ` segment records
+ * ("blocked" there reads as "still blocked"). */
+export type LeadSegmentOutcome =
 	| "confirmed"
 	| "refuted"
 	| "still blocked"
@@ -1649,7 +1650,7 @@ export type LeadValidationOutcome =
  * it off with an em dash — a prefix match reads both. Pure. */
 export function leadValidationOutcome(
 	details: string | null,
-): LeadValidationOutcome | null {
+): LeadSegmentOutcome | null {
 	if (details === null) return null;
 	const start = details.lastIndexOf("\nValidated by ");
 	if (start === -1) return null;
@@ -1678,24 +1679,59 @@ export type LeadFindingOutcome =
 	| "blocked"
 	| "deployment";
 
-/** The newest recorded outcome per lead id from validation findings, given the
- * rows in the order the runs wrote them: validation cards newest first
- * (created_at desc, id desc), each card's findings in arrival order (id asc).
- * The first result per lead inside a card rules, and the newest card that
- * carries any result for the lead decides — the same first-result-per-run and
- * newest-run rules the settle (first parsed result per lead) and
- * resetValidatedLeads (newest validation card, first parsed result) read, so
- * convergence can never disagree with them about a lead: a blocked result
- * whose later same-run duplicate says confirmed still waits, and a confirmed
- * result whose later duplicate says blocked still does not lock. Pure. */
-export function newestFindingOutcomes(
-	rows: readonly { prompt: string }[],
-): Map<string, LeadFindingOutcome> {
-	const map = new Map<string, LeadFindingOutcome>();
-	for (const row of rows) {
+/** The fields one recorded result carries for its reader: the outcome, the
+ * evidence lines after the prompt's first line, and the validation card
+ * (run) that recorded it. */
+export type LeadValidationOutcome = {
+	outcome: LeadFindingOutcome;
+	evidence: string;
+	cardId: string;
+};
+
+/** One recorded result row a caller feeds to validationOutcomes: the result
+ * prompt, its arrival order inside its run, and the run card's fields. */
+export type ValidationOutcomeRow = {
+	prompt: string;
+	order: number;
+	cardId: string;
+	cardCreatedAt: number | null;
+	cardKind: string;
+	cardFollowUpOf: string | null;
+};
+
+/** The ONE outcome selector for a review's validation results — the settle,
+ * resetValidatedLeads, the SQLite convergence and the PostgreSQL migration
+ * step all read through it, so they can never disagree about a lead. Only
+ * results of the lead's own review count (a foreign review's run never
+ * decides the lead); runs sort newest first (created_at desc, then card id
+ * desc); inside a run the first result for the lead rules (order asc) — the
+ * same rule the settle has always applied, and the reset since OTTR-1129.
+ * Returns the outcome per lead id. Pure. */
+export function validationOutcomes(
+	leadReviewId: string,
+	rows: readonly ValidationOutcomeRow[],
+): Map<string, LeadValidationOutcome> {
+	const ordered = rows
+		.filter(
+			(row) =>
+				row.cardKind === "validation" && row.cardFollowUpOf === leadReviewId,
+		)
+		.sort((a, b) => {
+			const ca = a.cardCreatedAt ?? 0;
+			const cb = b.cardCreatedAt ?? 0;
+			if (ca !== cb) return ca > cb ? -1 : 1;
+			if (a.cardId !== b.cardId) return a.cardId > b.cardId ? -1 : 1;
+			return a.order - b.order;
+		});
+	const map = new Map<string, LeadValidationOutcome>();
+	for (const row of ordered) {
 		const parsed = validationResult(row.prompt);
-		if (parsed !== null && !map.has(parsed.leadId))
-			map.set(parsed.leadId, parsed.outcome);
+		if (parsed === null || map.has(parsed.leadId)) continue;
+		map.set(parsed.leadId, {
+			outcome: parsed.outcome,
+			evidence: parsed.evidence,
+			cardId: row.cardId,
+		});
 	}
 	return map;
 }

@@ -4,7 +4,7 @@ import {
 	getPostgresDatabase,
 	type PostgresDatabase,
 } from "./postgresDriver.ts";
-import { legacyLeadWaits, newestFindingOutcomes } from "./scheduler.ts";
+import { legacyLeadWaits, validationOutcomes } from "./scheduler.ts";
 
 export function projectSchemaName(name: string): string {
 	const stem = name
@@ -297,22 +297,41 @@ export const projectMigrations: readonly PostgresMigration[] = [
 		);
 		// The newest recorded outcome per lead id, from review_findings: the
 		// authoritative record that survives a later grill's details wipe.
-		// The rows arrive in the runs' own order - validation cards newest
-		// first, each card's findings in arrival order - so the first result
-		// per lead inside a card rules, the same rule the settle and
-		// resetValidatedLeads read. The findings table ships in step one, so
-		// every schema that reaches this step has it.
-		const outcomes = newestFindingOutcomes(
-			await db
-				.query<{ prompt: string }, []>(
-					`SELECT f.prompt AS prompt
-					FROM review_findings f
-					JOIN tasks c ON c.id = f.card_id
-					WHERE f.prompt LIKE 'Validation: #%' AND c.kind = 'validation'
-					ORDER BY c.created_at DESC, c.id DESC, f.id ASC`,
-				)
-				.all(),
-		);
+		// validationOutcomes is the ONE selector the settle and
+		// resetValidatedLeads also read: it keeps only the lead's own review's
+		// runs (a foreign review's result never decides the lead), sorts runs
+		// newest first, and takes the first result per lead inside a run. The
+		// legacy rows group by their own review, so each group selects against
+		// its review. The findings table ships in step one, so every schema
+		// that reaches this step has it.
+		const findingRows = await db
+			.query<
+				{
+					prompt: string;
+					finding_order: number;
+					card_id: string;
+					created_at: number | null;
+					kind: string;
+					follow_up_of: string | null;
+				},
+				[]
+			>(
+				`SELECT f.prompt AS prompt, f.id AS finding_order, f.card_id AS card_id,
+					c.created_at AS created_at, c.kind AS kind,
+					c.follow_up_of AS follow_up_of
+				FROM review_findings f
+				JOIN tasks c ON c.id = f.card_id
+				WHERE f.prompt LIKE 'Validation: #%'`,
+			)
+			.all();
+		const outcomeRows = findingRows.map((row) => ({
+			prompt: row.prompt,
+			order: Number(row.finding_order),
+			cardId: row.card_id,
+			cardCreatedAt: row.created_at,
+			cardKind: row.kind,
+			cardFollowUpOf: row.follow_up_of,
+		}));
 		const legacy = await db
 			.query<
 				{
@@ -320,22 +339,33 @@ export const projectMigrations: readonly PostgresMigration[] = [
 					prompt: string;
 					details: string | null;
 					validated_at: number | null;
+					follow_up_of: string | null;
 				},
 				[]
 			>(
-				"SELECT id, prompt, details, validated_at FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+				"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
 			)
 			.all();
-		for (const row of legacy)
-			if (
-				legacyLeadWaits(
-					row.prompt,
-					row.validated_at,
-					row.details,
-					outcomes.get(row.id) ?? null,
+		const byReview = new Map<string, typeof legacy>();
+		for (const row of legacy) {
+			if (row.follow_up_of === null) continue;
+			const group = byReview.get(row.follow_up_of);
+			if (group === undefined) byReview.set(row.follow_up_of, [row]);
+			else group.push(row);
+		}
+		for (const [reviewId, group] of byReview) {
+			const outcomes = validationOutcomes(reviewId, outcomeRows);
+			for (const row of group)
+				if (
+					legacyLeadWaits(
+						row.prompt,
+						row.validated_at,
+						row.details,
+						outcomes.get(row.id)?.outcome ?? null,
+					)
 				)
-			)
-				await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);
+					await db.run(CONVERGE_LEAD_WAIT_SQL, [row.id]);
+		}
 	},
 ];
 

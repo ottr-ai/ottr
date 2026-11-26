@@ -16,6 +16,7 @@ import {
 	projectStepTwo,
 } from "./postgresSchema.ts";
 import { SCHEMA } from "./store.ts";
+import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
 
 /** Column names of one CREATE TABLE body, in order: the first token of each
  *  depth-0 comma group, constraint groups dropped. */
@@ -354,86 +355,70 @@ describe("PostgreSQL migration surface", () => {
 		// A duplicate ALTER on a fresh database is impossible here — the probe
 		// has no tables — so the fresh-database ordering is covered by the
 		// real-driver suite and the step's outside-projectStepOne placement pin.
-		db.querySeeds = [
+		// OTTR-1252: the shared outcome selector's cases (src/test/
+		// leadOutcomeCases.ts) drive the step through the same table the settle,
+		// the reset and the SQLite convergence use: only the lead's own review's
+		// runs count, runs newest first, the first result per lead inside a run.
+		// The stub's SELECTs read seeded rows; the selector sorts them itself.
+		const caseRows: unknown[] = [];
+		const caseLeads: { id: string; waits: boolean }[] = [];
+		leadOutcomeCases.forEach((outcomeCase, index) => {
+			const leadId = `C${index}`;
+			caseLeads.push({ id: leadId, waits: outcomeCase.waits });
+			for (const run of outcomeCase.runs) {
+				const cardId = `${leadId}-run-${run.foreign ? "F" : "R"}-${run.createdAt}`;
+				run.results.forEach((outcome, order) => {
+					caseRows.push({
+						prompt: `Validation: #${leadId} ${outcome}`,
+						order,
+						card_id: cardId,
+						created_at: run.createdAt,
+						kind: "validation",
+						follow_up_of: run.foreign ? "F" : "R",
+					});
+				});
+			}
+		});
+		// Two static rows beyond the table: the operator's applies answer (marker
+		// in the prompt, no findings) and a validated row with no readable record
+		// anywhere (recorded through the started-lead branch, which keeps no
+		// findings) — both stay decided.
+		const extras = [
 			{
-				match: "FROM review_findings",
-				rows: [
-					{ prompt: "Validation: #L6 blocked" },
-					{ prompt: "Validation: #L4 confirmed" },
-					// The newest card's duplicate results: the first per lead rules.
-					{ prompt: "Validation: #L7 blocked" },
-					{ prompt: "Validation: #L7 confirmed" },
-					{ prompt: "Validation: #L8 confirmed" },
-				],
+				id: "X1",
+				prompt:
+					"Needs validation: proxy header\nThe user answered the review's question: Applies",
+				validated_at: null,
+				details: null,
+				follow_up_of: "R",
 			},
+			{
+				id: "X2",
+				prompt: "Needs validation: grilled confirmed lead",
+				validated_at: 900,
+				details: "Grilled definition of ready",
+				follow_up_of: "R",
+			},
+		];
+		db.querySeeds = [
+			{ match: "FROM review_findings", rows: caseRows },
 			{
 				match: "FROM tasks",
 				rows: [
-					{
-						id: "L1",
-						prompt: "Needs validation: suspicious retry loop",
-						validated_at: null,
+					...caseLeads.map((lead) => ({
+						id: lead.id,
+						prompt: `Needs validation: case ${lead.id}`,
 						details: null,
-					},
-					{
-						id: "L2",
-						prompt: "Needs validation: flaky retry",
-						validated_at: 950,
-						details:
-							"\nValidated by validation run #9 on 2026-11-20: still blocked — no retry control.",
-					},
-					{
-						id: "L3",
-						prompt:
-							"Needs validation: proxy header\nBlocker: sandbox run: header control",
-						validated_at: 960,
-						details:
-							"\nValidated by validation run #10 on 2026-11-21: deployment — Which proxy terminates TLS?",
-					},
-					{
-						id: "L4",
-						prompt: "Needs validation: confirmed finding",
 						validated_at: 900,
-						details:
-							"\nValidated by validation run #11 on 2026-11-22: confirmed.",
-					},
-					{
-						id: "L5",
-						prompt:
-							"Needs validation: proxy header\n\nThe user answered the review's question: Applies",
-						validated_at: null,
-						details: null,
-					},
-					{
-						// A later grill replaced the details with its report and wiped
-						// the blocked segment; the finding above still says blocked.
-						id: "L6",
-						prompt: "Needs validation: grilled blocked lead",
-						validated_at: 900,
-						details: "Grilled definition of ready",
-					},
-					{
-						// The newest card's first result for L7 is blocked; its later
-						// same-run confirmed duplicate loses (the settle's rule), so
-						// L7 waits. L8's finding is confirmed: decided work.
-						id: "L7",
-						prompt: "Needs validation: grilled blocked lead",
-						validated_at: 900,
-						details: "Grilled definition of ready",
-					},
-					{
-						id: "L8",
-						prompt: "Needs validation: confirmed duplicate lead",
-						validated_at: 910,
-						details: "Grilled definition of ready",
-					},
+						follow_up_of: "R",
+					})),
+					...extras,
 				],
 			},
 		];
 		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
-		// The step consults the findings first: the authoritative outcome source
-		// that a details wipe cannot erase, in the runs' own order (validation
-		// cards newest first, arrival order inside a card).
+		// The step consults the findings first, and the selection filters by the
+		// lead's own review (the legacy rows carry follow_up_of for the grouping).
 		expect(
 			db.queried.some((statement) =>
 				statement.includes("FROM review_findings"),
@@ -441,12 +426,17 @@ describe("PostgreSQL migration surface", () => {
 		).toBe(true);
 		expect(
 			db.queried.some((statement) =>
-				statement.includes("ORDER BY c.created_at DESC, c.id DESC, f.id ASC"),
+				statement.includes("c.follow_up_of AS follow_up_of"),
 			),
 		).toBe(true);
 		const converged = db.runArgs
 			.filter(([statement]) => statement === CONVERGE_LEAD_WAIT_SQL)
 			.map(([, args]) => (args as unknown[])[0]);
-		expect(converged).toEqual(["L1", "L2", "L3", "L6", "L7"]);
+		const expected = [
+			...caseLeads.filter((lead) => lead.waits).map((lead) => lead.id),
+		];
+		expect(converged.sort()).toEqual(expected.sort());
+		expect(converged).not.toContain("X1");
+		expect(converged).not.toContain("X2");
 	});
 });
