@@ -48,6 +48,7 @@ import {
 	leadValidationStartRefusal,
 	liveCardOf,
 	queueOrder,
+	resolveDep,
 	reviewFindings,
 	reviewOpenFindings,
 	validatableReview,
@@ -4532,7 +4533,7 @@ function ProjectAdvisories(p: {
 /** OTTR-708: the cross-project dependency lookup for one project's board — resolves a
  * dependsOn id through the project's own cards first, then by the projects' id handles
  * (resolveDep, the server's rule). undefined when the project is not among `projects`. */
-function depIndexOf(
+export function depIndexOf(
 	projects: ProjectView[],
 	tasks: TaskCard[],
 	project: ProjectView,
@@ -4551,36 +4552,48 @@ function depIndexOf(
 /** OTTR-1321: the project context each dependency's own hold reads — the dependency
  * project's own cards (its merge gate scans its own open reviews, never the follower
  * project's) and its project's resolver (nested dependsOn ids resolve relative to it).
- * null when no card names the id, so the line keeps the plain wording. */
-function depHoldContexts(
+ * The context follows resolveDep's card — the same rule the follower's foreign index
+ * uses — so a historical copy of the same id in another project never supplies the
+ * context. null when the id names no card, so the line keeps the plain wording. */
+export function depHoldContexts(
 	projects: ProjectView[],
 	tasks: TaskCard[],
+	project: ProjectView,
 ): (id: string) => DepHoldContext | null {
-	const cards = new Map<string, TaskCard>();
 	const byProject = new Map<string, TaskCard[]>();
 	for (const t of tasks) {
-		cards.set(t.id, t);
 		const list = byProject.get(t.project);
 		if (list === undefined) byProject.set(t.project, [t]);
 		else list.push(t);
 	}
+	const deps: DepProject[] = projects.map((p) => ({
+		name: p.name,
+		prefix: p.taskPrefix,
+		getTask: (id: string) =>
+			(byProject.get(p.name) ?? []).find((c) => c.id === id) ?? null,
+	}));
+	const ownDep = deps.find((p) => p.name === project.name);
+	const own: DepProject =
+		ownDep ??
+		({
+			name: project.name,
+			prefix: project.taskPrefix,
+			getTask: () => null,
+		} as DepProject);
 	const indexes = new Map<string, DepIndex | undefined>();
 	const indexOf = (name: string): DepIndex | undefined => {
 		const hit = indexes.get(name);
 		if (hit !== undefined) return hit;
-		const project = projects.find((p) => p.name === name);
+		const view = projects.find((p) => p.name === name);
 		const index =
-			project === undefined ? undefined : depIndexOf(projects, tasks, project);
+			view === undefined ? undefined : depIndexOf(projects, tasks, view);
 		indexes.set(name, index);
 		return index;
 	};
 	return (id: string): DepHoldContext | null => {
-		const card = cards.get(id);
-		if (card === undefined) return null;
-		return {
-			cards: byProject.get(card.project) ?? [],
-			index: indexOf(card.project),
-		};
+		const r = resolveDep(id, deps, own);
+		if (!("task" in r)) return null;
+		return { cards: byProject.get(r.project) ?? [], index: indexOf(r.project) };
 	};
 }
 
@@ -17956,7 +17969,7 @@ function AppMainContent(p: {
 			navigate={navigate}
 			tasks={tasks.filter((t) => t.project === project.name)}
 			foreignDeps={depIndexOf(projects, tasks, project)}
-			foreignHolds={depHoldContexts(projects, tasks)}
+			foreignHolds={depHoldContexts(projects, tasks, project)}
 			deltas={deltas}
 			open={openTask}
 			seenAnswers={seenAnswers}

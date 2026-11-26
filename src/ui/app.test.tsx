@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DeepenCheck } from "../deepen.ts";
 import { DEEPEN_POINTS } from "../prompts.ts";
 import { parseUsage } from "../quota.ts";
-import { FINDINGS_HOLD } from "../scheduler.ts";
+import { FINDINGS_HOLD, PUSH_HOLD } from "../scheduler.ts";
 import fc from "../test/properties.ts";
 import type {
 	PerfMetrics,
@@ -39,7 +39,7 @@ import { resetCatalogCache } from "./models.ts";
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 import { ServiceQuotas } from "./serviceQuotas.tsx";
 // Static: status.ts touches no browser global at load.
-import { bellAlarms } from "./status.ts";
+import { bellAlarms, type DepHoldContext, statusLine } from "./status.ts";
 import {
 	installBrowserGlobals,
 	mount,
@@ -230,6 +230,8 @@ const {
 	SEARCH_APPLY_MS,
 	ComposeDialog,
 	ConsolidationReview,
+	depHoldContexts,
+	depIndexOf,
 	FollowUpDialog,
 	DeepenReview,
 	ReleaseDialog,
@@ -16658,4 +16660,79 @@ describe("credits chip in the board bar", () => {
 		// The chip fetches nothing; the recorded loads are the board's own boot calls.
 		expect(requested.every((url) => !url.includes("credit"))).toBe(true);
 	});
+});
+
+test("depHoldContexts follows the resolver's project, not the first id hit", async () => {
+	// Two projects hold the same historical id (a prefix change left the old copy
+	// in archive). The follower's foreign index resolves AGEN-162 to agent-data by
+	// its id handle, so the hold context must be agent-data's too (OTTR-1321
+	// send-back 3): archive's live review must not replace agent-data's push hold.
+	const view = (name: string, prefix: string): ProjectView =>
+		({ name, taskPrefix: prefix }) as unknown as ProjectView;
+	const projects = [
+		view("archive", "ARC"),
+		view("agent-data", "AGEN"),
+		view("ottr", "OTTR"),
+	];
+	const dep = (over: Record<string, unknown>): TaskCard =>
+		({
+			id: "AGEN-162",
+			title: "Sync rules",
+			kind: "work",
+			project: "agent-data",
+			stage: "merging",
+			state: "queued",
+			cancelledAt: null,
+			createdAt: Date.now(),
+			doneAt: null,
+			dependsOn: [],
+			releaseVersion: null,
+			followUpOf: null,
+			pushRetries: 0,
+			pendingBy: null,
+			validatedAt: null,
+			...over,
+		}) as unknown as TaskCard;
+	const tasks: TaskCard[] = [
+		// The historical copy in archive: a live review holds its merge.
+		dep({ project: "archive", title: "Old copy" }),
+		dep({
+			id: "ar1",
+			title: "Archive review",
+			kind: "review",
+			project: "archive",
+			stage: "in_progress",
+			state: "running",
+			createdAt: Date.now() - 60_000,
+		}),
+	];
+	const agentData = dep({ pushHold: true });
+	tasks.push(agentData);
+	const foreign = depIndexOf(projects, tasks, view("ottr", "OTTR"));
+	const foreignHolds = depHoldContexts(projects, tasks, view("ottr", "OTTR"));
+	const parked = {
+		id: "OTTR-1",
+		kind: "work",
+		cancelledAt: null,
+		state: "queued",
+		stage: "in_progress",
+		needsReason: "waiting for #AGEN-162 Sync rules",
+		pendingPrompt: null,
+		asked: null,
+		progress: null,
+		holdUntil: null,
+		releaseVersion: null,
+		doneAt: null,
+		prNumber: null,
+		pushSha: null,
+		validatedAt: null,
+		followUpOf: null,
+		dependsOn: ["AGEN-162"],
+	} as unknown as TaskCard;
+	const foreignCtx: (id: string) => DepHoldContext | null = foreignHolds;
+	expect(
+		statusLine(parked, true, undefined, false, [], foreign, foreignCtx),
+	).toBe(`waiting for #AGEN-162 Sync rules (${PUSH_HOLD})`);
+	// The context picks the resolved card's project: agent-data's own list.
+	expect(foreignCtx("AGEN-162")?.cards).toContain(agentData);
 });
