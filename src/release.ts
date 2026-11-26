@@ -574,34 +574,60 @@ async function collectCommits(
 			body: "",
 		}));
 	}
-	// The format's leading NUL splits the records: each record is
-	// `<sha>\x1f<subject>\x1f<body>\x1e` followed by the changed-file lines, so a body
-	// that quotes or holds newlines cannot shift the fields.
+	// The format's leading NUL splits the records; `-z` keeps file names as raw bytes
+	// (never C-quoted), so `landing/é.html` still matches a landing glob. With -z each
+	// record is `<sha>\x1f<subject>\x1f<body>\x1e` followed by `\0\n` and the changed
+	// files as NUL-terminated tokens, so a body that quotes or holds newlines cannot
+	// shift the fields.
 	const log = await git(
 		[
 			"log",
 			"--no-merges",
 			"--format=%x00%H%x1f%s%x1f%b%x1e",
 			"--name-only",
+			"-z",
 			`${from}..${sha}`,
 		],
 		mainPath,
 	);
-	return log.stdout
-		.split("\x00")
-		.slice(1)
-		.map((r) => {
-			const metaEnd = r.indexOf("\x1e");
-			const [hash = "", subject = "", body = ""] = r
+	let current: {
+		sha: string;
+		subject: string;
+		body: string;
+		files: string[];
+	} | null = null;
+	const out: {
+		sha: string;
+		subject: string;
+		body: string;
+		files: string[];
+	}[] = [];
+	let afterFormat = false;
+	for (const token of log.stdout.split("\x00")) {
+		const metaEnd = token.indexOf("\x1e");
+		if (metaEnd >= 0) {
+			const [hash = "", subject = "", body = ""] = token
 				.slice(0, metaEnd)
 				.split("\x1f");
-			const files = r
-				.slice(metaEnd + 1)
-				.split("\n")
-				.map((f) => f.trim())
-				.filter(Boolean);
-			return { sha: hash, subject, body, files };
-		});
+			current = { sha: hash, subject, body, files: [] };
+			out.push(current);
+			afterFormat = true;
+			continue;
+		}
+		if (current === null) continue;
+		if (afterFormat) {
+			// The `\n` git emits between the format record and the file list glues to
+			// the first file token; strip it before the name is stored.
+			afterFormat = false;
+			if (token.startsWith("\n")) {
+				const first = token.slice(1);
+				if (first !== "") current.files.push(first);
+				continue;
+			}
+		}
+		if (token !== "") current.files.push(token);
+	}
+	return out;
 }
 
 export async function planRelease(o: {

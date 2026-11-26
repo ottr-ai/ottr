@@ -505,6 +505,32 @@ describe("non-product path filter", () => {
 		expect(keepSummaryCard({ details: "report" }, globs)).toBe(true);
 	});
 
+	test("display spellings of a non-product path still drop the card", () => {
+		// diffFiles stores numstat's display form: rename notation and, without -z,
+		// C-quoted names. The filter must read the real paths inside them.
+		expect(
+			keepSummaryCard(
+				{ details: null, files: ["{landing => website}/index.html"] },
+				globs,
+			),
+		).toBe(false);
+		expect(
+			keepSummaryCard(
+				{ details: null, files: ['"landing/\\303\\251.html"'] },
+				globs,
+			),
+		).toBe(false);
+		expect(
+			keepSummaryCard(
+				{ details: null, files: ["README.md => GUIDE.md"] },
+				globs,
+			),
+		).toBe(false);
+		expect(
+			keepSummaryCard({ details: null, files: ["a.ts => b.ts"] }, globs),
+		).toBe(true);
+	});
+
 	test("an empty captured diff drops the card, a breaking report keeps it", () => {
 		expect(keepSummaryCard({ details: "no change", files: [] }, globs)).toBe(
 			false,

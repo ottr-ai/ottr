@@ -10,7 +10,7 @@
 
 /** Bun.Glob patterns for repository paths that are not the product: a landing page or
  * marketing site folder, root docs (README and the other root .md files), CI and issue
- * templates, and agent or board configuration. */
+ * templates, CI script folders, release scripts, and agent or board configuration. */
 export const DEFAULT_NON_PRODUCT_PATHS = [
 	"*.md",
 	".github/**",
@@ -19,6 +19,8 @@ export const DEFAULT_NON_PRODUCT_PATHS = [
 	"landing/**",
 	"site/**",
 	"website/**",
+	"ci/**",
+	"scripts/release.*",
 ];
 
 /** The non-product globs for one project: the defaults plus the setting's patterns. */
@@ -57,7 +59,8 @@ export type FilterableCard = {
 /** True when a card stays in the model input: a report that marks a breaking change
  * stays, a card with no captured files stays (the filter never hides what it cannot
  * see), and otherwise any product file keeps it. A card whose captured diff is empty
- * changed nothing on the target, so it drops. */
+ * changed nothing on the target, so it drops. diffFiles holds numstat's display form,
+ * so each name is unquoted and rename-expanded before the glob match. */
 export function keepSummaryCard(
 	card: FilterableCard,
 	globs: Bun.Glob[],
@@ -66,5 +69,77 @@ export function keepSummaryCard(
 	const files = card.files;
 	if (files === undefined || files === null) return true;
 	if (files.length === 0) return false;
-	return files.some((f) => !isNonProductPath(f, globs));
+	return files
+		.flatMap((f) => expandDiffPath(unquoteGitPath(f)))
+		.some((f) => !isNonProductPath(f, globs));
+}
+
+/** One C-quoted git display path (`"landing/\303\251.html"`) decoded to its real bytes:
+ * octal escapes are UTF-8 bytes, the rest are single characters. An unquoted name
+ * returns as itself. */
+export function unquoteGitPath(name: string): string {
+	if (!name.startsWith('"') || !name.endsWith('"') || name.length < 2)
+		return name;
+	const inner = name.slice(1, -1);
+	const bytes: number[] = [];
+	for (let i = 0; i < inner.length; ) {
+		const ch = inner[i];
+		if (ch !== "\\") {
+			bytes.push(inner.charCodeAt(i));
+			i += 1;
+			continue;
+		}
+		const seq = inner.slice(i + 1, i + 4);
+		if (/^[0-7]{3}$/.test(seq)) {
+			bytes.push(Number.parseInt(seq, 8));
+			i += 4;
+			continue;
+		}
+		const next = inner[i + 1];
+		if (next === undefined) break;
+		switch (next) {
+			case "n":
+				bytes.push(10);
+				break;
+			case "t":
+				bytes.push(9);
+				break;
+			case "r":
+				bytes.push(13);
+				break;
+			case "a":
+				bytes.push(7);
+				break;
+			case "b":
+				bytes.push(8);
+				break;
+			case "f":
+				bytes.push(12);
+				break;
+			case "v":
+				bytes.push(11);
+				break;
+			default:
+				// `\"` and `\\` land here; an unknown escape keeps the next character.
+				bytes.push(next.charCodeAt(0));
+		}
+		i += 2;
+	}
+	return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+/** One git display path expanded to the real paths it names: `dir/{old => new}/rest`
+ * and `old => new` renames name two paths, everything else one. */
+export function expandDiffPath(name: string): string[] {
+	const brace = /^([^{}]*)\{([^{}]*) => ([^{}]*)\}(.*)$/.exec(name);
+	if (brace !== null) {
+		const pre = brace[1] ?? "";
+		const old = brace[2] ?? "";
+		const renamed = brace[3] ?? "";
+		const post = brace[4] ?? "";
+		return [`${pre}${old}${post}`, `${pre}${renamed}${post}`];
+	}
+	const top = /^(.*) => (.*)$/.exec(name);
+	if (top !== null) return [top[1] ?? "", top[2] ?? ""];
+	return [name];
 }

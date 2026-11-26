@@ -515,6 +515,23 @@ describe("computeRelease non-product path filter", () => {
 		expect(computeRelease("v1.2.3", all).version).toBe("v1.3.0");
 	});
 
+	test("the defaults cover ci and release scripts, not only the site folders", () => {
+		const { notes, releasable } = computeRelease("v1.0.0", [
+			{
+				subject: "feat: tighten the ci gate",
+				body: "",
+				files: ["ci/check.sh"],
+			},
+			{
+				subject: "feat: bump the release script",
+				body: "",
+				files: ["scripts/release.mjs"],
+			},
+		]);
+		expect(notes).toBe("");
+		expect(releasable).toBe(false);
+	});
+
 	test("the project's patterns extend the defaults, commits without files keep", () => {
 		const all = [
 			{
@@ -1286,6 +1303,11 @@ describe("planRelease drops non-product commits from the notes", () => {
 			"-m",
 			"feat: add the built with Ottr badge to README.md",
 		);
+		// A non-ASCII name: without -z the log C-quotes the display path, whose leading
+		// quote defeats the landing/** glob (OTTR-1213 blocker 2).
+		writeFileSync(join(dir, "landing", "é.html"), "x");
+		await must(dir, "add", ".");
+		await must(dir, "commit", "-q", "-m", "feat: polish the landing page");
 		mkdirSync(join(dir, ".github", "workflows"), { recursive: true });
 		writeFileSync(join(dir, ".github", "workflows", "ci.yml"), "x");
 		await must(dir, "add", ".");
