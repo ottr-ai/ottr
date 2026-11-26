@@ -1801,9 +1801,10 @@ const sameOrUnder = (child: string, root: string): boolean => {
  * matching the pin (any config scope — the repo config is worker-writable) would redirect the
  * call to a repo the pin never named. git's rewrite rule is over-approximated to fail closed:
  * any matching prefix refuses, whatever the longest-match outcome would be. A `remote"<pin>"`
- * section (url or pushurl, any scope) is refused too: git resolves a repository argument as a
+ * section (any key, any scope) is refused too: git resolves a repository argument as a
  * remote name before it reads the argument as a URL, so the same-named section would receive
- * the call instead of the pinned repo. The config read is
+ * the call — and every key under it (a per-remote proxy, keys later git versions add)
+ * would bend that call — instead of the pinned repo. The config read is
  * a local subcommand: gitEnv strips the auth env from it. Returns the error text, else null.
  */
 export async function checkPinnedRemote(
@@ -1838,6 +1839,14 @@ export async function checkPinnedRemote(
 		const m = /^remote\.(.*)\.(?:url|pushurl)$/i.exec(key);
 		if (m !== null && m[1] === pinned)
 			return `repo config plants a remote named like the pinned origin: a remote.<…>.url/pushurl section would receive the call instead; remove that entry, the board pushes and fetches only the pinned URL`;
+		// OTTR-1300: the same-named section's other keys bend the pinned call too —
+		// remote.<pin>.proxy would carry the call's traffic and credential through
+		// a planted proxy, and later git versions add keys. Any key under the exact
+		// subsection refuses, fail closed like the rewrite scan; the branch above
+		// keeps OTTR-1002's url/pushurl message.
+		const sub = /^remote\.(.+)\.[^.]+$/i.exec(key);
+		if (sub !== null && sub[1] === pinned)
+			return `repo config plants a remote named like the pinned origin: a remote.<…> section key would apply to the pinned call; remove that entry, the board pushes and fetches only the pinned URL`;
 	}
 	return null;
 }

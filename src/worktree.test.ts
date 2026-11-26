@@ -2009,6 +2009,73 @@ describe("pinned origin URL (OTTR-348)", () => {
 		}
 	}, 60_000);
 
+	test("a remote section named like the pin fails closed for every key (OTTR-1300)", async () => {
+		const f = fixture();
+		// A per-remote proxy is observable without a live origin: the pin's own
+		// port listens on nothing, so only the planted proxy can receive the call
+		// — the call that carries the board's credential header.
+		const hits: string[] = [];
+		const proxy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(req) {
+				hits.push(new URL(req.url).pathname);
+				return new Response(null, { status: 404 });
+			},
+		});
+		try {
+			const pin = "http://127.0.0.1:1/repo.git";
+			run(
+				f.main,
+				"config",
+				`remote.${pin}.proxy`,
+				`http://127.0.0.1:${proxy.port}`,
+			);
+			// Control: the plant is live — plain git sends the pinned call through
+			// the proxy (the pin's port itself refuses every direct connection).
+			// The no_proxy env that strips proxies for loopback is emptied: curl
+			// would bypass the planted proxy for 127.0.0.1 otherwise. Async spawn:
+			// a sync spawn would block this event loop and starve the proxy.
+			const ls = Bun.spawn(["git", "ls-remote", pin], {
+				cwd: f.main,
+				env: {
+					...fixtureGitEnv(),
+					GIT_TERMINAL_PROMPT: "0",
+					no_proxy: "",
+					NO_PROXY: "",
+				},
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(await ls.exited).not.toBe(0);
+			expect(hits).toHaveLength(1);
+			expect(hits[0]).toContain("/repo.git/info/refs");
+			expect(await checkPinnedRemote(f.main, pin)).toContain(
+				"a remote.<…> section key would apply to the pinned call",
+			);
+			// The board path refuses before git runs: the proxy sees no second call.
+			const seen = hits.length;
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				pin,
+			);
+			expect(r.status).toBe("failed");
+			expect(
+				r.status === "failed" &&
+					r.error.includes("named like the pinned origin"),
+			).toBe(true);
+			expect(hits).toHaveLength(seen);
+		} finally {
+			proxy.stop(true);
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	test("a pin that is a git option, not a URL, fails closed", async () => {
 		const f = fixture();
 		try {

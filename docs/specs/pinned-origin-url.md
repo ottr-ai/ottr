@@ -85,7 +85,10 @@ from `origin` by name.
      remote name before it reads the argument as a URL, so a section named
      exactly like the pin (case-sensitive, git's own remote-name lookup) would
      receive the call — and the host-scoped credential — instead of the pinned
-     repo.
+     repo. OTTR-1300: the refusal covers every key under the section, not only
+     `url` and `pushurl` — any other key under it (a per-remote `proxy`, keys
+     later git versions add) would bend the pinned call and fails closed the
+     same way.
 6. `GIT_ALLOW_PROTOCOL` stays `https:ssh:file`. After this change a `file`
    transport can only be reached through the pinned URL (clone only accepts
    https/ssh URLs from the admin), and a local pin under a worker-writable root
