@@ -3248,16 +3248,22 @@ describe("serveWorker turn identity", () => {
 		30_000,
 	);
 
-	// Self identity: chown-to-self and setuid-to-self need no privilege, so
-	// the identity tests run on every gate (the cross-uid drop stays covered
-	// by the root-gated test above).
-	const selfIds = (): { uid: number; gid: number } => ({
-		uid: typeof process.getuid === "function" ? process.getuid() : 0,
-		gid: typeof process.getgid === "function" ? process.getgid() : 0,
-	});
+	// The run's identity under test. A root gate keeps the project's real
+	// hashed uid — the production path: the caller is root, this fixture's
+	// records hold uid 0 for root, and ensureProjectIdentity refuses an id
+	// an unrelated account holds. An unprivileged gate runs as the caller's
+	// own uid, where chown-to-self needs no privilege and no fixture record
+	// holds the id. Both keep the identity check fully intact.
+	const turnIdentity = (project: string): TurnIdentity =>
+		isRoot
+			? projectTurnUid(project)
+			: {
+					uid: typeof process.getuid === "function" ? process.getuid() : 0,
+					gid: typeof process.getgid === "function" ? process.getgid() : 0,
+				};
 
 	test("a run provisions the project identity and pins its git identity env", async () => {
-		const ids = selfIds();
+		const ids = turnIdentity("git-env-proj");
 		const workerHome = freshWorkerHome();
 		const homesRoot = freshWorkerHome();
 		const ws = freshWorkerHome();
@@ -3386,7 +3392,7 @@ describe("serveWorker turn identity", () => {
 
 	test("a root omp reset of the store modes is restored before each turn", async () => {
 		const project = "store-restore-proj";
-		const ids = selfIds();
+		const ids = turnIdentity(project);
 		const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
 			storeFixture(project);
 		// Store stub: opens the store through PI_CODING_AGENT_DIR the way omp
@@ -3467,7 +3473,7 @@ process.stdout.write(JSON.stringify({ uid: process.getuid(), opened }) + "\\n");
 
 	test("a mounted drifted store refuses the run instead of chmodding through the mount", async () => {
 		const project = "store-mounted-proj";
-		const ids = selfIds();
+		const ids = turnIdentity(project);
 		const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
 			storeFixture(project);
 		// Store stub: writes a marker first thing, so an assertion on the

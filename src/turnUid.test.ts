@@ -1384,6 +1384,25 @@ function freshIdentityFiles(): { passwd: string; group: string } {
 }
 
 describe("ensureProjectIdentity", () => {
+	test("refuses uid 0 when the records hold it for root", () => {
+		// The daemon-test identity selector must never pick uid 0 against the
+		// standard root fixture record: ensureProjectIdentity fails closed on
+		// an id an unrelated account holds (OTTR-1193), and the run would 500
+		// before spawn. This pins the exact collision the selector avoids.
+		const paths = freshIdentityFiles();
+		const project = "provision-root0";
+		const turnHome = fakeTurnHome(project);
+		writeFileSync(paths.passwd, "root:x:0:0:root:/root:/bin/bash\n");
+		writeFileSync(paths.group, "root:x:0:\n");
+		expect(() =>
+			ensureProjectIdentity(project, { uid: 0, gid: 0 }, turnHome, paths),
+		).toThrow(/id 0 is held by an unrelated account "root"/);
+		// Nothing was provisioned for the refused identity.
+		expect(readFileSync(paths.passwd, "utf8")).toBe(
+			"root:x:0:0:root:/root:/bin/bash\n",
+		);
+	});
+
 	test("adds one passwd and one group line over the real snapshot", () => {
 		const paths = freshIdentityFiles();
 		const project = "provision-proj";
