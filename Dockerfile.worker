@@ -12,12 +12,12 @@ LABEL ottr.image=worker
 # Debian trixie git version (the 1.4.5-debian base is trixie); a wrong pin fails the build loudly (D1).
 ARG GIT_VERSION=1:2.47.3-0+deb13u1
 # rtk (Rust Token Killer) — pix-optimizer rewrites known bash commands through it only
-# when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.1.0.
+# when the binary is on PATH; without it every command runs raw. Host /usr/local/bin runs 1.2.0.
 # amd64 uses static musl; arm64 uses glibc. A wrong pin fails the build loudly.
-ARG RTK_VERSION=1.2.0
+ARG RTK_VERSION=1.2.1
 # Release checksums.txt, one archive per target architecture.
-ARG RTK_SHA256_AMD64=70fee7b4a548c43dde94c77e2335550981b0bc2fb013691d8c8109b5bd0eda37
-ARG RTK_SHA256_ARM64=93c1dcd37fd5fcae8fa772a5b5c34a30af142ace4f4081c8f98319146b7a10a4
+ARG RTK_SHA256_AMD64=75f64525711be935657a6b228d929c24bd9d1ab7d640ea374a8b913e5b5bac05
+ARG RTK_SHA256_ARM64=5fd75151feeae2b81b1844fca9889610cc77408361653ef3f95d4b9d3e278f4f
 # ripwire (redhat-et) — call-graph CLI for structure questions before shared-code edits
 # (map, --impact, --affected). A wrong pin 404s the download (fails the build loudly).
 ARG RIPWIRE_VERSION=0.6.10
