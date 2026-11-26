@@ -1073,16 +1073,17 @@ function runChildEnv(
 	// The worker's own token drives every worker, and the container env can hold a git
 	// host token (an operator's GH_TOKEN): a turn inherits neither, from the container
 	// or the request. Push credentials stay on the server (D6).
-	const env: Record<string, string | undefined> = {
-		...process.env,
-		...requestEnv,
-	};
 	// The container may carry a Hindsight seed (docker-compose.yml): the board strips
 	// HINDSIGHT_* from the dispatched env and re-adds the run's own binding, so the
-	// container names must lose the seed before the merge, not the request's bound
-	// values after it (docs/specs/hindsight-bank-binding.md).
-	for (const k of Object.keys(process.env))
-		if (k.startsWith("HINDSIGHT_")) delete env[k];
+	// container names must lose the seed BEFORE the merge, or the delete after it would
+	// take the request's bound values too (docs/specs/hindsight-bank-binding.md).
+	const containerEnv: Record<string, string | undefined> = { ...process.env };
+	for (const k of Object.keys(containerEnv))
+		if (k.startsWith("HINDSIGHT_")) delete containerEnv[k];
+	const env: Record<string, string | undefined> = {
+		...containerEnv,
+		...requestEnv,
+	};
 	stripGitAuthEnv(env);
 	// OTTR-693: the board strips GIT_CONFIG_GLOBAL from the dispatched env (the
 	// pointer names a file only the server mounts); this side deletes whatever the

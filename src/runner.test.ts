@@ -5340,26 +5340,16 @@ describe("startRun agent layer pinning", () => {
 
 	test("a hindsight worker dispatch carries a per-run memory token bound to the project's bank", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-memtok-"));
-		const bodies: WorkerRequest[] = [];
-		// The stub holds the run open until released: the token must be live while
-		// its grant is asserted, and revoked once the run settles.
-		const { promise: release, resolve: unblock } =
-			Promise.withResolvers<void>();
-		const arrived = Promise.withResolvers<void>();
-		const server = Bun.serve({
-			port: 0,
-			fetch: async (req) => {
-				bodies.push((await req.json()) as WorkerRequest);
-				arrived.resolve();
-				await release;
-				return new Response(
-					`${JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } })}\n`,
-				);
-			},
-		});
+		const out = join(dir, "env.json");
+		const rel = join(dir, "release");
+		// The real daemon runs runChildEnv: the container-side seed below must not take
+		// the request's bound values (OTTR-1006 send-back: the strip now runs before the
+		// merge), and the fake omp dumps the env it actually received.
+		const server = serveWorker({ port: 0, ompPath: layerOmp });
 		const tokens = new VmTokens({ file: null });
 		const saved = saveEnv();
 		try {
+			// Container-style seeds, as docker-compose.yml sets them on the worker.
 			process.env.HINDSIGHT_API_URL = "http://hindsight.local:8888";
 			process.env.HINDSIGHT_API_TOKEN = "tenant-secret";
 			const { done } = await startRun({
@@ -5375,6 +5365,7 @@ describe("startRun agent layer pinning", () => {
 					throw new Error("a worker turn must never spawn locally");
 				}) as RunLauncher,
 				memoryTokens: tokens,
+				env: { LAYER_ENV_OUT: out, LAYER_RELEASE: rel },
 				board: {
 					url: "http://ottr:8080",
 					token: "boot-token",
@@ -5382,9 +5373,7 @@ describe("startRun agent layer pinning", () => {
 					taskId: "T-9",
 				},
 			});
-			await arrived.promise;
-			expect(bodies).toHaveLength(1);
-			const env = bodies[0]!.env;
+			const env = await untilEnv(out);
 			expect(env.HINDSIGHT_API_URL).toBe("http://ottr:8080/hindsight");
 			expect(env.HINDSIGHT_BANK_ID).toBe("ottr-velvarr");
 			expect(env.HINDSIGHT_SCOPING).toBe("global");
@@ -5392,10 +5381,10 @@ describe("startRun agent layer pinning", () => {
 			expect(token).toMatch(/^[0-9a-f]{64}$/);
 			// The grant binds the token to the run's project for /hindsight.
 			expect(tokens.check(token)?.project).toBe("velvarr");
-			// The tenant credential never rides the request: no env value carries it.
+			// The tenant credential never reaches the turn: no env value carries it.
 			expect(Object.values(env)).not.toContain("tenant-secret");
 			// Settled: the token is revoked, so a captured env stops working.
-			unblock();
+			writeFileSync(rel, "go\n");
 			const r = await done;
 			expect(r.exitCode).toBe(0);
 			expect(tokens.check(token)).toBeNull();
