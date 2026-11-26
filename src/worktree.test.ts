@@ -5646,6 +5646,100 @@ describe("git", () => {
 		for (const a of board) expect((await git(a, main)).code).toBe(0);
 		expect(existsSync(marker)).toBe(false);
 	}, 60_000);
+
+	test("pushBranch refuses a lazy fetch through a planted promisor uploadpack (R5-1)", async () => {
+		const origin = repo();
+		await must(origin, "init", "-q", "--bare", "-b", "main");
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		await must(main, "remote", "add", "origin", origin);
+		writeFileSync(join(main, "f.txt"), "one\n");
+		await must(main, "add", ".");
+		await must(main, "commit", "-q", "-m", "one");
+		await must(main, "push", "-q", "origin", "main");
+		// The poison: the branch tip's tree names a blob the odb does not hold. The tree
+		// object is hand-built (`<mode> <name>NUL<20 sha bytes>` — Bun's spawnSync drops a
+		// spawn input, so mktree --missing silently built an empty tree here) and stored
+		// with hash-object; commit-tree writes the commit and the ref plants it. A push
+		// that must send the tip walks into the missing blob.
+		const missing = "4444444444444444444444444444444444444444";
+		const spec = join(main, "poison.tree");
+		writeFileSync(
+			spec,
+			Buffer.concat([
+				Buffer.from("100644 poison.txt"),
+				Buffer.from([0]),
+				Buffer.alloc(20, 0x44),
+			]),
+		);
+		const tree = await must(main, "hash-object", "-w", "-t", "tree", spec);
+		// Prove the entry names the missing blob: an empty or fully readable tree would
+		// make the control below pass vacuously.
+		expect(await must(main, "cat-file", "-p", tree)).toContain(missing);
+		const poison = Bun.spawnSync(
+			[
+				gitExe(),
+				"-c",
+				"user.name=ott",
+				"-c",
+				"user.email=ott@example.invalid",
+				"commit-tree",
+				tree,
+				"-p",
+				await must(main, "rev-parse", "origin/main"),
+				"-m",
+				"poisoned",
+			],
+			{
+				cwd: main,
+				env: fixtureGitEnv(),
+				stdout: "pipe",
+				stderr: "pipe",
+				windowsHide: true,
+			},
+		);
+		if (poison.exitCode !== 0)
+			throw new Error(`git commit-tree: ${poison.stderr.toString()}`);
+		await must(
+			main,
+			"update-ref",
+			"refs/heads/ott/card",
+			poison.stdout.toString().trim(),
+		);
+		// The worker's plants: promisor config and a marker-writing uploadpack. The lazy
+		// fetch a push spawns for the missing blob re-reads this repo config and runs the
+		// planted transport inside the push's auth env, outside the board's PINNED_ARGS.
+		const marker = join(main, "planted.uploadpack");
+		const script = join(main, "uploadpack.sh");
+		writeFileSync(
+			script,
+			`#!/bin/sh\ntouch '${marker}'\necho planted uploadpack >&2\nexit 1\n`,
+		);
+		chmodSync(script, 0o755);
+		await must(main, "config", "extensions.partialClone", "origin");
+		await must(main, "config", "remote.origin.promisor", "true");
+		await must(main, "config", "remote.origin.uploadpack", script);
+		expect(existsSync(marker)).toBe(false);
+		// Control: unprotected plain git runs the plant when the push lazy-fetches the
+		// missing blob (probe 2026-11-26, git 2.47.3: the script ran 2-5 times per push).
+		const plain = { ...fixtureGitEnv() } as Record<string, string>;
+		delete plain.GIT_NO_LAZY_FETCH;
+		const ctl = Bun.spawnSync([gitExe(), "push", "-q", "origin", "ott/card"], {
+			cwd: main,
+			env: plain,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			windowsHide: true,
+		});
+		expect(ctl.exitCode).not.toBe(0);
+		expect(existsSync(marker)).toBe(true);
+		rmSync(marker);
+		// Board path: the push fails on the missing object and the plant never runs.
+		const res = await pushBranch(main, "ott/card", origin);
+		expect(res.status).toBe("failed");
+		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
 });
 
 describe("gitEnv", () => {

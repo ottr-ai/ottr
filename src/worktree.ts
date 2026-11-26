@@ -316,18 +316,21 @@ export function gitEnv(
 		Object.assign(env, auth);
 	} else {
 		stripGitAuthEnv(env);
-		// A local command that hits a missing object must fail, not start the lazy promisor
-		// fetch git spawns for it: that fetch re-reads the repo config a worker writes
-		// (R5-1) and runs its planted remote.<name>.uploadpack as the transport, outside
-		// the PINNED_ARGS that pin the board's own network subcommands. GIT_NO_LAZY_FETCH
-		// is the prohibition (rev-list exits 128 on the missing object); the transport
-		// pins mirror sealedGit's explicit env and cap a fetch that starts anyway.
-		// sealedGit re-enables the fetch ("0"): the lazy blob fetch of a partial clone is
-		// its job, through its stub gitdir and pinned ssh.
-		env.GIT_NO_LAZY_FETCH = "1";
+		// The transport pins mirror sealedGit's explicit env and cap a fetch that starts
+		// anyway.
 		env.GIT_SSH_COMMAND = "ssh -F /dev/null -o BatchMode=yes";
 		env.GIT_ALLOW_PROTOCOL = "https:ssh";
 	}
+	// A command that hits a missing object must fail, not start the lazy promisor fetch
+	// git spawns for it: that fetch re-reads the repo config a worker writes (R5-1) and
+	// runs its planted remote.<name>.uploadpack as the transport. A local command has no
+	// pin on that fetch, and a network command's PINNED_ARGS do not reach the in-process
+	// fetch either (probe 2026-11-26, git 2.47.3: a planted uploadpack ran inside a
+	// push's auth env), so the prohibition covers both branches. It sits after the auth
+	// merge; no resolver auth env carries the name. sealedGit re-enables the fetch
+	// ("0"): the lazy blob fetch of a partial clone is its job, through its stub gitdir
+	// and pinned ssh.
+	env.GIT_NO_LAZY_FETCH = "1";
 	return childDatabaseEnv(env);
 }
 
