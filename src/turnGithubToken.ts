@@ -94,12 +94,6 @@ async function checkRepo(
 	if (push) {
 		return { kind: "write", detail: `${repo}: token has push permission` };
 	}
-	if (bad.length > 0) {
-		return {
-			kind: "write",
-			detail: `${repo}: write-capable scopes (${bad.join(", ")})`,
-		};
-	}
 	return { kind: "none" };
 }
 
