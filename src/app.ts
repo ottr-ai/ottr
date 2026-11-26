@@ -2917,7 +2917,7 @@ export async function createApp(deps: AppDeps) {
 		const candidates = [
 			...liveAlerts.filter((alert) => alert.class === "complete"),
 			...(lastAlertInputs ?? [])
-				.filter((input) => input.stage !== "done")
+				.filter((input) => input.stage !== "done" && !input.cancelled)
 				.map((input) => ({ taskId: input.id, project: input.project })),
 		];
 		for (const alert of candidates) {
@@ -10642,6 +10642,12 @@ export async function createApp(deps: AppDeps) {
 		const vapidPublicKey = (await ensureVapid()).publicKey;
 		await updateSubs(deps.gstore, (current) => {
 			const previous = current.find((sub) => sub.endpoint === endpoint);
+			// Settings re-registers unchanged subscriptions; keep their pending digest identity.
+			const sameSubscription =
+				previous !== undefined &&
+				previous.keys.p256dh === keys.p256dh &&
+				previous.keys.auth === keys.auth &&
+				previous.vapidPublicKey === vapidPublicKey;
 			const classes = {
 				...ALL_CLASSES_ON,
 				...previous?.classes,
@@ -10652,7 +10658,9 @@ export async function createApp(deps: AppDeps) {
 				{
 					endpoint,
 					keys,
-					addedAt: Math.max(now(), (previous?.addedAt ?? 0) + 1),
+					addedAt: sameSubscription
+						? previous.addedAt
+						: Math.max(now(), (previous?.addedAt ?? 0) + 1),
 					classes: { ...classes },
 					vapidPublicKey,
 				},

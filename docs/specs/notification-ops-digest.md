@@ -62,10 +62,14 @@ The existing class grouping determines each device's notification text and desti
 The server records each pending event and its eligible subscription identities.
 The record preserves the deadline across restart.
 A later subscription does not receive events from before its subscription.
+Repeated registration of an unchanged endpoint, key pair, and VAPID binding preserves its identity.
+Changed keys or VAPID bindings create a new identity.
+A subscription that returns after unsubscribe receives no earlier events.
 
 At the deadline, the server checks current subscriptions, class preferences, project mutes, acknowledgements, and source state.
 It excludes a cancelled, reopened, acknowledged, superseded, or removed source.
 It must read the real project store when a pending card falls outside the board's Done window.
+A cancelled card outside the Done window does not remain in the completion-source scan.
 A read failure retains pending state and reports the error. It must not claim delivery or silently discard the event.
 A failed source read must not stop state frames, seen pruning, or Request, Error, and Ops pushes from healthy projects.
 If a board tab has recent focus at delivery time, the due digest is suppressed rather than postponed.
@@ -117,5 +121,7 @@ No raw error string becomes a push body.
 15. The bell shows each Ops failure once, with correct new/read state and its existing recovery action.
 16. Run the focused tests, UI detector, browser proof, `bun run check`, and `bun test` after the final edit.
 17. A project store failure retains the pending digest while healthy projects publish state frames, prune seen keys, and send urgent pushes.
+18. A refresh of the same subscription preserves its pending completion. Changed keys and subscriptions after unsubscribe receive no earlier events.
+19. Repeated state frames do not read cancelled cards outside the Done window as completion sources.
 
 Mutation testing does not run in this work turn.

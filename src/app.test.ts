@@ -15351,26 +15351,69 @@ describe("web push (R1-1, R2-3)", () => {
 		},
 	);
 
-	test("future and replaced subscriptions cannot inherit a pending completion", async () => {
-		const b = await alertBoard("digest-recipients");
-		const replaced = "https://push.example/replaced";
-		const returned = "https://push.example/returned";
-		const retained = "https://push.example/retained";
-		await b.subscribe(replaced);
-		await b.subscribe(returned);
-		await b.subscribe(retained);
-		const task = await b.s.createTask("old event");
-		await publishNow(b.m.app);
-		await b.s.updateTask(task.id, { stage: "done", state: "idle" });
-		await publishNow(b.m.app);
-		const from = pushSends.length;
-		await b.subscribe(replaced); // Same keys and millisecond, but a replacement identity.
-		await b.m.call("/api/push/unsubscribe", { endpoint: returned });
-		await b.subscribe(returned);
-		await b.subscribe("https://push.example/future");
-		await b.finishDigest();
-		expect(b.sentSince(from).map((send) => send.endpoint)).toEqual([retained]);
-	});
+	test.each([0, 1000])(
+		"an unchanged subscription refresh after %i ms keeps its pending completion",
+		async (elapsed) => {
+			const b = await alertBoard(`digest-refresh-${elapsed}`);
+			const endpoint = "https://push.example/refresh";
+			await b.subscribe(endpoint);
+			const task = await b.s.createTask("finish before Settings opens");
+			await publishNow(b.m.app);
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			const deadline = (await digestOf(b.m.g))!.deadline;
+			const from = pushSends.length;
+			b.clock.now += elapsed;
+			await b.m.call("/api/presence", { tab: "settings", focused: true });
+			await b.subscribe(endpoint);
+			await b.m.call("/api/presence", { tab: "settings", focused: false });
+			b.clock.now = deadline;
+			await b.m.app.publishState();
+			expect(b.sentSince(from)).toEqual([
+				{
+					endpoint,
+					payload: expect.objectContaining({
+						tag: "complete",
+						keys: [`done:${task.id}`],
+					}),
+				},
+			]);
+			expect(await digestOf(b.m.g)).toBeNull();
+		},
+	);
+
+	test.each(["p256dh", "auth"] as const)(
+		"future and %s-replaced subscriptions cannot inherit a pending completion",
+		async (key) => {
+			const b = await alertBoard(`digest-recipients-${key}`);
+			const replaced = "https://push.example/replaced";
+			const returned = "https://push.example/returned";
+			const retained = "https://push.example/retained";
+			await b.subscribe(replaced);
+			await b.subscribe(returned);
+			await b.subscribe(retained);
+			const task = await b.s.createTask("old event");
+			await publishNow(b.m.app);
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			const from = pushSends.length;
+			expect(
+				(
+					await b.m.call("/api/push/subscribe", {
+						endpoint: replaced,
+						keys: { p256dh: "k", auth: "a", [key]: "replacement" },
+					})
+				).status,
+			).toBe(200);
+			await b.m.call("/api/push/unsubscribe", { endpoint: returned });
+			await b.subscribe(returned);
+			await b.subscribe("https://push.example/future");
+			await b.finishDigest();
+			expect(b.sentSince(from).map((send) => send.endpoint)).toEqual([
+				retained,
+			]);
+		},
+	);
 
 	test.each(["occurrence", "deadline"] as const)(
 		"focus at %s suppresses Complete without later replay",
@@ -15434,6 +15477,36 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(live.complete).toEqual({ live: 24, seq: 1 });
 		await publishNow(b.m.app);
 		expect(b.sentSince(from)).toHaveLength(1);
+	});
+
+	test("cancelled cards outside the Done page leave the completion-source scan", async () => {
+		const b = await alertBoard("digest-cancelled-sources");
+		await b.subscribe("https://push.example/cancelled-sources");
+		const cancelled = await b.s.createTask("cancel without completion");
+		const active = await b.s.createTask("keep the board active");
+		await publishNow(b.m.app);
+		await b.s.updateTask(cancelled.id, { cancelledAt: b.clock.now });
+		await publishNow(b.m.app);
+		for (let i = 0; i < DONE_PAGE; i++) {
+			b.clock.now++;
+			const task = await b.s.createTask(`newer completion ${i}`);
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+		}
+		await publishNow(b.m.app);
+		const state = (await (
+			await b.m.call("/api/state")
+		).json()) as StateResponse;
+		expect(state.tasks.some((task) => task.id === cancelled.id)).toBe(false);
+		const read = spyOn(b.s, "getTask");
+		try {
+			for (let i = 0; i < 3; i++) {
+				await b.s.updateTask(active.id, { summary: `frame ${i}` });
+				await publishNow(b.m.app);
+			}
+			expect(read.mock.calls.map(([id]) => id)).not.toContain(cancelled.id);
+		} finally {
+			read.mockRestore();
+		}
 	});
 
 	test("a real source read failure retains the batch and reports the error", async () => {

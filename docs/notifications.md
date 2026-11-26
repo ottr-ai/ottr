@@ -17,6 +17,7 @@ The first eligible Complete event starts a 10-minute window for the board. Later
 The bell and task read markers remain immediate. Request, Error, and Ops do not wait for the digest.
 
 The server stores the deadline, events, and eligible devices across restart. A new subscription receives no older events.
+A refresh of the same subscription keeps its pending events.
 The deadline runs without an open tab or another state change. After restart, an overdue digest becomes eligible after source validation.
 Before delivery, the server checks current preferences, project mutes, acknowledgements, and source state.
 It excludes cancelled, reopened, acknowledged, superseded, or removed sources. It reads the project store for cards outside the Done window.
