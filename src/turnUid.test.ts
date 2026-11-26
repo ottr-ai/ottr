@@ -868,7 +868,7 @@ rootTest(
 	},
 );
 
-test("chownTreeFd finishes when a pinned directory is removed mid-walk", async () => {
+test("chownTreeFd continues chowning after a pinned directory is removed mid-walk", async () => {
 	const ws = freshDir("removed-ws");
 	const ids = selfIds();
 	const root = join(ws, "root");
@@ -883,20 +883,34 @@ test("chownTreeFd finishes when a pinned directory is removed mid-walk", async (
 	await Bun.sleep(15);
 	const before = statSync(survivor).ctimeMs;
 	const goneIno = statSync(join(root, "gone")).ino;
+	const stayIno = statSync(join(root, "stay")).ino;
 
 	// The removed-mid-walk seam: real listings everywhere, except the pinned
 	// 'gone' fd — the test removes that subdirectory after the walk pinned it
 	// and its listing then reports the unlink exactly as the kernel's scandir
 	// does on a magic link of an unlinked directory.
 	let goneFd = -1;
+	let stayFd = -1;
 	const listDir = (viaDir: string): string[] => {
 		const m = /^\/proc\/self\/fd\/(\d+)$/.exec(viaDir);
-		if (m && statSync(viaDir).ino === goneIno) {
+		if (!m) return readdirSync(viaDir);
+		const st = statSync(viaDir);
+		if (st.ino === goneIno) {
 			goneFd = Number(m[1]);
 			rmSync(join(root, "gone"), { recursive: true, force: true });
 			throw Object.assign(
 				new Error(`ENOENT: no such file or directory, scandir '${viaDir}'`),
 				{ code: "ENOENT", errno: -2, syscall: "scandir", path: viaDir },
+			);
+		}
+		if (st.ino === stayIno) stayFd = Number(m[1]);
+		if (Number(m[1]) === rootFd) {
+			// The root's listing order decides the walk's LIFO order: 'gone'
+			// last makes its ENOENT fire before the surviving subtree's own
+			// listing pass, so a walk that stops at the failure leaves the
+			// survivor unchowned and fails the ctime assertions below.
+			return readdirSync(viaDir).sort((a, b) =>
+				a === "gone" ? 1 : b === "gone" ? -1 : 0,
 			);
 		}
 		return readdirSync(viaDir);
@@ -905,13 +919,16 @@ test("chownTreeFd finishes when a pinned directory is removed mid-walk", async (
 	const rootFd = openPinned(root);
 	try {
 		chownTreeFd(rootFd, ids, listDir);
-		// The walk finished: the surviving subtree was chowned (its ctime
-		// moved), the walk closed the removed dir's own fd instead of leaking
-		// it, and the caller's root fd is still open.
+		// The ENOENT came first (goneFd recorded, stay listed after it) and
+		// the walk still chowned the surviving subtree afterwards (its ctime
+		// moved). Both walked fds are closed — the removed dir's own fd and
+		// the survivor's — and the caller's root fd is still open.
+		expect(goneFd).toBeGreaterThan(0);
+		expect(stayFd).toBeGreaterThan(0);
 		expect(statSync(survivor).ctimeMs).toBeGreaterThan(before);
 		expect(statSync(join(root, "stay")).ctimeMs).toBeGreaterThan(before);
-		expect(goneFd).toBeGreaterThan(0);
 		expect(() => fstatSync(goneFd)).toThrow();
+		expect(() => fstatSync(stayFd)).toThrow();
 		expect(fstatSync(rootFd).isDirectory()).toBe(true);
 	} finally {
 		closeSync(rootFd);
