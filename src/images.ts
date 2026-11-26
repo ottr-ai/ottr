@@ -76,7 +76,7 @@ export function saveImages(
 	const existing = withDir(root, dir, { create: true }, (d) => d.list());
 	let n = 0;
 	for (const name of existing) {
-		const m = /^(\d+)\.(png|jpg|gif|webp)$/.exec(name);
+		const m = /^(\d+)\.(png|jpg|gif|webp|ico)$/.exec(name);
 		if (m) n = Math.max(n, Number(m[1]));
 	}
 	const names: string[] = [];

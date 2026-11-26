@@ -1244,6 +1244,19 @@ describe("task routes", () => {
 		expect(await errorOf(leak)).toBe("unknown image");
 	});
 
+	test("the image route serves a stored ico shot", async () => {
+		const t = await store.createTask("ico shots");
+		const dir = await store.imagesDir(t.id);
+		mkdirSync(dir, { recursive: true });
+		const ico = Buffer.from([0, 0, 1, 0, 1, 0]);
+		writeFileSync(join(dir, "1.ico"), ico);
+		await store.updateTask(t.id, { shots: ["1.ico"] });
+		const ok = await get(`/api/projects/p1/tasks/${t.id}/images/1.ico`);
+		expect(ok.status).toBe(200);
+		expect(ok.headers.get("Content-Type")).toBe("image/x-icon");
+		expect(new Uint8Array(await ok.arrayBuffer())).toEqual(ico);
+	});
+
 	test("drawer detail lists saved files and serves them safely", async () => {
 		const t = await store.createTask("with saved files");
 		await store.updateTask(t.id, { stage: "done", state: "idle" });

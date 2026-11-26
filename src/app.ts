@@ -10187,7 +10187,7 @@ export async function createApp(deps: AppDeps) {
 		const name = req.params.name;
 		// Name is joined into a path: require the exact pattern plus membership in the task's image lists.
 		if (
-			!/^\d+\.(png|jpg|gif|webp)$/.test(name) ||
+			!/^\d+\.(png|jpg|gif|webp|ico)$/.test(name) ||
 			!(
 				task.images.includes(name) ||
 				task.pendingImages.includes(name) ||
