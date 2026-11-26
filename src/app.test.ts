@@ -40,6 +40,7 @@ import {
 	type CompletionDigest,
 	dependabotHeadPrefix,
 	type Entry,
+	localTmpSpace,
 	normalizeCompletionDigest,
 	ompSessionStores,
 	parseValidateAgainBody,
@@ -27286,6 +27287,27 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
 			"The temp disk (/tmp) of local is full (512 MiB free)",
 		]);
+	});
+
+	test("the local tmp source rules by the seam: a null seam wins over a full probe", () => {
+		const full: TmpDiskSpace = {
+			freeBytes: 512 * 1024 * 1024,
+			totalBytes: 4 * 1024 ** 3,
+		};
+		const ample: TmpDiskSpace = {
+			freeBytes: 20 * 1024 ** 3,
+			totalBytes: 40 * 1024 ** 3,
+		};
+		const probe = () => full;
+		// The kill for OTTR-1306's fallthrough: a present seam returning null must
+		// warn nothing even while the probe reads full. The old `seam?.() ?? probe()`
+		// returned the probe's full space here on every host.
+		expect(localTmpSpace(() => null, probe)).toBeNull();
+		// A present seam's value rides; only an absent seam reads the probe.
+		expect(localTmpSpace(() => ample, probe)).toBe(ample);
+		expect(localTmpSpace(undefined, probe)).toBe(full);
+		// A null probe under an absent seam warns nothing too.
+		expect(localTmpSpace(undefined, () => null)).toBeNull();
 	});
 
 	test("a null local seam keeps the host probe out of the state warnings", async () => {

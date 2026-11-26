@@ -1436,6 +1436,18 @@ export function workerTmpWarnings(
 	}
 	return out;
 }
+
+/** The state frame's local /tmp source: a present seam rules, a null result warns
+ *  nothing; only an absent seam reads the real probe. OTTR-1306: the old `??` sent a
+ *  null seam to the probe, so exact warning assertions read the machine's free /tmp
+ *  space. The probe parameter keeps the regression tests deterministic: they inject a
+ *  full-space reader instead of the host's. */
+export function localTmpSpace(
+	seam: (() => TmpDiskSpace | null) | undefined,
+	probe: () => TmpDiskSpace | null = tmpDiskSpace,
+): TmpDiskSpace | null {
+	return seam === undefined ? probe() : seam();
+}
 /**
  * Boot reconcile of the layer in-use registries (docs/specs/agent-layer-switch.md, "Record"):
  * reconciles each home's registry with `openLayers`, the recovery pins from the stores'
@@ -6751,12 +6763,10 @@ export async function createApp(deps: AppDeps) {
 				...workerSignInWarnings(workerSignInReports, list, roles),
 				// OTTR-754: one bell warning per runner whose /tmp is below the free-space
 				// limit; recomputed per poll, so it disappears when space returns. The
-				// local probe is the injected seam (tests) or the real /tmp statfs. A set
-				// seam returning null means "no space known": null must not fall through
-				// to the real probe (OTTR-1295), so only an absent seam reads the host.
-				...(deps.tmpSpace
-					? workerTmpWarnings(workerSignInReports, deps.tmpSpace())
-					: workerTmpWarnings(workerSignInReports, tmpDiskSpace())),
+				// local space rules by the seam (localTmpSpace): null warns nothing and
+				// never falls through to the real probe (OTTR-1295, OTTR-1306); only an
+				// absent seam reads the host statfs.
+				...workerTmpWarnings(workerSignInReports, localTmpSpace(deps.tmpSpace)),
 				// OTTR-763: the checkout guard's ambiguous-change notices; one per change,
 				// naming the commit and the running cards; bounded and expiring in the loop.
 				...(deps.checkoutNotices?.() ?? []),
