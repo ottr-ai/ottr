@@ -211,7 +211,10 @@ describe("old-driver file compatibility", () => {
 			(await reopened.listTurns("z-first")).map((turn) => turn.id),
 		).toEqual([8001, nextTurn.id]);
 		expect((await reopened.perfFacts()).turns[0]?.cost).toBe(cost);
-	}, 30_000);
+		// Re-opens the legacy file three times and runs an integrity check;
+		// measured 1.4-2.7 s solo, but a parallel full-suite run starved it past
+		// bun's 5 s default (OTTR-1306). 60 s is a ceiling, not a wait.
+	}, 60_000);
 });
 
 describe("moveInQueue", () => {

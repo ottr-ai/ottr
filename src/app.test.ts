@@ -18376,10 +18376,10 @@ describe("slim state and done pages (OTTR-965)", () => {
 		for (const id of expectDone) expect(ids.has(id)).toBe(true);
 		// The wide prompt text no longer rides.
 		expect(b.tasks.every((t) => t.prompt === undefined)).toBe(true);
-		// Seeding runs 6000 real store writes; measured 6.5-6.8 s on the dev
-		// workstation, so the 5000 ms default cannot hold. 30 s leaves about
-		// 4x headroom and still bounds a broken seed path.
-	}, 30_000);
+		// Seeding runs 6000 real store writes; measured 6.5-6.8 s solo, but a
+		// loaded full-suite run measured 20-38 s, past its earlier 20-30 s
+		// ceilings (OTTR-1306). 120 s still bounds a broken seed path.
+	}, 120_000);
 
 	test("the Done window keeps the cut plus pinned cards and drops the rest", async () => {
 		const { st, projects } = await slimBoard("slim-window");
@@ -19929,11 +19929,15 @@ describe("hosted owner-URL wall (OTTR-1012)", () => {
 });
 
 describe("update cycle control (OTTR-752)", () => {
+	// Every test here mounts a fresh board with two real stores. The describe
+	// runs 26-43 s solo, and inside a parallel full-suite run a single mount
+	// can starve past bun's 5 s default (OTTR-1306). 60 s per test and hook is
+	// a ceiling, not a wait.
 	const stores: ProjectStore[] = [];
 	let fixture = 0;
 	afterAll(async () => {
 		for (const s of stores) await closeTestStore(s);
-	});
+	}, 60_000);
 
 	const heartbeat = (
 		patch: Partial<UpdateHostHeartbeat> = {},
@@ -20024,7 +20028,7 @@ describe("update cycle control (OTTR-752)", () => {
 		};
 		expect(state.updateCycle.canStart).toBe(false);
 		expect((await unknown.call("/api/update", {})).status).toBe(409);
-	}, 30_000);
+	}, 60_000);
 
 	test("every live runner count prevents a request without a stored card", async () => {
 		const m = await board();
@@ -20049,7 +20053,7 @@ describe("update cycle control (OTTR-752)", () => {
 			expect((await m.call("/api/update", {})).status).toBe(409);
 			expect(m.app.drainedRunner("local")).toBe(false);
 		}
-	}, 30_000);
+	}, 60_000);
 
 	test("real stores refuse running and preparing cards in every project, even cancelled cards", async () => {
 		const m = await board();
@@ -20068,7 +20072,7 @@ describe("update cycle control (OTTR-752)", () => {
 			}
 		}
 		expect((await m.call("/api/update", {})).status).toBe(202);
-	}, 30_000);
+	}, 60_000);
 
 	test("a failed runner reader or project reader never proves idle", async () => {
 		const m = await board();
@@ -20098,7 +20102,7 @@ describe("update cycle control (OTTR-752)", () => {
 			failed.mockRestore();
 		}
 		expect((await m.view())?.canStart).toBe(true);
-	}, 30_000);
+	}, 60_000);
 
 	test("the final idle check follows the real streamed JSON reader", async () => {
 		const m = await board();
@@ -20122,7 +20126,7 @@ describe("update cycle control (OTTR-752)", () => {
 		const response = await fetch(req);
 		expect(response.status).toBe(409);
 		expect(m.app.drainedRunner("local")).toBe(false);
-	}, 30_000);
+	}, 60_000);
 
 	test("the idle check and manual hold share one synchronous operation", async () => {
 		const m = await board();
@@ -20137,7 +20141,7 @@ describe("update cycle control (OTTR-752)", () => {
 		expect((await m.call("/api/update", {})).status).toBe(202);
 		expect(observed.length).toBeGreaterThan(0);
 		expect(observed.every(Boolean)).toBe(true);
-	}, 30_000);
+	}, 60_000);
 
 	test("duplicate requests and polls share one id and hold all runner ids", async () => {
 		const m = await board();
@@ -20191,7 +20195,7 @@ describe("update cycle control (OTTR-752)", () => {
 		});
 		const again = await m.call("/api/update/host", heartbeat());
 		expect(((await again.json()) as UpdateHostReply).requestId).toBeNull();
-	}, 30_000);
+	}, 60_000);
 
 	test("manual hold completion and expiry preserve independent board and runner drains", async () => {
 		const m = await board();
@@ -20220,7 +20224,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setSystemTime();
 		}
-	}, 30_000);
+	}, 60_000);
 
 	test("DELETE drain cannot clear the separate manual hold", async () => {
 		const m = await board();
@@ -20230,7 +20234,7 @@ describe("update cycle control (OTTR-752)", () => {
 		expect(m.app.drainedRunner("local")).toBe(true);
 		expect(m.app.drained()).toBe(true);
 		expect((await m.view())?.phase).toBe("requested");
-	}, 30_000);
+	}, 60_000);
 
 	test("running heartbeat restores and clears the same hold across server and lease recovery", async () => {
 		const m = await board();
@@ -20259,7 +20263,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setSystemTime();
 		}
-	}, 30_000);
+	}, 60_000);
 
 	test("invalid input does not replace the host, clear the request or renew its lease", async () => {
 		const m = await board();
@@ -20296,7 +20300,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setSystemTime();
 		}
-	}, 30_000);
+	}, 60_000);
 
 	test("host registration requires direct peer state, not Host, keys, sessions or worker tokens", async () => {
 		const token = crypto.randomUUID();
@@ -20390,7 +20394,7 @@ describe("update cycle control (OTTR-752)", () => {
 				)
 			).status,
 		).toBe(202);
-	}, 30_000);
+	}, 60_000);
 
 	test("host metadata fits the body cap and redacts known secrets before any live reader sees it", async () => {
 		const m = await board();
@@ -20430,7 +20434,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setGitSecrets(previous);
 		}
-	}, 30_000);
+	}, 60_000);
 
 	test("Origin and JSON guards protect both routes before any mutation", async () => {
 		const m = await board();
@@ -20451,7 +20455,7 @@ describe("update cycle control (OTTR-752)", () => {
 			expect((await m.call(path, [])).status).toBe(400);
 		}
 		expect(await m.view()).toBeNull();
-	}, 30_000);
+	}, 60_000);
 
 	test("hosted mode refuses even a signed owner and exposes no controller view", async () => {
 		const secret = crypto.randomUUID();
@@ -20499,7 +20503,7 @@ describe("update cycle control (OTTR-752)", () => {
 			balance: 12.5,
 			accountUrl: "http://127.0.0.1:9/account",
 		});
-	}, 30_000);
+	}, 60_000);
 
 	test("hosted mode keeps the operator's alate pairing and model roles from a signed owner", async () => {
 		const secret = crypto.randomUUID();
@@ -20597,7 +20601,8 @@ describe("update cycle control (OTTR-752)", () => {
 			if (previousKey === undefined) delete process.env.ALATE_API_KEY;
 			else process.env.ALATE_API_KEY = previousKey;
 		}
-	});
+	}, 60_000);
+
 	test("the hosted credit hold refuses the board's own model-call routes", async () => {
 		const secret = crypto.randomUUID();
 		let hold = false;
@@ -20715,7 +20720,7 @@ describe("update cycle control (OTTR-752)", () => {
 			if (previous === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
 			else process.env.OTTR_BOARD_OMP_HOME = previous;
 		}
-	}, 30_000);
+	}, 60_000);
 
 	test("GET and existing socket update frames use live host availability and discard stale values", async () => {
 		const m = await board({ realPort: true });
@@ -20831,7 +20836,7 @@ describe("update cycle control (OTTR-752)", () => {
 			setSystemTime();
 			socket.close();
 		}
-	}, 30_000);
+	}, 60_000);
 });
 
 describe("drain route", () => {
@@ -27281,6 +27286,49 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 			"The temp disk (/tmp) of worker-a is full (512 MiB free)",
 			"The temp disk (/tmp) of local is full (512 MiB free)",
 		]);
+	});
+
+	test("a null local seam keeps the host probe out of the state warnings", async () => {
+		// OTTR-1306: `??` sent a seam result of null to the real probe, so on a
+		// machine whose /tmp is full the state payload gained a local line no test
+		// injected. The seam result must rule: null warns nothing, whatever the
+		// host's free space reads.
+		const workerApp = await createTestApp({
+			gstore,
+			defaultDir: root,
+			projects: new Map(),
+			...loopStubs(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: [],
+			tmpSpace: () => null,
+			shared: {
+				maxTotalRuns: 3,
+				reviewCheck: true,
+				workCheck: true,
+				idleReviews: true,
+				trendingScan: true,
+				commitIdentity: null,
+				removedPaths: [],
+				envValues: {},
+				envPlain: {},
+				projectPaths: [],
+				projectOrder: [],
+			},
+			serverRef: { current: undefined },
+		});
+		const srv = Bun.serve({ port: 0, ...workerApp.serveOptions });
+		workerApp.serverRef.current = srv;
+		try {
+			const res = await fetch(new URL("/api/state", srv.url), {
+				headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+			});
+			const { warnings } = (await res.json()) as { warnings: string[] };
+			expect(warnings.some((w) => w.includes("of local is full"))).toBe(false);
+		} finally {
+			srv.stop(true);
+		}
 	});
 
 	test("the tmp advisories keep their subject and host in the bell's short line", () => {
