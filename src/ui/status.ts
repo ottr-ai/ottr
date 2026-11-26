@@ -9,6 +9,7 @@ import {
 	queueOrder,
 	type ReviewTask,
 	reviewFindings,
+	waitingOn,
 } from "../scheduler.ts";
 import type { ProjectView, Task, TaskCard } from "../types.ts";
 import { duration, until } from "./time.ts";
@@ -119,21 +120,58 @@ export function holdLeft(
 	return `held · ${holder === undefined ? "" : `${holder} limit · `}${time} left`;
 }
 
-/** The statusLine words for a queued card that keeps a reason: a future holdUntil counts
- *  down (a usage limit), the rest shows the card as resuming with the reason on record. */
-function queuedHoldLine(holdUntil: number | null, reason: string): string {
-	// A future holdUntil holds the card (a usage limit): count down instead of
-	// the raw reset stamp the reason carries.
-	if (holdUntil !== null && holdUntil > Date.now())
-		return holdLeft(holdUntil, Date.now(), reason) ?? reason;
-	return "resuming";
+/** The project cards the queued dependency line reads: a lane list carries the wire
+ * card, so the fields a dependency's own hold needs ride along when the caller passes
+ * full cards; a list without them keeps the plain dependency wording. */
+type StatusTasks = ReviewTask &
+	Pick<
+		Task,
+		| "title"
+		| "state"
+		| "queuedAt"
+		| "needsReason"
+		| "holdUntil"
+		| "pushRetries"
+		| "pendingBy"
+		| "validatedAt"
+	> &
+	Partial<Pick<TaskCard, "pushHold" | "vmHold" | "sandboxLead">>;
+
+/** The queued card's dependency line (OTTR-1321): depHold's "waiting for #<id> <title>"
+ * over the project's cards, cross-project ids through foreign — an open dependency
+ * blocks the dispatch at every stage, so the line outranks the resume words. With one
+ * open dependency whose own hold the cards carry, the line names that hold the way the
+ * dependency's own card would: "waiting for #d1 schema (held · zai limit · 12m left)".
+ * Several open dependencies keep the plain list; null with none open. */
+function depHoldLine(
+	t: Pick<Task, "dependsOn">,
+	tasks: readonly StatusTasks[] | undefined,
+	foreign?: DepIndex,
+): string | null {
+	const base = depHold(tasks ?? [], t, foreign);
+	if (base === null || tasks === undefined) return base;
+	const waiting = waitingOn(tasks, t, foreign);
+	const open = waiting[0];
+	if (waiting.length !== 1 || open === undefined) return base;
+	const dep = tasks.find((c) => c.id === open.id);
+	if (dep === undefined) return base;
+	// The dependency's own hold, in the order its own card shows it: a live usage-limit
+	// countdown first, then holdFor (merge gate, push hold, its own dependencies).
+	const countdown =
+		dep.holdUntil !== null && dep.holdUntil > Date.now()
+			? (holdLeft(dep.holdUntil, Date.now(), dep.needsReason) ??
+				dep.needsReason)
+			: null;
+	const own = countdown ?? holdFor(dep, tasks, foreign);
+	return own === null ? base : `${base} (${own})`;
 }
 
 /** The statusLine words for a queued card: a pending sandbox lead waits for its review's
  *  validation run — no work turn can ever take it, so that hold outranks a queued reply
- *  and the tracker's reason — a re-queued card counts its hold down or names the
- *  tracker's reason, a pending reply waits for a slot (for the restart while draining),
- *  and the rest wait for rules, their merge hold, or a free slot. */
+ *  and the tracker's reason — a re-queued card counts a future hold down, names its open
+ *  dependencies (OTTR-1321), or shows the resume words with the reason on record, a
+ *  pending reply waits for a slot (for the restart while draining), and the rest wait
+ *  for rules, their merge hold, or a free slot. */
 function queuedLine(
 	t: Pick<
 		TaskCard,
@@ -146,6 +184,7 @@ function queuedLine(
 		| "id"
 		| "validatedAt"
 		| "followUpOf"
+		| "dependsOn"
 	> & {
 		/** The wire stamp (taskView); store rows read the prompt tag instead. */
 		sandboxLead?: true;
@@ -153,14 +192,26 @@ function queuedLine(
 	hasRules: boolean,
 	hold: string | null | undefined,
 	drain: boolean,
-	tasks:
-		| readonly (ReviewTask & Pick<Task, "title" | "state" | "queuedAt">)[]
-		| undefined,
+	tasks: readonly StatusTasks[] | undefined,
+	foreign: DepIndex | undefined,
 ): string {
 	if (t.stage === "backlog") return "grill queued";
 	const leadHold = leadValidationHold(t);
 	if (leadHold !== null) return leadHold;
-	if (t.needsReason !== null) return queuedHoldLine(t.holdUntil, t.needsReason);
+	// A future holdUntil holds the card (a usage limit): count down instead of
+	// the raw reset stamp the reason carries.
+	if (
+		t.needsReason !== null &&
+		t.holdUntil !== null &&
+		t.holdUntil > Date.now()
+	)
+		return holdLeft(t.holdUntil, Date.now(), t.needsReason) ?? t.needsReason;
+	// An open dependency keeps the card parked even with a free slot, so its line
+	// names the real blocker before the resume words (OTTR-1321).
+	const dep = depHoldLine(t, tasks, foreign);
+	if (dep !== null) return dep;
+	// No open dependency and no future hold: the card resumes, the reason on record.
+	if (t.needsReason !== null) return "resuming";
 	if (t.pendingPrompt !== null)
 		return drain
 			? "reply queued · waits for the update restart"
@@ -215,6 +266,7 @@ export function statusLine(
 		| "pushSha"
 		| "validatedAt"
 		| "followUpOf"
+		| "dependsOn"
 	> & {
 		/** The wire stamp (taskView); store rows read the prompt tag instead. */
 		sandboxLead?: true;
@@ -224,13 +276,18 @@ export function statusLine(
 	/** True while an update holds new turns (POST /api/drain): every queued card waits for the restart. */
 	drain = false,
 	/** The project's cards, when the caller has them: counts a running review's findings
-	 * (reviewProgress) and a queued card's position (queuePosition). */
-	tasks?: readonly (ReviewTask & Pick<Task, "title" | "state" | "queuedAt">)[],
+	 * (reviewProgress), a queued card's position (queuePosition), and a queued card's
+	 * dependency line (OTTR-1321). */
+	tasks?: readonly StatusTasks[],
+	/** OTTR-708's cross-project dependency lookup, when the caller has it: an open
+	 * foreign dependency keeps the dep line instead of the resume words. */
+	foreign?: DepIndex,
 ): string {
 	// A cancelled card is final; the card's "Cancelled" chip carries the time.
 	if (t.cancelledAt !== null) return "cancelled";
 	// A queued card that keeps a reason was queued again by the tracker (restart, background-job exit).
-	if (t.state === "queued") return queuedLine(t, hasRules, hold, drain, tasks);
+	if (t.state === "queued")
+		return queuedLine(t, hasRules, hold, drain, tasks, foreign);
 	if (t.state === "preparing") return "preparing";
 	if (t.state === "running")
 		return t.progress ?? reviewProgress(tasks ?? [], t) ?? "running";

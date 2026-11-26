@@ -3,6 +3,7 @@ import {
 	type DepIndex,
 	type DepProject,
 	findDep,
+	PUSH_HOLD,
 	REVIEW_HOLD_MAX_MS,
 } from "../scheduler.ts";
 import type { TaskCard } from "../types.ts";
@@ -33,6 +34,7 @@ const t = (
 	pendingPrompt: null,
 	asked: null,
 	holdUntil: null,
+	dependsOn: [],
 	kind: "work",
 	releaseVersion: null,
 	doneAt: null,
@@ -48,6 +50,120 @@ test("statusLine queued precedence: needsReason beats everything", () => {
 	expect(
 		statusLine(t({ needsReason: "exit 1", pendingPrompt: "hi" }), false),
 	).toBe("resuming");
+});
+
+test("statusLine: a queued card names its open dependency, not resuming", () => {
+	// OTTR-1321: the parked shape (needsReason on record, stage in_progress) sat at
+	// "resuming" for hours while its dependency held the dispatch.
+	const dep = card({ id: "d1", title: "Schema", stage: "in_progress" });
+	const parked = t({
+		stage: "in_progress",
+		needsReason: "waiting for #d1 Schema",
+		dependsOn: ["d1"],
+	});
+	expect(statusLine(parked, true, undefined, false, [dep])).toBe(
+		"waiting for #d1 Schema",
+	);
+	// The dependency done: the card resumes again, the stale reason on record.
+	const done = card({
+		id: "d1",
+		title: "Schema",
+		stage: "done",
+		state: "idle",
+	});
+	expect(statusLine(parked, true, undefined, false, [done])).toBe("resuming");
+	// A card without a tracker reason names the dependency too, at any stage.
+	const plain = t({ stage: "in_progress", dependsOn: ["d1"] });
+	expect(statusLine(plain, true, undefined, false, [dep])).toBe(
+		"waiting for #d1 Schema",
+	);
+});
+
+test("statusLine: a cross-project dependency id resolves to its title", () => {
+	const foreign: DepIndex = (id) =>
+		id === "AGEN-161"
+			? {
+					id,
+					title: "Sync the token grant pinning rule",
+					stage: "merging",
+					cancelledAt: null,
+				}
+			: null;
+	const parked = t({
+		stage: "in_progress",
+		needsReason: "waiting for #AGEN-161 Sync the token grant pinning rule",
+		dependsOn: ["AGEN-161"],
+	});
+	expect(statusLine(parked, true, undefined, false, [], foreign)).toBe(
+		"waiting for #AGEN-161 Sync the token grant pinning rule",
+	);
+});
+
+test("statusLine: the one open dependency's own hold rides the dep line", () => {
+	const parked = t({
+		stage: "in_progress",
+		needsReason: "waiting for #d1 Schema",
+		dependsOn: ["d1"],
+	});
+	// A usage-limit hold on the dependency counts down inside the dep line.
+	const held = card({
+		id: "d1",
+		title: "Schema",
+		stage: "todo",
+		holdUntil: Date.now() + 3600_000,
+		needsReason:
+			"The zai usage limit is reached. The board starts the task again after the limit resets.",
+	});
+	expect(statusLine(parked, true, undefined, false, [held])).toMatch(
+		/^waiting for #d1 Schema \(held · zai limit · .+ left\)$/,
+	);
+	// A merge held because main is ahead of origin names the push hold text.
+	const pushed = card({
+		id: "d2",
+		title: "Notes",
+		stage: "merging",
+		pushHold: true,
+	});
+	expect(
+		statusLine(
+			t({
+				stage: "in_progress",
+				needsReason: "waiting for #d2 Notes",
+				dependsOn: ["d2"],
+			}),
+			true,
+			undefined,
+			false,
+			[pushed],
+		),
+	).toBe(`waiting for #d2 Notes (${PUSH_HOLD})`);
+	// The dependency's hold facts absent: the plain dep line stays.
+	const bare = card({ id: "d3", title: "Lint", stage: "todo" });
+	expect(
+		statusLine(
+			t({
+				stage: "in_progress",
+				needsReason: "waiting for #d3 Lint",
+				dependsOn: ["d3"],
+			}),
+			true,
+			undefined,
+			false,
+			[bare],
+		),
+	).toBe("waiting for #d3 Lint");
+	// Several open dependencies keep depHold's plain list, no per-card suffixes.
+	const a = card({ id: "d4", title: "Alpha", stage: "todo" });
+	const b = card({ id: "d5", title: "Beta", stage: "todo" });
+	expect(
+		statusLine(
+			t({ stage: "in_progress", dependsOn: ["d4", "d5"] }),
+			true,
+			undefined,
+			false,
+			[a, b],
+		),
+	).toBe("waiting for #d4 Alpha, #d5 Beta");
 });
 
 test("statusLine: a pending sandbox lead's validation wait beats a queued reply", () => {

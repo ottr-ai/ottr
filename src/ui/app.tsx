@@ -6729,7 +6729,7 @@ export function LaneCol({
 				holds.set(t.id, hold);
 				statuses.set(
 					t.id,
-					statusLine(t, hasRules, hold, draining, projectTasks),
+					statusLine(t, hasRules, hold, draining, projectTasks, foreignDeps),
 				);
 				rereleases.set(t.id, reReleaseOf(t, projectTasks));
 			}
