@@ -14990,9 +14990,10 @@ describe("work card check", () => {
 				block("tests were weakened", "const x = 1;"),
 				pass(),
 				pass(),
-				pass([], [
-					{ id: 1, reason: "the retry loop now covers the last attempt" },
-				]),
+				pass(
+					[],
+					[{ id: 1, reason: "the retry loop now covers the last attempt" }],
+				),
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
@@ -15044,9 +15045,10 @@ describe("work card check", () => {
 						notes: [imitator],
 					}),
 				}),
-				pass([], [
-					{ id: 1, reason: "the retry loop now covers the last attempt" },
-				]),
+				pass(
+					[],
+					[{ id: 1, reason: "the retry loop now covers the last attempt" }],
+				),
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
