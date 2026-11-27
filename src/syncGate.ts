@@ -351,21 +351,26 @@ function runChild(
 	return promise;
 }
 
-/** The branch's changed files: the diff from the fork point to HEAD, full tree —
- *  the hash set filters by the install contract's mappings afterwards. */
-async function changedFiles(target: SyncGateTarget): Promise<string[]> {
+/** The branch's changed files: the diff from the fork point to the pinned head
+ *  sha (the commit the snapshot archives — never the mutable HEAD ref, which a
+ *  commit landing mid-run would move), full tree; the hash set filters by the
+ *  install contract's mappings afterwards. */
+async function changedFiles(
+	target: SyncGateTarget,
+	head: string,
+): Promise<string[]> {
 	if (target.base === null) return [];
 	const out = await gitOut(
 		target.worktree,
-		["diff", ...NO_EXT_DIFF, "--name-only", `${target.base}...HEAD`],
+		["diff", ...NO_EXT_DIFF, "--name-only", "-z", `${target.base}...${head}`],
 		target.alateDir,
 		target.home,
 	);
 	if (out === null) return [];
-	return out
-		.split("\n")
-		.map((l) => l.trim())
-		.filter((l) => l !== "");
+	// The -z format separates names with NUL and never quotes them, so each
+	// entry equals the snapshot's raw path bytes: unicode, quotes, and
+	// whitespace survive the membership check.
+	return out.split("\0").filter((path) => path !== "");
 }
 
 /** Every projects/ file the snapshot carries: the staleness guard's candidate
@@ -451,8 +456,9 @@ export async function runSyncGate(
 	);
 	try {
 		// The branch's changed set before the child runs: the staleness guard
-		// needs it, and the post-run hash set reuses it.
-		const changed = new Set(await changedFiles(target));
+		// needs it, and the post-run hash set reuses it. Pinned to the archived
+		// commit, so a commit landing mid-run cannot reclassify the snapshot.
+		const changed = new Set(await changedFiles(target, head));
 		// The staleness guard (OTTR-1305): a branch forked before a mapped
 		// projects/ file gained its current content carries stale bytes at HEAD,
 		// and sync would install them over the fresher installed twin. For each

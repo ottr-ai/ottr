@@ -55,8 +55,11 @@ to the calling run's own card and project.
      ignored file leave `--porcelain` empty — so the install never reads
      the worktree's disk (step 7).
   6. File hashes: the branch's changed files (the diff from the fork
-     point to HEAD, full tree) filtered to the paths the agent-data
-     install contract maps, plus the caller-requested `files` paths.
+     point to the archived commit — the captured head sha, never the
+     mutable HEAD ref — full tree, NUL-separated raw names so unicode,
+     quotes, and whitespace survive) filtered to the paths the
+     agent-data install contract maps, plus the caller-requested
+     `files` paths.
      Mappings: `projects/<p>/<rest>` to the installed twin
      `<workspace>/<p>/<rest>`; `user/<rest>` below the gate child's home;
      a root `<name>.md` rule to `<home>/.omp/agent/rules/<name>`. Sources
@@ -99,8 +102,8 @@ to the calling run's own card and project.
 - Stale-source skip (OTTR-1305). Before the child runs, the gate walks
   the snapshot's `projects/<p>/<rest>` files. The guard checks three
   facts for each path: the installed twin exists, its bytes differ from
-  the snapshot source, and the branch's diff (fork point to HEAD) does
-  not include the path. When all three hold, the gate declines the
+  the snapshot source, and the branch's diff (fork point to the
+  archived commit) does not include the path. When all three hold, the gate declines the
   install for that path: the branch forked before the file gained its
   current content, so its bytes are stale against the fresher live
   checkout. The record gains a `skipped` entry

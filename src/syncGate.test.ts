@@ -119,6 +119,43 @@ function seedStaleWorktree(dir: string): string {
 	return base;
 }
 
+/** A committed card worktree whose branch changes three hostile-named
+ *  projects/ files — non-ASCII, a trailing space, and a double quote — the
+ *  name bytes the changed-set parser must carry intact. Returns the base sha. */
+function seedHostileNames(dir: string): string {
+	mkdirSync(join(dir, "projects/ottr"), { recursive: true });
+	writeFileSync(join(dir, "projects/ottr/文档.md"), "unicode base\n");
+	writeFileSync(join(dir, "projects/ottr/trailing .md"), "trailing base\n");
+	writeFileSync(join(dir, 'projects/ottr/we"ird.md'), "quoted base\n");
+	sh("git init -q -b main", dir);
+	sh("git config user.email t@t && git config user.name t", dir);
+	sh("git add -A && git commit -qm base", dir);
+	const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+	sh("git checkout -q -b ott/card", dir);
+	writeFileSync(join(dir, "projects/ottr/文档.md"), "unicode card\n");
+	writeFileSync(join(dir, "projects/ottr/trailing .md"), "trailing card\n");
+	writeFileSync(join(dir, 'projects/ottr/we"ird.md'), "quoted card\n");
+	sh("git add -A && git commit -qm card", dir);
+	return base;
+}
+
+/** A committed card worktree whose branch changes only projects/ottr/AGENTS.md;
+ *  projects/ottr/notes.md stays at its base bytes, so a commit that lands
+ *  mid-run can change it without the archived commit ever seeing that change. */
+function seedTwoFiles(dir: string): string {
+	mkdirSync(join(dir, "projects/ottr"), { recursive: true });
+	writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "base agents\n");
+	writeFileSync(join(dir, "projects/ottr/notes.md"), "base notes\n");
+	sh("git init -q -b main", dir);
+	sh("git config user.email t@t && git config user.name t", dir);
+	sh("git add -A && git commit -qm base", dir);
+	const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+	sh("git checkout -q -b ott/card", dir);
+	writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "card agents\n");
+	sh("git add -A && git commit -qm card", dir);
+	return base;
+}
+
 /** The mechanics probe: a transparent stand-in for runner-mechanics tests only.
  *  It enforces the argv contract (exit 2 without --data, so a launcher that
  *  drops the flag fails every mechanics test), echoes its argv and a fixed set
@@ -669,6 +706,117 @@ describe("stale-source skip (OTTR-1305)", () => {
 			.split("\n")
 			.find((l) => l.startsWith("probe sha256 "));
 		expect(shaLine?.endsWith(shaOf("card agents\n"))).toBe(true);
+	});
+});
+
+describe("changed-file classification", () => {
+	test("unicode, quoted, and trailing-space names keep their branch changes (no skip)", async () => {
+		const root = freshDir("names");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		const base = seedHostileNames(wt);
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedProbe(alateDir);
+		// The live twins all drifted, so any name the parser corrupts fails the
+		// changed-set membership and wrongly turns the card's change into a skip.
+		mkdirSync(join(root, "ottr"), { recursive: true });
+		writeFileSync(join(root, "ottr", "文档.md"), "live unicode\n");
+		writeFileSync(join(root, "ottr", "trailing .md"), "live trailing\n");
+		writeFileSync(join(root, "ottr", 'we"ird.md'), "live quoted\n");
+		const record = await runSyncGate(
+			targetFor({ root, worktree: wt, base, alateDir, home }),
+		);
+		expect(record.code).toBe(0);
+		// The card changed every one of these paths, so the guard must skip none.
+		expect(record.skipped).toBeUndefined();
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		const expected: [string, string, string][] = [
+			["projects/ottr/文档.md", "unicode card\n", "live unicode\n"],
+			["projects/ottr/trailing .md", "trailing card\n", "live trailing\n"],
+			['projects/ottr/we"ird.md', "quoted card\n", "live quoted\n"],
+		];
+		for (const [path, source, twin] of expected) {
+			expect(byPath.get(path)?.sourceSha256).toBe(shaOf(source));
+			expect(byPath.get(path)?.installedSha256).toBe(shaOf(twin));
+			expect(byPath.get(path)?.match).toBe(false);
+		}
+		expect(record.files.map((f) => f.path).sort()).toEqual(
+			expected.map(([path]) => path).sort(),
+		);
+	});
+
+	test("the changed set describes the archived commit, not a HEAD that moved mid-run", async () => {
+		const root = freshDir("pinhead");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		const base = seedTwoFiles(wt);
+		// The commit the gate will capture and archive: branch HEAD before the run.
+		const card = execSync("git rev-parse HEAD", { cwd: wt }).toString().trim();
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedProbe(alateDir);
+		mkdirSync(join(root, "ottr"), { recursive: true });
+		writeFileSync(join(root, "ottr", "AGENTS.md"), "fresh live agents\n");
+		writeFileSync(join(root, "ottr", "notes.md"), "fresh notes\n");
+		// A git shim that forces the race deterministically: when the gate's diff
+		// spawn arrives, the shim first commits c3 in the worktree (moving HEAD
+		// past the archived commit) and only then delegates to the real git. A
+		// changed set read from the mutable HEAD ref then classifies c3's
+		// notes.md change into the snapshot's run; the pinned sha keeps it out.
+		const realGit = execSync("which git", { cwd: root }).toString().trim();
+		const shimDir = freshDir("shim");
+		const shim = join(shimDir, "git");
+		writeFileSync(
+			shim,
+			[
+				"#!/bin/sh",
+				'case "$*" in',
+				"*--name-only*)",
+				`printf 'c3 notes\\n' > ${JSON.stringify(join(wt, "projects/ottr/notes.md"))}`,
+				`${realGit} -C ${JSON.stringify(wt)} add -A`,
+				`${realGit} -C ${JSON.stringify(wt)} commit -qm c3`,
+				";;",
+				"esac",
+				`exec ${realGit} "$@"`,
+				"",
+			].join("\n"),
+		);
+		chmodSync(shim, 0o755);
+		const savedPath = process.env.PATH;
+		process.env.PATH = `${shimDir}:${savedPath ?? ""}`;
+		try {
+			const record = await runSyncGate(
+				targetFor({ root, worktree: wt, base, alateDir, home }),
+			);
+			expect(record.code).toBe(0);
+			// Control: the shim really moved the worktree's HEAD mid-run.
+			const headAfter = execSync("git rev-parse HEAD", {
+				cwd: wt,
+			})
+				.toString()
+				.trim();
+			expect(headAfter).not.toBe(base);
+			// The run pinned and archived the pre-race commit, never the moved ref.
+			expect(record.head).toBe(card);
+			expect(record.head).not.toBe(headAfter);
+			// notes.md is unchanged in the archived commit and its twin drifted, so
+			// the guard must skip it — a mutable-HEAD diff would see c3's change and
+			// wrongly let the child install the snapshot's stale bytes there.
+			expect(record.skipped).toEqual([
+				{ path: "projects/ottr/notes.md", reason: STALE_SOURCE_SKIP_REASON },
+			]);
+			// The card's own change classifies normally against the pinned commit.
+			const byPath = new Map(record.files.map((f) => [f.path, f]));
+			expect(byPath.get("projects/ottr/AGENTS.md")?.sourceSha256).toBe(
+				shaOf("card agents\n"),
+			);
+			expect(byPath.get("projects/ottr/notes.md")?.sourceSha256).toBe(
+				shaOf("base notes\n"),
+			);
+		} finally {
+			process.env.PATH = savedPath;
+		}
 	});
 });
 
