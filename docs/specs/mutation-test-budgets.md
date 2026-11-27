@@ -11,7 +11,9 @@ If an asynchronous application teardown hook has no explicit budget, give it a 6
 Keep existing explicit teardown budgets.
 
 A timeout remains a failure.
-All assertions, fixture data, property runs, and production behavior stay unchanged.
+Preserve the asserted behavior and property run counts.
+Keep production behavior unchanged.
+The registration fixture uses a unique host label and a fixture-local Git `insteadOf` rule, independent of TMPDIR.
 
 ## Boundaries
 
@@ -19,6 +21,9 @@ Bun 1.4.5 ignores `[test].timeout` in `bunfig.toml`.
 A two-file probe shows that `setDefaultTimeout` in a preload affects only the first file.
 A `beforeEach` probe does not change the timeout of the current test.
 Use the existing per-test timeout argument instead of a global workaround.
+
+Give fresh test-parent directories traversal permission for the fixture UIDs.
+Keep the liveness markers and per-project private directories protected.
 
 Do not change the mutation thresholds, mutation targets, test selection, or property run counts.
 Do not add retries.
