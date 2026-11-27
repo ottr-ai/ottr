@@ -27957,9 +27957,9 @@ describe("omp watch probe wiring", () => {
 		const tarballBytes = new TextEncoder().encode("fake omp candidate tarball");
 		const tarballIntegrity =
 			"sha512-" +
-			Buffer.from(
-				await crypto.subtle.digest("SHA-512", tarballBytes),
-			).toString("base64");
+			Buffer.from(await crypto.subtle.digest("SHA-512", tarballBytes)).toString(
+				"base64",
+			);
 		const candidateModels = '{"models":[{"provider":"zai","id":"glm-6.2"}]}';
 
 		// The stand-in vm-runner: every POST /validate body is recorded, and the
@@ -28053,31 +28053,31 @@ describe("omp watch probe wiring", () => {
 		};
 		const probeSpawn: ProcSpawn = async (argv) => {
 			spawnCalls.push([...argv]);
-		if (argv[0] === "tar" && argv.includes("-xOzf")) {
-			// Member-only manifest read: the stdout carries package.json.
-			return {
-				code: 0,
-				stdout: new TextEncoder().encode(PKG_JSON),
-				stderr: "",
-			};
-		}
-		if (argv[0] === "bun" && argv.includes("--lockfile-only")) {
-			const dir = valueAfter(argv, "--cwd") ?? argv[argv.length - 1]!;
-			writeFileSync(
-				join(dir, "bun.lock"),
-				JSON.stringify({
-					lockfileVersion: 1,
-					packages: {
-						"@oh-my-pi/pi-coding-agent@18.16.0": [
-							"@oh-my-pi/pi-coding-agent@18.16.0",
-							"",
-							{},
-						],
-					},
-				}),
-			);
-			return { code: 0, stdout: new Uint8Array(), stderr: "" };
-		}
+			if (argv[0] === "tar" && argv.includes("-xOzf")) {
+				// Member-only manifest read: the stdout carries package.json.
+				return {
+					code: 0,
+					stdout: new TextEncoder().encode(PKG_JSON),
+					stderr: "",
+				};
+			}
+			if (argv[0] === "bun" && argv.includes("--lockfile-only")) {
+				const dir = valueAfter(argv, "--cwd") ?? argv[argv.length - 1]!;
+				writeFileSync(
+					join(dir, "bun.lock"),
+					JSON.stringify({
+						lockfileVersion: 1,
+						packages: {
+							"@oh-my-pi/pi-coding-agent@18.16.0": [
+								"@oh-my-pi/pi-coding-agent@18.16.0",
+								"",
+								{},
+							],
+						},
+					}),
+				);
+				return { code: 0, stdout: new Uint8Array(), stderr: "" };
+			}
 			if (argv[0] === "tar" && argv.includes("-cf")) {
 				const out = valueAfter(argv, "-cf") ?? argv[argv.length - 1]!;
 				mkdirSync(dirname(out), { recursive: true });
@@ -28092,7 +28092,10 @@ describe("omp watch probe wiring", () => {
 		const ompBoard = async (dirName: string) => {
 			const dir = join(root, dirName);
 			mkdirSync(dir, { recursive: true });
-			writeFileSync(join(dir, "Dockerfile.worker"), "ARG OMP_VERSION=18.15.0\n");
+			writeFileSync(
+				join(dir, "Dockerfile.worker"),
+				"ARG OMP_VERSION=18.15.0\n",
+			);
 			const st = await ProjectStore.open(dir);
 			testStores.add(st);
 			await st.setSettings({ ompWatch: true });
@@ -28140,9 +28143,13 @@ describe("omp watch probe wiring", () => {
 			disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`);
 		db.exec(`INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES
 			('zai', 'api_key', '{"key":"k","source":"t"}', NULL, 1, 1)`);
-		db.exec(`CREATE TABLE auth_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL)`);
+		db.exec(
+			`CREATE TABLE auth_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL)`,
+		);
 		db.exec(`INSERT INTO auth_schema_version (id, value) VALUES (1, 8)`);
-		db.exec(`CREATE TABLE auth_change_revision (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL)`);
+		db.exec(
+			`CREATE TABLE auth_change_revision (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL)`,
+		);
 		db.exec(`INSERT INTO auth_change_revision (id, value) VALUES (1, 1)`);
 		db.close();
 
@@ -28182,7 +28189,10 @@ describe("omp watch probe wiring", () => {
 			},
 		});
 		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
 			const url = String(input);
 			if (url === OMP_PACKAGE_URL) return Response.json(packument());
 			if (url.startsWith("https://registry.test/pkg/-/"))
