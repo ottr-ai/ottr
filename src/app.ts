@@ -727,6 +727,13 @@ interface AppDeps {
 		project: string,
 		id: string,
 	): { text: string; at?: number } | null;
+	/** OTTR-1318 test/instrumentation seam: awaited once a Back to todo move holds
+	 * its reservation, before any disposal work. Production leaves it unset. */
+	backToTodoReserved?: (taskId: string) => Promise<void>;
+	/** OTTR-1318 test/instrumentation seam: awaited once a create request has
+	 * committed the card row with its dependency list, before the response.
+	 * Production leaves it unset. */
+	taskBirthRecorded?: (taskId: string) => Promise<void>;
 	schedule: () => void | Promise<void>;
 	/** Internal service bindings only. The app owns their clock and publication lifecycle. */
 	serviceQuotas?: Omit<ServiceQuotaCoordinatorOptions, "now" | "onChange">;
@@ -5811,6 +5818,14 @@ export async function createApp(deps: AppDeps) {
 		if (req.method !== "GET") {
 			const originRefused = originWall(req);
 			if (originRefused !== null) return Promise.resolve(originRefused);
+		}
+		// OTTR-1318: a mutating request that targets a card inside a Back to todo move
+		// answers 409 instead of racing the move's git work. One guard in the wrapper —
+		// the move's own route and cancel (the escape hatch) pass; every other per-task
+		// route, present or future, waits for the move to finish.
+		if (req.method !== "GET") {
+			const reservedRefused = await reservedTaskRefusal(req);
+			if (reservedRefused !== null) return Promise.resolve(reservedRefused);
 		}
 		const wall = await wallRefusal(req, req.headers.get("host"));
 		if (wall !== null) return Promise.resolve(wall);
@@ -12538,6 +12553,30 @@ export async function createApp(deps: AppDeps) {
 	 * future, without per-path guards. The marker distinguishes the move's own claim
 	 * from a scheduler claim, so a crashed move can be reclaimed. */
 	const BACK_TO_TODO_RESERVE = "Moving back to todo...";
+	/** OTTR-1318: the api wrapper's reservation guard. A mutating request that names a
+	 * card inside a Back to todo move answers 409: the move is between its reservation
+	 * and its final write, so any write here invalidates the guarded row and races the
+	 * disposal. The move's own route and cancel (the escape hatch) pass; every other
+	 * per-task route — steer, reply, star, triage, model, and whatever ships next —
+	 * waits for the move to finish. GETs never reach this. */
+	async function reservedTaskRefusal(req: Request): Promise<Response | null> {
+		const m = /^\/api\/projects\/([^/]+)\/tasks\/([^/]+)(?:\/([^/]+))?/.exec(
+			new URL(req.url).pathname,
+		);
+		if (m === null) return null;
+		const [, project, id, action] = m;
+		if (action === undefined || action === "backlog" || action === "cancel")
+			return null;
+		const found = await resolveTask(
+			decodeURIComponent(project ?? ""),
+			id ?? "",
+		);
+		if (found instanceof Response) return null;
+		const { task } = found;
+		if (task.state === "preparing" && task.needsReason === BACK_TO_TODO_RESERVE)
+			return json({ error: "the card is being moved back to todo" }, 409);
+		return null;
+	}
 	/** OTTR-1318: one Back to todo move at a time per card. The lock makes the
 	 * reservation exclusive: a second request that arrives while the first holds the
 	 * card waits here, and its re-read inside the lock meets the moved row and answers
@@ -12602,6 +12641,10 @@ export async function createApp(deps: AppDeps) {
 				state: "preparing",
 				needsReason: BACK_TO_TODO_RESERVE,
 			});
+			// Test/instrumentation seam: the reservation is held; the pause point every
+			// serialization proof below gates on.
+			if (deps.backToTodoReserved !== undefined)
+				await deps.backToTodoReserved(task.id);
 			// A refused or failed move puts the card back the way the operator found
 			// it; best-effort, because a writer that landed meanwhile owns the row.
 			const restore = async (): Promise<void> => {
@@ -12661,6 +12704,11 @@ export async function createApp(deps: AppDeps) {
 					}
 				}
 				try {
+					await appendLog(
+						e.store,
+						task.id,
+						"+ back to todo: removing the worktree",
+					);
 					await removeWorktree({
 						mainPath: e.path,
 						worktreePath: reserved.worktree,
@@ -15100,6 +15148,10 @@ export async function createApp(deps: AppDeps) {
 		});
 		if (made instanceof Response) return made;
 		const { task: t, decoded } = made;
+		// Test/instrumentation seam: the row is committed with its dependency list;
+		// probes fired here must see the birth write, never the pre-write window.
+		if (deps.taskBirthRecorded !== undefined)
+			await deps.taskBirthRecorded(t.id);
 		const saved = await saveTaskImages(e, t, decoded);
 		if (saved instanceof Response) return saved;
 		await withTask(e, saved, async () => {

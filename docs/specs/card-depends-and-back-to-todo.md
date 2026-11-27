@@ -83,6 +83,11 @@ The existing route gains a second source: a stage `in_progress` card in state
   reservation; the marker proves the claim is the move's, so a later move
   reclaims it instead of stranding the card (cancel stays the other way
   out).
+- The api wrapper refuses every mutating request that names a card inside the
+  move (409, "the card is being moved back to todo"): one guard covers steer,
+  reply, star, triage, model, unmark-research, and every per-task route that
+  ships later. The move's own route and cancel (the escape hatch) pass, and
+  GETs never reach the guard.
 - Allowed only when the card holds no work: the worktree, if one exists, must
   be clean (`git status` empty) and hold no commits past its base/target
   (`unsavedWork` in `src/worktree.ts`). A husk (unlinked or missing worktree
@@ -159,7 +164,8 @@ The existing route gains a second source: a stage `in_progress` card in state
   the create transaction, the edit route's validate-and-write under
   `withDepWriteLock`, the settle's prune-and-write under the same lock — and
   the Back to todo reservation is the one run state (`preparing`) no
-  dispatcher starts from. A new writer or dispatch path that skips these
+  dispatcher starts from, with the api wrapper refusing every other mutating
+  write to a reserved card. A new writer or dispatch path that skips these
   choke points reopens the class.
 - A cross-project cycle can only be detected while both cards' projects are on
   the board; an id the resolver cannot reach counts as satisfied at

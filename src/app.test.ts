@@ -691,6 +691,14 @@ async function mount(
 		deepen?: Parameters<typeof createApp>[0]["deepen"];
 		/** Gateway check seam for the deepen route; defaults to the real spawn. */
 		deepenCheck?: Parameters<typeof createApp>[0]["deepenCheck"];
+		/** OTTR-1318: awaited once a Back to todo move holds its reservation. */
+		backToTodoReserved?: Parameters<
+			typeof createApp
+		>[0]["backToTodoReserved"];
+		/** OTTR-1318: awaited once a create request committed the card row. */
+		taskBirthRecorded?: Parameters<
+			typeof createApp
+		>[0]["taskBirthRecorded"];
 		/** Gateway spawn seam for the release-summary route; defaults to the real spawn. */
 		releaseSummarySpawn?: Parameters<
 			typeof createApp
@@ -753,6 +761,8 @@ async function mount(
 		creditHoldActive: input.creditHoldActive,
 		deepen: input.deepen,
 		deepenCheck: input.deepenCheck,
+		backToTodoReserved: input.backToTodoReserved,
+		taskBirthRecorded: input.taskBirthRecorded,
 		finishKept: async () => ({ ok: true }),
 		claimedPids: () => new Set<number>(),
 		schedule: input.schedule ?? (() => {}),
@@ -14680,27 +14690,40 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 	const dependsOnRoute = (name: string, id: string): string =>
 		`/api/projects/${name}/tasks/${id}/depends-on`;
 
-	/** Polls the store until a Back to todo move holds its reservation (state
-	 * `preparing` under the move's marker). The awaited condition is the reserved
-	 * row itself; setImmediate yields event-loop turns without binding the wait to
-	 * a wall-clock duration — a fake clock cannot run the server's git work — and
-	 * the iteration cap bounds a broken move. */
-	const awaitReserved = async (
+	/** Fires a Back to todo move that pauses inside its reservation (the mount's
+	 * backToTodoReserved seam holds it) and probes a route against the reserved
+	 * card: the probe must answer 409 with the move's reason — no write may race
+	 * the move's disposal — and after the release the move completes. Returns the
+	 * probe response. */
+	const probeDuringReservation = async (
 		s: Dep1318Fixture,
-		id: string,
-	): Promise<void> => {
-		for (let i = 0; i < 5000; i++) {
-			const row = await s.store.getTask(id);
-			if (
-				row?.state === "preparing" &&
-				row.needsReason === "Moving back to todo..."
-			)
-				return;
-			const { promise, resolve } = Promise.withResolvers<void>();
-			setImmediate(resolve);
-			await promise;
-		}
-		throw new Error("the move never took its reservation");
+		action: string,
+		body: Record<string, unknown> = {},
+	): Promise<Response> => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const m = await mount({
+			projects: s.projects,
+			backToTodoReserved: async () => {
+				entered.resolve();
+				await release.promise;
+			},
+		});
+		const card = await parkCard(s, "reserved card", null, null);
+		const move = m.call(
+			`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+			{ to: "todo" },
+		);
+		await entered.promise;
+		const probe = await m.call(
+			`/api/projects/${s.entry.name}/tasks/${card.id}/${action}`,
+			body,
+		);
+		release.resolve();
+		const res = await move;
+		expect(res.status).toBe(200);
+		expect((await s.store.getTask(card.id))?.stage).toBe("todo");
+		return probe;
 	};
 
 	test("the depends-on route stores a replaced list on a parked in-progress card", async () => {
@@ -15050,7 +15073,15 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 	test("two concurrent back-to-todo moves answer exactly one 200 and one 409", async () => {
 		const s = await setup("p-dep1318-race");
 		try {
-			const m = await mount({ projects: s.projects });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const m = await mount({
+				projects: s.projects,
+				backToTodoReserved: async () => {
+					entered.resolve();
+					await release.promise;
+				},
+			});
 			const wt = s.worktree("card-race");
 			const card = await parkCard(s, "raced card", wt, "card-race");
 			const baseline = (await s.store.getTask(card.id))!.revision;
@@ -15058,13 +15089,13 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				m.call(`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`, {
 					to: "todo",
 				});
-			// Start the first move and wait until it holds the reservation (state
-			// `preparing` under the move's marker): the second request then starts
-			// INSIDE the first one's reservation window, so the per-card lock — not a
-			// revision guard — is what excludes it.
+			// The first move pauses INSIDE its reservation window; the second starts
+			// while the window is still open and must queue on the per-card lock —
+			// without the lock it would reclaim the reservation and dispose again.
 			const first = move();
-			await awaitReserved(s, card.id);
+			await entered.promise;
 			const second = move();
+			release.resolve();
 			const [r1, r2] = await Promise.all([first, second]);
 			expect([r1.status, r2.status].sort()).toEqual([200, 409]);
 			const after = (await s.store.getTask(card.id))!;
@@ -15072,9 +15103,13 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 			expect(after.state).toBe("queued");
 			expect(after.worktree).toBeNull();
 			// Exactly two guarded writes happened (reserve, final): the loser started
-			// inside the reservation window and still wrote nothing, so disposal ran
-			// once.
+			// inside the window and still wrote nothing.
 			expect(after.revision).toBe(baseline + 2);
+			// Exactly one disposal attempt: the card log records each removal try.
+			const log = readFileSync(await s.store.logPath(card.id), "utf8");
+			expect(
+				log.split("+ back to todo: removing the worktree").length - 1,
+			).toBe(1);
 			expect(existsSync(wt)).toBe(false);
 			expect(run(s.dir, "git for-each-ref refs/heads/card-race")).toBe("");
 		} finally {
@@ -15085,7 +15120,15 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 	test("merge-anyway refuses a card the back-to-todo move has reserved", async () => {
 		const s = await setup("p-dep1318-mrg");
 		try {
-			const m = await mount({ projects: s.projects });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const m = await mount({
+				projects: s.projects,
+				backToTodoReserved: async () => {
+					entered.resolve();
+					await release.promise;
+				},
+			});
 			const wt = s.worktree("card-mrg");
 			const card = await parkCard(s, "blocked card", wt, "card-mrg");
 			await s.store.updateTask(card.id, {
@@ -15104,10 +15147,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
 				{ to: "todo" },
 			);
-			// Inside the reservation window the card is `preparing`: merge-anyway must
-			// refuse instead of dispatching a merge turn whose worktree the move then
-			// removes.
-			await awaitReserved(s, card.id);
+			await entered.promise;
 			const merge = await m.call(
 				`/api/projects/${s.entry.name}/tasks/${card.id}/merge-anyway`,
 				{ reason: "ship it" },
@@ -15116,11 +15156,85 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 			expect(await errorOf(merge)).toBe(
 				"the card is being moved back to todo",
 			);
+			release.resolve();
 			const res = await move;
 			expect(res.status).toBe(200);
 			const after = (await s.store.getTask(card.id))!;
 			expect(after.stage).toBe("todo");
 			expect(after.worktree).toBeNull();
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("steer refuses a card the back-to-todo move has reserved", async () => {
+		const s = await setup("p-dep1318-steer");
+		try {
+			const probe = await probeDuringReservation(s, "steer", {
+				text: "keep going",
+			});
+			expect(probe.status).toBe(409);
+			expect(await errorOf(probe)).toBe(
+				"the card is being moved back to todo",
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("star refuses a card the back-to-todo move has reserved", async () => {
+		const s = await setup("p-dep1318-star");
+		try {
+			const probe = await probeDuringReservation(s, "star", {
+				starred: true,
+			});
+			expect(probe.status).toBe(409);
+			expect(await errorOf(probe)).toBe(
+				"the card is being moved back to todo",
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("triage refuses a card the back-to-todo move has reserved", async () => {
+		const s = await setup("p-dep1318-tri");
+		try {
+			const probe = await probeDuringReservation(s, "triage", {
+				priority: "P1",
+			});
+			expect(probe.status).toBe(409);
+			expect(await errorOf(probe)).toBe(
+				"the card is being moved back to todo",
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("model refuses a card the back-to-todo move has reserved", async () => {
+		const s = await setup("p-dep1318-model");
+		try {
+			const probe = await probeDuringReservation(s, "model", {
+				model: "zai/glm-5.3-flash",
+			});
+			expect(probe.status).toBe(409);
+			expect(await errorOf(probe)).toBe(
+				"the card is being moved back to todo",
+			);
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("unmark-research refuses a card the back-to-todo move has reserved", async () => {
+		const s = await setup("p-dep1318-unmark");
+		try {
+			const probe = await probeDuringReservation(s, "unmark-research");
+			expect(probe.status).toBe(409);
+			expect(await errorOf(probe)).toBe(
+				"the card is being moved back to todo",
+			);
 		} finally {
 			s.cleanup();
 		}
@@ -15220,33 +15334,37 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 	test("a created card is born with its dependencies, so no edit closes a cycle through it", async () => {
 		const s = await setup("p-dep1318-birth", "P");
 		try {
-			const m = await mount({ projects: s.projects });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const m = await mount({
+				projects: s.projects,
+				taskBirthRecorded: async () => {
+					entered.resolve();
+					await release.promise;
+				},
+			});
 			const blocker = await s.store.createTask("birth blocker");
 			expect(blocker.id).toBe("P-1");
-			// The created card's PREFIX id is predictable (P-2), so an edit can race
-			// the create and name it while the row exists but its dependency list has
-			// not landed. While the id is missing the edit answers 404 and retries;
-			// once the row exists its list must already be on it, so the only allowed
-			// answer is 400 — the cycle the birth list closes. A 200 would mean the
-			// row was observable without its dependencies.
+			// The create pauses right after the birth commit — the exact interleave the
+			// two-phase write used to expose — and the probe names the created card
+			// while the request is still in flight.
 			const create = m.call(`/api/projects/${s.entry.name}/tasks`, {
 				prompt: "born with deps",
 				dependsOn: [blocker.id],
 			});
-			let probeStatus = 404;
-			for (let i = 0; i < 400; i++) {
-				const probe = await m.call(
-					dependsOnRoute(s.entry.name, blocker.id),
-					{ dependsOn: ["P-2"] },
-				);
-				if (probe.status !== 404) {
-					probeStatus = probe.status;
-					break;
-				}
-			}
+			await entered.promise;
+			const probe = await m.call(dependsOnRoute(s.entry.name, blocker.id), {
+				dependsOn: ["P-2"],
+			});
+			// A 404 would mean the probe ran before the row existed; a 200 would mean
+			// the row was observable without its dependencies (the old birth window).
+			// The birth list is on the row, so the cycle is the only answer — assert
+			// the error text, because a bad dependency id answers 400 too.
+			expect(probe.status).toBe(400);
+			expect(await errorOf(probe)).toBe("dependsOn would form a cycle");
+			release.resolve();
 			const created = await create;
 			expect(created.status).toBe(200);
-			expect(probeStatus).toBe(400);
 			expect((await s.store.getTask("P-2"))?.dependsOn).toEqual([
 				blocker.id,
 			]);
