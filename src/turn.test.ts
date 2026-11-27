@@ -94,8 +94,8 @@ import {
 } from "./scheduler.ts";
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
-import fc from "./test/properties.ts";
 import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
+import fc from "./test/properties.ts";
 import { turnEnv } from "./tokens.ts";
 import type { TurnLoop, TurnOps, TurnProject } from "./turn.ts";
 import {
@@ -30233,8 +30233,8 @@ describe("stored review findings", () => {
 			new Set([lead.id]),
 			lead.id,
 		);
-		expect("id" in filed).toBe(true);
-		if (!("id" in filed)) throw new Error("no validation run filed");
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error(filed.error);
 		const card = (await store.getTask(filed.id))!;
 		expect(card.details).toBe(
 			`Batch validation of 1 lead(s) of review ${review.id}.`,
@@ -30252,6 +30252,34 @@ describe("stored review findings", () => {
 		expect(moved.state).toBe("idle");
 		expect(moved.queuedAt).toBeNull();
 		expect(moved.needsReason).toBeNull();
+	});
+
+	test("the legacy park transaction leaves a marked waiting lead in todo", async () => {
+		const { store, projects, loop } = await validationCase(baseRecord());
+		const review = await doneReview(store, "main");
+		const lead = await waitingLead(
+			store,
+			review.id,
+			"Needs validation: marked lead\nBlocker: sandbox run: control",
+		);
+		const before = await store.getTask(lead.id);
+		const refused = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			undefined,
+			new Set([lead.id]),
+			lead.id,
+		);
+		expect(refused).toEqual({
+			error:
+				"the lead to park must be a queued pending sandbox lead of this review",
+			status: 409,
+		});
+		expect(await store.getTask(lead.id)).toEqual(before);
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "validation"),
+		).toEqual([]);
 	});
 
 	test("a refused park inside the filing leaves the lead untouched (OTTR-1247)", async () => {
@@ -30279,7 +30307,8 @@ describe("stored review findings", () => {
 
 		// An open run blocks before any write: the lead stays queued in todo.
 		const first = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in first).toBe(true);
+		expect("error" in first).toBe(false);
+		if ("error" in first) throw new Error(first.error);
 		const refused = await loop.filePendingValidationRun(
 			entryOf(projects, store),
 			review.id,
@@ -30296,7 +30325,7 @@ describe("stored review findings", () => {
 		// A stale park target (here: a lead of another review) refuses inside the
 		// transaction and still writes nothing. Cancelling the first run clears the
 		// open-run block; the strict start overrides the declined review.
-		await store.updateTask("id" in first ? first.id : "", {
+		await store.updateTask(first.id, {
 			cancelledAt: Date.now(),
 		});
 		const otherReview = await doneReview(store, "other");
@@ -30488,8 +30517,8 @@ describe("stored review findings", () => {
 			"Needs validation: config double-read\nBlocker: sandbox run: config load",
 		);
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error(v1.error);
 		// The user starts the lead while the run is open (an accept or a drag).
 		// The routing tick holds such a lead until the settle, so the settle sees
 		// it started — the CLIP-107 shape.
@@ -30535,8 +30564,8 @@ describe("stored review findings", () => {
 			"Needs validation: legacy cache read\nBlocker: sandbox run: cache load",
 		);
 		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
-		expect("id" in v1).toBe(true);
-		if (!("id" in v1)) throw new Error("no validation run filed");
+		expect("error" in v1).toBe(false);
+		if ("error" in v1) throw new Error(v1.error);
 		// The lead ran as a work turn before the batch rule: it holds a worktree
 		// with unsaved work, and it is started when the settle reads it.
 		await store.updateTask(refuted.id, {
@@ -31487,8 +31516,7 @@ describe("stored review findings", () => {
 			"Needs validation: refuted wait\nBlocker: sandbox run: cr",
 			3,
 		);
-		for (const f of [cf, bf, rf])
-			await store.appendReviewFinding(review.id, f);
+		for (const f of [cf, bf, rf]) await store.appendReviewFinding(review.id, f);
 		const confirmed = await waitingLead(store, review.id, cf.prompt);
 		const blocked = await waitingLead(store, review.id, bf.prompt);
 		const refuted = await waitingLead(store, review.id, rf.prompt);
@@ -31499,7 +31527,9 @@ describe("stored review findings", () => {
 		// The waiting leads all entered the batch despite their todo stages.
 		expect((await store.getTask(v1.id))!.prompt).toContain(`#${confirmed.id}`);
 		batches.push([
-			mkFinding(`Validation: #${confirmed.id} confirmed\nthe job reproduces it`),
+			mkFinding(
+				`Validation: #${confirmed.id} confirmed\nthe job reproduces it`,
+			),
 			mkFinding(`Validation: #${blocked.id} blocked\nstill lacks the control`),
 			mkFinding(
 				`Validation: #${refuted.id} refuted\nthe job passes without it`,
@@ -31946,7 +31976,7 @@ describe("stored review findings", () => {
 	// runs newest first, the first result per lead inside a run.
 	test.each(leadOutcomeCases)(
 		"settle applies $name -> $own (waits: $waits)",
-		async ({ runs, own, waits }) => {
+		async ({ runs, waits }) => {
 			const { store, projects, loop, batches } = await validationCase(
 				baseRecord(),
 			);
@@ -32072,9 +32102,7 @@ describe("stored review findings", () => {
 	// a details-only blocked lead migrated into a wait whose validatedAt no
 	// reset could clear, and every filing returned 409.
 	test("a migrated blocked lead's preserved validatedAt resets through the real filing path", async () => {
-		const { store, projects, loop, batches } = await validationCase(
-			baseRecord(),
-		);
+		const { store, projects, loop } = await validationCase(baseRecord());
 		const review = await doneReview(store, "migrated lead review");
 		const lead = await waitingLead(
 			store,

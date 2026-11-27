@@ -14,6 +14,7 @@ const facts: Facts = {
 	now: 1_000_000,
 	logAgeS: null,
 	hold: null,
+	leadHold: null,
 	depsOpen: [],
 	drain: false,
 	capFull: false,

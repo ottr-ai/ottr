@@ -262,14 +262,6 @@ describe("PostgreSQL migration surface", () => {
 		expect(db.executed).toContain(
 			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
 		);
-		// The step really consults the legacy rows (the SELECT carries the cheap
-		// prefilters; the newest-outcome decision runs per row in TypeScript,
-		// which no LIKE can read), and the per-row write is the shared statement.
-		expect(
-			db.queried.some((statement) =>
-				statement.includes("prompt NOT LIKE '%The user answered the review%'"),
-			),
-		).toBe(true);
 		expect(
 			db.executed.filter((statement) => statement === CONVERGE_LEAD_WAIT_SQL),
 			"the probe's SELECT returns no rows, so no convergence write may run",
@@ -292,19 +284,22 @@ describe("PostgreSQL migration surface", () => {
 		).toEqual([]);
 	});
 
+	// Version 7 repairs the index. Later migrations have separate checks.
+	const repairMigrations = projectMigrations.slice(0, 7);
+
 	test("the repair skips an already-migrated database whose index is correct or absent", async () => {
 		const migrated = (indexdef: string | null) => {
 			const db = new MigrationProbeDb(indexdef);
 			// Versions 1..6 recorded before the repair step existed: every
 			// earlier step skips and only the repair's decision runs.
-			for (let version = 1; version < projectMigrationCount; version++)
+			for (let version = 1; version < repairMigrations.length; version++)
 				db.run("INSERT INTO schema_migrations (version) VALUES (?)", [version]);
 			return db;
 		};
 		const correct = migrated(
 			'CREATE INDEX idx_code_scan_alert_card_filed ON "p_probe_000000000000".code_scan_alert USING btree (card_filed_at)',
 		);
-		await applyPostgresMigrations(correct.asDatabase(), projectMigrations);
+		await applyPostgresMigrations(correct.asDatabase(), repairMigrations);
 		expect(
 			correct.executed.filter(
 				(statement) =>
@@ -313,7 +308,7 @@ describe("PostgreSQL migration surface", () => {
 			),
 		).toEqual([]);
 		const absent = migrated(null);
-		await applyPostgresMigrations(absent.asDatabase(), projectMigrations);
+		await applyPostgresMigrations(absent.asDatabase(), repairMigrations);
 		expect(
 			absent.executed.filter((statement) => statement.startsWith("DROP INDEX")),
 		).toEqual([]);
@@ -323,11 +318,11 @@ describe("PostgreSQL migration surface", () => {
 		const db = new MigrationProbeDb(
 			'CREATE INDEX idx_code_scan_alert_card_filed ON "p_probe_000000000000".code_scan_alert USING btree (task_id)',
 		);
-		for (let version = 1; version < projectMigrationCount; version++)
+		for (let version = 1; version < repairMigrations.length; version++)
 			db.run("INSERT INTO schema_migrations (version) VALUES (?)", [version]);
 		// The seeding itself is not part of the migration run under test.
 		db.executed.length = 0;
-		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
+		await applyPostgresMigrations(db.asDatabase(), repairMigrations);
 		// Exact run: the migrations table, then the drop, then the deployed
 		// definition, then the step's version record. A repair that drops
 		// without recreating, recreates the wrong columns, or recreates before

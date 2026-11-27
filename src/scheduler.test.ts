@@ -40,8 +40,8 @@ import {
 	lastReviewBase,
 	leadBlocker,
 	leadValidationHold,
-	leadValidationStartRefusal,
 	leadValidationOutcome,
+	leadValidationStartRefusal,
 	legacyLeadWaits,
 	liveCard,
 	liveCardOf,
@@ -1932,6 +1932,19 @@ describe("OTTR-1128: a lead never runs as a work turn and never holds its review
 		expect(
 			leadValidationStartRefusal({ ...lead, state: "idle" }, "id00001"),
 		).toBe("state");
+	});
+
+	test("marked leads refuse the legacy park path in store and wire rows", () => {
+		const lead = task({
+			prompt: "Needs validation: marked lead\nBlocker: sandbox run: control",
+			followUpOf: "review",
+			waitsValidation: true,
+		});
+		for (const row of [
+			lead,
+			{ ...lead, prompt: undefined, sandboxLead: true as const },
+		])
+			expect(leadValidationStartRefusal(row, "review")).toBe("state");
 	});
 
 	test("validatableReview: a done review, or one idle at merging", () => {

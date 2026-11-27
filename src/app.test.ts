@@ -2700,8 +2700,9 @@ describe("task routes", () => {
 		// Not sure leaves the lead open: the answer only records. The question
 		// itself is answered, so the card lands Done with the lead still open.
 		const three = (await store.getTask(lead3.id))!;
-		expect(three.stage).toBe("backlog");
-		expect(three.state).toBe("idle");
+		expect(three.stage).toBe("todo");
+		expect(three.state).toBe("queued");
+		expect(three.waitsValidation).toBe(true);
 		expect(three.cancelledAt).toBeNull();
 		expect(three.details).toBe(
 			`\n\nThe user answered the review's question: ${LEAD_UNSURE_OPTION}`,
@@ -2716,8 +2717,9 @@ describe("task routes", () => {
 		});
 		expect(res2.status).toBe(200);
 		const freeLead = (await store.getTask(free.lead1.id))!;
-		expect(freeLead.stage).toBe("backlog");
-		expect(freeLead.state).toBe("idle");
+		expect(freeLead.stage).toBe("todo");
+		expect(freeLead.state).toBe("queued");
+		expect(freeLead.waitsValidation).toBe(true);
 		expect(freeLead.cancelledAt).toBeNull();
 		expect(freeLead.details).toBe(
 			"\n\nThe user answered the review's question: only behind our staging proxy",
@@ -13153,6 +13155,32 @@ describe("manual validation start route (OTTR-1047)", () => {
 				// The parked lead sorts ahead of the severity order.
 				expect(seen[0]!.park).toBe(lead.id);
 				expect(seen[0]!.first?.has(lead.id)).toBe(true);
+			} finally {
+				validateLeadsImpl = null;
+				for (const t of await store.listTasks())
+					if (t.kind === "validation" && t.followUpOf === review.id)
+						await store.updateTask(t.id, { cancelledAt: Date.now() });
+				await store.updateTask(review.id, { cancelledAt: Date.now() });
+				await store.updateTask(lead.id, { cancelledAt: Date.now() });
+			}
+		});
+
+		test("a marked lead cannot use the legacy park route", async () => {
+			const { review, lead } = await doneReviewWithQueuedLead();
+			await store.updateTask(lead.id, { waitsValidation: true });
+			const before = await store.getTask(lead.id);
+			let filed = 0;
+			validateLeadsImpl = async () => {
+				filed++;
+				return { id: "nope", reset: [] };
+			};
+			try {
+				const res = await post(`/api/projects/p1/tasks/${review.id}/validate`, {
+					lead: lead.id,
+				});
+				expect(res.status).toBe(409);
+				expect(filed).toBe(0);
+				expect(await store.getTask(lead.id)).toEqual(before);
 			} finally {
 				validateLeadsImpl = null;
 				await store.updateTask(review.id, { cancelledAt: Date.now() });

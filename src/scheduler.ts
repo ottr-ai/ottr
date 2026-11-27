@@ -1579,8 +1579,8 @@ export type LeadStartRefusal =
 	/** The prompt carries no pending sandbox lead (wrong tag or a deployment fact
 	 * answered as normal work). */
 	| "not-lead"
-	/** The lead is not a queued todo/in_progress card without a worktree and
-	 * without a queued reply. */
+	/** The lead has a wait marker or is not a queued todo/in_progress card
+	 * without a worktree and without a queued reply. */
 	| "state";
 
 export function leadValidationStartRefusal(
@@ -1593,6 +1593,7 @@ export function leadValidationStartRefusal(
 		| "pendingPrompt"
 		| "worktree"
 		| "validatedAt"
+		| "waitsValidation"
 	> & {
 		/** Store rows carry the prompt tag; wire rows ship no prompt and carry the
 		 * `sandboxLead` stamp instead. */
@@ -1612,6 +1613,8 @@ export function leadValidationStartRefusal(
 	)
 		return "not-lead";
 	if (
+		// Marked leads use their own Validate now route, never the legacy park.
+		lead.waitsValidation ||
 		!(
 			(lead.stage === "todo" || lead.stage === "in_progress") &&
 			lead.state === "queued"

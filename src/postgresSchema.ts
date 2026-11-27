@@ -313,7 +313,7 @@ export const projectMigrations: readonly PostgresMigration[] = [
 				},
 				[]
 			>(
-				"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+				"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%'",
 			)
 			.all();
 		const byReview = new Map<string, typeof legacy>();

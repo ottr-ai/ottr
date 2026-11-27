@@ -41,8 +41,8 @@ import {
 	tasksDirFor,
 } from "./store.ts";
 import { prConflictReason } from "./supervisor.ts";
-import { type StoreChildHandle, spawnStoreChild } from "./test/storeChild.ts";
 import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
+import { type StoreChildHandle, spawnStoreChild } from "./test/storeChild.ts";
 import {
 	answeredCard,
 	PR_REVIEW_POSTED,
@@ -6864,13 +6864,13 @@ Validated by validation run #11 on 2026-11-22: deployment — Which proxy termin
 				('detailsonly1', 'details-only blocked lead', 'Needs validation: details-only blocker', 'backlog', 'idle', 'work', 810, 1010, 'rev1', NULL, 955,
 					'Unverified lead from review rev1.
 Validated by validation run #12 on 2026-11-23: still blocked — no retry control.')`);
-		// A validation card plus the recorded findings: the authoritative outcome
-		// record — the only source the convergence reads, because a reset can
-		// only act on recorded findings. The blocked finding turns a grilled,
-		// wiped lead back into undecided work; the confirmed finding keeps its
-		// row decided; blocked1 and deploy1 carry their outcomes only as
-		// details segments, so they stay decided backlog work — waiting on a
-		// details-only outcome would lock them behind a reset that cannot act.
+		raw.exec(`INSERT INTO tasks
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
+			VALUES ('quoted1', 'quoted answer text', 'Needs validation: the report quotes The user answered the review.', 'backlog', 'idle', 'work', 815, 1015, 'rev1', NULL, 956,
+				'Unverified lead.
+Validated by validation run #12 on 2026-11-23: still blocked — no retry control.')`);
+		// Findings survive a later details edit. Migration and reset read them
+		// through the same selector. The details-only rows cover the legacy fallback.
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of)
 			VALUES
@@ -6962,6 +6962,12 @@ Validated by validation run #12 on 2026-11-23: still blocked — no retry contro
 		expect(detailsOnly.stage).toBe("todo");
 		expect(detailsOnly.waitsValidation).toBe(true);
 		expect(detailsOnly.validatedAt).toBe(955);
+		const quoted = (await store.getTask("quoted1"))!;
+		expect(quoted.stage).toBe("todo");
+		expect(quoted.state).toBe("queued");
+		expect(quoted.waitsValidation).toBe(true);
+		expect(quoted.queuedAt).toBe(1015);
+		expect(quoted.validatedAt).toBe(956);
 		// The grill wiped the blocked lead's details too, but its recorded
 		// finding says blocked — undecided work that waits again, so a move to
 		// todo cannot start it unconfirmed (batching and the blocked-only reset

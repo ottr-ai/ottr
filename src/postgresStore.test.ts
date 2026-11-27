@@ -211,6 +211,7 @@ try {
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-parked', 'parked confirmed lead', 'Needs validation: confirmed finding', 'backlog', 'idle', 'work', 200, 600, 'legacy-review', 700, E'Unverified lead from review legacy-review.\\nValidated by validation run #9 on 2026-11-20: confirmed.')");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-answered', 'parked answered lead', E'Needs validation: proxy header\\nThe user answered the review''s question: Applies', 'backlog', 'idle', 'work', 300, 650, 'legacy-review')");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES ('legacy-blocked', 'parked blocked lead', 'Needs validation: flaky retry loop', 'backlog', 'idle', 'work', 400, 700, 'legacy-review', 750, E'Unverified lead from review legacy-review.\\nValidated by validation run #10 on 2026-11-21: still blocked — no retry control.')");
+        await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, validated_at, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ['legacy-quoted', 'quoted answer text', 'Needs validation: the report quotes The user answered the review.', 'backlog', 'idle', 'work', 450, 710, 'legacy-review', 751, 'Unverified lead.\nValidated by validation run #old on 2026-11-21: still blocked — no retry control.']);
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at) VALUES ('legacy-plain', 'plain card', 'Fix the login redirect', 'backlog', 'idle', 'work', 500, 800)");
         await leadDb.run("INSERT INTO tasks (id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of) VALUES ('legacy-valcard', 'validation run', 'Batch validation of 2 lead(s) of review.', 'done', 'idle', 'validation', 600, 850, 'legacy-review')");
         // The grilled leads: a later grill replaced their details with its
@@ -256,6 +257,9 @@ try {
         { id: 'legacy-parked', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 700 },
         { id: 'legacy-plain', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
       ]);
+      assert.deepEqual(await leadDb.query("SELECT stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id = 'legacy-quoted'").get(), {
+        stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 710, validated_at: 751,
+      });
       await applyPostgresMigrations(leadDb, projectMigrations);
       assert.deepEqual(Array.from(await leadDb.query("SELECT stage, queued_at FROM tasks WHERE id = 'legacy-lead'").all()), [
         { stage: 'todo', queued_at: 500 },

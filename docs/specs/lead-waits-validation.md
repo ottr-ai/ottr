@@ -42,8 +42,7 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    -- per legacy row, grouped by its review:
    SELECT id, prompt, details, validated_at, follow_up_of FROM tasks
    WHERE stage = 'backlog' AND cancelled_at IS NULL
-     AND prompt LIKE 'Needs validation%'
-     AND prompt NOT LIKE '%The user answered the review%';
+     AND prompt LIKE 'Needs validation%';
    -- per row: UPDATE tasks SET stage = 'todo', state = 'queued',
    --   waits_validation = 1, queued_at = updated_at WHERE id = ?
    ```
@@ -55,6 +54,7 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    The scoped reset reads the same legacy result, so Validate now can clear a blocked stamp.
    When `validatedAt` exists without a readable result, the row keeps its decision.
    The per-row decision uses TypeScript, not SQL `LIKE`, to preserve the result order.
+   The query does not exclude quoted answer text. `legacyLeadWaits` alone checks the answer marker.
    `Needs-validation lead questions...` does not match the lead prefix because it contains a hyphen.
 3. PostgreSQL: the column lives only in a numbered step, never in
    `projectStepOne` — the steps run on fresh databases too, so a stepOne
@@ -144,6 +144,8 @@ No schema change or validation prompt change is necessary.
 - The steer route refuses a waiting lead (409): a reply must not start a work turn.
 - The prompt-edit route refuses a waiting lead (409): an edit that drops the tag
   would strand the marker.
+- The review route's legacy `{ lead }` park action refuses marked leads.
+  Marked leads use their own Validate now route and retain the todo form.
 - The lead answer flow: "applies" clears `waitsValidation` and queues the lead
   (todo/queued/queuedAt, answer appended to the prompt); "does not apply"
   cancels it. The old backlog+idle shape keeps working where it still exists.
@@ -208,6 +210,8 @@ waiting lead instead of "queued with no hold found".
 9. A cancelled run's deployment finding does not prevent a lead retry or classify the drawer as deployment.
 10. A lifecycle test checks queued, running, needs-you, cancelled, and done validation cards through the real store.
 11. One mounted drawer enables Validate now when a run finishes, then disables it when a new run appears.
+12. A legacy lead with quoted answer text still takes the waiting form.
+13. The legacy park route and filing transaction refuse marked leads without a state change.
 
 
 ## Non-goals

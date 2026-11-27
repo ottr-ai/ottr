@@ -9,7 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { leadCardTitle, retitleBareLeadTitles } from "./auditLeads.ts";
+import { retitleBareLeadTitles } from "./auditLeads.ts";
 import { mkdirBelow, writeBelow } from "./confine.ts";
 import {
 	closeLocked,
@@ -2812,8 +2812,8 @@ export class ProjectStore {
 				// excludes both batching and the blocked-result reset, so re-locking
 				// it would strand the work. A per-row decision in TypeScript, not one
 				// UPDATE, because "newest recorded outcome" needs the last Validated-by
-				// segment of the details text — a LIKE cannot read newest-wins. The
-				// SELECT prefilter drops answered rows cheaply; the helper re-checks.
+				// segment of the details text — a LIKE cannot read newest-wins.
+				// The helper checks the answer marker after the SELECT.
 				// Guarded like the backfills above: a tasks table old enough to miss
 				// cancelled_at or details predates review findings entirely, so it
 				// holds no leads. Idempotent: only stage-backlog rows match, so a
@@ -2845,7 +2845,7 @@ export class ProjectStore {
 							},
 							[]
 						>(
-							"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+							"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%'",
 						)
 						.all();
 					const byReview = new Map<string, typeof legacy>();
