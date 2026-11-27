@@ -7,6 +7,7 @@ import {
 	REVIEW_HOLD_MAX_MS,
 } from "../scheduler.ts";
 import type { TaskCard } from "../types.ts";
+import { buildCardIndex } from "./cardIndex.ts";
 import {
 	alarmLabel,
 	cardMark,
@@ -14,6 +15,7 @@ import {
 	etaLeft,
 	holdFor,
 	holdLeft,
+	indexDepIndex,
 	queuePosition,
 	releaseHolding,
 	reReleaseOf,
@@ -28,6 +30,7 @@ const t = (
 	overrides: Partial<Parameters<typeof statusLine>[0]> = {},
 ): Parameters<typeof statusLine>[0] => ({
 	id: "t1",
+	project: "p",
 	cancelledAt: null,
 	state: "queued",
 	stage: "todo",
@@ -903,33 +906,53 @@ test("reviewProgress counts a running review's landed findings", () => {
 	const open = finding({ id: "f2" });
 	const gone = finding({ id: "f3", cancelledAt: 5 });
 	// A cancelled finding is not open: like reReleaseOf, it counts as handled.
-	expect(reviewProgress([r, done1, open, gone], r)).toBe(
+	expect(reviewProgress(buildCardIndex([r, done1, open, gone]), r)).toBe(
 		"2 of 3 findings done",
 	);
 	// A release card runs the same review: it counts too.
 	const rel = release({ state: "running", stage: "in_progress", doneAt: null });
-	expect(reviewProgress([rel, done1, open], rel)).toBe("1 of 2 findings done");
+	expect(reviewProgress(buildCardIndex([rel, done1, open]), rel)).toBe(
+		"1 of 2 findings done",
+	);
 	// Not running, not a review, or no finding yet: null, the plain words stay.
 	expect(
-		reviewProgress([r, done1, open], review({ stage: "in_progress" })),
+		reviewProgress(
+			buildCardIndex([r, done1, open]),
+			review({ stage: "in_progress" }),
+		),
 	).toBeNull();
 	expect(
 		reviewProgress(
-			[r, done1, open],
+			buildCardIndex([r, done1, open]),
 			review({ stage: "in_progress", state: "idle" }),
 		),
 	).toBeNull();
-	expect(reviewProgress([r], r)).toBeNull();
+	expect(reviewProgress(buildCardIndex([r]), r)).toBeNull();
 	// Through statusLine the count replaces "running" on the card; progress outranks it.
-	expect(statusLine(r, true, null, false, [r, done1, open, gone])).toBe(
-		"2 of 3 findings done",
-	);
+	expect(
+		statusLine(
+			r,
+			true,
+			null,
+			false,
+			undefined,
+			undefined,
+			undefined,
+			buildCardIndex([r, done1, open, gone]),
+		),
+	).toBe("2 of 3 findings done");
 	expect(statusLine(r, true, null, false)).toBe("running");
 	expect(
-		statusLine({ ...r, progress: "Stryker 5% · 1/10" }, true, null, false, [
-			r,
-			done1,
-		]),
+		statusLine(
+			{ ...r, progress: "Stryker 5% · 1/10" },
+			true,
+			null,
+			false,
+			undefined,
+			undefined,
+			undefined,
+			buildCardIndex([r, done1]),
+		),
 	).toBe("Stryker 5% · 1/10");
 });
 
@@ -1045,4 +1068,321 @@ test("etaLeft gives the mutation-run style estimate until the median is used up"
 	// The median used up: elapsed alone from there.
 	expect(etaLeft(60_000, started, started + 60_000)).toBeNull();
 	expect(etaLeft(60_000, started, started + 120_000)).toBeNull();
+});
+
+// OTTR-1255 send-back regressions: the hold gates read the complete project graph
+// from the card index, so a settled card outside the Done window neither fakes a
+// hold nor hides behind the window cut.
+
+import type { CardRef } from "../types.ts";
+import { projectGraph } from "./status.ts";
+
+const ref = (
+	over: Partial<CardRef> & { id: string; project: string },
+): CardRef => ({
+	sessionTitle: `Title of ${over.id}`,
+	kind: "work",
+	stage: "done",
+	state: "idle",
+	cancelledAt: null,
+	createdAt: 1_000,
+	updatedAt: 2_000,
+	queuedAt: null,
+	doneAt: 1_500,
+	followUpOf: null,
+	followUpOfProject: null,
+	asked: null,
+	dependsOn: [],
+	commits: 3,
+	releaseVersion: null,
+	leadAtDone: false,
+	...over,
+});
+
+test("a merging descendant behind a hidden done finding stays held while its review runs", () => {
+	// Review R (open) filed F, F is done and outside the Done window, and F's
+	// child D sits in merging. The windowed list lost F, so its closure lost D
+	// and the merge ran while the review was open. The graph sees the chain and
+	// holds D behind the review exactly as it would with F in the window.
+	const rows: CardRef[] = [
+		ref({
+			id: "R-1",
+			project: "p",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			doneAt: null,
+		}),
+		ref({
+			id: "F-1",
+			project: "p",
+			followUpOf: "R-1",
+			followUpOfProject: "p",
+			doneAt: 900,
+		}),
+		ref({
+			id: "D-1",
+			project: "p",
+			stage: "merging",
+			state: "queued",
+			doneAt: null,
+			followUpOf: "F-1",
+			followUpOfProject: "p",
+		}),
+	];
+	const index = buildCardIndex(rows);
+	const graph = projectGraph(index, "p");
+	// Complete data: D is a finding of the open review through the hidden F, so
+	// reviewHoldFor exempts it (a finding merges while its review runs).
+	expect(
+		holdFor(
+			{
+				id: "D-1",
+				stage: "merging",
+				state: "queued",
+				dependsOn: [],
+				pushRetries: 0,
+				pendingBy: null,
+				validatedAt: null,
+				followUpOf: null,
+				cancelledAt: null,
+			},
+			graph,
+		),
+	).toBe(null);
+	// The windowed list the old code used lost F, so it lost D's exemption and
+	// held the descendant behind the review — the fixed bug.
+	const windowed = projectGraph(
+		buildCardIndex(rows.filter((r) => r.id !== "F-1")),
+		"p",
+	);
+	expect(
+		holdFor(
+			{
+				id: "D-1",
+				stage: "merging",
+				state: "queued",
+				dependsOn: [],
+				pushRetries: 0,
+				pendingBy: null,
+				validatedAt: null,
+				followUpOf: null,
+				cancelledAt: null,
+			},
+			windowed,
+		),
+	).toBe("waiting for the review to finish");
+	// With the review done, its done finding holds nothing: the descendant frees.
+	const doneReview = rows.map((r) =>
+		r.id === "R-1"
+			? { ...r, stage: "done" as const, state: "idle" as const, doneAt: 950 }
+			: r,
+	);
+	const doneGraph = projectGraph(buildCardIndex(doneReview), "p");
+	expect(
+		holdFor(
+			{
+				id: "D-1",
+				stage: "merging",
+				state: "queued",
+				dependsOn: [],
+				pushRetries: 0,
+				pendingBy: null,
+				validatedAt: null,
+				followUpOf: null,
+				cancelledAt: null,
+			},
+			doneGraph,
+		),
+	).toBe(null);
+});
+
+test("a done dep outside the window satisfies the dependency", () => {
+	const rows: CardRef[] = [
+		ref({ id: "A-1", project: "p", doneAt: 900 }),
+		ref({
+			id: "B-1",
+			project: "p",
+			stage: "todo",
+			state: "queued",
+			doneAt: null,
+		}),
+	];
+	const graph = projectGraph(buildCardIndex(rows), "p");
+	expect(
+		holdFor(
+			{
+				id: "B-1",
+				stage: "todo",
+				state: "queued",
+				dependsOn: ["A-1"],
+				pushRetries: 0,
+				pendingBy: null,
+				validatedAt: null,
+				followUpOf: null,
+				cancelledAt: null,
+			},
+			graph,
+		),
+	).toBe(null);
+});
+
+test("reReleaseOf counts a hidden done finding's open child", () => {
+	// Release card with held merges; its finding F is done and outside the window,
+	// but F's child K is open. Windowed data saw zero findings and offered the
+	// re-release; the graph sees K and refuses.
+	const rows: CardRef[] = [
+		ref({
+			id: "REL-1",
+			project: "p",
+			kind: "review",
+			releaseVersion: "1.2.0",
+			stage: "todo",
+			state: "needs_you",
+			doneAt: null,
+		}),
+		ref({
+			id: "F-1",
+			project: "p",
+			followUpOf: "REL-1",
+			followUpOfProject: "p",
+			doneAt: 900,
+		}),
+		ref({
+			id: "K-1",
+			project: "p",
+			stage: "todo",
+			state: "queued",
+			doneAt: null,
+			followUpOf: "F-1",
+			followUpOfProject: "p",
+		}),
+	];
+	const graph = projectGraph(buildCardIndex(rows), "p");
+	const release = {
+		id: "REL-1",
+		project: "p",
+		cancelledAt: null,
+		releaseVersion: "1.2.0" as string | null,
+		stage: "todo" as const,
+		state: "needs_you" as const,
+		heldMerges: ["M-1", "M-2"],
+		kind: "review" as const,
+		doneAt: null,
+		sessionTitle: "Release 1.2.0",
+		promptAuthor: "user",
+	} as TaskCard;
+	expect(reReleaseOf(release, graph)).toBe(null);
+	// And with K done too, the offer returns with both findings counted.
+	const doneK = ref({
+		id: "K-1",
+		project: "p",
+		followUpOf: "F-1",
+		followUpOfProject: "p",
+	});
+	const all = projectGraph(
+		buildCardIndex([...rows.filter((r) => r.id !== "K-1"), doneK]),
+		"p",
+	);
+	expect(reReleaseOf(release, all)).toEqual({
+		ids: ["M-1", "M-2"],
+		findings: 2,
+	});
+});
+
+test("the index resolver keeps a local hidden done dep ahead of a foreign twin", () => {
+	// Local p has a done X-7 hidden by the window; foreign q has an OPEN X-7 and
+	// the id handle X. The real resolver (indexDepIndex -> resolveDep) must read
+	// the local done card first: no hold. Without the local row it resolves the
+	// foreign open twin through the prefix and names the hold — that direction
+	// is the OTTR-708 contract, unchanged.
+	const rows: CardRef[] = [
+		ref({ id: "X-7", project: "p", doneAt: 900 }),
+		ref({
+			id: "X-7",
+			project: "q",
+			stage: "in_progress",
+			state: "running",
+			doneAt: null,
+		}),
+		ref({
+			id: "B-1",
+			project: "p",
+			stage: "todo",
+			state: "queued",
+			doneAt: null,
+		}),
+	];
+	const projects = [
+		{ name: "p", prefix: "P" },
+		{ name: "q", prefix: "X" },
+	];
+	const full = buildCardIndex(rows);
+	const fullDeps = indexDepIndex(full, projects, "p");
+	const graph = projectGraph(full, "p");
+	const merge = {
+		id: "B-1",
+		stage: "todo" as const,
+		state: "queued" as const,
+		dependsOn: ["X-7"],
+		pushRetries: 0,
+		pendingBy: null,
+		validatedAt: null,
+		followUpOf: null,
+		cancelledAt: null,
+	};
+	// The own project holds the id, so the prefix walk never runs: the hidden
+	// done local card satisfies the dependency.
+	expect(holdFor(merge, graph, fullDeps ?? undefined)).toBe(null);
+	// Windowed: the local row left the window, so the resolver walks the prefix
+	// and finds the foreign open twin — the hold names it.
+	const windowed = buildCardIndex(
+		rows.filter((r) => !(r.project === "p" && r.id === "X-7")),
+	);
+	const windowedDeps = indexDepIndex(windowed, projects, "p");
+	expect(
+		holdFor(merge, projectGraph(windowed, "p"), windowedDeps ?? undefined),
+	).toBe("waiting for #X-7 Title of X-7");
+	// The resolver itself answers both directions, not just through holdFor.
+	expect(fullDeps?.("X-7")?.project).toBe("p");
+	expect(windowedDeps?.("X-7")?.project).toBe("q");
+});
+
+test("reviewProgress counts findings the window dropped", () => {
+	const rows: CardRef[] = [
+		ref({
+			id: "R-9",
+			project: "p",
+			kind: "review",
+			stage: "in_progress",
+			state: "running",
+			doneAt: null,
+		}),
+		ref({
+			id: "F-1",
+			project: "p",
+			followUpOf: "R-9",
+			followUpOfProject: "p",
+			doneAt: 900,
+		}),
+		ref({
+			id: "F-2",
+			project: "p",
+			followUpOf: "R-9",
+			followUpOfProject: "p",
+			stage: "todo",
+			state: "queued",
+			doneAt: null,
+		}),
+	];
+	expect(
+		reviewProgress(buildCardIndex(rows), {
+			id: "R-9",
+			project: "p",
+			kind: "review",
+			releaseVersion: null,
+			doneAt: null,
+			state: "running",
+		}),
+	).toBe("1 of 2 findings done");
 });

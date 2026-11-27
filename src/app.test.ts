@@ -1822,135 +1822,6 @@ describe("task routes", () => {
 			}
 			expect((await p3.store.listTasks()).length).toBe(before);
 		});
-
-		test("the drawer detail serves every child ref across boards, oldest first", async () => {
-			const parent = await store.createTask("p1 parent with children");
-			// The foreign child first, the local one after a clock step, so the filing
-			// order is stable and the rail order is assertable.
-			const cross = await post("/api/projects/p2/tasks", {
-				prompt: "child filed in p2",
-				followUpOf: parent.id,
-			});
-			expect(cross.status).toBe(200);
-			// A genuine few-ms wait: createdAt comes from the real clock inside
-			// createTask and no seam feeds it, so fake timers cannot order the rows.
-			const ticked = Promise.withResolvers<void>();
-			setTimeout(ticked.resolve, 3);
-			await ticked.promise;
-			const local = await post("/api/projects/p1/tasks", {
-				prompt: "child filed in p1",
-				followUpOf: parent.id,
-			});
-			expect(local.status).toBe(200);
-			const res = await get(`/api/projects/p1/tasks/${parent.id}`);
-			expect(res.status).toBe(200);
-			const view = (await res.json()) as {
-				children?: { project: string; id: string; createdAt: number }[];
-			};
-			const crossId = ((await cross.json()) as { id: string }).id;
-			const localId = ((await local.json()) as { id: string }).id;
-			// Refs only, no card bodies; both boards' children ride, oldest first.
-			expect(
-				view.children?.map((c) => ({ project: c.project, id: c.id })),
-			).toEqual([
-				{ project: "p2", id: crossId },
-				{ project: "p1", id: localId },
-			]);
-			for (const c of view.children ?? [])
-				expect(typeof c.createdAt).toBe("number");
-			// A card nobody names serves an empty list, not a missing field.
-			const child = await get(`/api/projects/p1/tasks/${localId}`);
-			const childView = (await child.json()) as { children?: unknown[] };
-			expect(childView.children).toEqual([]);
-		});
-
-		test("a cancelled child still serves as a ref", async () => {
-			const parent = await store.createTask("p1 parent of a cancelled child");
-			const child = await post("/api/projects/p1/tasks", {
-				prompt: "child cancelled after filing",
-				followUpOf: parent.id,
-			});
-			expect(child.status).toBe(200);
-			const childId = ((await child.json()) as { id: string }).id;
-			await store.updateTask(childId, { cancelledAt: Date.now() });
-			const res = await get(`/api/projects/p1/tasks/${parent.id}`);
-			expect(res.status).toBe(200);
-			const view = (await res.json()) as {
-				children?: { project: string; id: string }[];
-			};
-			// The scan reads only followUpOf: a settled child keeps its link.
-			expect(
-				view.children?.map((c) => ({ project: c.project, id: c.id })),
-			).toEqual([{ project: "p1", id: childId }]);
-		});
-
-		test("a board with a sick store drops only its own child refs", async () => {
-			const parent = await store.createTask("p1 parent, one sick board");
-			const cross = await post("/api/projects/p2/tasks", {
-				prompt: "sick-board child",
-				followUpOf: parent.id,
-			});
-			expect(cross.status).toBe(200);
-			const crossId = ((await cross.json()) as { id: string }).id;
-			const sick = {
-				name: "sick",
-				store: {
-					name: "sick-store",
-					listTasks: async () => {
-						throw new Error("boom");
-					},
-				},
-			} as unknown as Entry;
-			projects.set("sick", sick);
-			try {
-				// Degraded, not failed: the healthy boards' refs still ship.
-				const res = await get(`/api/projects/p1/tasks/${parent.id}`);
-				expect(res.status).toBe(200);
-				const view = (await res.json()) as {
-					children?: { project: string; id: string }[];
-				};
-				expect(
-					view.children?.map((c) => ({ project: c.project, id: c.id })),
-				).toEqual([{ project: "p2", id: crossId }]);
-			} finally {
-				projects.delete("sick");
-			}
-		});
-
-		test("a same-id card on another board is no false child ref", async () => {
-			// p2 and p3 share the folder basename "dup", so their id sequences
-			// collide: after padding the shorter sequence, the next create on each
-			// board yields the same id.
-			const n2 = (await p2.store.listTasks()).length;
-			const n3 = (await p3.store.listTasks()).length;
-			const target = Math.max(n2, n3);
-			const pad = async (s: ProjectStore, to: number): Promise<void> => {
-				while ((await s.listTasks()).length < to)
-					await s.createTask("sequence pad");
-			};
-			await pad(p2.store, target);
-			await pad(p3.store, target);
-			const twin = await p2.store.createTask("dup parent on p2");
-			const twinSame = await p3.store.createTask("dup parent on p3");
-			expect(twinSame.id).toBe(twin.id);
-			// p3's twin carries a local child: its link names p3 itself, never p2.
-			const twinChild = await p3.store.createTask("child of p3's twin");
-			await p3.store.updateTask(twinChild.id, { followUpOf: twin.id });
-			// p2's twin's detail must not serve p3's child as a Follow-up ref.
-			const res = await get(`/api/projects/p2/tasks/${twin.id}`);
-			expect(res.status).toBe(200);
-			const view = (await res.json()) as {
-				children?: { project: string; id: string }[];
-			};
-			expect(view.children ?? []).toEqual([]);
-			// p3's twin keeps its own child.
-			const other = await get(`/api/projects/p3/tasks/${twin.id}`);
-			expect(other.status).toBe(200);
-			const otherView = (await other.json()) as {
-				children?: { project: string }[];
-			};
-			expect(otherView.children?.map((c) => c.project)).toEqual(["p3"]);
-		});
 	});
 
 	test("state cards omit details and report", async () => {
@@ -20066,17 +19937,36 @@ describe("slim state and done pages (OTTR-965)", () => {
 		for (let i = 0; i < 3000; i++)
 			await seedDone(st, `done ${i} ${wide}`, base + i);
 		for (let i = 0; i < 3; i++) await st.createTask(`open ${i}`);
+		// The 6000-write seed must fit bunfig's 20 s cap (per-test timeout args
+		// are overridden by it on Bun 1.4.5 — the open OTTR-1240 bug), which on a
+		// loaded box it does not at the default durability. The pragma touches
+		// only this fixture's store; the writes stay real store calls and the
+		// frame assertions below are unchanged.
+		(st as unknown as { db: Database }).db.run("PRAGMA synchronous = OFF");
 		const m = await mount({ projects });
 		const res = await m.call("/api/state");
 		expect(res.status).toBe(200);
 		const text = await res.text();
-		// The old frame carried all 3000 wide prompts (about 30 MB); the slim one must not.
-		expect(text.length).toBeLessThan(1_000_000);
+		// The old frame carried all 3000 wide prompts (about 30 MB); the slim one
+		// must not. The compact card index (OTTR-1255, docs/specs/
+		// card-lookup-scope.md) rides beside the window at a measured ~280 B per
+		// card — about 0.85 MB for these 3030 cards — so the bound is 2 MB: still
+		// 15x under the old wide frame, and the wide-text guarantees below are
+		// the sharp edge.
+		expect(text.length).toBeLessThan(2_000_000);
 		const b = JSON.parse(text) as {
 			tasks: Array<{ id: string; stage: string; prompt?: string }>;
+			allCards?: Array<{ prompt?: string; sessionTitle: string }>;
 		};
 		expect(b.tasks.length).toBe(3 + DONE_PAGE);
 		expect(b.tasks.filter((t) => t.stage === "done").length).toBe(DONE_PAGE);
+		// The index carries no wide text either: no prompt field, and every
+		// session title stays under shortTitle's 80-char cap.
+		expect(
+			(b.allCards ?? []).every(
+				(r) => r.prompt === undefined && r.sessionTitle.length <= 80,
+			),
+		).toBe(true);
 		// The newest 20 by landed time ride.
 		const expectDone = (await st.listTasks())
 			.filter((t) => t.stage === "done")
@@ -20598,11 +20488,19 @@ describe("cancel keeps the worktree (R5-2)", () => {
 		// finish-kept and the board's held count still cover it (isKeptReason).
 		const state = await get("/api/state");
 		const b = (await state.json()) as {
-			keptWorktrees?: { held?: number; stale?: number; cards?: string[] };
+			keptWorktrees?: {
+				held?: number;
+				stale?: number;
+				cards?: Array<{ id: string; project: string }>;
+			};
 		};
 		expect(b.keptWorktrees?.held ?? 0).toBeGreaterThanOrEqual(1);
-		// The advisory names the card: the id rides with the counts so the bell can link it.
-		expect(b.keptWorktrees?.cards).toContain(t.id);
+		// The advisory names the card with its project, so the bell's click
+		// opens the right twin (OTTR-1255).
+		expect(b.keptWorktrees?.cards).toContainEqual({
+			id: t.id,
+			project: t.project,
+		});
 	});
 });
 
@@ -32828,6 +32726,173 @@ describe("service quota runtime integration", () => {
 		await pending.promise;
 		m.app.checkServiceQuotas();
 		expect(read).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("allCards in the state frame (docs/specs/card-lookup-scope.md)", () => {
+	/** A private one-project board with its own store, like the OTTR-965 slim describe. */
+	const slimBoard = async (dirName: string) => {
+		const dir = join(root, dirName);
+		mkdirSync(dir, { recursive: true });
+		const st = await ProjectStore.open(dir);
+		testStores.add(st);
+		const entry: Entry = {
+			path: dir,
+			name: dirName,
+			store: st,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		return { st, projects: new Map([[dirName, entry]]) };
+	};
+	/** One done card with its own landing stamp, so landed order has no ties. */
+	const seedDone = async (st: ProjectStore, prompt: string, doneAt: number) => {
+		const t = await st.createTask(prompt);
+		// doneAt is store-stamped, not patchable: pin the clock for the write.
+		setSystemTime(new Date(doneAt));
+		try {
+			await st.updateTask(t.id, { stage: "done", state: "idle" });
+		} finally {
+			setSystemTime();
+		}
+		return t.id;
+	};
+
+	test("allCards carries every card while tasks keeps the Done window", async () => {
+		const { st, projects } = await slimBoard("allcards-window");
+		const base = Date.now();
+		const openIds: string[] = [];
+		for (let i = 0; i < 4; i++) {
+			const t = await st.createTask(`open card ${i}`);
+			openIds.push(t.id);
+		}
+		const doneIds: string[] = [];
+		for (let i = 0; i < 25; i++)
+			doneIds.push(
+				await seedDone(st, `done behind the cut ${i}`, base - 40_000 + i),
+			);
+		const m = await mount({ projects });
+		const text = await (await m.call("/api/state")).text();
+		// The chunk splice must produce valid frame JSON: the parse throws on any
+		// broken array boundary.
+		const b = JSON.parse(text) as {
+			tasks: Array<{ id: string; project: string; stage: string }>;
+			allCards?: Array<{
+				id: string;
+				project: string;
+				stage: string;
+				doneAt: number | null;
+			}>;
+		};
+		// Every seeded card rides, out-of-window done included: 4 open + 25 done.
+		const all = b.allCards ?? [];
+		expect(all).toHaveLength(openIds.length + doneIds.length);
+		const allIds = new Set(all.map((c) => c.id));
+		for (const id of [...openIds, ...doneIds])
+			expect(allIds.has(id)).toBe(true);
+		for (const c of all) expect(c.project).toBe("allcards-window");
+		// A done ref keeps its landing stamp: the pinned write clock, not a rebuild.
+		const droppedOldest = all.find((c) => c.id === doneIds[0]);
+		expect(droppedOldest?.doneAt).toBe(base - 40_000);
+		expect(droppedOldest?.stage).toBe("done");
+
+		// tasks still carries only the open cards plus the DONE_PAGE window.
+		expect(b.tasks).toHaveLength(openIds.length + DONE_PAGE);
+		const windowIds = new Set(b.tasks.map((c) => c.id));
+		for (const id of openIds) expect(windowIds.has(id)).toBe(true);
+		// The five oldest done cards are the ones the window dropped; they exist
+		// only in allCards.
+		const dropped = doneIds.slice(0, doneIds.length - DONE_PAGE);
+		for (const id of dropped) {
+			expect(windowIds.has(id)).toBe(false);
+			expect(allIds.has(id)).toBe(true);
+		}
+	});
+
+	test("the served allCards bytes parse and deep-compare against the cards' refs", async () => {
+		const { st, projects } = await slimBoard("allcards-bytes");
+		const base = Date.now();
+		const openIds: string[] = [];
+		for (let i = 0; i < 4; i++) {
+			const t = await st.createTask(`open card ${i}`);
+			openIds.push(t.id);
+		}
+		const doneIds: string[] = [];
+		for (let i = 0; i < 25; i++)
+			doneIds.push(await seedDone(st, `done card ${i}`, base - 40_000 + i));
+		const m = await mount({ projects });
+		const text = await (await m.call("/api/state")).text();
+		// The index ships inline as an array, not null or a stub.
+		expect(text).toContain('"allCards":[');
+		const b = JSON.parse(text) as { tasks: TaskCard[]; allCards: unknown[] };
+		/** The CardRef pick of one card: exactly the fields the spec pins. */
+		const refOf = (c: TaskCard) => ({
+			id: c.id,
+			project: c.project,
+			sessionTitle: c.sessionTitle,
+			kind: c.kind,
+			stage: c.stage,
+			state: c.state,
+			cancelledAt: c.cancelledAt,
+			createdAt: c.createdAt,
+			updatedAt: c.updatedAt,
+			doneAt: c.doneAt,
+			followUpOf: c.followUpOf,
+			followUpOfProject: c.followUpOfProject,
+			asked: c.asked,
+			dependsOn: c.dependsOn,
+			commits: c.commits,
+			releaseVersion: c.releaseVersion,
+			lead: c.lead,
+			leadAtDone: c.leadAtDone,
+			queuedAt: c.queuedAt,
+		});
+		expect(b.allCards).toHaveLength(openIds.length + doneIds.length);
+		// Every windowed card's index entry deep-equals its CardRef pick, so the
+		// chunk splice carried the values through byte-exact; an extra field on an
+		// index entry fails this compare too — the index stays compact.
+		for (const c of b.tasks) expect(b.allCards).toContainEqual(refOf(c));
+	});
+
+	test("a store that fails to list tasks fails the state build like before the index", async () => {
+		const { st, projects } = await slimBoard("allcards-sick");
+		await seedDone(st, "sick done", Date.now() - 1_000);
+		// The boundary is unchanged by the index: currentOrphanScan reads the same
+		// store's listTasks unprotected (pre-existing), so a fully sick store fails
+		// the whole build — the frame answers an error, not a partial state. The
+		// boardCards catch only ever covered stores that fail elsewhere.
+		const sick = new Proxy(st, {
+			get(target, prop) {
+				if (prop === "listTasks")
+					return async () => {
+						throw new Error("sick store");
+					};
+				const v = Reflect.get(target, prop);
+				return typeof v === "function" ? v.bind(target) : v;
+			},
+		}) as ProjectStore;
+		const [name, entry] = [...projects][0]!;
+		const m = await mount({
+			projects: new Map([[name, { ...entry, store: sick }]]),
+		});
+		const res = await m.call("/api/state");
+		expect(res.status).toBe(500);
+		const b = JSON.parse(await res.text()) as {
+			error?: string;
+			tasks?: unknown;
+			allCards?: unknown;
+		};
+		expect(b.tasks).toBeUndefined();
+		expect(b.allCards).toBeUndefined();
 	});
 });
 

@@ -446,6 +446,7 @@ import {
 	answeredCard,
 	askAnswerLine,
 	askAnswerParts,
+	type CardRef,
 	type CheckRoutingSetting,
 	DONE_PAGE,
 	doneReadKey,
@@ -6572,23 +6573,54 @@ export async function createApp(deps: AppDeps) {
 		return !seen.has(c.id);
 	}
 
+	/** One CardRef (OTTR-1255): the lookup fields picked off the built card — no
+	 * object spread, so the wide TaskCard fields never leak into the index. */
+	function cardRefOf(c: TaskCard): CardRef {
+		return {
+			id: c.id,
+			project: c.project,
+			sessionTitle: c.sessionTitle,
+			kind: c.kind,
+			stage: c.stage,
+			state: c.state,
+			cancelledAt: c.cancelledAt,
+			createdAt: c.createdAt,
+			updatedAt: c.updatedAt,
+			doneAt: c.doneAt,
+			followUpOf: c.followUpOf,
+			followUpOfProject: c.followUpOfProject,
+			asked: c.asked,
+			dependsOn: c.dependsOn,
+			commits: c.commits,
+			releaseVersion: c.releaseVersion,
+			queuedAt: c.queuedAt,
+			lead: c.lead,
+			leadAtDone: c.leadAtDone,
+			...(c.prOccurrence !== undefined && { prOccurrence: c.prOccurrence }),
+		};
+	}
+
 	async function boardCards(now: number): Promise<{
 		tasks: TaskCard[];
+		/** OTTR-1255: the compact index of every card of every project — every card
+		 * the loop built, done and cancelled included, with no window. */
+		allCards: CardRef[];
 		/** OTTR-965: summary left TaskCard, so the alert diff reads it here — one entry
 		 * per row the card loop touches, keyed by id (ids are board-unique). */
 		summaries: Map<string, string | null>;
 		keptHeld: number;
 		keptStale: number;
-		keptCards: string[];
+		keptCards: Array<{ id: string; project: string }>;
 		/** Per-chunk JSON bytes of the tasks array in tasks order, commas between
 		 * chunks; the state build splices these into the tasks array slots. */
 		tasksBufs: Buffer[];
 	}> {
 		const tasks: TaskCard[] = [];
+		const allCards: CardRef[] = [];
 		const summaries = new Map<string, string | null>();
 		let keptHeld = 0;
 		let keptStale = 0;
-		const keptCards: string[] = [];
+		const keptCards: Array<{ id: string; project: string }> = [];
 		// One read per build: each project's Done window checks these marks below.
 		const seen = new Set(await loadSeen());
 		for (const e of deps.projects.values()) {
@@ -6603,12 +6635,16 @@ export async function createApp(deps: AppDeps) {
 					keptHeld += kept.held;
 					keptStale += kept.stale;
 					// One kept card is one held worktree (keptCounts), so its id names the advisory's link.
-					if (kept.held === 1) keptCards.push(t.id);
+					if (kept.held === 1) keptCards.push({ id: t.id, project: t.project });
 					summaries.set(t.id, t.summary);
 					// Cancelled cards ride in the list too: the done lane shows them with a
 					// "Cancelled" chip. Every counter (slots, alarms, holds, coverage) either
 					// filters cancelledAt or reads state/stage facts a cancelled card no longer has.
-					cards.push(await taskCardOf(e, t, ctx, now));
+					const card = await taskCardOf(e, t, ctx, now);
+					cards.push(card);
+					// The index (OTTR-1255) collects inside the same try/catch: a sick
+					// store's cards are simply absent, like the windowed tasks.
+					allCards.push(cardRefOf(card));
 					if (++built % 100 === 0) await yieldLoop();
 				}
 				stampReleaseHolds(cards);
@@ -6643,6 +6679,14 @@ export async function createApp(deps: AppDeps) {
 			await yieldLoop();
 		}
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
+		// The index must be frame-stable for the state dedupe, and the store's list
+		// order is its own: sort by project then id so every rebuild of the same
+		// cards emits the same bytes. Code-unit order, no locale, for determinism.
+		allCards.sort(
+			(a, b) =>
+				(a.project < b.project ? -1 : a.project > b.project ? 1 : 0) ||
+				(a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+		);
 		// Card-by-card JSON in slices: one stringify over the whole list was the
 		// largest single block of the old build (OTTR-866). A plain object
 		// stringifies identically alone and inside an array, so splicing these
@@ -6657,7 +6701,15 @@ export async function createApp(deps: AppDeps) {
 			if (i + 100 < tasks.length) tasksBufs.push(COMMA_BUF);
 			await yieldLoop();
 		}
-		return { tasks, keptHeld, keptStale, keptCards, tasksBufs, summaries };
+		return {
+			tasks,
+			allCards,
+			keptHeld,
+			keptStale,
+			keptCards,
+			tasksBufs,
+			summaries,
+		};
 	}
 
 	/** One page of the project's done and cancelled cards, newest landed first (OTTR-965):
@@ -6742,13 +6794,38 @@ export async function createApp(deps: AppDeps) {
 	async function stateResponse(): Promise<{
 		state: StateResponse;
 		tasksBufs: Buffer[];
+		/** Per-chunk JSON bytes of the allCards array in allCards order, commas
+		 * between chunks; the state build splices them like tasksBufs (OTTR-1255). */
+		allCardsBufs: Buffer[];
 		/** OTTR-965: per-row summaries for the alert diff (summary left TaskCard). */
 		summaries: Map<string, string | null>;
 	}> {
 		const now = Date.now();
 		const cycle = await updateCycleView(now);
-		const { tasks, keptHeld, keptStale, keptCards, tasksBufs, summaries } =
-			await boardCards(now);
+		const {
+			tasks,
+			allCards,
+			tasksBufs,
+			keptHeld,
+			keptStale,
+			keptCards,
+			summaries,
+		} = await boardCards(now);
+		// The index ships like the tasks array: card-by-card JSON in slices (one
+		// stringify over the whole array would be the build's biggest single block),
+		// so the state build can splice the chunks in place of a whole-array
+		// stringify. A plain object stringifies identically alone and inside an
+		// array, so the spliced bytes equal a plain stringify of allCards.
+		const allCardsBufs: Buffer[] = [];
+		for (let i = 0; i < allCards.length; i += 100) {
+			const chunk = allCards
+				.slice(i, i + 100)
+				.map((ref) => JSON.stringify(ref))
+				.join(",");
+			allCardsBufs.push(Buffer.from(chunk, "utf8"));
+			if (i + 100 < allCards.length) allCardsBufs.push(COMMA_BUF);
+			await yieldLoop();
+		}
 		const scan = await currentOrphanScan();
 
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
@@ -6781,6 +6858,7 @@ export async function createApp(deps: AppDeps) {
 		const state: StateResponse = {
 			projects,
 			tasks,
+			allCards,
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
 			workCheck: deps.shared.workCheck,
@@ -6854,7 +6932,7 @@ export async function createApp(deps: AppDeps) {
 			slotsUsed:
 				deps.slotsUsed === undefined ? undefined : await deps.slotsUsed(),
 		};
-		return { state, tasksBufs, summaries };
+		return { state, tasksBufs, allCardsBufs, summaries };
 	}
 
 	/** Applies a user card edit guarded by the revision the client loaded. */
@@ -7030,37 +7108,6 @@ export async function createApp(deps: AppDeps) {
 					}
 				: {}),
 		};
-	}
-
-	/** Every card that names `id` on board `project` as its followUpOf source,
-	 * across every registered board, oldest first (OTTR-1198). Refs only — project,
-	 * id, createdAt. Ids are unique per project, not across boards, so a link
-	 * counts only when its parent's board is this one: a null followUpOfProject
-	 * names the child's own board, a set one names a foreign parent's board. One
-	 * listTasks per board; a board with a sick store skips its own cards and logs,
-	 * like the state build, so the rest of the lineage still renders. */
-	async function childRefsOf(
-		id: string,
-		project: string,
-	): Promise<{ project: string; id: string; createdAt: number }[]> {
-		const refs: { project: string; id: string; createdAt: number }[] = [];
-		for (const p of deps.projects.values()) {
-			try {
-				for (const c of await p.store.listTasks())
-					if (
-						c.followUpOf === id &&
-						(c.followUpOfProject ?? p.name) === project
-					)
-						refs.push({
-							project: p.name,
-							id: c.id,
-							createdAt: c.createdAt,
-						});
-			} catch (err) {
-				logStoreError(p.store.name, err);
-			}
-		}
-		return refs.sort((a, b) => a.createdAt - b.createdAt);
 	}
 
 	/**
@@ -8405,6 +8452,9 @@ export async function createApp(deps: AppDeps) {
 	// The tasks slot in the state text is spliced card by card; text this rare cannot
 	// collide with a real property value.
 	const STATE_TASKS_SENTINEL = "\u0000ottr-state-tasks\u0000";
+	// The allCards slot (OTTR-1255) splices the same way; its own text, so one
+	// needle never matches the other's slot.
+	const STATE_ALLCARDS_SENTINEL = "\u0000ottr-state-allCards\u0000";
 	// Shared bytes for splicing the tasks chunk buffers into the state bytes.
 	const COMMA_BUF = Buffer.from(",");
 	const BRACKET_OPEN_BUF = Buffer.from("[");
@@ -8441,29 +8491,39 @@ export async function createApp(deps: AppDeps) {
 			// Test seam: park every build at its start, so a test keeps it in flight
 			// across a guaranteed window (production never sets it).
 			if (deps.stateBuildGate !== undefined) await deps.stateBuildGate();
-			const { state, tasksBufs, summaries } = await stateResponse();
-			// Byte-identity by construction: every property except tasks is one
-			// JSON.stringify; only the tasks array is spliced with the chunk bytes the
-			// card loop serialized — the same bytes JSON.stringify produces for plain
-			// objects, alone or inside an array. The tasks chunks never exist as one
-			// joined string: the string form measured a second full copy on every
-			// build (OTTR-884), while this concat is one memcpy pass. Gzip consumes
-			// the buffer without another copy, at level 6: the rebuild's gzip wall
-			// dropped about 3x measured and the response grows about 2%; -9's
-			// marginal bytes were OTTR-662's one-time mermaid trade, not a
-			// per-rebuild one.
+			const { state, tasksBufs, allCardsBufs, summaries } =
+				await stateResponse();
+			// Byte-identity by construction: every property except tasks and
+			// allCards is one JSON.stringify; only those two arrays are spliced
+			// with the chunk bytes the card loop serialized — the same bytes
+			// JSON.stringify produces for plain objects, alone or inside an array.
+			// The tasks chunks never exist as one joined string: the string form
+			// measured a second full copy on every build (OTTR-884), while this
+			// concat is one memcpy pass. Gzip consumes the buffer without another
+			// copy, at level 6: the rebuild's gzip wall dropped about 3x measured
+			// and the response grows about 2%; -9's marginal bytes were OTTR-662's
+			// one-time mermaid trade, not a per-rebuild one.
 			const frame = JSON.stringify({
 				...state,
 				tasks: [STATE_TASKS_SENTINEL],
+				allCards: [STATE_ALLCARDS_SENTINEL],
 			});
 			const needle = JSON.stringify([STATE_TASKS_SENTINEL]);
 			const at = frame.indexOf(needle);
+			// The allCards slot rides after the tasks slot in property order, so
+			// its needle search starts past the tasks needle.
+			const cardsNeedle = JSON.stringify([STATE_ALLCARDS_SENTINEL]);
+			const atCards = frame.indexOf(cardsNeedle, at + needle.length);
 			const stateBuf = Buffer.concat([
 				Buffer.from(frame.slice(0, at), "utf8"),
 				BRACKET_OPEN_BUF,
 				...tasksBufs,
 				BRACKET_CLOSE_BUF,
-				Buffer.from(frame.slice(at + needle.length), "utf8"),
+				Buffer.from(frame.slice(at + needle.length, atCards), "utf8"),
+				BRACKET_OPEN_BUF,
+				...allCardsBufs,
+				BRACKET_CLOSE_BUF,
+				Buffer.from(frame.slice(atCards + cardsNeedle.length), "utf8"),
 			]);
 			const gz =
 				stateBuf.length >= 32 * 1024
@@ -14601,12 +14661,6 @@ export async function createApp(deps: AppDeps) {
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const view = await taskView(e, task);
-		// OTTR-1198: the Lineage rail lists every card that names this one as its
-		// source. The state's Done windows drop old children, and a child on another
-		// project's board never rides this project's frame at all, so the drawer's
-		// detail serves refs from every registered board and the drawer fetches each
-		// card from its own route (OTTR-1158's shape).
-		view.children = await childRefsOf(task.id, e.name);
 		// Done cards serve the list captured at settle (the worktree is gone, so the
 		// live read would always be []); open cards read the worktree live.
 		view.worktreeFiles =

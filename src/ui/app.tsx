@@ -39,9 +39,7 @@ import { forModel, providerOf, tightest, tightestFor } from "../quota.ts";
 import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
 	type DepIndex,
-	type DepProject,
 	FINDINGS_HOLD,
-	findDep,
 	holdWaitCards,
 	isReview,
 	type LeadStartRefusal,
@@ -49,11 +47,9 @@ import {
 	leadValidationStartRefusal,
 	liveCardOf,
 	queueOrder,
-	resolveDep,
 	reviewFindings,
 	reviewOpenFindings,
 	validatableReview,
-	waitingOn,
 } from "../scheduler.ts";
 import {
 	type AddProjectResponse,
@@ -63,6 +59,7 @@ import {
 	askAnswerLine,
 	askAnswerParts,
 	askAnswerWithNote,
+	type CardRef,
 	doneReadKey,
 	type GhStatus,
 	type HostedCreditsView,
@@ -108,6 +105,12 @@ import {
 	type AttachedImages,
 	readPicks,
 } from "./attach.ts";
+import {
+	buildCardIndex,
+	type CardIndex,
+	lookupCard,
+	lookupCardIn,
+} from "./cardIndex.ts";
 import {
 	type DiffSection,
 	diffLinkParts,
@@ -281,9 +284,14 @@ import {
 	bellAlarms,
 	cardMark,
 	type DepHoldContext,
+	type DepRow,
+	type GraphTask,
 	holdFor,
 	holdLeft,
+	indexDepIndex,
 	isProposal,
+	projectGraph,
+	refRow,
 	reReleaseOf,
 	splitAlarms,
 	statusLine,
@@ -962,7 +970,7 @@ function cardTags(
 	github: string | null,
 	release: string | null,
 	holdRelease: { id: string; version: string | null } | null | undefined,
-	onOpenTask: ((id: string) => void) | undefined,
+	onOpenTask: ((id: string, project?: string) => void) | undefined,
 	onRerelease: ((id: string) => void) | undefined,
 ): ReactNode {
 	if (
@@ -1000,7 +1008,7 @@ function cardTags(
 					onClick={(e) => {
 						// The card body is a stretched open link: keep the click off it.
 						e.stopPropagation();
-						navClick(e, () => onOpenTask(holdRelease.id));
+						navClick(e, () => onOpenTask(holdRelease.id, task.project));
 					}}
 				>
 					<Icon name="corner-up-left" size={12} />
@@ -1637,19 +1645,19 @@ function Sparkline({
  *  on the board. The card's title rides the tooltip. */
 function SystemCardLink({
 	card,
-	tasks,
+	cardIndex,
 	openTask,
 }: {
 	card: SystemCard;
-	tasks: TaskCard[];
-	openTask: (id: string) => void;
+	cardIndex: CardIndex;
+	openTask: (id: string, project?: string) => void;
 }) {
-	const t = tasks.find((x) => x.project === card.project && x.id === card.id);
+	const t = lookupCardIn(cardIndex, card.id, card.project);
 	return (
 		<a
 			href={taskPath(card.project, card.id)}
 			title={t?.sessionTitle}
-			onClick={(e) => navClick(e, () => openTask(card.id))}
+			onClick={(e) => navClick(e, () => openTask(card.id, card.project))}
 		>
 			{card.id}
 		</a>
@@ -1677,7 +1685,7 @@ function eventCount(total: number | null, hour: number | null): ReactNode {
 /** One container row of the System table: warn head, metrics or gap, turns, mutation lock. */
 function containerRow(
 	c: SystemSnapshot["containers"][number],
-	tasks: TaskCard[],
+	cardIndex: CardIndex,
 	at: number,
 	links: (cards: SystemCard[]) => ReactNode,
 	openTask: (id: string) => void,
@@ -1695,7 +1703,7 @@ function containerRow(
 						: `not reachable since ${clockTime(c.unreachableSince)}`}
 				</td>
 			)}
-			{containerTurns(c, tasks, openTask, links)}
+			{containerTurns(c, cardIndex, openTask, links)}
 			{containerLock(c, links)}
 		</tr>
 	);
@@ -1846,7 +1854,7 @@ function vmBusyWaiters(
  *  on the vm-runner row each turn also gains its VM facts and the busy cards follow. */
 function containerTurns(
 	c: SystemSnapshot["containers"][number],
-	tasks: TaskCard[],
+	cardIndex: CardIndex,
 	openTask: (id: string) => void,
 	links: (cards: SystemCard[]) => ReactNode,
 ): ReactNode {
@@ -1870,7 +1878,11 @@ function containerTurns(
 					);
 					return (
 						<li key={`${t.project}/${t.id}`}>
-							<SystemCardLink card={t} tasks={tasks} openTask={openTask} />
+							<SystemCardLink
+								card={t}
+								cardIndex={cardIndex}
+								openTask={openTask}
+							/>
 							{t.usage !== null && (
 								<span className="sys-sub">
 									{turnUsageParts(t.usage).map((part, i) => (
@@ -1922,10 +1934,12 @@ function containerLock(
 
 function SystemView({
 	state,
+	cardIndex,
 	openTask,
 }: {
 	state: StateResponse;
-	openTask: (id: string) => void;
+	cardIndex: CardIndex;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const system = useSystem();
 	const tasks = state.tasks;
@@ -1940,7 +1954,7 @@ function SystemView({
 			<SystemCardLink
 				key={`${c.project}/${c.id}`}
 				card={c}
-				tasks={tasks}
+				cardIndex={cardIndex}
 				openTask={openTask}
 			/>
 		));
@@ -1987,7 +2001,7 @@ function SystemView({
 								</thead>
 								<tbody>
 									{system.containers.map((c) =>
-										containerRow(c, tasks, system.at, links, openTask),
+										containerRow(c, cardIndex, system.at, links, openTask),
 									)}
 								</tbody>
 							</table>
@@ -2229,7 +2243,7 @@ function HowItWorksModal({
 	userLayer: ProvisioningResponse["userLayer"] | null;
 	onClose: () => void;
 	act: Act;
-	open: (id: string) => void;
+	open: (id: string, project?: string) => void;
 }) {
 	const [result, setResult] = useState<
 		{ text: string } | { missing: true } | { failed: true } | null
@@ -2275,7 +2289,7 @@ function HowItWorksModal({
 									{ prompt: EXPLAIN_PROJECT },
 								);
 								onClose();
-								open(t.id);
+								open(t.id, project);
 							})
 						}
 						title={`Create a task that writes docs/how-it-works.md with Mermaid diagrams of this project${diagramsNote === null ? "" : `. ${diagramsNote}`}`}
@@ -4507,7 +4521,7 @@ function ReviewStateChip(p: {
 	review: ProjectView["archReview"];
 	target: string | null;
 	project: string;
-	open: (id: string) => void;
+	open: (id: string, project?: string) => void;
 }) {
 	const cardId = p.review?.runningCardId ?? null;
 	if (cardId !== null)
@@ -4516,7 +4530,7 @@ function ReviewStateChip(p: {
 				className="arch-live"
 				href={taskPath(p.project, cardId)}
 				title={`Open review card ${cardId}: a review is queued or running, or its findings are still open`}
-				onClick={(e) => navClick(e, () => p.open(cardId))}
+				onClick={(e) => navClick(e, () => p.open(cardId, p.project))}
 			>
 				Review in progress
 				<Icon name="chevron-right" size={13} />
@@ -4659,7 +4673,7 @@ function ProjectAdvisories(p: {
 	 *  OTTR-1065 — the interview starts from the rules advisory or the wizard. */
 	initGit: () => Promise<boolean>;
 	rulesTask: TaskCard | null;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const { project, short, q, rulesTask } = p;
 	return (
@@ -4756,7 +4770,7 @@ function ProjectAdvisories(p: {
 					) : (
 						<BusyButton
 							run={async () => {
-								p.openTask(rulesTask.id);
+								p.openTask(rulesTask.id, rulesTask.project);
 								return true;
 							}}
 						>
@@ -4788,18 +4802,31 @@ function ProjectAdvisories(p: {
  * (resolveDep, the server's rule). undefined when the project is not among `projects`. */
 export function depIndexOf(
 	projects: ProjectView[],
-	tasks: TaskCard[],
+	cardIndex: CardIndex,
 	project: ProjectView,
-): DepIndex | undefined {
-	const cards = new Map<string, TaskCard>();
-	for (const t of tasks) cards.set(`${t.project}\u0000${t.id}`, t);
-	const deps: DepProject[] = projects.map((p) => ({
-		name: p.name,
-		prefix: p.taskPrefix,
-		getTask: (id: string) => cards.get(`${p.name}\u0000${id}`) ?? null,
-	}));
-	const own = deps.find((p) => p.name === project.name);
-	return own === undefined ? undefined : (id) => findDep(id, deps, own);
+	/** The loaded wide rows: a resolved open card hands back its full wire card, so
+	 * its hold facts (usage-limit countdown, push hold) ride the dependency line. */
+	boardTasks: readonly TaskCard[] = [],
+): ((id: string) => DepRow | TaskCard | null) | undefined {
+	// The shared resolver (status.ts, send-back 25): the application and the
+	// tests exercise one implementation, so a regression in the index
+	// construction fails the status tests too. The index holds every settled
+	// card, so a hidden done card keeps winning over a foreign id even after a
+	// prefix change: local hits resolve before the prefix walk.
+	const resolve = indexDepIndex(
+		cardIndex,
+		projects.map((p) => ({ name: p.name, prefix: p.taskPrefix })),
+		project.name,
+	);
+	if (resolve === undefined) return undefined;
+	return (id) => {
+		const r = resolve(id);
+		if (r === null) return null;
+		const wide = boardTasks.find(
+			(t) => t.id === r.id && t.project === r.project,
+		);
+		return wide === undefined ? r : wide;
+	};
 }
 
 /** OTTR-1321: the project context each dependency's own hold reads — the dependency
@@ -4810,50 +4837,51 @@ export function depIndexOf(
  * context. null when the id names no card, so the line keeps the plain wording. */
 export function depHoldContexts(
 	projects: ProjectView[],
-	tasks: TaskCard[],
+	cardIndex: CardIndex,
+	boardTasks: readonly TaskCard[],
 	project: ProjectView,
 ): (id: string) => DepHoldContext | null {
-	const byProject = new Map<string, TaskCard[]>();
-	for (const t of tasks) {
-		const list = byProject.get(t.project);
-		if (list === undefined) byProject.set(t.project, [t]);
-		else list.push(t);
-	}
-	const deps: DepProject[] = projects.map((p) => ({
-		name: p.name,
-		prefix: p.taskPrefix,
-		getTask: (id: string) =>
-			(byProject.get(p.name) ?? []).find((c) => c.id === id) ?? null,
-	}));
-	const ownDep = deps.find((p) => p.name === project.name);
-	const own: DepProject =
-		ownDep ??
-		({
-			name: project.name,
-			prefix: project.taskPrefix,
-			getTask: () => null,
-		} as DepProject);
-	const indexes = new Map<string, DepIndex | undefined>();
-	const indexOf = (name: string): DepIndex | undefined => {
-		const hit = indexes.get(name);
-		if (hit !== undefined) return hit;
-		const view = projects.find((p) => p.name === name);
-		const index =
-			view === undefined ? undefined : depIndexOf(projects, tasks, view);
-		indexes.set(name, index);
-		return index;
-	};
+	const foreign = depIndexOf(projects, cardIndex, project, boardTasks);
+	const contexts = new Map<string, DepHoldContext>();
 	return (id: string): DepHoldContext | null => {
-		const r = resolveDep(id, deps, own);
-		if (!("task" in r)) return null;
-		return { cards: byProject.get(r.project) ?? [], index: indexOf(r.project) };
+		const r = foreign?.(id) ?? null;
+		if (r === null) return null;
+		const hit = contexts.get(r.project);
+		if (hit !== undefined) return hit;
+		const view = projects.find((p) => p.name === r.project);
+		// The dependency project's complete graph (OTTR-1255): its merge gate sees
+		// its settled cards the Done window dropped, and its open cards keep their
+		// wide hold fields from the loaded rows.
+		const ctx: DepHoldContext = {
+			cards: wideGraph(cardIndex, r.project, boardTasks),
+			index:
+				view === undefined
+					? undefined
+					: depIndexOf(projects, cardIndex, view, boardTasks),
+		};
+		contexts.set(r.project, ctx);
+		return ctx;
 	};
+}
+
+/** One project's complete card graph for the hold machinery (OTTR-1255): every index
+ * ref shaped by projectGraph, with each loaded wide row in place of its ref, so a
+ * settled card outside the Done window holds or frees like the scheduler's own lists
+ * and an open card keeps its usage-limit countdown, PR facts and pending prompt. */
+export function wideGraph(
+	cardIndex: CardIndex,
+	project: string,
+	boardTasks: readonly TaskCard[],
+): GraphTask[] {
+	const wide = new Map<string, TaskCard>();
+	for (const t of boardTasks) if (t.project === project) wide.set(t.id, t);
+	return projectGraph(cardIndex, project).map((g) => wide.get(g.id) ?? g);
 }
 
 export function ProjectBoard({
 	project,
 	tasks,
-	deltas,
+	cardIndex,
 	open,
 	seenAnswers,
 	seenDoneSince,
@@ -4870,7 +4898,8 @@ export function ProjectBoard({
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
-	deltas: Map<string, number>;
+	/** Every card of every project (OTTR-1255); the lanes' status lines read it. */
+	cardIndex: CardIndex;
 	open: (id: string, project?: string) => void;
 	seenAnswers: Set<string>;
 	/** The server's done baseline; the unread rule reads it (OTTR-827). */
@@ -5056,6 +5085,16 @@ export function ProjectBoard({
 	// instead of a second "Discuss rules" that would only answer "queued".
 	const rulesTask = liveCardOf(tasks, "interview");
 	// Search filter and per-stage counts (unit-tested in queue.ts): the tab strip and lane heads read them.
+	// The whole project's cards from the index, shaped for the hold machinery (OTTR-1255):
+	// a settled card outside the Done window must hold or free exactly like the
+	// scheduler's own complete lists, so a hidden done finding cannot fake a hold.
+	const graph = useMemo(
+		() => wideGraph(cardIndex, project.name, tasks),
+		[cardIndex, project.name, tasks],
+	);
+	// Per-project deltas (send-back 21): the previous done card is a same-project
+	// card, so foreign same-id rows must never answer this project's delta.
+	const deltas = useMemo(() => commitDeltas(graph), [graph]);
 	const { shown, counts } = laneCounts(
 		tasks,
 		applied,
@@ -5285,7 +5324,7 @@ export function ProjectBoard({
 				act={act}
 				goRoles={() => {
 					setShowRelease(false);
-					navigate?.(settingsPath(null) + "#model-roles-section");
+					navigate?.(`${settingsPath(null)}#model-roles-section`);
 				}}
 			/>
 			<ArchReviewDialog
@@ -5483,6 +5522,7 @@ export function ProjectBoard({
 								stage={c.key}
 								tasks={col}
 								pendingCards={c.key === "todo" ? pendingCards : undefined}
+								cardIndex={cardIndex}
 								more={c.key === "done" ? doneHidden : 0}
 								// With a query applied "Show more" pages the server search instead
 								// of the older-pages fetch.
@@ -5533,6 +5573,7 @@ export function ProjectBoard({
 									c.key === "todo" ? counts.backlog.total : undefined
 								}
 								projectTasks={tasks}
+								graph={graph}
 								foreignDeps={foreignDeps}
 								foreignHolds={foreignHolds}
 								onRerelease={rerelease}
@@ -5579,7 +5620,7 @@ function Triage({
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
 	/** Board-wide setup problems (setupHints); each row opens Settings → Alate. */
@@ -5621,7 +5662,7 @@ function Triage({
 									key={t.id}
 									className="tri"
 									href={taskPath(t.project, t.id)}
-									onClick={(e) => navClick(e, () => openTask(t.id))}
+									onClick={(e) => navClick(e, () => openTask(t.id, t.project))}
 								>
 									<Mark kind={cardMark(t)} />
 									{owner !== undefined && <ProjectTag project={owner} />}
@@ -5685,6 +5726,7 @@ type OverviewTab = (typeof OVERVIEW_TABS)[number];
 export function Overview({
 	projects,
 	tasks,
+	cardIndex,
 	compose,
 	onAdd,
 	openTask,
@@ -5693,9 +5735,11 @@ export function Overview({
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
+	/** Every card of every project (OTTR-1255); the Last activity column reads it. */
+	cardIndex: CardIndex;
 	compose: (name: string) => void;
 	onAdd: () => void;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
 	/** The provisioning poll App owns; null data before the first answer (hosted mode keeps it null). */
@@ -5761,6 +5805,15 @@ export function Overview({
 			)}
 		</>
 	);
+	// Last activity per project, over every card (OTTR-1255): the windowed own-list
+	// max went stale once the Done window dropped a project's newest card.
+	const lastByProject = new Map<string, number>();
+	for (const bucket of cardIndex.values())
+		for (const t of bucket) {
+			const prev = lastByProject.get(t.project);
+			if (prev === undefined || t.updatedAt > prev)
+				lastByProject.set(t.project, t.updatedAt);
+		}
 	// One card, like Projects: the KPI strip, a hairline, then the per-project table, whose first
 	// header names the range. The same range buttons drive both.
 	const performance = (
@@ -5820,8 +5873,9 @@ export function Overview({
 							const split = splitAlarms(own);
 							// Last activity reads every card, cancelled ones included: the cancel
 							// stamp is the project's latest event (updateTask bumps updated_at)
-							// and the card stays visible under Done.
-							const last = Math.max(0, ...own.map((t) => t.updatedAt));
+							// and the card stays visible under Done. The index spans every card
+							// (OTTR-1255), so the stamp survives the Done window cut.
+							const last = Math.max(0, lastByProject.get(p.name) ?? 0);
 							return (
 								<tr
 									key={p.name}
@@ -6309,7 +6363,7 @@ export function KpiStrip({
 	openTask,
 }: {
 	fleet: PerfMetrics;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const ptsFmt = (v: number) => `${Math.round(v * 100)} pts`;
 	return (
@@ -6414,7 +6468,7 @@ function Kpi({
 	alarm?: boolean;
 	/** Task the value points at; the link wraps the value so the whole number opens the card. */
 	link?: { id: string; project: string; title: string } | null;
-	onOpen?: (id: string) => void;
+	onOpen?: (id: string, project?: string) => void;
 }) {
 	const { value, prev } = stat;
 	const d = value !== null && prev !== null ? value - prev : null;
@@ -6436,7 +6490,7 @@ function Kpi({
 						className="v-link"
 						href={taskPath(link.project, link.id)}
 						title={link.title}
-						onClick={(e) => navClick(e, () => onOpen(link.id))}
+						onClick={(e) => navClick(e, () => onOpen(link.id, link.project))}
 					>
 						{vContent}
 					</a>
@@ -6524,7 +6578,7 @@ export function PerfTable({
 	projects: ProjectView[];
 	/** Header of the project column; the Performance card puts the range label here. */
 	firstCol?: string;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const viewOf = (name: string) => projects.find((p) => p.name === name);
 	const labelOf = (name: string) => viewOf(name)?.settings.displayName ?? name;
@@ -6628,7 +6682,11 @@ export function PerfTable({
 												className="v-link"
 												href={taskPath(maxTask.project, maxTask.id)}
 												title={`Open ${maxTask.project} ${maxTask.id}`}
-												onClick={(e) => navClick(e, () => openTask(maxTask.id))}
+												onClick={(e) =>
+													navClick(e, () =>
+														openTask(maxTask.id, maxTask.project),
+													)
+												}
 											>
 												{tokFmt(p.contextMaxTokens.value)}
 											</a>
@@ -6946,7 +7004,9 @@ function laneView(
 export function LaneCol({
 	stage,
 	tasks,
+	cardIndex,
 	projectTasks,
+	graph,
 	foreignDeps,
 	foreignHolds,
 	hasRules,
@@ -6975,6 +7035,8 @@ export function LaneCol({
 	tasks: TaskCard[];
 	/** Todo lane only: placeholders of creates the server has not answered yet (OTTR-1337). */
 	pendingCards?: PendingCreate[];
+	/** Every card of every project (OTTR-1255); statusLine's reviewProgress reads it. */
+	cardIndex: CardIndex;
 	/** Todo lane only: idle backlog cards below the divider (started ones render in the lane's own list); the queue DnD never touches them. */
 	parked?: TaskCard[];
 	/** All parked (idle) backlog cards, ignoring the filter: the label count next to the Backlog label. */
@@ -6996,6 +7058,9 @@ export function LaneCol({
 	onStarredToggle?: () => void;
 	/** Every lane's cards: a dependency hold must find a dependency that sits in another lane. */
 	projectTasks: TaskCard[];
+	/** The index-shaped whole-project list (OTTR-1255): the hold and release gates read
+	 * every settled card, not only the windowed ones. */
+	graph: GraphTask[];
 	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
 	 * foreign card; absent before the first state frame or for an unknown project. */
 	foreignDeps?: DepIndex;
@@ -7081,7 +7146,7 @@ export function LaneCol({
 			for (const t of list) {
 				if (done.has(t.id)) continue;
 				done.add(t.id);
-				const hold = holdFor(t, projectTasks, foreignDeps, Date.now());
+				const hold = holdFor(t, graph, foreignDeps, Date.now());
 				holds.set(t.id, hold);
 				statuses.set(
 					t.id,
@@ -7090,12 +7155,13 @@ export function LaneCol({
 						hasRules,
 						hold,
 						draining,
-						projectTasks,
+						graph,
 						foreignDeps,
 						foreignHolds,
+						cardIndex,
 					),
 				);
-				rereleases.set(t.id, reReleaseOf(t, projectTasks));
+				rereleases.set(t.id, reReleaseOf(t, graph));
 			}
 		};
 		scan(projectTasks);
@@ -7104,11 +7170,13 @@ export function LaneCol({
 		return { holds, statuses, rereleases };
 	}, [
 		projectTasks,
+		graph,
 		tasks,
 		parked,
 		hasRules,
 		draining,
 		foreignDeps,
+		cardIndex,
 		foreignHolds,
 	]);
 	// One drag wiring per queued card, rebuilt only when the drag state or the queued order
@@ -7632,7 +7700,7 @@ function UpdatesPanel({
 	updates: UpdatesView | null;
 	tasks: TaskCard[];
 	act: (fn: () => Promise<void>) => Promise<boolean>;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	onClose: () => void;
 }) {
 	// One refresh per open, fire-and-forget: the WS frame re-renders the panel when the pull lands.
@@ -7806,14 +7874,14 @@ function UpdateCardLink({
 	openTask,
 }: {
 	card: TaskCard;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 }) {
 	return (
 		<a
 			className="updates-inprogress"
 			href={taskPath(card.project, card.id)}
 			title={card.sessionTitle}
-			onClick={(e) => navClick(e, () => openTask(card.id))}
+			onClick={(e) => navClick(e, () => openTask(card.id, card.project))}
 		>
 			in progress
 		</a>
@@ -7856,7 +7924,7 @@ export function UpdateRowLine({
 	card: TaskCard | null;
 	selected: boolean;
 	onToggle: () => void;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 }) {
 	// managedBy rows offer no actions (U5); removed rows are not selectable but
 	// do offer Skip below (keep the local copy, hide the row).
@@ -8396,7 +8464,7 @@ export function AddProjectModal({
 }: {
 	act: Act;
 	onClose: () => void;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	projects: ProjectView[];
 	onNotice?: (message: string) => void;
 }) {
@@ -8674,7 +8742,7 @@ export function AddProjectModal({
 				await post(`${base}/settings`, { setupChecklist: false });
 				refreshState();
 				onClose();
-				if (result.id !== null) openTask(result.id);
+				if (result.id !== null) openTask(result.id, current.name);
 			}, setErr);
 		} finally {
 			finishing.current = false;
@@ -9092,7 +9160,7 @@ export function SetupChecklist({
 	save: (patch: Record<string, unknown>) => Promise<boolean>;
 	/** The live rules interview card, when one runs: the rules item then opens it. */
 	rulesTask: TaskCard | null;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	interview: (path: string, body: Record<string, unknown>) => Promise<boolean>;
 	initGit: () => Promise<boolean>;
 	onOpenSetup: () => void;
@@ -9109,7 +9177,7 @@ export function SetupChecklist({
 				) : rulesTask !== null ? (
 					<BusyButton
 						run={async () => {
-							openTask(rulesTask.id);
+							openTask(rulesTask.id, rulesTask.project);
 							return true;
 						}}
 					>
@@ -9858,15 +9926,15 @@ function RelatedTasks({
 	items,
 	selfProject,
 	project,
-	tasks,
+	cardIndex,
 	onOpenTask,
 	draining,
 }: {
 	items: TaskCard[];
 	selfProject: string;
 	project: ProjectView;
-	tasks: TaskCard[];
-	onOpenTask: (id: string) => void;
+	cardIndex: CardIndex;
+	onOpenTask: (id: string, project?: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
 }) {
@@ -9892,7 +9960,14 @@ function RelatedTasks({
 								{statusLine(
 									k,
 									project.hasRules,
-									holdFor(k, tasks, undefined, Date.now()),
+									// A foreign blocker holds behind its own project's
+									// review, never the drawer project's (send-back 19).
+									holdFor(
+										k,
+										projectGraph(cardIndex, k.project),
+										undefined,
+										Date.now(),
+									),
 									draining,
 								)}
 							</span>
@@ -10214,7 +10289,7 @@ export function OrphanNotice(props: {
 	orphans: OrphanRow[];
 	fresh: boolean;
 	nowMs: number;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	inboxKey?: string;
 }): ReactNode {
 	const { orphans, fresh, nowMs, openTask, inboxKey } = props;
@@ -10297,7 +10372,7 @@ export function OrphanNotice(props: {
 									type="button"
 									className="notif-link"
 									title={`Open card ${card}`}
-									onClick={() => openTask(card)}
+									onClick={() => openTask(card, o.project ?? undefined)}
 								>
 									{card}
 								</button>
@@ -10350,7 +10425,8 @@ function LineageCardLink({
 	state,
 	onOpenTask,
 }: {
-	card: TaskCard;
+	/** A windowed row or an index ref (OTTR-1255): the link reads these three only. */
+	card: Pick<TaskCard, "id" | "project" | "sessionTitle">;
 	selfProject: string;
 	/** Row label after the title: "parent", or empty on a follow-up row. */
 	tag: string;
@@ -10363,11 +10439,11 @@ function LineageCardLink({
 		<a
 			className="lineage-row"
 			href={taskPath(card.project, card.id)}
-			title={card.sessionTitle ?? card.title}
+			title={card.sessionTitle}
 			onClick={(e) => navClick(e, () => onOpenTask(card.id, card.project))}
 		>
 			<span className="lineage-key">{card.id}</span>
-			<span className="lineage-title">{card.sessionTitle ?? card.title}</span>
+			<span className="lineage-title">{card.sessionTitle}</span>
 			<span className="lineage-end">
 				{card.project !== selfProject && (
 					<span className="lineage-tag">{card.project}</span>
@@ -10386,13 +10462,13 @@ function LineageCardLink({
 function ProposalReasonLink({
 	reason,
 	selfProject,
-	tasks,
+	cardIndex,
 	onOpenTask,
 }: {
 	reason: string;
 	selfProject: string;
-	tasks: TaskCard[];
-	onOpenTask: (id: string) => void;
+	cardIndex: CardIndex;
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	const m =
 		/^(Retro proposal from |Fork proposal from )(\S+?)(?: \("|\. |$)/.exec(
@@ -10407,7 +10483,7 @@ function ProposalReasonLink({
 				<CardIdLinks
 					text={reason}
 					selfProject={selfProject}
-					tasks={tasks}
+					cardIndex={cardIndex}
 					onOpenTask={onOpenTask}
 				/>
 			</span>
@@ -10416,9 +10492,7 @@ function ProposalReasonLink({
 		);
 	const id: string = hit;
 	const linked =
-		tasks.find((t) => t.id === id && t.project === selfProject) ??
-		tasks.find((t) => t.id === id) ??
-		null;
+		lookupCardIn(cardIndex, id, selfProject) ?? lookupCard(cardIndex, id);
 	const start = lead.length;
 	const end = start + id.length;
 	// One span, not a fragment: .needs-reason is a flex row and multiple children
@@ -10432,8 +10506,10 @@ function ProposalReasonLink({
 				<a
 					className="reason-card-link"
 					href={taskPath(linked.project, linked.id)}
-					title={linked.sessionTitle ?? linked.title}
-					onClick={(e) => navClick(e, () => onOpenTask(linked.id))}
+					title={linked.sessionTitle}
+					onClick={(e) =>
+						navClick(e, () => onOpenTask(linked.id, linked.project))
+					}
 				>
 					{id}
 				</a>
@@ -10448,13 +10524,13 @@ function ProposalReasonLink({
 function CardIdLinks({
 	text,
 	selfProject,
-	tasks,
+	cardIndex,
 	onOpenTask,
 }: {
 	text: string;
 	selfProject: string;
-	tasks: TaskCard[];
-	onOpenTask: (id: string) => void;
+	cardIndex: CardIndex;
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	const parts: ReactNode[] = [];
 	const re = /\b[A-Z]{1,4}-\d+\b/g;
@@ -10463,9 +10539,7 @@ function CardIdLinks({
 		if (m.index > last) parts.push(text.slice(last, m.index));
 		const id = m[0];
 		const linked =
-			tasks.find((t) => t.id === id && t.project === selfProject) ??
-			tasks.find((t) => t.id === id) ??
-			null;
+			lookupCardIn(cardIndex, id, selfProject) ?? lookupCard(cardIndex, id);
 		parts.push(
 			linked === null ? (
 				id
@@ -10474,8 +10548,10 @@ function CardIdLinks({
 					key={`${id}-${m.index}`}
 					className="reason-card-link"
 					href={taskPath(linked.project, linked.id)}
-					title={linked.sessionTitle ?? linked.title}
-					onClick={(e) => navClick(e, () => onOpenTask(linked.id))}
+					title={linked.sessionTitle}
+					onClick={(e) =>
+						navClick(e, () => onOpenTask(linked.id, linked.project))
+					}
 				>
 					{id}
 				</a>
@@ -10593,7 +10669,7 @@ function ProposalPanel({
 	task,
 	loading,
 	selfProject,
-	tasks,
+	cardIndex,
 	onOpenTask,
 	editOpen,
 	editGuardTitle,
@@ -10613,8 +10689,9 @@ function ProposalPanel({
 	/** True while the detail fetch runs: the prompt slots hold a loading line. */
 	loading: boolean;
 	selfProject: string;
-	tasks: TaskCard[];
-	onOpenTask: (id: string) => void;
+	/** Every card of every project (OTTR-1255); the reason's card ids resolve here. */
+	cardIndex: CardIndex;
+	onOpenTask: (id: string, project?: string) => void;
 	editOpen: boolean;
 	editGuardTitle: string;
 	edit: string | null;
@@ -10641,7 +10718,7 @@ function ProposalPanel({
 			<ProposalReasonLink
 				reason={task.needsReason ?? ""}
 				selfProject={selfProject}
-				tasks={tasks}
+				cardIndex={cardIndex}
 				onOpenTask={onOpenTask}
 			/>
 		</div>
@@ -10666,7 +10743,7 @@ function ProposalPanel({
 						<CardIdLinks
 							text={s.why}
 							selfProject={selfProject}
-							tasks={tasks}
+							cardIndex={cardIndex}
 							onOpenTask={onOpenTask}
 						/>
 					</dd>
@@ -10818,7 +10895,7 @@ function DrawerHead(p: {
 	cancelled: boolean;
 	askedNow: boolean;
 	waiting: TaskCard[];
-	tasks: TaskCard[];
+	graph: GraphTask[];
 	draining: boolean;
 	act: Act;
 	copiedId: ReturnType<typeof useFlash>[0];
@@ -10833,7 +10910,7 @@ function DrawerHead(p: {
 		cancelled,
 		askedNow,
 		waiting,
-		tasks,
+		graph,
 		draining,
 		act,
 		copiedId,
@@ -10952,7 +11029,7 @@ function DrawerHead(p: {
 								// The list below names the cards; the meta line only counts them.
 								waiting.length > 0
 									? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
-									: holdFor(task, tasks, undefined, Date.now()),
+									: holdFor(task, graph, undefined, Date.now()),
 								draining,
 							)}
 						</span>
@@ -11005,115 +11082,37 @@ function DrawerMut(p: { mut: ReturnType<typeof strykerProgress> | null }) {
 /** Drawer Lineage section: extracted verbatim from the drawer body. */
 function DrawerLineage(p: {
 	row: TaskCard;
-	parent: TaskCard | null;
-	retroSource: (LineageRef & { card: TaskCard | null }) | null;
-	kids: TaskCard[];
-	/** Every loaded card, any project: the descendant tree's source (Drawer's
-	 * boardTasks). The drawer's context `tasks` list is project-scoped and would
-	 * drop a grandchild filed into another project. */
-	boardTasks: TaskCard[];
-	/** OTTR-1198: children the state's frames dropped (an older done child, or one
-	 * filed into another project's board); the detail names them and each row
-	 * fetches the card from its own tasks route. */
-	childRefs: (LineageRef & { createdAt: number })[];
-	/** Fetch entries keyed "<project>/<id>", read for a child ref's row; a missing
-	 * key reads as the row's loading state. */
-	lineageFetches: Record<string, LineageFetch>;
+	parent: CardRef | null;
+	retroSource: (LineageRef & { card: CardRef | null }) | null;
+	/** Every card of every project (OTTR-1255): the parent, the retro source and the
+	 * whole descendant tree resolve from it, the cards the Done window dropped and the
+	 * ones filed into another project included, so no lineage fetch runs. */
+	cardIndex: CardIndex;
 	onOpenTask: (id: string, project?: string) => void;
-	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
-	 * dropped; null when the card sits in the state and nothing fetches. */
-	parentFetch: LineageFetch | null;
-	retroFetch: LineageFetch | null;
-	/** Refetches one lineage card after a failed fetch (the row's Retry button). */
-	onLineageRetry: (c: LineageRef) => void;
-	/** The live state span for a fetched card, built by the drawer. */
-	stateRow: (k: TaskCard) => ReactNode;
+	/** The live state span for a lineage card, built by the drawer. */
+	stateRow: (k: LineageCard) => ReactNode;
 }) {
-	const {
-		row,
-		parent,
-		retroSource,
-		kids,
-		boardTasks,
-		childRefs,
-		lineageFetches,
-		onOpenTask,
-		parentFetch,
-		retroFetch,
-		onLineageRetry,
-		stateRow,
-	} = p;
-	/** An inert rail row for a linked card the rail cannot link (yet): the same
-	 * three-column structure as a card row, so the loading, not-found and error rows
-	 * never shift the layout next to a real card row (OTTR-1158). */
-	const goneRow = (
-		id: string,
-		tag: string,
-		text: string,
-		title: string,
-		retry?: LineageRef,
-	): ReactNode => (
+	const { row, parent, retroSource, cardIndex, onOpenTask, stateRow } = p;
+	/** An inert rail row for a linked card no project holds (OTTR-1255): the same
+	 * three-column structure as a card row, so the not-found row never shifts the
+	 * layout next to a real card row. */
+	const goneRow = (id: string, tag: string): ReactNode => (
 		<li className="lineage-gone">
-			<span className="lineage-row" title={title}>
+			<span className="lineage-row" title={`${id} does not exist`}>
 				<span className="lineage-key">{id}</span>
-				<span className="lineage-title">{text}</span>
+				<span className="lineage-title">Card not found</span>
 				<span className="lineage-end">
 					<span className="lineage-tag">{tag}</span>
-					{retry !== undefined && (
-						<button
-							type="button"
-							className="notif-link"
-							onClick={() => onLineageRetry(retry)}
-						>
-							Retry
-						</button>
-					)}
 				</span>
 			</span>
 		</li>
 	);
-	/** The rail row for a linked card the state list dropped (OTTR-1158): a real link
-	 * once its fetch lands, loading / 404 / error rows before that. Only a 404 earns
-	 * "Card not found" — an older done card exists, it just left the window. */
-	const fetchRow = (
-		c: LineageRef,
-		fetch: LineageFetch | null,
-		tag: string,
-	): ReactNode => {
-		// No entry yet (first render before the fetch state lands) reads as loading.
-		if (fetch === null || fetch.status === "loading")
-			return goneRow(c.id, tag, "Loading…", `Loading ${c.id}`);
-		switch (fetch.status) {
-			case "card":
-				return (
-					<li>
-						<LineageCardLink
-							card={fetch.card}
-							selfProject={row.project}
-							tag={tag}
-							onOpenTask={onOpenTask}
-							state={stateRow(fetch.card)}
-						/>
-					</li>
-				);
-			case "missing":
-				return goneRow(c.id, tag, "Card not found", `${c.id} does not exist`);
-			case "error":
-				return goneRow(
-					c.id,
-					tag,
-					"Could not load card",
-					`${c.id}: ${fetch.message}`,
-					c,
-				);
-		}
-	};
 	// Per-node fold state: `${project}/${id}` → override. The id alone collides
 	// across projects (real stores reuse ids), and one disclosure must not move
 	// both branches. The default folds a quiet subtree: no open card in it — the
 	// node's own state included — and more than three rows.
 	const [folded, setFolded] = useState<Record<string, boolean>>({});
-	const tree = lineageTree(row, childMap(boardTasks));
+	const tree = lineageTree(row, childMap(cardIndex));
 	/** One descendant row: the card link with its live state and its open count,
 	 * then — unless folded — its children one indent deeper, oldest first. */
 	const renderNode = (n: LineageNode, depth: number): ReactNode => {
@@ -11203,26 +11202,12 @@ function DrawerLineage(p: {
 			</li>
 		);
 	};
-	// The Follow-ups rows, oldest first: the frame's tree nodes and the fetched
-	// refs merged by the filing order; a frame row wins a tie, so an in-frame
-	// child never flashes into a loading row (OTTR-1198).
-	const railRows: (
-		| { kind: "node"; node: LineageNode }
-		| { kind: "ref"; ref: LineageRef & { createdAt: number } }
-	)[] = [
-		...tree.kids.map((node) => ({ kind: "node" as const, node })),
-		...childRefs.map((ref) => ({ kind: "ref" as const, ref })),
-	].sort(
-		(a, b) =>
-			(a.kind === "node" ? a.node.card.createdAt : a.ref.createdAt) -
-			(b.kind === "node" ? b.node.card.createdAt : b.ref.createdAt),
-	);
 	return (
 		<>
 			{" "}
 			{/* Lineage rail: the parent above, this card as the filled node. Follow-ups run in
 					    parallel, so they hang one level in off this card's node, each on its own elbow. */}
-			{(row.followUpOf !== null || kids.length > 0 || childRefs.length > 0) && (
+			{(row.followUpOf !== null || tree.kids.length > 0) && (
 				<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
 					<ol className="lineage-rail">
 						{retroSource !== null &&
@@ -11236,11 +11221,7 @@ function DrawerLineage(p: {
 									/>
 								</li>
 							) : (
-								fetchRow(
-									{ project: retroSource.project, id: retroSource.id },
-									retroFetch,
-									"retro source",
-								)
+								goneRow(retroSource.id, "retro source")
 							))}
 						{row.followUpOf !== null &&
 							(parent !== null ? (
@@ -11250,20 +11231,11 @@ function DrawerLineage(p: {
 										selfProject={row.project}
 										tag={retroSource !== null ? "retro" : "parent"}
 										onOpenTask={onOpenTask}
-										state={
-											parentFetch?.status === "card"
-												? stateRow(parent)
-												: undefined
-										}
 									/>
 								</li>
 							) : (
-								fetchRow(
-									{
-										project: row.followUpOfProject ?? row.project,
-										id: row.followUpOf,
-									},
-									parentFetch,
+								goneRow(
+									row.followUpOf,
 									retroSource !== null ? "retro" : "parent",
 								)
 							))}
@@ -11275,26 +11247,9 @@ function DrawerLineage(p: {
 								</span>
 								<span className="lineage-tag">this card</span>
 							</span>
-							{(kids.length > 0 || childRefs.length > 0) && (
+							{tree.kids.length > 0 && (
 								<ol className="lineage-branch" aria-label="Follow-ups">
-									{railRows.map((e) => {
-										if (e.kind === "ref") {
-											const f =
-												lineageFetches[`${e.ref.project}/${e.ref.id}`] ?? null;
-											return (
-												<Fragment key={`${e.ref.project}/${e.ref.id}`}>
-													{fetchRow(
-														e.ref,
-														f,
-														f?.status === "card" && f.card.kind === "retro"
-															? "retro"
-															: "",
-													)}
-												</Fragment>
-											);
-										}
-										return renderNode(e.node, 1);
-									})}
+									{tree.kids.map((n) => renderNode(n, 1))}
 								</ol>
 							)}
 						</li>
@@ -11416,14 +11371,15 @@ function DrawerWaiting(p: {
 	proposal: boolean;
 	row: TaskCard;
 	project: ProjectView;
-	tasks: TaskCard[];
-	onOpenTask: (id: string) => void;
+	/** Every card of every project (OTTR-1255); the reason's card ids resolve here. */
+	cardIndex: CardIndex;
+	onOpenTask: (id: string, project?: string) => void;
 	draining: boolean;
 }) {
 	const {
 		waiting,
 		project,
-		tasks,
+		cardIndex,
 		onOpenTask,
 		draining,
 		task,
@@ -11440,7 +11396,7 @@ function DrawerWaiting(p: {
 						items={waiting}
 						selfProject={row.project}
 						project={project}
-						tasks={tasks}
+						cardIndex={cardIndex}
 						onOpenTask={onOpenTask}
 						draining={draining}
 					/>
@@ -11457,7 +11413,7 @@ function DrawerWaiting(p: {
 						<ProposalReasonLink
 							reason={task.needsReason}
 							selfProject={row.project}
-							tasks={tasks}
+							cardIndex={cardIndex}
 							onOpenTask={onOpenTask}
 						/>
 					</div>
@@ -12393,7 +12349,7 @@ function TurnLinks(p: {
 	task: TaskView;
 	lastRetro: WorkStep | undefined;
 	lastFindingStep: Map<string, number>;
-	onOpenTask: (id: string) => void;
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	const { s, idx, task, lastRetro, lastFindingStep, onOpenTask } = p;
 	return (
@@ -12407,7 +12363,7 @@ function TurnLinks(p: {
 					onKeyDown={(e) => e.stopPropagation()}
 					onClick={(e) => {
 						e.stopPropagation();
-						navClick(e, () => onOpenTask(s.retroId));
+						navClick(e, () => onOpenTask(s.retroId, task.project));
 					}}
 				>
 					Open retro
@@ -12421,7 +12377,7 @@ function TurnLinks(p: {
 					onKeyDown={(e) => e.stopPropagation()}
 					onClick={(e) => {
 						e.stopPropagation();
-						navClick(e, () => onOpenTask(s.finding.id));
+						navClick(e, () => onOpenTask(s.finding.id, task.project));
 					}}
 				>
 					Open finding
@@ -12484,7 +12440,7 @@ function TurnStep(p: {
 	setOpenTurn: React.Dispatch<React.SetStateAction<number | string | null>>;
 	lastRetro: WorkStep | undefined;
 	lastFindingStep: Map<string, number>;
-	onOpenTask: (id: string) => void;
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	const {
 		s,
@@ -12601,7 +12557,7 @@ function DrawerStepItem(p: {
 	setOpenTurn: React.Dispatch<React.SetStateAction<number | string | null>>;
 	lastRetro: WorkStep | undefined;
 	lastFindingStep: Map<string, number>;
-	onOpenTask: (id: string) => void;
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	if (p.s.kind === "check") return <CheckStep s={p.s} catalog={p.catalog} />;
 	if (p.s.kind === "filed") return <FiledStep s={p.s} />;
@@ -12841,7 +12797,7 @@ function DrawerSteps(p: {
 	saveSteerEdit: (text: string) => Promise<boolean>;
 	cancelSteer: (expectedRevision: number) => Promise<boolean>;
 	steerConflict: { current: string | null; cancel: boolean } | null;
-	onOpenTask: (id: string) => void;
+	onOpenTask: (id: string, project?: string) => void;
 }) {
 	const {
 		ctx,
@@ -14520,49 +14476,40 @@ const releaseWaits = (v: TaskView): boolean =>
 	v.state === "needs_you" &&
 	v.cancelledAt === null;
 
-/** A linked card named only by id and project: the state's Done window may not carry
- * it, and the drawer fetches it from that project's tasks route (OTTR-1158). */
+/** A linked card named only by id and project: the index resolves it (OTTR-1255). */
 type LineageRef = { project: string; id: string };
 
-/** Fetch state of one lineage card the state's Done window dropped (OTTR-1158). */
-type LineageFetch =
-	| ({ status: "loading" } & LineageRef)
-	| ({ status: "card"; card: TaskCard } & LineageRef)
-	| ({ status: "missing" } & LineageRef)
-	| ({ status: "error"; message: string } & LineageRef);
-
 /** The follow-up lineage of a drawer card: its parent row and, for a retro, the source
- * card above it. Null when the card is a root, or the parent is no retro. */
+ * card above it, both resolved from the card index — the Done window may have dropped
+ * them (OTTR-1158). Null when the card is a root, or the parent is no retro. */
 function followUpParent(
 	row: TaskCard,
-	tasks: TaskCard[],
+	cardIndex: CardIndex,
 ): {
-	parent: TaskCard | null;
-	retroSource: (LineageRef & { card: TaskCard | null }) | null;
+	parent: CardRef | null;
+	retroSource: (LineageRef & { card: CardRef | null }) | null;
 } {
 	const parent =
 		row.followUpOf === null
 			? null
-			: (tasks.find(
-					(t) =>
-						t.id === row.followUpOf &&
-						t.project === (row.followUpOfProject ?? row.project),
-				) ?? null);
+			: lookupCardIn(
+					cardIndex,
+					row.followUpOf,
+					row.followUpOfProject ?? row.project,
+				);
 	// A retro's proposal card reads its lineage from the retro's source: the parent row is the
-	// retro and the source card sits above it. Null when the parent is no retro. `project` is
-	// the route the drawer fetches an out-of-window source from.
+	// retro and the source card sits above it. Null when the parent is no retro.
 	const retroSource =
 		parent === null || parent.kind !== "retro" || parent.followUpOf === null
 			? null
 			: {
 					id: parent.followUpOf,
 					project: parent.followUpOfProject ?? parent.project,
-					card:
-						tasks.find(
-							(t) =>
-								t.id === parent.followUpOf &&
-								t.project === (parent.followUpOfProject ?? parent.project),
-						) ?? null,
+					card: lookupCardIn(
+						cardIndex,
+						parent.followUpOf,
+						parent.followUpOfProject ?? parent.project,
+					),
 				};
 	return { parent, retroSource };
 }
@@ -14571,25 +14518,42 @@ function followUpParent(
  * deeper levels collapse into the deepest shown branch's "+N more" row. */
 const LINEAGE_DEPTH = 4;
 
-/** Children by parent key `${followUpOfProject ?? project}/${followUpOf}`, oldest first.
- * One pass over the board, so the rail never scans it once per level. */
-function childMap(tasks: TaskCard[]): Map<string, TaskCard[]> {
-	const map = new Map<string, TaskCard[]>();
-	for (const t of tasks) {
-		if (t.followUpOf === null) continue;
-		const key = `${t.followUpOfProject ?? t.project}/${t.followUpOf}`;
-		const list = map.get(key);
-		if (list === undefined) map.set(key, [t]);
-		else list.push(t);
-	}
+/** Children by parent key `${followUpOfProject ?? project}/${followUpOf}`, oldest first,
+ * over every card of every project (OTTR-1255): the index holds the settled children the
+ * Done window dropped and the ones filed into another project, so no lineage fetch runs.
+ * One pass, so the rail never scans the index once per level. */
+function childMap(cardIndex: CardIndex): Map<string, CardRef[]> {
+	const map = new Map<string, CardRef[]>();
+	for (const bucket of cardIndex.values())
+		for (const t of bucket) {
+			if (t.followUpOf === null) continue;
+			const key = `${t.followUpOfProject ?? t.project}/${t.followUpOf}`;
+			const list = map.get(key);
+			if (list === undefined) map.set(key, [t]);
+			else list.push(t);
+		}
 	for (const list of map.values())
 		list.sort((a, b) => a.createdAt - b.createdAt);
 	return map;
 }
 
+/** The card facts a lineage row reads: an index ref, or the drawer's own wide row. */
+type LineageCard = Pick<
+	CardRef,
+	| "id"
+	| "project"
+	| "sessionTitle"
+	| "kind"
+	| "stage"
+	| "cancelledAt"
+	| "createdAt"
+	| "followUpOf"
+	| "followUpOfProject"
+>;
+
 /** One card in the drawer's descendant tree, with the counts its row shows. */
 type LineageNode = {
-	card: TaskCard;
+	card: LineageCard;
 	/** Children, oldest first (visited cards skipped). */
 	kids: LineageNode[];
 	/** Cards this subtree holds below the card, rendered or not. */
@@ -14607,11 +14571,11 @@ type LineageNode = {
  * S-1), so the walk can come back to the drawer card: the set renders each card
  * once and stops there. It also collapses duplicate task objects (OTTR-1258). */
 function lineageTree(
-	card: TaskCard,
-	byParent: Map<string, TaskCard[]>,
+	card: LineageCard,
+	byParent: Map<string, CardRef[]>,
 ): LineageNode {
 	const build = (
-		c: TaskCard,
+		c: LineageCard,
 		depth: number,
 		seen: Set<string>,
 	): LineageNode => {
@@ -14884,7 +14848,8 @@ export function Drawer({
 	onMarkSeen,
 	delta,
 	tasks,
-	boardTasks,
+	boardTasks = tasks,
+	cardIndex,
 	onOpenTask,
 	draining,
 	usedTotal,
@@ -14907,12 +14872,14 @@ export function Drawer({
 	onMarkSeen: () => void;
 	delta?: number;
 	tasks: TaskCard[];
-	/** Every loaded card, any project: the descendant tree's source. The context
-	 * list in `tasks` is project-scoped (AppDrawer), so a grandchild filed into
-	 * another project sits only here (OTTR-1258); no second fetch runs for it.
-	 * Optional only for direct fixtures, which hold one list; AppDrawer always
-	 * passes the full loaded board. */
+	/** Every loaded card, any project: the wide rows (OTTR-965 window). A foreign
+	 * lineage card or open dependency keeps its holdUntil, reason and PR facts from
+	 * here when the project-scoped context lacks it. Optional only for direct
+	 * fixtures, which hold one list; AppDrawer always passes the full loaded board. */
 	boardTasks?: TaskCard[];
+	/** Every card of every project (OTTR-1255): the lineage rail, the dependency
+	 * chain and the hold gates resolve from it, Done window or not. */
+	cardIndex: CardIndex;
 	onOpenTask: (id: string, project?: string) => void;
 	/** True while an update holds new turns (POST /api/drain): queued cards wait for the restart. */
 	draining: boolean;
@@ -14920,82 +14887,20 @@ export function Drawer({
 	usedTotal: number;
 	maxTotal: number | null;
 }) {
-	const { parent, retroSource } = followUpParent(row, tasks);
-	// OTTR-1158: the state carries only the Done window (the newest done and cancelled
-	// cards plus the pinned ones), so a parent or retro source older than that window is
-	// absent here even while its card exists. Fetch each missing card once from its own
-	// tasks route so the rail keeps a real link; only a 404 earns the not-found row.
-	// Keyed by "<project>/<id>", so a same-id card on another board cannot stand in.
-	const parentRef: LineageRef | null =
-		row.followUpOf === null || parent !== null
-			? null
-			: {
-					project: row.followUpOfProject ?? row.project,
-					id: row.followUpOf,
-				};
-	const retroRef: LineageRef | null =
-		retroSource === null || retroSource.card !== null
-			? null
-			: { project: retroSource.project, id: retroSource.id };
-	const lineageKey = (c: LineageRef): string => `${c.project}/${c.id}`;
-	const [lineage, setLineage] = useState<Record<string, LineageFetch>>({});
-	const loadLineage = (refs: LineageRef[], force = false): void => {
-		for (const c of refs) {
-			const key = lineageKey(c);
-			// A ref with a live entry keeps it: a re-run that names the same refs (a
-			// detail refetch naming the same children) must not reset rows that
-			// already resolved. A ref whose entry is gone fetches again — the want
-			// can empty the map (the card rode the frame) and name the ref once more
-			// (it left the frame), and that row must never sit on a stuck loading
-			// state. Retry forces past the guard.
-			if (!force && lineage[key] !== undefined) continue;
-			setLineage((m) => ({
-				...m,
-				[key]: { status: "loading", ...c },
-			}));
-			void readDetail(
-				`/api/projects/${encodeURIComponent(c.project)}/tasks/${encodeURIComponent(c.id)}`,
-			)
-				.then((v) => {
-					// Only a loading entry takes the answer: a response that lands after the
-					// drawer moved to another card (entries reset) or after a retry armed a
-					// fresh request must not write stale state.
-					setLineage((m) =>
-						m[lineageKey(c)]?.status === "loading"
-							? {
-									...m,
-									[lineageKey(c)]: {
-										status: "card",
-										...c,
-										card: taskCardFromDetail(v),
-									},
-								}
-							: m,
-					);
-				})
-				.catch((e: unknown) => {
-					const msg = e instanceof Error ? e.message : String(e);
-					setLineage((m) =>
-						m[lineageKey(c)]?.status === "loading"
-							? {
-									...m,
-									[lineageKey(c)]:
-										msg === "404"
-											? { status: "missing", ...c }
-											: { status: "error", ...c, message: msg },
-								}
-							: m,
-					);
-				});
-		}
+	const { parent, retroSource } = followUpParent(row, cardIndex);
+	/** The wide loaded row of a card, else its index ref adapted to the wide shape
+	 * (OTTR-1255): a row the Done window dropped renders its live state from the index,
+	 * never a hold stamp or PR fact, which only open (loaded) cards carry. */
+	const fullRow = (k: Pick<CardRef, "id" | "project">): TaskCard | null => {
+		const wide = boardTasks.find(
+			(t) => t.id === k.id && t.project === k.project,
+		);
+		if (wide !== undefined) return wide;
+		const ref = lookupCardIn(cardIndex, k.id, k.project);
+		return ref === null ? null : refRow(ref);
 	};
-	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
-	// The whole descendant tree hangs below, one level in per card; childMap walks the
-	// loaded board once, so the rail never scans it once per level.
-	const treeTasks = boardTasks ?? tasks;
-	const kids = childMap(treeTasks).get(`${row.project}/${row.id}`) ?? [];
 	/** The live state span a lineage row shows after its tags, as the meta line shows
-	 * it. Follow-up rows and fetched parent rows share it. */
+	 * it. A foreign card holds behind its own project's graph, never this drawer's. */
 	const lineageState = (k: TaskCard): ReactNode => (
 		<span
 			className={
@@ -15009,66 +14914,89 @@ export function Drawer({
 			{statusLine(
 				k,
 				project.hasRules,
-				holdFor(k, tasks, undefined, Date.now()),
+				holdFor(
+					k,
+					k.project === project.name
+						? graph
+						: wideGraph(cardIndex, k.project, boardTasks),
+					undefined,
+					Date.now(),
+				),
 				draining,
 			)}
 		</span>
 	);
-	// The rail rows for cards the Done window dropped: the fetch state fills the row
-	// until the card lands, then the plain link renders with its live state.
-	const parentFetch: LineageFetch | null =
-		parentRef === null
-			? null
-			: (lineage[lineageKey(parentRef)] ?? {
-					status: "loading",
-					...parentRef,
-				});
-	const retroFetch: LineageFetch | null =
-		retroRef === null
-			? null
-			: (lineage[lineageKey(retroRef)] ?? {
-					status: "loading",
-					...retroRef,
-				});
-	// A child ref's fetch entry (OTTR-1198) rides to DrawerLineage as the `lineage`
-	// map keyed "<project>/<id>"; a missing key reads as the row's loading state.
-	const parentCard =
-		parent ?? (parentFetch?.status === "card" ? parentFetch.card : null);
-	const retroCard =
-		retroSource === null
-			? null
-			: {
-					id: retroSource.id,
-					project: retroSource.project,
-					card:
-						retroSource.card ??
-						(retroFetch?.status === "card" ? retroFetch.card : null),
-				};
+	/** A lineage row's live state span: the card's wide row, else its index ref. */
+	const lineageStateOf = (k: LineageCard): ReactNode => {
+		const full = fullRow(k);
+		return full === null ? null : lineageState(full);
+	};
 	// A held card waits until these are done; a cancelled dependency counts as done.
-	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
-	// The banner names every card the holds park, deduped by card: the dependency
-	// list, and — at merging, the only stage mergeHold applies to (holdFor), and
-	// never for a cancelled card, which the scheduler skips — the review holds'
-	// cards: another review's hold, or this parked review's own findings hold
-	// riding its needsReason. The scheduler reads one project's store, so the hold
-	// walk reads only this card's project: a foreign child filed off this review
-	// is no finding of it.
-	const holdTasks =
-		row.stage === "merging" && row.cancelledAt === null
-			? tasks.filter((t) => t.project === row.project)
+	// The whole project comes from the index (OTTR-1255) and `foreign` resolves a
+	// cross-project dep, so a follow-up that depends on its foreign parent keeps its
+	// "Waiting for" hold whatever the Done window did.
+	const foreign = useMemo(
+		() => depIndexOf(projects, cardIndex, project, boardTasks),
+		[projects, cardIndex, project, boardTasks],
+	);
+	// The whole project from the index, shaped for the hold gates (OTTR-1255); the
+	// loaded wide rows replace their refs, so open cards keep their hold fields.
+	const graph = useMemo(
+		() => wideGraph(cardIndex, project.name, boardTasks),
+		[cardIndex, project.name, boardTasks],
+	);
+	// Waiting rows as full-card-shaped rows: an own dep resolves project-exact, a
+	// foreign one through the project-scoped resolver, so the hold and its status
+	// line survive the Done window.
+	const waiting =
+		row.stage !== "done"
+			? row.dependsOn.flatMap((id) => {
+					// A waiter is open: not cancelled, not done. A windowed row
+					// keeps every wide field (the usage-limit countdown, the PR
+					// facts); the adapter only shapes rows the window dropped or
+					// that live in another project, and a foreign open card
+					// prefers its own full windowed row the same way.
+					const isWaiter = (
+						d: Pick<TaskCard, "cancelledAt" | "stage">,
+					): boolean => d.cancelledAt === null && d.stage !== "done";
+					const wide = tasks.find(
+						(t) => t.id === id && t.project === project.name,
+					);
+					if (wide !== undefined) return isWaiter(wide) ? [wide] : [];
+					const hit = foreign?.(id) ?? null;
+					if (hit === null) return [];
+					// The wide frame carries a foreign open card's hold fields
+					// (usage-limit countdown, PR facts); the index ref is the
+					// fallback for a row the frame itself lacks.
+					const wideForeign = boardTasks.find(
+						(t) => t.id === hit.id && t.project === hit.project,
+					);
+					if (wideForeign !== undefined)
+						return isWaiter(wideForeign) ? [wideForeign] : [];
+					const full = lookupCardIn(cardIndex, hit.id, hit.project);
+					if (full === null) return [];
+					return isWaiter(full) ? [refRow(full)] : [];
+				})
 			: [];
-	const waitSources = [
-		...waiting,
-		...(holdTasks.length > 0
+	// The banner names every card the holds park, deduped by card: the dependency
+	// list, and - at merging, the only stage mergeHold applies to (holdFor), and
+	// never for a cancelled card, which the scheduler skips - the review holds'
+	// cards: another review's hold, or this parked review's own findings hold
+	// riding its needsReason. The hold reads the complete project graph
+	// (OTTR-1255), so a finding the Done window dropped still names its card.
+	const holdRows =
+		row.stage === "merging" && row.cancelledAt === null
 			? [
 					...(row.needsReason === FINDINGS_HOLD
-						? reviewOpenFindings(reviewFindings(holdTasks, row), row)
+						? reviewOpenFindings(reviewFindings(graph, row), row)
 						: []),
-					...holdWaitCards(holdTasks, row),
-				]
-			: []),
-	];
-	const waitAll = waitSources.filter(
+					...holdWaitCards(graph, row),
+				].flatMap((c) => {
+					const full = fullRow(c);
+					return full === null ? [] : [full];
+				})
+			: [];
+	const waitAll = [...waiting, ...holdRows].filter(
 		(t, i, all) =>
 			all.findIndex((o) => o.project === t.project && o.id === t.id) === i,
 	);
@@ -15156,32 +15084,6 @@ export function Drawer({
 			clearTimeout(retry);
 		};
 	}, [row.project, row.id, rowKey]);
-	// OTTR-1198: children the state's frames dropped — an older done child, or one
-	// filed into another project's board. The drawer's detail names them (the server
-	// scans every registered board for followUpOf links); each ref fetches its card
-	// from its own tasks route like the parent rows. Refs the frame already carries
-	// stay out: their rows render from state, live.
-	const kidKeys = new Set(kids.map((k) => `${k.project}/${k.id}`));
-	const childRefs: (LineageRef & { createdAt: number })[] = (
-		detail?.children ?? []
-	)
-		.filter((c) => !kidKeys.has(`${c.project}/${c.id}`))
-		.sort((a, b) => a.createdAt - b.createdAt);
-	// lineageWant encodes exactly parentRef, retroRef and the child refs: the fetch
-	// restarts when the drawer's card changes or its fetched lineage lands.
-	const lineageWant = `${parentRef === null ? "" : lineageKey(parentRef)} ${retroRef === null ? "" : lineageKey(retroRef)} ${childRefs.map((c) => lineageKey(c)).join(" ")}`;
-	useEffect(() => {
-		const refs: LineageRef[] = [];
-		if (parentRef !== null) refs.push(parentRef);
-		if (retroRef !== null) refs.push(retroRef);
-		for (const c of childRefs) refs.push(c);
-		// Empty want: this card has every lineage card in state — drop the old fetch state.
-		if (refs.length === 0) {
-			setLineage({});
-			return;
-		}
-		loadLineage(refs);
-	}, [lineageWant]);
 	// The state row omits the wide fields (OTTR-965): the fallback renders empty until
 	// the detail fetch lands; the prompt section holds its space with a loading line.
 	const task: TaskView = detail ?? {
@@ -15358,21 +15260,21 @@ export function Drawer({
 	// line names the wait), and its review's batch validation run is the only way
 	// forward. One POST names the lead: the filing parks it into the review's
 	// backlog inside its own transaction, so a refusal leaves the lead — and this
-	// drawer's hold and error — untouched. The parent resolves through the lineage
-	// fetch too: the Done window can drop the review from the board's task list.
+	// drawer's hold and error — untouched. The parent resolves through the card
+	// index (OTTR-1255): the Done window can drop the review from the task list.
 	// The button renders whenever the hold does and a review exists; the shared
 	// `leadValidationStartRefusal` predicate (the route's own gate) disables it
 	// with the refusal as its title whenever the route would refuse.
 	const leadValidate =
-		!cancelled && leadValidationHold(task) !== null && parentCard !== null
+		!cancelled && leadValidationHold(task) !== null && parent !== null
 			? {
-					id: parentCard.id,
-					project: parentCard.project,
+					id: parent.id,
+					project: parent.project,
 					refusal:
-						leadValidationStartRefusal(task, parentCard.id) ??
+						leadValidationStartRefusal(task, parent.id) ??
 						// The filing's other precondition: the review can take a batch
 						// (done, or held at merging for its findings).
-						(validatableReview(parentCard) ? null : ("review" as const)),
+						(validatableReview(parent) ? null : ("review" as const)),
 				}
 			: null;
 	const [leadValidateError, setLeadValidateError] = useState<string | null>(
@@ -15934,7 +15836,7 @@ export function Drawer({
 						cancelled={cancelled}
 						askedNow={askedNow}
 						waiting={waitAll}
-						tasks={tasks}
+						graph={graph}
 						draining={draining}
 						act={act}
 						copiedId={copiedId}
@@ -15952,7 +15854,7 @@ export function Drawer({
 								task={task}
 								loading={detail === null}
 								selfProject={row.project}
-								tasks={tasks}
+								cardIndex={cardIndex}
 								onOpenTask={onOpenTask}
 								editOpen={editOpen}
 								editGuardTitle={editGuardTitle}
@@ -15983,17 +15885,11 @@ export function Drawer({
 					<DrawerMut mut={mut} />
 					<DrawerLineage
 						row={row}
-						parent={parentCard}
-						retroSource={retroCard}
-						kids={kids}
-						boardTasks={treeTasks}
-						childRefs={childRefs}
-						lineageFetches={lineage}
+						parent={parent}
+						retroSource={retroSource}
+						cardIndex={cardIndex}
 						onOpenTask={onOpenTask}
-						parentFetch={parentFetch}
-						retroFetch={retroFetch}
-						onLineageRetry={(c) => loadLineage([c], true)}
-						stateRow={lineageState}
+						stateRow={lineageStateOf}
 					/>
 					<DrawerLateCommits task={task} cancelled={cancelled} />
 					<DrawerAskPanel
@@ -16010,7 +15906,7 @@ export function Drawer({
 						proposal={proposal}
 						row={row}
 						project={project}
-						tasks={tasks}
+						cardIndex={cardIndex}
 						onOpenTask={onOpenTask}
 						draining={draining}
 					/>
@@ -16729,7 +16625,7 @@ export type CardLinkCtx = {
 		id: string,
 		project: string | null,
 	): { project: string; id: string } | null;
-	open(id: string): void;
+	open(id: string, project?: string): void;
 };
 
 /** Links inside a server warning: https:// URLs open in a new tab, and a
@@ -16798,7 +16694,7 @@ export function warningLinks(
 						href={taskPath(ref.project, ref.id)}
 						title={`Open card ${ref.id}`}
 						onClick={(e) => {
-							navClick(e, () => cards.open(ref.id));
+							navClick(e, () => cards.open(ref.id, ref.project));
 						}}
 					>
 						{m[0]}
@@ -17312,7 +17208,6 @@ function taskCardFromDetail(detail: TaskView): TaskCard {
 		lateCommits: _lateCommits,
 		retro: _retro,
 		findings: _findings,
-		children: _children,
 		...card
 	} = detail;
 	return { ...card, answered: answeredCard(turns) };
@@ -17502,8 +17397,8 @@ export function appInboxMeta(
 	critKey: string | null,
 	needTasks: TaskCard[],
 	askCards: TaskCard[],
-	prActivity: TaskCard[],
-	prPosted: TaskCard[],
+	prActivity: CardRef[],
+	prPosted: CardRef[],
 	infoKeys: (string | null)[],
 	warnings: string[],
 	alarmCount: number,
@@ -17634,8 +17529,8 @@ export function AppInboxPanel(p: {
 	critKey: string | null;
 	needTasks: TaskCard[];
 	askCards: TaskCard[];
-	prActivity: TaskCard[];
-	prPosted: TaskCard[];
+	prActivity: CardRef[];
+	prPosted: CardRef[];
 	alarmCount: number;
 	updatesKey: string | null;
 	updateCount: number;
@@ -17657,6 +17552,8 @@ export function AppInboxPanel(p: {
 	provisionErrKey: string | null;
 	state: StateResponse | null;
 	warnings: string[];
+	/** Every card of every project (OTTR-1255); the panel's card links resolve here. */
+	cardIndex: CardIndex;
 	orphanList: OrphanProcess[];
 	orphansErrorKey: string | null;
 	orphansKey: string | null;
@@ -17666,7 +17563,7 @@ export function AppInboxPanel(p: {
 	signinAdvisories: DeadSignIn[];
 	projects: ProjectView[];
 	nowMs: number;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	entries: InboxEntry[];
 	inbox: InboxSummary;
 	ackInbox: (keys: string[]) => void;
@@ -17702,6 +17599,7 @@ export function AppInboxPanel(p: {
 		provisionErrKey,
 		state,
 		warnings,
+		cardIndex,
 		orphanList,
 		orphansErrorKey,
 		orphansKey,
@@ -17719,8 +17617,8 @@ export function AppInboxPanel(p: {
 		setError,
 		setNotice,
 	} = p;
-	// Card references in the lines resolve against the live frame; open hides the
-	// panel first so the drawer lands unobstructed, like the alarm rows below.
+	// Card references in the lines resolve against the card index (OTTR-1255); open
+	// hides the panel first so the drawer lands unobstructed, like the alarm rows below.
 	const cardCtx: CardLinkCtx | null =
 		state === null
 			? null
@@ -17728,14 +17626,17 @@ export function AppInboxPanel(p: {
 					resolve(id, project) {
 						if (project !== null && !projects.some((pr) => pr.name === project))
 							return null;
-						const task = state.tasks.find((t) => t.id === id);
-						return task === undefined
-							? null
-							: { project: task.project, id: task.id };
+						// An explicit project resolves exactly: a warning naming
+						// z#X-1 must not fall to a hidden a/X-1 (send-back 10).
+						const c =
+							project === null
+								? lookupCard(cardIndex, id)
+								: lookupCardIn(cardIndex, id, project);
+						return c === null ? null : { project: c.project, id: c.id };
 					},
-					open(id) {
+					open(id, project) {
 						document.getElementById("inbox")?.hidePopover();
-						openTask(id);
+						openTask(id, project);
 					},
 				};
 	const critLine =
@@ -17787,7 +17688,7 @@ export function AppInboxPanel(p: {
 													className="alarm-link"
 													href={taskPath(t.project, t.id)}
 													onClick={(e) => {
-														navClick(e, () => openTask(t.id));
+														navClick(e, () => openTask(t.id, t.project));
 														// Hides the inbox panel; hiding a closed one is a no-op.
 														document.getElementById("inbox")?.hidePopover();
 													}}
@@ -17801,9 +17702,7 @@ export function AppInboxPanel(p: {
 													<span className="alarm-key" title={`Task ${t.id}`}>
 														{t.id}
 													</span>
-													<span className="alarm-title">
-														{t.sessionTitle ?? t.title}
-													</span>
+													<span className="alarm-title">{t.sessionTitle}</span>
 													{isNew(key) && <span className="new-tag">New</span>}
 												</a>
 											</li>
@@ -18194,7 +18093,7 @@ function AppInfoLines(p: {
 function AppKeptNotice(p: {
 	keptCount: StateResponse["keptWorktrees"];
 	keptKey: string | null;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	isNew: (key: string) => boolean;
 }) {
 	const { keptCount, keptKey, openTask, isNew } = p;
@@ -18210,7 +18109,7 @@ function AppKeptNotice(p: {
 					{keptCount.stale > 0
 						? `, ${keptCount.stale} past the quarantine threshold`
 						: ""}
-					{cards.map((id, i) => (
+					{cards.map(({ id, project }, i) => (
 						<Fragment key={id}>
 							{i === 0 && ": "}
 							{i > 0 && ", "}
@@ -18222,7 +18121,9 @@ function AppKeptNotice(p: {
 									// Navigation rows leave the panel: hiding first keeps the
 									// drawer unobstructed, like the alarm rows above.
 									document.getElementById("inbox")?.hidePopover();
-									openTask(id);
+									// The card's project rides the advisory (OTTR-1255):
+									// a retained z/X-1 must not fall to a hidden a/X-1 twin.
+									openTask(id, project);
 								}}
 							>
 								{id}
@@ -18255,7 +18156,7 @@ function AppAdvisoryLines(p: {
 	alatePendingKey: string | null;
 	signinAdvisories: DeadSignIn[];
 	nowMs: number;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	isNew: (key: string) => boolean;
 	cards?: CardLinkCtx | null;
 }) {
@@ -18501,12 +18402,13 @@ function AppMainContent(p: {
 	project: ProjectView | null;
 	projects: ProjectView[];
 	tasks: TaskCard[];
+	/** Every card of every project (OTTR-1255); threaded to the views that look ids up. */
+	cardIndex: CardIndex;
 	seenAnswers: Set<string>;
 	/** The server's done baseline; the unread rule reads it (OTTR-827). */
 	seenDoneSince: number;
-	deltas: Map<string, number>;
 	act: Act;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	navigate: (path: string) => void;
 	setComposeFor: (v: string | null) => void;
 	setDraftFor: (v: string | null) => void;
@@ -18526,9 +18428,9 @@ function AppMainContent(p: {
 		project,
 		projects,
 		tasks,
+		cardIndex,
 		seenAnswers,
 		seenDoneSince,
-		deltas,
 		act,
 		openTask,
 		navigate,
@@ -18546,6 +18448,7 @@ function AppMainContent(p: {
 		<SettingsPage
 			projects={projects}
 			tasks={tasks}
+			cardIndex={cardIndex}
 			maxTotal={state.maxTotal}
 			reviewCheck={state.reviewCheck}
 			workCheck={state.workCheck}
@@ -18559,11 +18462,12 @@ function AppMainContent(p: {
 			hosted={hosted}
 		/>
 	) : onSystem ? (
-		<SystemView state={state} openTask={openTask} />
+		<SystemView state={state} cardIndex={cardIndex} openTask={openTask} />
 	) : project === null ? (
 		<Overview
 			projects={projects}
 			tasks={tasks}
+			cardIndex={cardIndex}
 			compose={setComposeFor}
 			onAdd={() => setShowAdd(true)}
 			openTask={openTask}
@@ -18576,9 +18480,9 @@ function AppMainContent(p: {
 			project={project}
 			navigate={navigate}
 			tasks={tasks.filter((t) => t.project === project.name)}
-			foreignDeps={depIndexOf(projects, tasks, project)}
-			foreignHolds={depHoldContexts(projects, tasks, project)}
-			deltas={deltas}
+			cardIndex={cardIndex}
+			foreignDeps={depIndexOf(projects, cardIndex, project, tasks)}
+			foreignHolds={depHoldContexts(projects, cardIndex, tasks, project)}
 			open={openTask}
 			seenAnswers={seenAnswers}
 			seenDoneSince={seenDoneSince}
@@ -18612,13 +18516,14 @@ export function AppDrawer(p: {
 	state: StateResponse | null;
 	projects: ProjectView[];
 	tasks: TaskCard[];
-	deltas: Map<string, number>;
+	/** Every card of every project (OTTR-1255); the drawer's lineage rail reads it. */
+	cardIndex: CardIndex;
 	draining: boolean;
 	usedTotal: number;
 	seenAnswers: ReadonlySet<string>;
 	origin: React.RefObject<{ id: string; from: string } | null>;
 	act: Act;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	markRead: (t: TaskCard | null | undefined) => void;
 	markUnread: (t: TaskCard | null | undefined) => void;
 	closeDrawer: () => void;
@@ -18633,7 +18538,7 @@ export function AppDrawer(p: {
 		state,
 		projects,
 		tasks,
-		deltas,
+		cardIndex,
 		draining,
 		usedTotal,
 		seenAnswers,
@@ -18668,39 +18573,65 @@ export function AppDrawer(p: {
 	// lineage rail resolves (OTTR-787) — the drawer card's foreign parent, that
 	// parent's own source (a retro's source card), the drawer card's foreign
 	// children, and a foreign proposal whose retro is this card or a retro filed
-	// off it. The source card's drawer nests such a proposal under its retro, and
-	// the proposal's drawer links the retro and the source instead of a bare id.
+	// off it. All of it resolves from the card index (OTTR-1255): a settled
+	// foreign card keeps its place in the drawer's context after the Done
+	// window dropped it, so its "Waiting for" hold and status line survive.
 	const linkedParent =
 		drawerTask.followUpOf !== null && drawerTask.followUpOfProject !== null
-			? (tasks.find(
-					(t) =>
-						t.id === drawerTask.followUpOf &&
-						t.project === drawerTask.followUpOfProject,
-				) ?? null)
+			? lookupCardIn(
+					cardIndex,
+					drawerTask.followUpOf,
+					drawerTask.followUpOfProject,
+				)
 			: null;
-	const drawerTasks = tasks.filter(
-		(t) =>
-			t.project === drawerProject.name ||
-			(drawerTask.followUpOf !== null &&
+	const ownCards = tasks.filter((t) => t.project === drawerProject.name);
+	const foreignRows: TaskCard[] = [];
+	for (const bucket of cardIndex.values())
+		for (const c of bucket) {
+			if (c.project === drawerProject.name) continue;
+			const isForeignParent =
+				drawerTask.followUpOf !== null &&
 				drawerTask.followUpOfProject !== null &&
-				t.id === drawerTask.followUpOf &&
-				t.project === drawerTask.followUpOfProject) ||
-			(linkedParent !== null &&
+				c.id === drawerTask.followUpOf &&
+				c.project === drawerTask.followUpOfProject;
+			const parentSource =
+				linkedParent !== null &&
 				linkedParent.followUpOf !== null &&
-				t.id === linkedParent.followUpOf &&
-				t.project ===
-					(linkedParent.followUpOfProject ?? linkedParent.project)) ||
-			(t.followUpOf === drawerTask.id &&
-				t.followUpOfProject === drawerTask.project) ||
-			(t.followUpOfProject === drawerTask.project &&
-				tasks.some(
-					(x) =>
-						x.id === t.followUpOf &&
-						x.project === drawerProject.name &&
-						(x.id === drawerTask.id ||
-							(x.kind === "retro" && x.followUpOf === drawerTask.id)),
-				)),
-	);
+				c.id === linkedParent.followUpOf &&
+				c.project === (linkedParent.followUpOfProject ?? linkedParent.project);
+			const isForeignChild =
+				c.followUpOf === drawerTask.id &&
+				c.followUpOfProject === drawerTask.project;
+			// A foreign proposal under this card's retro: its followUpOf names a card
+			// of this project that is the drawer card or a retro filed off it.
+			const host =
+				c.followUpOfProject === drawerProject.name && c.followUpOf !== null
+					? lookupCardIn(cardIndex, c.followUpOf, drawerProject.name)
+					: null;
+			const isForeignProposal =
+				host !== null &&
+				(host.id === drawerTask.id ||
+					(host.kind === "retro" && host.followUpOf === drawerTask.id));
+			if (
+				isForeignParent ||
+				parentSource ||
+				isForeignChild ||
+				isForeignProposal
+			) {
+				// An open foreign card rides every frame, so its full row (with the
+				// PR facts, reason and hold stamps) wins; only a row the window
+				// dropped goes through the neutral adapter.
+				const full = tasks.find(
+					(t) => t.id === c.id && t.project === c.project,
+				);
+				foreignRows.push(full ?? refRow(c));
+			}
+		}
+	const drawerTasks = [...ownCards, ...foreignRows];
+	// Per-project deltas (send-back 21): computed over the drawer card's own
+	// project, so a foreign same-id done card cannot answer the chip. No hook:
+	// this runs after the early returns above.
+	const deltas = commitDeltas(projectGraph(cardIndex, drawerTask.project));
 	return (
 		<Drawer
 			key={drawerTask.id}
@@ -18710,9 +18641,10 @@ export function AppDrawer(p: {
 			projects={projects}
 			delta={deltas.get(drawerTask.id)}
 			tasks={drawerTasks}
-			// The tree's source stays unfiltered: a descendant the project-scoped
-			// context drops (a grandchild filed into another project) still renders.
+			// The loaded board stays unfiltered: a foreign lineage card or dependency
+			// keeps its wide row (the project-scoped context drops it).
 			boardTasks={tasks}
+			cardIndex={cardIndex}
 			onOpenTask={openTask}
 			draining={draining}
 			usedTotal={usedTotal}
@@ -18873,7 +18805,7 @@ function AppOverlays(p: {
 	state: StateResponse | null;
 	tasks: TaskCard[];
 	act: Act;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	onNotice: (message: string) => void;
 	setShowAdd: (v: boolean) => void;
 	setShowUpdates: (v: boolean) => void;
@@ -18990,6 +18922,13 @@ export function App() {
 	// Hoisted above markRead/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
 	const tasks = state?.tasks ?? [];
 	const projects = state?.projects ?? [];
+	// Every card of every project, bucketed by id (OTTR-1255). The frame's allCards
+	// array is fresh each push, so this rebuilds per frame (about 1 ms at 2100 cards);
+	// no memoized component takes the map as a prop.
+	const cardIndex = useMemo(
+		() => buildCardIndex(state?.allCards ?? []),
+		[state?.allCards],
+	);
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
 	const coveredUpdates = coveredUpdateIds(tasks);
 	/** OTTR-827: marks a card read — the plain id always, and (OTTR-566) the completion key
@@ -19068,10 +19007,12 @@ export function App() {
 	const openTask = useCallback(
 		(id: string, explicitProject?: string) => {
 			// Each open adds one history entry. The path names the task and its project.
+			// OTTR-1255: the card resolve reads the index, so the route names the card's
+			// real project even when the Done window dropped it.
 			const card =
 				explicitProject === undefined
-					? tasks.find((t) => t.id === id)
-					: tasks.find((t) => t.id === id && t.project === explicitProject);
+					? lookupCard(cardIndex, id)
+					: lookupCardIn(cardIndex, id, explicitProject);
 			const projectName =
 				card?.project ??
 				explicitProject ??
@@ -19084,13 +19025,21 @@ export function App() {
 			setView(projectName);
 			setSelectedProjectName(projectName);
 			setSelectedId(id);
-			if (card !== undefined && autoMarkOnOpen(card)) markRead(card);
-			if (card === undefined) {
+			// The read mark rides the windowed row: autoMarkOnOpen reads answered,
+			// research and steps, which the index does not carry. The drawer's open
+			// effect marks a fetched row instead (OTTR-1136).
+			const row = tasks.find(
+				(t) =>
+					t.id === id &&
+					(explicitProject === undefined || t.project === explicitProject),
+			);
+			if (row !== undefined && autoMarkOnOpen(row)) markRead(row);
+			if (card === null) {
 				setError(null);
 				setFallbackAttempt((attempt) => attempt + 1);
 			}
 		},
-		[tasks, projects, view, markRead],
+		[cardIndex, tasks, projects, view, markRead],
 	);
 	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
 	 * drawer selection stays untouched, like the hashchange listener did. */
@@ -19337,8 +19286,10 @@ export function App() {
 				// The frame carries the server's seen list, which now includes (or settled) every ack sent before it.
 				setAckLocal(new Set());
 				// Drafts die with their ask: a sent, cancelled or other-device answer drops them.
+				// The ask set reads every card (OTTR-1255): an asked card outside the Done
+				// window used to leave a stale draft alive.
 				pruneAskDrafts(
-					new Set(s.tasks.filter((t) => t.asked !== null).map((t) => t.id)),
+					new Set(s.allCards.filter((t) => t.asked !== null).map((t) => t.id)),
 				);
 				// Append-only union: a local mark between frames must survive the next server frame.
 				setSeenAnswers((prev) => new Set([...prev, ...s.seenAnswers]));
@@ -19571,7 +19522,18 @@ export function App() {
 		[pendingCreates],
 	);
 
+	// OTTR-1255: the selection's existence and project resolve from the index, so
+	// routing works for a selected card outside the Done window. The drawer's wide
+	// row still needs the windowed card or the fallback fetch (the OTTR-965 fields
+	// the index lacks), so that pipeline keeps its windowed find.
 	const selectedStateTask =
+		selectedId === null
+			? undefined
+			: ((selectedProjectName === null
+					? lookupCard(cardIndex, selectedId)
+					: lookupCardIn(cardIndex, selectedId, selectedProjectName)) ??
+				undefined);
+	const selectedRow =
 		selectedId === null
 			? undefined
 			: tasks.find(
@@ -19596,21 +19558,21 @@ export function App() {
 		latestTaskSelection.current = {
 			id: selectedId,
 			project: lookupProject,
-			task: selectedStateTask,
+			task: selectedRow,
 			revision: previousRevision + 1,
 		};
 		if (selectedId === null) {
 			setFallbackTask(null);
 			setFallbackTaskSource(null);
 			setFallbackStatus("idle");
-		} else if (selectedStateTask !== undefined) {
-			setFallbackTask(selectedStateTask);
+		} else if (selectedRow !== undefined) {
+			setFallbackTask(selectedRow);
 			setFallbackTaskSource("state");
 		}
-	}, [selectedId, lookupProject, selectedStateTask]);
+	}, [selectedId, lookupProject, selectedRow]);
 	const selectedProjectForView =
 		selectedStateTask?.project ?? selectedProjectName;
-	const hasSelectedStateTask = selectedStateTask !== undefined;
+	const hasSelectedStateTask = selectedRow !== undefined;
 	const stateLoaded = state !== null;
 	const fallbackMatches =
 		fallbackTask !== null &&
@@ -19820,7 +19782,6 @@ export function App() {
 		drawerHasFallback && fallbackTask !== null
 			? [...tasks, fallbackTask]
 			: tasks;
-	const deltas = commitDeltas(tasks);
 	// Live agent counts for the drawer's Workflow modal: the scheduler's own slot count
 	// (OTTR-1143) against the global cap; SystemBar shows the same number in the app bar.
 	const usedTotal =
@@ -19833,7 +19794,7 @@ export function App() {
 		needsShown,
 		activity: prActivity,
 		posted: prPosted,
-	} = bellAlarms(tasks, needs, projects);
+	} = bellAlarms(cardIndex, needs, projects);
 	const prAlarms = prActivity.length + prPosted.length;
 	const alarmLine = alarmLabel(needsShown.length, askCards.length, prAlarms);
 	const alarmCount = needsShown.length + askCards.length + prAlarms;
@@ -20055,7 +20016,7 @@ export function App() {
 											`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
 											{},
 										);
-										openTask(card.id);
+										openTask(card.id, checkProject);
 									})
 								}
 							>
@@ -20099,6 +20060,7 @@ export function App() {
 						provisionErrKey={provisionErrKey}
 						state={state}
 						warnings={warnings}
+						cardIndex={cardIndex}
 						orphanList={orphanList}
 						orphansError={orphansError}
 						orphansErrorKey={orphansErrorKey}
@@ -20241,9 +20203,9 @@ export function App() {
 							project={project}
 							projects={projects}
 							tasks={tasks}
+							cardIndex={cardIndex}
 							seenAnswers={seenAnswers}
 							seenDoneSince={seenDoneSince}
-							deltas={deltas}
 							act={act}
 							openTask={openTask}
 							navigate={navigate}
@@ -20294,7 +20256,7 @@ export function App() {
 					state={state}
 					projects={projects}
 					tasks={drawerContextTasks}
-					deltas={deltas}
+					cardIndex={cardIndex}
 					draining={draining}
 					usedTotal={usedTotal}
 					seenAnswers={seenAnswers}

@@ -32,6 +32,8 @@ import {
 	PR_REVIEW_WAITING,
 	UPDATE_HOLD_REASON,
 } from "../types.ts";
+// Static: cardIndex.ts and status.ts touch no browser global at load.
+import { buildCardIndex } from "./cardIndex.ts";
 import type { Act } from "./kit.tsx";
 // Static: models.ts touches no browser global at load, so hoisting is safe.
 import { resetCatalogCache } from "./models.ts";
@@ -39,7 +41,7 @@ import { resetCatalogCache } from "./models.ts";
 import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 import { ServiceQuotas } from "./serviceQuotas.tsx";
 // Static: status.ts touches no browser global at load.
-import { bellAlarms, statusLine } from "./status.ts";
+import { bellAlarms, projectGraph, statusLine } from "./status.ts";
 import {
 	installBrowserGlobals,
 	mount,
@@ -82,7 +84,7 @@ const mountProjectBoard = async (project: ProjectView, tasks: TaskCard[]) =>
 		<ProjectBoard
 			project={project}
 			tasks={tasks}
-			deltas={new Map()}
+			cardIndex={buildCardIndex(tasks)}
 			open={() => {}}
 			seenAnswers={new Set()}
 			seenDoneSince={0}
@@ -110,12 +112,16 @@ const typeIntoFor =
 		setter.call(el, value);
 	};
 
-// LaneCol props every lane describe passes unchanged.
+// LaneCol props every lane describe passes unchanged. The index stays empty:
+// only the review-findings test below overrides it with its own cards.
+const laneColIndex = buildCardIndex([]);
 const laneColBase = {
+	cardIndex: laneColIndex,
+	graph: projectGraph(laneColIndex, "proj"),
 	projectTasks: [] as TaskCard[],
+	deltas: new Map<string, number>(),
 	hasRules: true,
 	github: null,
-	deltas: new Map<string, number>(),
 	open: () => {},
 	unread: () => false,
 	onReorder: async () => true,
@@ -871,6 +877,7 @@ const drawerBaseCore = {
 	draining: false,
 	usedTotal: 0,
 	maxTotal: null,
+	wideTasks: [] as TaskCard[],
 };
 const drawerBase = {
 	task: null as never,
@@ -878,6 +885,9 @@ const drawerBase = {
 	...drawerBaseCore,
 	read: true,
 	tasks: [],
+	// The lookups miss on an empty index; describes that need a resolved row
+	// spread a real one from their fixture cards.
+	cardIndex: buildCardIndex([]),
 	onOpenTask: () => {},
 };
 
@@ -913,6 +923,8 @@ const listBaseReadonly = {
 	project: listProject,
 	...drawerBaseCore,
 	read: false,
+	// Lineage describes below spread a real index from their fixture cards.
+	cardIndex: buildCardIndex([]),
 	onOpenTask: () => {},
 };
 const listBaseRead = {
@@ -920,6 +932,7 @@ const listBaseRead = {
 	...drawerBaseCore,
 	read: true,
 	tasks: [],
+	cardIndex: buildCardIndex([]),
 	onOpenTask: () => {},
 };
 
@@ -1220,6 +1233,8 @@ describe("LaneCol backlog divider", () => {
 				stage="in_progress"
 				tasks={[review]}
 				projectTasks={[review, done, open]}
+				cardIndex={buildCardIndex([review, done, open])}
+				graph={projectGraph(buildCardIndex([review, done, open]), "proj")}
 			/>,
 		).replaceAll("<!-- -->", "");
 		// The count rides the ticking meta line in place of the bare "running".
@@ -1246,6 +1261,7 @@ describe("LaneCol backlog divider", () => {
 				stage="todo"
 				tasks={[first, second]}
 				projectTasks={[first, second]}
+				graph={projectGraph(buildCardIndex([first, second]), "proj")}
 			/>,
 		).replaceAll("<!-- -->", "");
 		// Earlier queuedAt runs first, so q1 reads #1.
@@ -1266,7 +1282,13 @@ describe("LaneCol backlog divider", () => {
 			holdUntil: Date.now() + 13 * 60_000 + 30_000,
 		});
 		const html = renderToStaticMarkup(
-			<LaneCol {...base} stage="todo" tasks={[held]} projectTasks={[held]} />,
+			<LaneCol
+				{...base}
+				stage="todo"
+				tasks={[held]}
+				projectTasks={[held]}
+				graph={projectGraph(buildCardIndex([held]), "proj")}
+			/>,
 		).replaceAll("<!-- -->", "");
 		expect(html).toContain("held · openai-codex limit · 13m left");
 		// The hover title and the sr line carry the full reason.
@@ -1290,7 +1312,13 @@ describe("LaneCol backlog divider", () => {
 			holdUntil: Date.now() + 13 * 60_000 + 30_000,
 		});
 		const html = renderToStaticMarkup(
-			<LaneCol {...base} stage="todo" tasks={[held]} projectTasks={[held]} />,
+			<LaneCol
+				{...base}
+				stage="todo"
+				tasks={[held]}
+				projectTasks={[held]}
+				graph={projectGraph(buildCardIndex([held]), "proj")}
+			/>,
 		).replaceAll("<!-- -->", "");
 		expect(html).toContain("held · 13m left");
 		expect(html).not.toContain("limit · 13m left");
@@ -3183,6 +3211,7 @@ describe("settings TOC", () => {
 			<SettingsPage
 				projects={[]}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 				maxTotal={null}
 				reviewCheck={false}
 				workCheck={false}
@@ -3331,20 +3360,16 @@ describe("Drawer parent chip", () => {
 		"requestAnimationFrame",
 		"cancelAnimationFrame",
 	]);
-	// The production onClick React rendered onto the node; happy-dom's dispatched
-	// events never reach React's plugin (same helper the prompt editor tests use).
-	const json = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "content-type": "application/json" },
-		});
 	/** Renders the drawer with `fetch` stubbed: every URL 404s except the ones
 	 * `serve` answers. The two acts let the mount fetches land, like the prompt
-	 * editor tests; `fetches` records every URL the drawer asked for. */
+	 * editor tests; `fetches` records every URL the drawer asked for. `all` is
+	 * the allCards shape the index is built from (OTTR-1255); the windowed
+	 * `tasks` stay the default. */
 	const mountDrawer = async (
 		task: TaskCard,
 		tasks: TaskCard[],
 		serve: (url: string) => Response | Promise<Response>,
+		all: TaskCard[] = tasks,
 	): Promise<{
 		container: HTMLDivElement;
 		fetches: string[];
@@ -3356,7 +3381,12 @@ describe("Drawer parent chip", () => {
 			return serve(url);
 		});
 		const { container, unmount } = await mount(
-			<Drawer {...base} task={task} tasks={tasks} />,
+			<Drawer
+				{...base}
+				task={task}
+				tasks={tasks}
+				cardIndex={buildCardIndex(all)}
+			/>,
 		);
 		await act(async () => {});
 		return {
@@ -3369,7 +3399,7 @@ describe("Drawer parent chip", () => {
 		};
 	};
 
-	test("a parent outside the Done window loads: loading row first, then the card as a link", async () => {
+	test("a parent outside the Done window renders its link at once, with no fetch", async () => {
 		const parent = cardFixture({
 			id: "P-9",
 			stage: "done",
@@ -3382,35 +3412,25 @@ describe("Drawer parent chip", () => {
 			state: "idle",
 			followUpOf: "P-9",
 		});
-		// Held release: the fetch stays pending until the test releases it, so the
-		// loading row is observable.
-		const { promise: pending, resolve: release } =
-			Promise.withResolvers<Response>();
-		const { container, fetches, close } = await mountDrawer(child, [], (url) =>
-			url.endsWith("/tasks/P-9")
-				? pending
-				: new Response("{}", { status: 404 }),
+		// The parent is done and out of the window, but every card rides allCards,
+		// so the lineage rail resolves it from the index (OTTR-1255).
+		const { container, fetches, close } = await mountDrawer(
+			child,
+			[],
+			() => new Response("{}", { status: 404 }),
+			[parent],
 		);
 		try {
-			// The fetch went to the parent's tasks route, the same one the drawer's
-			// detail read uses.
-			expect(fetches).toContain("/api/projects/proj/tasks/P-9");
-			// Before the fetch lands: the id on the same three-column row shape, so
-			// nothing shifts when the card arrives. Never "Not on the board".
-			expect(container.querySelector(".lineage-gone") !== null).toBe(true);
-			expect(container.textContent).toContain("P-9");
-			expect(container.textContent).toContain("Loading");
-			expect(container.textContent).not.toContain("Not on the board");
-			release(json({ ...parent, turns: [] }));
-			await act(async () => {});
+			// No lineage fetch ran: the index answered the lookup, never the tasks route.
+			expect(fetches.some((u) => u.endsWith("/tasks/P-9"))).toBe(false);
 			const link = container.querySelector<HTMLAnchorElement>(
 				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-9"]',
 			);
 			expect(link !== null).toBe(true);
-			// Real id, title and live stage; the link's text is its accessible name.
+			// Real id and title; the link's text is its accessible name.
 			expect(link?.textContent).toContain("P-9");
 			expect(link?.textContent).toContain("Parent work");
-			expect(link?.textContent).toContain("done");
+			expect(link?.textContent).toContain("parent");
 			expect(container.textContent).not.toContain("Not on the board");
 			expect(container.querySelector(".lineage-gone")).toBeNull();
 		} finally {
@@ -3418,111 +3438,33 @@ describe("Drawer parent chip", () => {
 		}
 	});
 
-	test("a parent whose fetch fails offers Retry, and Retry loads the card", async () => {
-		const parent = cardFixture({
-			id: "P-5",
-			stage: "done",
-			state: "idle",
-			sessionTitle: "Late parent",
-		});
+	test("a parent id absent from every project renders the not-found row, with no fetch", async () => {
 		const child = childCard({
 			id: "C-1",
 			stage: "done",
 			state: "idle",
-			followUpOf: "P-5",
+			followUpOf: "P-NULL",
 		});
-		let fail = true;
-		const { container, close } = await mountDrawer(child, [], (url) =>
-			url.endsWith("/tasks/P-5")
-				? fail
-					? new Response("{}", { status: 500 })
-					: json({ ...parent, turns: [] })
-				: new Response("{}", { status: 404 }),
+		const { container, fetches, close } = await mountDrawer(
+			child,
+			[],
+			() => new Response("{}", { status: 404 }),
 		);
 		try {
-			// Only a 404 proves the card does not exist; a server error keeps the id
-			// visible with an inline retry.
-			expect(container.textContent).toContain("Could not load card");
-			expect(container.textContent).not.toContain("Card not found");
-			const retry = container.querySelector<HTMLButtonElement>(
-				".lineage-gone button",
-			);
-			expect(retry?.textContent).toBe("Retry");
-			fail = false;
-			await act(async () => {
-				onClickOf(retry as unknown as Element)({});
-			});
-			await act(async () => {});
-			const link = container.querySelector<HTMLAnchorElement>(
-				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-5"]',
-			);
-			expect(link !== null).toBe(true);
-			expect(link?.textContent).toContain("Late parent");
-			expect(container.querySelector(".lineage-gone")).toBeNull();
+			// A miss reads as not-found; no fetch tries to find the id anywhere.
+			expect(fetches.some((u) => u.endsWith("/tasks/P-NULL"))).toBe(false);
+			expect(container.querySelector(".lineage-gone") !== null).toBe(true);
+			expect(container.textContent).toContain("P-NULL");
+			expect(container.textContent).toContain("Card not found");
+			expect(container.textContent).not.toContain("Loading");
+			expect(container.querySelector(".lineage-gone button")).toBeNull();
+			expect(container.textContent).not.toContain("Not on the board");
 		} finally {
 			await close();
 		}
 	});
 
-	test("a ref whose entry the frame reset fetches again instead of sticking on loading", async () => {
-		const parent = cardFixture({
-			id: "P-9",
-			stage: "done",
-			state: "idle",
-			sessionTitle: "Parent work",
-		});
-		const child = childCard({
-			id: "C-1",
-			stage: "done",
-			state: "idle",
-			followUpOf: "P-9",
-		});
-		const fetches: string[] = [];
-		const { restore } = stubFetch(async (url) => {
-			fetches.push(url);
-			return url.endsWith("/tasks/P-9")
-				? json({ ...parent, turns: [] })
-				: new Response("{}", { status: 404 });
-		});
-		const { container, root, unmount } = await mount(
-			<Drawer {...base} task={child} tasks={[]} />,
-		);
-		const link = (): Element | null =>
-			container.querySelector(
-				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-9"]',
-			);
-		const parentFetchCount = (): number =>
-			fetches.filter((f) => f.endsWith("/tasks/P-9")).length;
-		try {
-			// Mount with the parent outside the frame: the row fetches and links.
-			await act(async () => {});
-			await act(async () => {});
-			expect(link() !== null).toBe(true);
-			const first = parentFetchCount();
-			expect(first).toBeGreaterThanOrEqual(1);
-			// The parent rides the frame: the row renders from state and the want
-			// empties, dropping the fetch entries.
-			await act(async () => {
-				root.render(<Drawer {...base} task={child} tasks={[parent]} />);
-			});
-			await act(async () => {});
-			expect(parentFetchCount()).toBe(first);
-			// The parent leaves the frame again: the row must fetch again, never
-			// sit on a loading row with no entry behind it.
-			await act(async () => {
-				root.render(<Drawer {...base} task={child} tasks={[]} />);
-			});
-			await act(async () => {});
-			await act(async () => {});
-			expect(link() !== null).toBe(true);
-			expect(parentFetchCount()).toBe(first + 1);
-		} finally {
-			await unmount();
-			restore();
-		}
-	});
-
-	test("a cross-project parent outside the window fetches from its own project", async () => {
+	test("a cross-project parent outside the window resolves from the index, with no fetch", async () => {
 		const parent = cardFixture({
 			id: "P-2",
 			project: "other",
@@ -3537,14 +3479,17 @@ describe("Drawer parent chip", () => {
 			followUpOf: "P-2",
 			followUpOfProject: "other",
 		});
-		const { container, fetches, close } = await mountDrawer(child, [], (url) =>
-			url.endsWith("/projects/other/tasks/P-2")
-				? json({ ...parent, turns: [] })
-				: new Response("{}", { status: 404 }),
+		const { container, fetches, close } = await mountDrawer(
+			child,
+			[],
+			() => new Response("{}", { status: 404 }),
+			[parent],
 		);
 		try {
-			// The route uses the linked card's project, and the link href follows it.
-			expect(fetches).toContain("/api/projects/other/tasks/P-2");
+			// No fetch to the linked card's project: the index answered already.
+			expect(fetches.some((u) => u.endsWith("/projects/other/tasks/P-2"))).toBe(
+				false,
+			);
 			const link = container.querySelector<HTMLAnchorElement>(
 				'.lineage-rail a.lineage-row[href="/projects/other/tasks/P-2"]',
 			);
@@ -3558,7 +3503,7 @@ describe("Drawer parent chip", () => {
 		}
 	});
 
-	test("a cross-project child outside every window loads from the detail's refs", async () => {
+	test("a cross-project child outside every window renders from the index, with no fetch", async () => {
 		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
 		const farKid = cardFixture({
 			id: "AG-1",
@@ -3570,39 +3515,18 @@ describe("Drawer parent chip", () => {
 			followUpOfProject: "proj",
 			createdAt: 500,
 		});
-		// Held release: the child fetch stays pending until the test releases it,
-		// so the loading row is observable.
-		const { promise: pending, resolve: release } =
-			Promise.withResolvers<Response>();
-		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
-			url.endsWith("/tasks/S-1")
-				? json({
-						...self,
-						turns: [],
-						prompt: "work",
-						summary: null,
-						details: null,
-						report: null,
-						diffFiles: null,
-						workCheckLog: [],
-						workCheckReport: null,
-						gate: null,
-						children: [{ project: "other", id: "AG-1", createdAt: 500 }],
-					})
-				: url.endsWith("/projects/other/tasks/AG-1")
-					? pending
-					: new Response("{}", { status: 404 }),
+		const { container, fetches, close } = await mountDrawer(
+			self,
+			[],
+			() => new Response("{}", { status: 404 }),
+			[farKid],
 		);
 		try {
-			await act(async () => {});
-			// The ref names the child's own board, and the fetch follows it.
-			expect(fetches).toContain("/api/projects/other/tasks/AG-1");
-			// Before the fetch lands: the id on the shared row shape. Never silence.
-			expect(container.querySelector(".lineage-gone") !== null).toBe(true);
-			expect(container.textContent).toContain("AG-1");
-			expect(container.textContent).toContain("Loading");
-			release(json({ ...farKid, turns: [] }));
-			await act(async () => {});
+			// The index carries the child filed into another board: no lineage fetch
+			// runs, and the row links at once (OTTR-1198 through the index).
+			expect(
+				fetches.some((u) => u.endsWith("/projects/other/tasks/AG-1")),
+			).toBe(false);
 			const link = container.querySelector<HTMLAnchorElement>(
 				'.lineage-rail a.lineage-row[href="/projects/other/tasks/AG-1"]',
 			);
@@ -3616,7 +3540,7 @@ describe("Drawer parent chip", () => {
 		}
 	});
 
-	test("a done child the board's Done window dropped loads from the detail's ref", async () => {
+	test("a done or cancelled child the Done window dropped renders from the index", async () => {
 		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
 		const oldKid = cardFixture({
 			id: "K-9",
@@ -3626,81 +3550,39 @@ describe("Drawer parent chip", () => {
 			followUpOf: "S-1",
 			createdAt: 500,
 		});
-		// No state rows: the Done window dropped the child, only the detail's
-		// ref still names it.
-		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
-			url.endsWith("/tasks/S-1")
-				? json({
-						...self,
-						turns: [],
-						prompt: "work",
-						summary: null,
-						details: null,
-						report: null,
-						diffFiles: null,
-						workCheckLog: [],
-						workCheckReport: null,
-						gate: null,
-						children: [{ project: "proj", id: "K-9", createdAt: 500 }],
-					})
-				: url.endsWith("/tasks/K-9")
-					? json({ ...oldKid, turns: [] })
-					: new Response("{}", { status: 404 }),
+		const cancelledKid = cardFixture({
+			id: "K-10",
+			stage: "todo",
+			state: "idle",
+			cancelledAt: 700,
+			sessionTitle: "Cancelled child",
+			followUpOf: "S-1",
+			createdAt: 600,
+		});
+		// No state rows: the Done window dropped both children; only the index names them.
+		const { container, fetches, close } = await mountDrawer(
+			self,
+			[],
+			() => new Response("{}", { status: 404 }),
+			[oldKid, cancelledKid],
 		);
 		try {
-			await act(async () => {});
-			// The ref names this board: the fetch follows the child's own project,
-			// and the settled child renders as a real link, never as silence.
-			expect(fetches).toContain("/api/projects/proj/tasks/K-9");
-			const link = container.querySelector<HTMLAnchorElement>(
-				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/K-9"]',
-			);
-			expect(link !== null).toBe(true);
-			expect(link?.textContent).toContain("K-9");
-			expect(link?.textContent).toContain("Old child");
-			expect(link?.textContent).toContain("done");
-			expect(container.querySelector(".lineage-gone")).toBeNull();
+			for (const [id, title] of [
+				["K-9", "Old child"],
+				["K-10", "Cancelled child"],
+			]) {
+				const link = container.querySelector<HTMLAnchorElement>(
+					`.lineage-rail a.lineage-row[href="/projects/proj/tasks/${id}"]`,
+				);
+				expect(link?.textContent).toContain(title);
+				expect(fetches.some((u) => u.endsWith(`/tasks/${id}`))).toBe(false);
+			}
 		} finally {
 			await close();
 		}
 	});
 
-	test("a child ref whose fetch 404s renders Card not found with its id", async () => {
-		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
-		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
-			url.endsWith("/tasks/S-1")
-				? json({
-						...self,
-						turns: [],
-						prompt: "work",
-						summary: null,
-						details: null,
-						report: null,
-						diffFiles: null,
-						workCheckLog: [],
-						workCheckReport: null,
-						gate: null,
-						children: [{ project: "proj", id: "GONE-1", createdAt: 600 }],
-					})
-				: new Response("{}", { status: 404 }),
-		);
-		try {
-			await act(async () => {});
-			// The ref fetch ran, and the id stays visible on the row: a card that
-			// cannot be found never leaves the rail by silence.
-			expect(fetches).toContain("/api/projects/proj/tasks/GONE-1");
-			expect(container.textContent).toContain("GONE-1");
-			expect(container.textContent).toContain("Card not found");
-			const gone = container.querySelector(".lineage-gone");
-			expect(gone !== null).toBe(true);
-			// A 404 is the proof of absence: it offers no Retry button.
-			expect(gone?.querySelector("button")).toBeNull();
-		} finally {
-			await close();
-		}
-	});
-
-	test("state children and fetched refs share one branch, oldest first", async () => {
+	test("window children and index-only children share one branch, oldest first", async () => {
 		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
 		const stateKid = cardFixture({
 			id: "K-1",
@@ -3727,32 +3609,15 @@ describe("Drawer parent chip", () => {
 			followUpOfProject: "proj",
 			createdAt: 2000,
 		});
-		const { container, close } = await mountDrawer(self, [stateKid], (url) => {
-			if (url.endsWith("/tasks/S-1"))
-				return json({
-					...self,
-					turns: [],
-					prompt: "work",
-					summary: null,
-					details: null,
-					report: null,
-					diffFiles: null,
-					workCheckLog: [],
-					workCheckReport: null,
-					gate: null,
-					children: [
-						{ project: "other", id: "AG-0", createdAt: 500 },
-						{ project: "other", id: "AG-2", createdAt: 2000 },
-					],
-				});
-			if (url.endsWith("/tasks/AG-0")) return json({ ...oldRef, turns: [] });
-			if (url.endsWith("/tasks/AG-2")) return json({ ...newRef, turns: [] });
-			return new Response("{}", { status: 404 });
-		});
+		const { container, close } = await mountDrawer(
+			self,
+			[stateKid],
+			() => new Response("{}", { status: 404 }),
+			[stateKid, oldRef, newRef],
+		);
 		try {
-			await act(async () => {});
-			// One Follow-ups branch, filed order across the state/frame border:
-			// the older fetched ref above the state row, the younger below it.
+			// One Follow-ups branch in filing order across the window border: the
+			// older index-only card above the window row, the younger below it.
 			const at = (id: string): number =>
 				container.textContent?.indexOf(id) ?? -1;
 			expect(at("AG-0")).toBeGreaterThanOrEqual(0);
@@ -3777,7 +3642,12 @@ describe("Drawer parent chip", () => {
 			followUpOf: "P-1",
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={child} tasks={[parent]} />,
+			<Drawer
+				{...base}
+				task={child}
+				tasks={[parent]}
+				cardIndex={buildCardIndex([parent])}
+			/>,
 		);
 		expect(html).toContain('class="lineage-row"');
 		expect(html).toContain("parent");
@@ -3789,11 +3659,13 @@ describe("Drawer parent chip", () => {
 		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
 		const kid = (id: string, createdAt: number) =>
 			cardFixture({ id, followUpOf: "S-1", createdAt });
+		const kids = [kid("K-3", 3000), kid("K-1", 1000), kid("K-2", 2000)];
 		const html = renderToStaticMarkup(
 			<Drawer
 				{...base}
 				task={self}
-				tasks={[kid("K-3", 3000), kid("K-1", 1000), kid("K-2", 2000)]}
+				tasks={kids}
+				cardIndex={buildCardIndex(kids)}
 			/>,
 		);
 		const at = (id: string) => html.indexOf(`>${id}<`);
@@ -3818,9 +3690,9 @@ describe("Drawer parent chip", () => {
 		const PROPOSALS = 'aria-label="Proposals"';
 		const SUBTASKS = 'aria-label="Sub-tasks"';
 
-		test("a retro source outside the Done window loads as a link", async () => {
+		test("a retro source outside the Done window renders its link from the index", async () => {
 			// The retro parent sits in the state; its source is older than the window,
-			// so the drawer fetches it from the source's tasks route.
+			// but every card rides allCards, so the rail resolves it without a fetch.
 			const source = cardFixture({
 				id: "SRC-1",
 				stage: "done",
@@ -3844,13 +3716,12 @@ describe("Drawer parent chip", () => {
 			const { container, fetches, close } = await mountDrawer(
 				self,
 				[retro],
-				(url) =>
-					url.endsWith("/tasks/SRC-1")
-						? json({ ...source, turns: [] })
-						: new Response("{}", { status: 404 }),
+				() => new Response("{}", { status: 404 }),
+				[retro, source],
 			);
 			try {
-				expect(fetches).toContain("/api/projects/proj/tasks/SRC-1");
+				// No fetch went to the source's tasks route; the index resolved it.
+				expect(fetches.some((u) => u.endsWith("/tasks/SRC-1"))).toBe(false);
 				const link = container.querySelector<HTMLAnchorElement>(
 					'.lineage-rail a.lineage-row[href="/projects/proj/tasks/SRC-1"]',
 				);
@@ -3865,17 +3736,19 @@ describe("Drawer parent chip", () => {
 		});
 
 		test("a retro is a follow-up row and its proposals nest under it, oldest first", () => {
+			const cards = [
+				card("P-2", "R-1", 4000),
+				card("R-1", "S-1", 2000, { kind: "retro" }),
+				card("F-1", "S-1", 1000),
+				// An accepted proposal no longer carries the proposal reason.
+				card("P-1", "R-1", 3000, { needsReason: null }),
+			];
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={self}
-					tasks={[
-						card("P-2", "R-1", 4000),
-						card("R-1", "S-1", 2000, { kind: "retro" }),
-						card("F-1", "S-1", 1000),
-						// An accepted proposal no longer carries the proposal reason.
-						card("P-1", "R-1", 3000, { needsReason: null }),
-					]}
+					tasks={cards}
+					cardIndex={buildCardIndex(cards)}
 				/>,
 			);
 			expect(at(html, "F-1")).toBeGreaterThan(at(html, "S-1"));
@@ -3892,16 +3765,18 @@ describe("Drawer parent chip", () => {
 		});
 
 		test("each retro lists only its own proposals, retros oldest first", () => {
+			const cards = [
+				card("R-2", "S-1", 3000, { kind: "retro" }),
+				card("Q-2", "R-2", 4000),
+				card("R-1", "S-1", 1000, { kind: "retro" }),
+				card("Q-1", "R-1", 2000),
+			];
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={self}
-					tasks={[
-						card("R-2", "S-1", 3000, { kind: "retro" }),
-						card("Q-2", "R-2", 4000),
-						card("R-1", "S-1", 1000, { kind: "retro" }),
-						card("Q-1", "R-1", 2000),
-					]}
+					tasks={cards}
+					cardIndex={buildCardIndex(cards)}
 				/>,
 			);
 			const parts = html.split(PROPOSALS);
@@ -3917,14 +3792,16 @@ describe("Drawer parent chip", () => {
 		});
 
 		test("a cancelled retro and a declined proposal keep their cancelled state", () => {
+			const cards = [
+				card("R-1", "S-1", 1000, { kind: "retro", cancelledAt: 1500 }),
+				card("P-1", "R-1", 2000, { cancelledAt: 2500 }),
+			];
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={self}
-					tasks={[
-						card("R-1", "S-1", 1000, { kind: "retro", cancelledAt: 1500 }),
-						card("P-1", "R-1", 2000, { cancelledAt: 2500 }),
-					]}
+					tasks={cards}
+					cardIndex={buildCardIndex(cards)}
 				/>,
 			);
 			expect(html.match(/>cancelled</g)).toHaveLength(2);
@@ -3932,11 +3809,13 @@ describe("Drawer parent chip", () => {
 		});
 
 		test("a follow-up's own follow-ups nest one level deeper", () => {
+			const cards = [card("F-1", "S-1", 1000), card("G-1", "F-1", 2000)];
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={self}
-					tasks={[card("F-1", "S-1", 1000), card("G-1", "F-1", 2000)]}
+					tasks={cards}
+					cardIndex={buildCardIndex(cards)}
 				/>,
 			);
 			expect(html).toContain(">F-1<");
@@ -3951,14 +3830,16 @@ describe("Drawer parent chip", () => {
 
 		test("a proposal's rail reads retro source, retro, this card", () => {
 			const proposal = childCard({ id: "P-1", followUpOf: "R-1" });
+			const cards = [
+				card("S-1", "V-1", 500, { sessionTitle: "Source work" }),
+				card("R-1", "S-1", 1000, { kind: "retro" }),
+			];
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={proposal}
-					tasks={[
-						card("S-1", "V-1", 500, { sessionTitle: "Source work" }),
-						card("R-1", "S-1", 1000, { kind: "retro" }),
-					]}
+					tasks={cards}
+					cardIndex={buildCardIndex(cards)}
 				/>,
 			);
 			expect(at(html, "S-1")).toBeGreaterThan(-1);
@@ -3975,19 +3856,22 @@ describe("Drawer parent chip", () => {
 			expect(html).not.toContain(">V-1<");
 		});
 
-		test("a retro source the window dropped holds its id until its fetch lands", () => {
+		test("a retro source id absent from every project renders the not-found row", () => {
 			const proposal = childCard({ id: "P-1", followUpOf: "R-1" });
+			const retro = card("R-1", "S-9", 1000, { kind: "retro" });
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={proposal}
-					tasks={[card("R-1", "S-9", 1000, { kind: "retro" })]}
+					tasks={[retro]}
+					cardIndex={buildCardIndex([retro])}
 				/>,
 			);
-			// Static render runs no fetch: the loading row keeps the source's id and
-			// tag on the same row shape, with no link yet and no "Not on the board".
+			// No project lists S-9, so the gone row keeps the id and tag on the
+			// same row shape — no fetch runs behind it, and no link appears.
 			expect(html).toContain("lineage-gone");
-			expect(html).toContain("Loading");
+			expect(html).toContain(">S-9<");
+			expect(html).toContain("Card not found");
 			expect(html).not.toContain("/tasks/S-9");
 			const gone = html.slice(html.indexOf("lineage-gone"), at(html, "R-1"));
 			expect(gone).toContain(">retro source<");
@@ -3996,11 +3880,13 @@ describe("Drawer parent chip", () => {
 
 		test("a parent that is no retro gets no grandparent row", () => {
 			const child = childCard({ id: "C-1", followUpOf: "P-1" });
+			const cards = [card("P-1", "G-1", 1000), card("G-1", "", 500)];
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
 					task={child}
-					tasks={[card("P-1", "G-1", 1000), card("G-1", "", 500)]}
+					tasks={cards}
+					cardIndex={buildCardIndex(cards)}
 				/>,
 			);
 			expect(html).toContain(">P-1<");
@@ -4043,6 +3929,20 @@ describe("Drawer parent chip", () => {
 						stage: "in_progress",
 					}),
 				]}
+				cardIndex={buildCardIndex([
+					cardFixture({
+						id: "K-1",
+						followUpOf: "S-1",
+						createdAt: 1000,
+						stage: "done",
+					}),
+					cardFixture({
+						id: "G-1",
+						followUpOf: "K-1",
+						createdAt: 2000,
+						stage: "in_progress",
+					}),
+				])}
 			/>,
 		);
 		// The grandchild renders one indent under the done child.
@@ -4086,6 +3986,20 @@ describe("Drawer parent chip", () => {
 						stage: "in_progress",
 					}),
 				]}
+				cardIndex={buildCardIndex([
+					cardFixture({
+						id: "F-1",
+						followUpOf: "R-1",
+						createdAt: 1000,
+						stage: "done",
+					}),
+					cardFixture({
+						id: "G-1",
+						followUpOf: "F-1",
+						createdAt: 2000,
+						stage: "in_progress",
+					}),
+				])}
 			/>,
 		);
 		const waiting = html.slice(html.indexOf('id="drawer-waiting"'));
@@ -4106,6 +4020,14 @@ describe("Drawer parent chip", () => {
 					cardFixture({ id: "L-5", followUpOf: "L-4", createdAt: 5000 }),
 					cardFixture({ id: "L-6", followUpOf: "L-5", createdAt: 6000 }),
 				]}
+				cardIndex={buildCardIndex([
+					cardFixture({ id: "L-1", followUpOf: "S-1", createdAt: 1000 }),
+					cardFixture({ id: "L-2", followUpOf: "L-1", createdAt: 2000 }),
+					cardFixture({ id: "L-3", followUpOf: "L-2", createdAt: 3000 }),
+					cardFixture({ id: "L-4", followUpOf: "L-3", createdAt: 4000 }),
+					cardFixture({ id: "L-5", followUpOf: "L-4", createdAt: 5000 }),
+					cardFixture({ id: "L-6", followUpOf: "L-5", createdAt: 6000 }),
+				])}
 			/>,
 		);
 		// Levels 1-4 render; levels 5 and 6 collapse into L-4's "+2 more" row.
@@ -4129,6 +4051,11 @@ describe("Drawer parent chip", () => {
 					cardFixture({ id: "D-1", followUpOf: "C-1", createdAt: 2000 }),
 					cardFixture({ id: "D-1", followUpOf: "C-1", createdAt: 3000 }),
 				]}
+				cardIndex={buildCardIndex([
+					cardFixture({ id: "C-1", followUpOf: "S-1", createdAt: 1000 }),
+					cardFixture({ id: "D-1", followUpOf: "C-1", createdAt: 2000 }),
+					cardFixture({ id: "D-1", followUpOf: "C-1", createdAt: 3000 }),
+				])}
 			/>,
 		);
 		expect(html.match(/>D-1</g)).toHaveLength(1);
@@ -4149,6 +4076,12 @@ describe("Drawer parent chip", () => {
 					doneKid("G-2", "Q-1", 3000),
 					doneKid("G-3", "Q-1", 4000),
 				]}
+				cardIndex={buildCardIndex([
+					doneKid("Q-1", "S-1", 1000),
+					doneKid("G-1", "Q-1", 2000),
+					doneKid("G-2", "Q-1", 3000),
+					doneKid("G-3", "Q-1", 4000),
+				])}
 			/>,
 		);
 		const open = renderToStaticMarkup(
@@ -4166,6 +4099,17 @@ describe("Drawer parent chip", () => {
 					}),
 					doneKid("G-3", "Q-1", 4000),
 				]}
+				cardIndex={buildCardIndex([
+					doneKid("Q-1", "S-1", 1000),
+					doneKid("G-1", "Q-1", 2000),
+					cardFixture({
+						id: "G-2",
+						followUpOf: "Q-1",
+						createdAt: 3000,
+						stage: "in_progress",
+					}),
+					doneKid("G-3", "Q-1", 4000),
+				])}
 			/>,
 		);
 		expect(foldButton(quiet)).toContain('aria-expanded="false"');
@@ -4199,6 +4143,12 @@ describe("Drawer parent chip", () => {
 					kid("G-2", "Q-1", 3000, "done"),
 					kid("G-3", "Q-1", 4000, "done"),
 				]}
+				cardIndex={buildCardIndex([
+					kid("Q-1", "S-1", 1000, "in_progress"),
+					kid("G-1", "Q-1", 2000, "done"),
+					kid("G-2", "Q-1", 3000, "done"),
+					kid("G-3", "Q-1", 4000, "done"),
+				])}
 			/>,
 		);
 		expect(foldButton(html)).toContain('aria-expanded="true"');
@@ -4226,6 +4176,7 @@ describe("Drawer parent chip", () => {
 				{...base}
 				task={cardFixture({ id: "T-1", stage: "todo", createdAt: 300 })}
 				tasks={[runningReview, finding]}
+				cardIndex={buildCardIndex([runningReview, finding])}
 			/>,
 		);
 		expect(todo).not.toContain('id="drawer-waiting"');
@@ -4239,6 +4190,7 @@ describe("Drawer parent chip", () => {
 					createdAt: 300,
 				})}
 				tasks={[runningReview, finding]}
+				cardIndex={buildCardIndex([runningReview, finding])}
 			/>,
 		);
 		expect(landed).not.toContain('id="drawer-waiting"');
@@ -4261,7 +4213,12 @@ describe("Drawer parent chip", () => {
 			createdAt: 100,
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={held} tasks={[running]} />,
+			<Drawer
+				{...base}
+				task={held}
+				tasks={[running]}
+				cardIndex={buildCardIndex([running])}
+			/>,
 		);
 		const waiting = html.slice(html.indexOf('id="drawer-waiting"'));
 		expect(waiting).toContain('href="/projects/proj/tasks/R-1"');
@@ -4270,6 +4227,7 @@ describe("Drawer parent chip", () => {
 				{...base}
 				task={cardFixture({ id: "T-2", stage: "todo", createdAt: 300 })}
 				tasks={[running, held]}
+				cardIndex={buildCardIndex([running, held])}
 			/>,
 		);
 		expect(bystander).not.toContain('id="drawer-waiting"');
@@ -4293,7 +4251,12 @@ describe("Drawer parent chip", () => {
 			createdAt: 100,
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={cancelled} tasks={[running]} />,
+			<Drawer
+				{...base}
+				task={cancelled}
+				tasks={[running]}
+				cardIndex={buildCardIndex([running])}
+			/>,
 		);
 		expect(html).not.toContain('id="drawer-waiting"');
 	});
@@ -4325,7 +4288,12 @@ describe("Drawer parent chip", () => {
 			stage: "in_progress",
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={review} tasks={[foreign, own]} />,
+			<Drawer
+				{...base}
+				task={review}
+				tasks={[foreign, own]}
+				cardIndex={buildCardIndex([foreign, own])}
+			/>,
 		);
 		const waiting = html.slice(html.indexOf('id="drawer-waiting"'));
 		expect(waiting).toContain('href="/projects/proj/tasks/F-1"');
@@ -4363,6 +4331,7 @@ describe("Drawer parent chip", () => {
 				{...base}
 				task={treeSelf}
 				tasks={chain}
+				cardIndex={buildCardIndex(chain)}
 				onOpenTask={(id, project) => opened.push([id, project])}
 			/>,
 		);
@@ -4463,7 +4432,12 @@ describe("Drawer parent chip", () => {
 		// The board list holds the drawer card itself, as the live state does:
 		// only then does K-1's bucket point back at S-1 and close the cycle.
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={self} tasks={[self, k]} />,
+			<Drawer
+				{...base}
+				task={self}
+				tasks={[self, k]}
+				cardIndex={buildCardIndex([self, k])}
+			/>,
 		);
 		const rail = railHtml(html);
 		// K-1 renders twice: the parent chip row above this card's node, and its
@@ -4512,7 +4486,7 @@ describe("Drawer parent chip", () => {
 				state={null}
 				projects={[listProject]}
 				tasks={[review, child, grand]}
-				deltas={new Map()}
+				cardIndex={buildCardIndex([review, child, grand])}
 				draining={false}
 				usedTotal={0}
 				seenAnswers={new Set()}
@@ -4616,6 +4590,7 @@ describe("Drawer meta ran-on row", () => {
 				usedTotal={0}
 				maxTotal={null}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 			/>,
 		);
 		// The static render has no detail fetch: no turns arrived yet, so the row
@@ -4655,7 +4630,12 @@ describe("Drawer cross-project lineage", () => {
 			followUpOfProject: "other",
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={child} tasks={[parent]} />,
+			<Drawer
+				{...base}
+				task={child}
+				tasks={[parent]}
+				cardIndex={buildCardIndex([parent])}
+			/>,
 		);
 		expect(html).toContain('class="lineage-row"');
 		// The href uses the linked card's project, not the open card's.
@@ -4676,7 +4656,12 @@ describe("Drawer cross-project lineage", () => {
 			stage: "todo",
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={self} tasks={[kid]} />,
+			<Drawer
+				{...base}
+				task={self}
+				tasks={[kid]}
+				cardIndex={buildCardIndex([kid])}
+			/>,
 		);
 		expect(html).toContain("K-1");
 		// The href uses the linked card's project, not the open card's.
@@ -4686,9 +4671,9 @@ describe("Drawer cross-project lineage", () => {
 	});
 
 	test("a same-id card on another board does not pose as the parent", async () => {
-		// The id+project lookup and the fetch both use the child's project
-		// (followUpOfProject ?? project), so the impostor's project never serves the
-		// row; the route's 404 earns the not-found row, never a stale link.
+		// The lookup pins id+project (followUpOfProject ?? project), so the
+		// impostor's project never resolves the row; the miss reads as not-found,
+		// with no fetch that could pick up a stale card.
 		const child = childCard({
 			id: "C-1",
 			stage: "done",
@@ -4706,12 +4691,17 @@ describe("Drawer cross-project lineage", () => {
 			return new Response("{}", { status: 404 });
 		});
 		const { container, unmount } = await mount(
-			<Drawer {...base} task={child} tasks={[impostor]} />,
+			<Drawer
+				{...base}
+				task={child}
+				tasks={[impostor]}
+				cardIndex={buildCardIndex([impostor])}
+			/>,
 		);
 		try {
 			await act(async () => {});
-			// The fetch went to the child's project, and its 404 reads as not-found.
-			expect(fetches).toContain("/api/projects/proj/tasks/P-1");
+			// No fetch tried the parent's route; the index miss is final.
+			expect(fetches.some((u) => u.endsWith("/tasks/P-1"))).toBe(false);
 			expect(container.textContent).toContain("Card not found");
 			expect(container.textContent).not.toContain("Impostor work");
 			expect(container.textContent).not.toContain("Not on the board");
@@ -4735,7 +4725,12 @@ describe("Drawer cross-project lineage", () => {
 			followUpOfProject: "other",
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={self} tasks={[stranger]} />,
+			<Drawer
+				{...base}
+				task={self}
+				tasks={[stranger]}
+				cardIndex={buildCardIndex([stranger])}
+			/>,
 		);
 		expect(html).not.toContain("drawer-lineage");
 		expect(html).not.toContain("lineage-branch");
@@ -4754,8 +4749,25 @@ describe("Drawer cross-project lineage", () => {
 			stage: "in_progress",
 			state: "running",
 		});
+		// The waiting row resolves through the card index (OTTR-1255): the foreign
+		// id walks the projects' id handles, so "other" must ride the list with
+		// its prefix and its card the index.
+		const other = {
+			name: "other",
+			github: null,
+			hasRules: true,
+			sessionsDir: "/tmp/other/.tasks/sessions",
+			settings: {},
+			taskPrefix: "D",
+		} as unknown as ProjectView;
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={row} tasks={[dep]} />,
+			<Drawer
+				{...base}
+				task={row}
+				tasks={[dep]}
+				projects={[drawerProject, other]}
+				cardIndex={buildCardIndex([dep])}
+			/>,
 		);
 		expect(html).toContain('href="/projects/other/tasks/D-9"');
 	});
@@ -4938,6 +4950,7 @@ describe("Drawer hold hint expiry", () => {
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
 		tasks: [],
+		cardIndex: buildCardIndex([]),
 		onOpenTask: () => {},
 		draining: false,
 		usedTotal: 0,
@@ -6020,6 +6033,7 @@ describe("Drawer approve button", () => {
 						needsReason,
 					})}
 					tasks={[source]}
+					cardIndex={buildCardIndex([source])}
 				/>,
 			);
 		// The current reason: the id is a link to the card, the rest stays text.
@@ -6071,6 +6085,7 @@ describe("Drawer approve button", () => {
 						needsReason,
 					})}
 					tasks={[match]}
+					cardIndex={buildCardIndex([match])}
 				/>,
 			);
 		const html = render(
@@ -6400,6 +6415,7 @@ describe("cancelled cards on the board", () => {
 			<Overview
 				projects={[project]}
 				tasks={[live, dead]}
+				cardIndex={buildCardIndex([live, dead])}
 				compose={() => {}}
 				onAdd={() => {}}
 				openTask={() => {}}
@@ -7414,6 +7430,7 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 		onMarkUnread: () => {},
 		onMarkSeen: () => {},
 		tasks: [],
+		cardIndex: buildCardIndex([]),
 		onOpenTask: () => {},
 		draining: false,
 		usedTotal: 0,
@@ -7903,9 +7920,9 @@ describe("PR review draft-run status on a mounted ask composer", () => {
 
 describe("LaneCol release hold", () => {
 	const base = {
+		cardIndex: buildCardIndex([]),
 		hasRules: true,
 		github: null,
-		deltas: new Map<string, number>(),
 		open: () => {},
 		unread: () => false,
 		onReorder: async () => true,
@@ -7913,6 +7930,13 @@ describe("LaneCol release hold", () => {
 		draining: false,
 		onRerelease: () => {},
 	} as const;
+	// The hold props ride the same cards the render passes as projectTasks:
+	// holds, the re-release line and the findings count resolve over the graph.
+	const laneHold = (cards: TaskCard[]) => ({
+		projectTasks: cards,
+		graph: projectGraph(buildCardIndex(cards), "proj"),
+		deltas: new Map<string, number>(),
+	});
 
 	// The release card parked with its findings done: the board names the held merges.
 	const releaseCard = (heldMerges?: string[]): TaskCard =>
@@ -7939,15 +7963,15 @@ describe("LaneCol release hold", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol
 				{...base}
-				stage="merging"
-				tasks={[r1]}
-				projectTasks={[
+				{...laneHold([
 					r1,
 					finding("done", "f1"),
 					finding("done", "f2"),
 					heldMerge("m1"),
 					heldMerge("m2"),
-				]}
+				])}
+				stage="merging"
+				tasks={[r1]}
 			/>,
 		);
 		expect(html).toContain("merges wait for this release");
@@ -7967,9 +7991,9 @@ describe("LaneCol release hold", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol
 				{...base}
+				{...laneHold([pr])}
 				stage="in_progress"
 				tasks={[pr]}
-				projectTasks={[pr]}
 			/>,
 		);
 		expect(html).toContain(
@@ -7989,9 +8013,9 @@ describe("LaneCol release hold", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol
 				{...base}
+				{...laneHold([pr])}
 				stage="in_progress"
 				tasks={[pr]}
-				projectTasks={[pr]}
 				unread={() => true}
 			/>,
 		);
@@ -8003,9 +8027,9 @@ describe("LaneCol release hold", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol
 				{...base}
+				{...laneHold([r1, finding("todo", "f1"), heldMerge("m1")])}
 				stage="merging"
 				tasks={[r1]}
-				projectTasks={[r1, finding("todo", "f1"), heldMerge("m1")]}
 			/>,
 		);
 		expect(html).not.toContain("merges wait for this release");
@@ -8017,9 +8041,9 @@ describe("LaneCol release hold", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol
 				{...base}
+				{...laneHold([r1, finding("done", "f3"), heldMerge("m1")])}
 				stage="todo"
 				tasks={[heldMerge("m1")]}
-				projectTasks={[r1, finding("done", "f3"), heldMerge("m1")]}
 			/>,
 		);
 		expect(html).toContain("hold-link");
@@ -8389,6 +8413,8 @@ describe("path URL card links", () => {
 	test("a board card opens through an anchor to the card's path", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol
+				cardIndex={buildCardIndex([])}
+				graph={projectGraph(buildCardIndex([]), "proj")}
 				stage="todo"
 				tasks={[cardFixture({ id: "X" })]}
 				projectTasks={[]}
@@ -8448,7 +8474,12 @@ describe("path URL card links", () => {
 			followUpOf: "C-1",
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...drawerBase} task={child} tasks={[parent, kid]} />,
+			<Drawer
+				{...drawerBase}
+				task={child}
+				tasks={[parent, kid]}
+				cardIndex={buildCardIndex([parent, kid])}
+			/>,
 		);
 		expect(html).toContain('href="/projects/proj/tasks/P-1"');
 		expect(html).toContain('href="/projects/proj/tasks/K-1"');
@@ -8534,7 +8565,7 @@ test("OTTR-827: the rail dot counts exactly the cards whose face shows New", () 
 		<ProjectBoard
 			project={mkProject("velvarr")}
 			tasks={[answered]}
-			deltas={new Map()}
+			cardIndex={buildCardIndex([answered])}
 			open={() => {}}
 			seenAnswers={new Set()}
 			seenDoneSince={since}
@@ -9180,7 +9211,7 @@ describe("ProjectBoard done lane time view", () => {
 			<ProjectBoard
 				project={project}
 				tasks={held}
-				deltas={new Map()}
+				cardIndex={buildCardIndex(held)}
 				open={() => {}}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -9215,7 +9246,7 @@ describe("ProjectBoard done lane time view", () => {
 					<ProjectBoard
 						project={{ ...project, doneTotal: 62 }}
 						tasks={[...held, landedMatch]}
-						deltas={new Map()}
+						cardIndex={buildCardIndex([...held, landedMatch])}
 						open={() => {}}
 						seenAnswers={new Set()}
 						seenDoneSince={0}
@@ -9580,7 +9611,7 @@ describe("ProjectBoard skill-gap markers", () => {
 			<ProjectBoard
 				project={boardProject}
 				tasks={[]}
-				deltas={new Map()}
+				cardIndex={buildCardIndex([])}
 				open={open}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -10275,6 +10306,7 @@ const replyDrawerBase = {
 	onMarkUnread: () => {},
 	onMarkSeen: () => {},
 	tasks: [],
+	cardIndex: buildCardIndex([]),
 	onOpenTask: () => {},
 	draining: false,
 	usedTotal: 0,
@@ -10953,7 +10985,12 @@ describe("Drawer proposal decision panel", () => {
 			proposalSummary: summary,
 		});
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={task} tasks={[source]} />,
+			<Drawer
+				{...base}
+				task={task}
+				tasks={[source]}
+				cardIndex={buildCardIndex([source])}
+			/>,
 		);
 		expect(html).toContain('id="drawer-decide"');
 		// Always open, no section head: nothing can fold the decision away.
@@ -11277,6 +11314,7 @@ describe("Drawer proposal panel editing (client)", () => {
 				onMarkUnread: () => {},
 				onMarkSeen: () => {},
 				tasks: [],
+				cardIndex: buildCardIndex([]),
 				onOpenTask: () => {},
 				draining: false,
 				usedTotal: 0,
@@ -11333,7 +11371,7 @@ describe("ProjectBoard sync-commit advisories", () => {
 			<ProjectBoard
 				project={project}
 				tasks={tasks}
-				deltas={new Map()}
+				cardIndex={buildCardIndex(tasks)}
 				open={() => {}}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -11429,12 +11467,13 @@ describe("ProjectBoard repo link", () => {
 			...over,
 		}) as unknown as ProjectView;
 
-	const renderBoard = (project: ProjectView): string =>
-		renderToStaticMarkup(
+	const renderBoard = (project: ProjectView): string => {
+		const tasks = [cardFixture({ id: "t1", title: "Fix bug" })];
+		return renderToStaticMarkup(
 			<ProjectBoard
 				project={project}
-				tasks={[cardFixture({ id: "t1", title: "Fix bug" })]}
-				deltas={new Map()}
+				tasks={tasks}
+				cardIndex={buildCardIndex(tasks)}
 				open={() => {}}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -11445,6 +11484,7 @@ describe("ProjectBoard repo link", () => {
 				draining={false}
 			/>,
 		);
+	};
 
 	test("the header links the repo by its owner/repo slug", () => {
 		const html = renderBoard(
@@ -11512,7 +11552,7 @@ describe("ProjectBoard rules interview action", () => {
 			<ProjectBoard
 				project={projectNoRules}
 				tasks={tasks}
-				deltas={new Map()}
+				cardIndex={buildCardIndex(tasks)}
 				open={() => {}}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -11580,6 +11620,7 @@ describe("ProjectBoard PR-mode suggestion action", () => {
 			}
 			return new Response("{}", { status: 404 });
 		});
+		const tasks = [cardFixture({ id: "t1", title: "Fix bug" })];
 		const { container, unmount } = await mount(
 			<ProjectBoard
 				project={
@@ -11601,8 +11642,8 @@ describe("ProjectBoard PR-mode suggestion action", () => {
 						sessionsDir: "/tmp/s",
 					} as unknown as ProjectView
 				}
-				tasks={[cardFixture({ id: "t1", title: "Fix bug" })]}
-				deltas={new Map()}
+				tasks={tasks}
+				cardIndex={buildCardIndex(tasks)}
 				open={() => {}}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -13432,6 +13473,7 @@ describe("Drawer PR link", () => {
 		usedTotal: 0,
 		maxTotal: null,
 		tasks: [],
+		cardIndex: buildCardIndex([]),
 	};
 
 	test("a card with an open PR links PR #N from its drawer meta", () => {
@@ -13543,6 +13585,7 @@ describe("Optimistic taps (client)", () => {
 		usedTotal: 0,
 		maxTotal: null,
 		tasks: [] as TaskCard[],
+		cardIndex: buildCardIndex([]),
 	};
 
 	// happy-dom's dispatched events never reach React's event plugin; call the
@@ -13833,10 +13876,12 @@ describe("Optimistic taps (client)", () => {
 	});
 
 	const laneBase = {
+		cardIndex: buildCardIndex([]),
+		graph: projectGraph(buildCardIndex([]), "proj"),
 		projectTasks: [] as TaskCard[],
+		deltas: new Map<string, number>(),
 		hasRules: true,
 		github: null,
-		deltas: new Map<string, number>(),
 		open: () => {},
 		unread: () => false,
 		filtering: false,
@@ -14478,8 +14523,8 @@ describe("Drawer start validation run on a queued lead", () => {
 	// its review's batch validation run. One POST names the lead: the filing parks
 	// it in the review's backlog inside its own transaction, so a refusal leaves
 	// the hold, the button and the error untouched. The review resolves through
-	// the lineage fetch too, because the Done window can drop it from the board's
-	// task list.
+	// the card index (OTTR-1255), because the Done window can drop it from the
+	// board's task list.
 	installBrowserGlobals([
 		"Event",
 		"HTMLElement",
@@ -14512,7 +14557,7 @@ describe("Drawer start validation run on a queued lead", () => {
 		}) as TaskCard;
 
 	/** Renders the lead's drawer with the review out of the board's task list;
-	 * the drawer loads it through the lineage route. `handlers` answer the
+	 * the drawer resolves it from the card index. `handlers` answer the
 	 * action POSTs and record them. */
 	const withLeadDrawer = async (
 		lead: TaskCard,
@@ -14544,10 +14589,15 @@ describe("Drawer start validation run on a queued lead", () => {
 			return new Response("{}", { status: 404 });
 		});
 		const { container, root, unmount } = await mount(
-			<Drawer {...drawerBase} task={lead} tasks={[lead]} />,
+			<Drawer
+				{...drawerBase}
+				task={lead}
+				tasks={[lead]}
+				cardIndex={buildCardIndex(review === null ? [lead] : [lead, review])}
+			/>,
 		);
 		try {
-			// One act for the lead detail, one for the lineage fetch of the review.
+			// The lead detail lands; the review resolves from the card index.
 			await act(async () => {});
 			await act(async () => {});
 			await run({ posts, container, root });
@@ -15660,7 +15710,7 @@ describe("Release card re-release confirm names its target", () => {
 			<ProjectBoard
 				project={boardProject}
 				tasks={[release]}
-				deltas={new Map()}
+				cardIndex={buildCardIndex([release])}
 				open={() => {}}
 				seenAnswers={new Set()}
 				seenDoneSince={0}
@@ -15873,19 +15923,24 @@ describe("memoized Card renders", () => {
 		unread: (): boolean => false,
 		onReorder: async (): Promise<boolean> => true,
 	};
-	const laneProps = (tasks: TaskCard[], projectTasks: TaskCard[]) => ({
-		stage: "todo" as const,
-		tasks,
-		projectTasks,
-		hasRules: true,
-		github: null,
-		deltas: new Map<string, number>(),
-		open: stable.open,
-		unread: stable.unread,
-		onReorder: stable.onReorder,
-		filtering: false,
-		draining: false,
-	});
+	const laneProps = (tasks: TaskCard[], projectTasks: TaskCard[]) => {
+		const index = buildCardIndex(tasks);
+		return {
+			stage: "todo" as const,
+			tasks,
+			projectTasks,
+			cardIndex: index,
+			graph: projectGraph(index, "proj"),
+			deltas: new Map<string, number>(),
+			hasRules: true,
+			github: null,
+			open: stable.open,
+			unread: stable.unread,
+			onReorder: stable.onReorder,
+			filtering: false,
+			draining: false,
+		};
+	};
 
 	test("a state push that changes one card does not re-render the unchanged card", async () => {
 		// A sibling test file can leave the shared catalog cache filled (one bun
@@ -16148,6 +16203,7 @@ const panelBase = {
 	prActivity: [],
 	prPosted: [],
 	alarmCount: 0,
+	cardIndex: buildCardIndex([]),
 	updatesKey: null,
 	updateCount: 0,
 	isNew: () => false,
@@ -16370,7 +16426,7 @@ describe("bell PR rows in quiet projects", () => {
 		const waiting = card("pr3", { state: "needs_you" });
 		const plain = cardFixture({ id: "t9", state: "needs_you" });
 		const split = bellAlarms(
-			[posted, commented, waiting, plain],
+			buildCardIndex([posted, commented, waiting, plain]),
 			[waiting, plain],
 			[project(false)],
 		);
@@ -16392,7 +16448,11 @@ describe("bell PR rows in quiet projects", () => {
 			},
 		});
 		const commented = card("pr2", { prOccurrence: { draft: 3, comments: 4 } });
-		const split = bellAlarms([posted, commented], [], [project(true)]);
+		const split = bellAlarms(
+			buildCardIndex([posted, commented]),
+			[],
+			[project(true)],
+		);
 		expect(split.posted.map((t) => t.id)).toEqual(["pr1"]);
 		expect(split.activity.map((t) => t.id)).toEqual(["pr2"]);
 	});
@@ -17341,6 +17401,586 @@ describe("credits chip in the board bar", () => {
 	});
 });
 
+describe("allCards lookups on the board (docs/specs/card-lookup-scope.md)", () => {
+	// The full board mount needs the same globals as the credits describe above:
+	// a happy-dom Window swapped in beforeAll and restored in afterAll, plus a
+	// fetch stub that answers the boot conversation and fails every other load.
+	const { window } = installBrowserGlobals([
+		"location",
+		"history",
+		"HTMLDialogElement",
+		"HTMLTextAreaElement",
+		"Node",
+		"getComputedStyle",
+		"requestAnimationFrame",
+		"cancelAnimationFrame",
+		"CSS",
+		"sessionStorage",
+		"localStorage",
+	]);
+	const host = globalThis as unknown as Record<string, unknown>;
+	// happy-dom implements no popover attribute yet; the menus call hidePopover().
+	const proto = window.HTMLElement.prototype as unknown as Record<
+		string,
+		unknown
+	>;
+	beforeAll(() => {
+		proto.showPopover ??= () => {};
+		proto.hidePopover ??= () => {};
+	});
+	// fetch is swapped per test in this describe; its original comes back after all.
+	const realFetch = globalThis.fetch;
+	afterAll(() => {
+		globalThis.fetch = realFetch;
+	});
+
+	// --- fixtures ---------------------------------------------------------------
+
+	const proj = {
+		name: "proj",
+		icon: null,
+		remote: null,
+		path: "/tmp/proj",
+		sessionsDir: "/tmp/proj/.tasks/sessions",
+		hasRules: true,
+		target: "origin/main",
+		gitless: false,
+		dirty: false,
+		github: null,
+		latestRelease: null,
+		latestImage: null,
+		archReview: null,
+		settings: { displayName: "Proj", maxParallel: 2 },
+		taskPrefix: "P",
+		doneTotal: 1,
+	} as unknown as ProjectView;
+
+	const acard = (over: Partial<TaskCard>): TaskCard =>
+		({
+			id: "P-1",
+			title: "card",
+			sessionTitle: "card",
+			project: "proj",
+			kind: "work",
+			state: "queued",
+			stage: "todo",
+			cancelledAt: null,
+			createdAt: 1,
+			updatedAt: 1,
+			doneAt: null,
+			commits: [],
+			dependsOn: [],
+			updateIds: [],
+			workCheckLog: [],
+			shots: [],
+			images: [],
+			pendingImages: [],
+			keptFiles: [],
+			lateCommits: [],
+			releaseVersion: null,
+			followUpOf: null,
+			followUpOfProject: null,
+			asked: null,
+			answered: false,
+			answeredAt: null,
+			needsReason: null,
+			pendingPrompt: null,
+			priority: null,
+			closeCandidate: null,
+			starred: false,
+			...over,
+		}) as unknown as TaskCard;
+
+	// Done cards the window dropped: they exist, so every lookup must find them,
+	// but state.tasks must never list them.
+	const oldParent = acard({
+		id: "P-OLD-PARENT",
+		title: "Old done parent",
+		sessionTitle: "Old done parent",
+		stage: "done",
+		state: "idle",
+		createdAt: 90,
+		doneAt: 100,
+		commits: 0,
+	});
+	const oldKid = acard({
+		id: "P-OLD-KID",
+		title: "Old done kid",
+		sessionTitle: "Old done kid",
+		stage: "done",
+		state: "idle",
+		createdAt: 80,
+		doneAt: 90,
+		followUpOf: "P-1",
+		followUpOfProject: "proj",
+		commits: 0,
+	});
+	const oldSource = acard({
+		id: "P-OLD-SRC",
+		title: "Retro source",
+		sessionTitle: "Retro source",
+		stage: "done",
+		state: "idle",
+		createdAt: 70,
+		doneAt: 80,
+		commits: 0,
+	});
+	const ancientDone = acard({
+		id: "P-DONE-OLD-1",
+		title: "Ancient done",
+		sessionTitle: "Ancient done",
+		stage: "done",
+		state: "idle",
+		createdAt: 60,
+		doneAt: 70,
+		commits: 0,
+	});
+	// The one done card inside the window.
+	const freshDone = acard({
+		id: "P-DONE-1",
+		title: "Fresh done",
+		sessionTitle: "Fresh done",
+		stage: "done",
+		state: "idle",
+		createdAt: 4000,
+		doneAt: 5000,
+		commits: 8,
+	});
+	// The wrong-project probe (send-back): the foreign done X-1 hides behind the
+	// Done window; the local open X-1 renders in the lane and its click must open
+	// the local card, never the foreign one.
+	const otherProj = {
+		...proj,
+		name: "other",
+		path: "/tmp/other",
+		sessionsDir: "/tmp/other/.tasks/sessions",
+		settings: { displayName: "Other", maxParallel: 2 },
+		taskPrefix: "O",
+		doneTotal: 1,
+	} as unknown as ProjectView;
+	const foreignDone = acard({
+		id: "X-1",
+		title: "Foreign done twin",
+		sessionTitle: "Foreign done twin",
+		project: "other",
+		stage: "done",
+		state: "idle",
+		createdAt: 50,
+		doneAt: 60,
+		commits: 0,
+	});
+	const localTwin = acard({
+		id: "X-1",
+		title: "Local open twin",
+		sessionTitle: "Local open twin",
+		createdAt: 4500,
+	});
+	// The delta probe (send-back): the previous done card sits outside the
+	// window, so only allCards can supply the +5 delta for the fresh done card.
+	const prevDone = acard({
+		id: "P-DONE-OLD-2",
+		title: "Delta base",
+		sessionTitle: "Delta base",
+		stage: "done",
+		state: "idle",
+		createdAt: 55,
+		doneAt: 65,
+		commits: 3,
+	});
+	// The open cards: one with an out-of-window parent, one whose parent id no
+	// project holds, and a proposal whose Why line names an out-of-window id.
+	const child = acard({
+		id: "P-1",
+		title: "Follow-up child",
+		sessionTitle: "Follow-up child",
+		followUpOf: "P-OLD-PARENT",
+		followUpOfProject: "proj",
+		dependsOn: ["P-DEP-1", "P-DEP-2"],
+	});
+	const goneRefCard = acard({
+		id: "P-2",
+		title: "Gone parent card",
+		sessionTitle: "Gone parent card",
+		followUpOf: "P-NULL",
+		followUpOfProject: "proj",
+	});
+	const proposal = acard({
+		id: "P-3",
+		title: "Retro proposal",
+		sessionTitle: "Retro proposal",
+		kind: "retro",
+		stage: "in_progress",
+		state: "needs_you",
+		needsReason:
+			"Retro proposal from P-OLD-SRC. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+		followUpOf: "P-OLD-SRC",
+		followUpOfProject: "proj",
+	});
+	// Waiting-chain probes (send-back 3): the drawer card P-1 depends on an
+	// open local card and on a cancelled one — only the open one is a waiter —
+	// and P-4 depends on a foreign card parked by a usage limit, whose
+	// countdown must survive the adapter.
+	const depOpen = acard({
+		id: "P-DEP-1",
+		title: "Open dependency",
+		sessionTitle: "Open dependency",
+		createdAt: 30,
+	});
+	const depCancelled = acard({
+		id: "P-DEP-2",
+		title: "Cancelled dependency",
+		sessionTitle: "Cancelled dependency",
+		cancelledAt: 40,
+		createdAt: 31,
+	});
+	const foreignHeld = acard({
+		id: "O-1",
+		title: "Foreign held dep",
+		sessionTitle: "Foreign held dep",
+		project: "other",
+		stage: "todo",
+		state: "queued",
+		holdUntil: Date.now() + 3_600_000,
+		needsReason:
+			"The zai usage limit is reached. The board starts the task again after the limit resets at 2026-11-26 18:00 UTC. Send a message to run it now, or cancel the task.",
+		createdAt: 32,
+	});
+	const foreignWaiter = acard({
+		id: "P-4",
+		title: "Foreign waiter",
+		sessionTitle: "Foreign waiter",
+		createdAt: 33,
+		dependsOn: ["O-1"],
+	});
+
+	// One fixture: state.tasks holds ONLY the windowed cards, allCards the full set.
+	const windowTasks = [
+		child,
+		foreignWaiter,
+		depOpen,
+		depCancelled,
+		foreignHeld,
+		goneRefCard,
+		proposal,
+		freshDone,
+		localTwin,
+	];
+	const everyCard = [
+		// The foreign twin sorts before the local one (project, then id — the
+		// server's allCards order), so a dropped project argument fails this test.
+		foreignDone,
+		...windowTasks,
+		oldParent,
+		oldKid,
+		oldSource,
+		ancientDone,
+		prevDone,
+	];
+	const stateFrame = {
+		projects: [proj, otherProj],
+		tasks: windowTasks,
+		allCards: everyCard,
+		maxTotal: null,
+		reviewCheck: false,
+		workCheck: false,
+		idleReviews: false,
+		trendingScan: true,
+		trendingStatus: { lastRunAt: null, lastError: null, running: false },
+		serverVersion: "vtest",
+		quota: null,
+		onboarding: false,
+		user: null,
+		seenAnswers: [],
+		seenDoneSince: 0,
+		inboxSeen: [],
+		orphans: [],
+		orphansError: null,
+		keptWorktrees: { held: 0, stale: 0 },
+		drainUntil: null,
+		drainCommits: null,
+		warnings: [],
+		updates: null,
+		alatePendingSince: null,
+		alateProvisionError: null,
+		deadSignIns: [],
+		seedFailed: null,
+		restartWait: null,
+		commitIdentity: null,
+	} as unknown as StateResponse;
+
+	// --- harness ----------------------------------------------------------------
+
+	const requested: string[] = [];
+
+	/** Flushes fetch-fed state frames and effects until `pred` holds. */
+	async function waitFor(pred: () => boolean): Promise<void> {
+		for (let i = 0; i < 200; i++) {
+			if (pred()) return;
+			await act(async () => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				setTimeout(resolve, 5);
+				await promise;
+			});
+		}
+		throw new Error(
+			`condition not reached; body: ${document.body.innerHTML.slice(0, 1200)}`,
+		);
+	}
+
+	const boardLoaded = (): boolean => {
+		const main = document.querySelector("main.main");
+		return main !== null && !(main.textContent ?? "").includes("Loading board");
+	};
+	const drawerOpen = (): boolean =>
+		document.querySelector("dialog.drawer")?.hasAttribute("open") === true;
+
+	/** Opens the card's drawer through the lane row's own open link. */
+	const openCard = async (id: string): Promise<void> => {
+		const open = document.querySelector(
+			`.card[data-task-id="${id}"] a.card-open`,
+		);
+		expect(open).not.toBeNull();
+		await act(async () => {
+			(open as HTMLElement).click();
+		});
+		await waitFor(drawerOpen);
+	};
+
+	/** Mounts the board at `path` against the fixture frame and runs `check`;
+	 * every fetched URL lands in `requested`. The drawer's wide-card detail
+	 * answers from allCards, the way the server's route does. */
+	const withBoard = async (
+		path: string,
+		check: () => Promise<void>,
+	): Promise<void> => {
+		requested.length = 0;
+		host.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			requested.push(url);
+			let body: unknown = { error: "not in this test" };
+			let status = 503;
+			if (url === "/api/boot") {
+				body = { onboarding: false, version: "vtest", live: false };
+				status = 200;
+			} else if (url === "/api/state") {
+				body = stateFrame;
+				status = 200;
+			} else if (url === "/api/update") {
+				body = { behind: 0, commits: [] };
+				status = 200;
+			} else if (url === "/api/system") {
+				body = {
+					at: 1,
+					containers: [],
+					vm: {
+						cpuPct: null,
+						cpus: 4,
+						load1: null,
+						memAvailable: null,
+						memTotal: null,
+						history: [],
+					},
+					holds: {
+						drainUntil: null,
+						drainCommits: null,
+						maxTotal: null,
+						running: 0,
+						queued: 0,
+						oldestQueuedAt: null,
+					},
+				};
+				status = 200;
+			} else if (url.endsWith("/context")) {
+				body = { context: null };
+				status = 200;
+			} else {
+				const detail = /\/api\/projects\/([^/]+)\/tasks\/([^/?]+)$/.exec(url);
+				const row =
+					detail === null
+						? undefined
+						: everyCard.find(
+								(c) =>
+									c.id === detail[2] &&
+									c.project === decodeURIComponent(detail[1] ?? ""),
+							);
+				if (row !== undefined) {
+					body = {
+						...row,
+						prompt: "work",
+						summary: null,
+						details: null,
+						report: null,
+						gate: null,
+						workCheckReport: null,
+						turns: [],
+						diffFiles: null,
+						worktreeFiles: [],
+					};
+					status = 200;
+				} else {
+					body = {};
+					status = 404;
+				}
+			}
+			return new Response(JSON.stringify(body), {
+				status,
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as typeof fetch;
+		window.history.replaceState(null, "", path);
+		const { unmount } = await mount(<App />);
+		try {
+			await waitFor(boardLoaded);
+			await check();
+		} finally {
+			await unmount();
+		}
+	};
+
+	/** The lineage fetches for one card id: the loads the rail must not make. */
+	const lineageFetches = (id: string): string[] =>
+		requested.filter((url) => url.endsWith(`/tasks/${id}`));
+
+	// --- tests ------------------------------------------------------------------
+
+	test("a lineage parent outside the Done window renders its link with no lineage fetch", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("P-1");
+			const selector =
+				'dialog.drawer .lineage-rail a.lineage-row[href="/projects/proj/tasks/P-OLD-PARENT"]';
+			await waitFor(() => document.querySelector(selector) !== null);
+			const parent = document.querySelector(selector);
+			// The row carries the parent's own title, like an in-window parent.
+			expect(parent?.querySelector(".lineage-title")?.textContent).toBe(
+				"Old done parent",
+			);
+			// The parent resolved from the index: no fetch named it.
+			expect(lineageFetches("P-OLD-PARENT")).toEqual([]);
+		});
+	});
+
+	test("a lineage child outside the Done window renders its row", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("P-1");
+			const selector =
+				'dialog.drawer .lineage-branch a.lineage-row[href="/projects/proj/tasks/P-OLD-KID"]';
+			await waitFor(() => document.querySelector(selector) !== null);
+			const kid = document.querySelector(selector);
+			expect(kid?.querySelector(".lineage-title")?.textContent).toBe(
+				"Old done kid",
+			);
+			expect(lineageFetches("P-OLD-KID")).toEqual([]);
+		});
+	});
+
+	test("a proposal's Why line links an out-of-window done id", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("P-3");
+			const selector =
+				'dialog.drawer .decide-reason a.reason-card-link[href="/projects/proj/tasks/P-OLD-SRC"]';
+			await waitFor(() => document.querySelector(selector) !== null);
+			const link = document.querySelector(selector);
+			expect(link?.textContent).toBe("P-OLD-SRC");
+			expect(link?.getAttribute("title")).toBe("Retro source");
+			// The link resolved from the index, not from a fetch.
+			expect(lineageFetches("P-OLD-SRC")).toEqual([]);
+		});
+	});
+
+	test("the Done lane still shows only the windowed done cards", async () => {
+		await withBoard("/projects/proj", async () => {
+			// The windowed done card renders in its lane ...
+			expect(
+				document.querySelector('.card[data-task-id="P-DONE-1"]'),
+			).not.toBeNull();
+			// ... and a card that exists only in allCards renders nowhere.
+			expect(
+				document.querySelector('.card[data-task-id="P-DONE-OLD-1"]'),
+			).toBeNull();
+			expect(
+				document.querySelector('.card[data-task-id="P-OLD-PARENT"]'),
+			).toBeNull();
+		});
+	});
+
+	test("a lane click on a shared id opens the local card, not the foreign twin", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("X-1");
+			await waitFor(drawerOpen);
+			// The drawer names the local project's card: the click carried the
+			// card's own project, so the foreign done twin (outside the window)
+			// never wins the id lookup.
+			const drawer = document.querySelector("dialog.drawer");
+			expect(drawer?.textContent ?? "").toContain("Local open twin");
+			expect(drawer?.textContent ?? "").toContain("Proj");
+			expect(drawer?.textContent ?? "").not.toContain("Other");
+			const detail = requested.filter((url) =>
+				url.endsWith("/api/projects/other/tasks/X-1"),
+			);
+			expect(detail).toEqual([]);
+		});
+	});
+
+	test("the delta chip reads the previous done card outside the window", async () => {
+		await withBoard("/projects/proj", async () => {
+			// commitDeltas reads allCards (OTTR-1255): the +5 delta against the
+			// window-dropped Delta base card renders on the lane's fresh done card,
+			// whose windowed predecessor list cannot know Delta base.
+			const chip = '.card[data-task-id="P-DONE-1"] .commits';
+			await waitFor(() => {
+				const el = document.querySelector(chip);
+				return el !== null && el.textContent === "+5 → 8";
+			});
+			expect(document.querySelector(chip)?.textContent).toBe("+5 → 8");
+		});
+	});
+
+	test("the waiting chain keeps open local deps and drops cancelled ones", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("P-1");
+			await waitFor(drawerOpen);
+			const waiting = document.querySelector("dialog.drawer .lineage-deps");
+			expect(waiting?.textContent ?? "").toContain("P-DEP-1");
+			expect(waiting?.textContent ?? "").toContain("Open dependency");
+			// The cancelled dependency is satisfied: it never joins the list.
+			expect(waiting?.textContent ?? "").not.toContain("P-DEP-2");
+		});
+	});
+
+	test("a foreign usage-limit dep keeps its countdown through the adapter", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("P-4");
+			await waitFor(drawerOpen);
+			// The full windowed row rides: holdUntil and the usage-limit reason
+			// render the countdown; the ref adapter (which nulls them) would
+			// degrade this row to a plain "queued".
+			await waitFor(() =>
+				(
+					document.querySelector("dialog.drawer .lineage-deps")?.textContent ??
+					""
+				).includes("zai limit"),
+			);
+			expect(
+				document.querySelector("dialog.drawer .lineage-deps")?.textContent,
+			).toContain("O-1");
+		});
+	});
+
+	test("a lineage ref no project holds renders Card not found with zero fetches", async () => {
+		await withBoard("/projects/proj", async () => {
+			await openCard("P-2");
+			await waitFor(
+				() => document.querySelector("dialog.drawer .lineage-gone") !== null,
+			);
+			const gone = document.querySelector("dialog.drawer .lineage-gone");
+			expect(gone?.textContent).toContain("Card not found");
+			expect(gone?.textContent).toContain("P-NULL");
+			// The miss answered from the index: no fetch fired for the id.
+			expect(lineageFetches("P-NULL")).toEqual([]);
+		});
+	});
+});
+
 test("depHoldContexts follows the resolver's project, not the first id hit", async () => {
 	// Two projects hold the same historical id (a prefix change left the old copy
 	// in archive). The follower's foreign index resolves AGEN-162 to agent-data by
@@ -17358,6 +17998,7 @@ test("depHoldContexts follows the resolver's project, not the first id hit", asy
 		({
 			id: "AGEN-162",
 			title: "Sync rules",
+			sessionTitle: "Sync rules",
 			kind: "work",
 			project: "agent-data",
 			stage: "merging",
@@ -17410,8 +18051,15 @@ test("depHoldContexts follows the resolver's project, not the first id hit", asy
 		const tasks: TaskCard[] = agentDataFirst
 			? [agentData, archiveCopy, archiveReview]
 			: [archiveCopy, archiveReview, agentData];
-		const foreign = depIndexOf(projects, tasks, view("ottr", "OTTR"));
-		const foreignHolds = depHoldContexts(projects, tasks, view("ottr", "OTTR"));
+		// The index carries every card; the loaded rows carry the wide hold fields.
+		const index = buildCardIndex(tasks);
+		const foreign = depIndexOf(projects, index, view("ottr", "OTTR"), tasks);
+		const foreignHolds = depHoldContexts(
+			projects,
+			index,
+			tasks,
+			view("ottr", "OTTR"),
+		);
 		expect(
 			statusLine(parked, true, undefined, false, [], foreign, foreignHolds),
 		).toBe(`waiting for #AGEN-162 Sync rules (${PUSH_HOLD})`);

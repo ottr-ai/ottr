@@ -11,6 +11,7 @@ import type {
 	TrendingStatus,
 } from "../types.ts";
 import { TRENDING_TOKEN_HINT } from "../types.ts";
+import { buildCardIndex } from "./cardIndex.ts";
 import { resetCatalogCache } from "./models.ts";
 import {
 	AlateSection,
@@ -303,6 +304,7 @@ async function watchForm(
 		<ProjectSettingsForm
 			project={p}
 			tasks={[]}
+			cardIndex={buildCardIndex([])}
 			trendingScan={true}
 			act={async (fn) => {
 				await fn();
@@ -346,6 +348,7 @@ async function mountForm(
 		<ProjectSettingsForm
 			project={project}
 			tasks={[]}
+			cardIndex={buildCardIndex([])}
 			trendingScan={true}
 			act={async (fn) => {
 				await fn();
@@ -1655,7 +1658,11 @@ describe("ProjectSettingsForm review counter", () => {
 
 	test("counts from the review's base: the sha links to the commit, the card id opens the card", async () => {
 		const opened: string[] = [];
-		const review = { id: "R-1", doneAt: DONE_AT } as unknown as TaskCard;
+		const review = {
+			id: "R-1",
+			project: "proj",
+			doneAt: DONE_AT,
+		} as unknown as TaskCard;
 		const { container, unmount } = await mountProjectForm(
 			projectWith(
 				{
@@ -1840,6 +1847,7 @@ describe("Project switch cards", () => {
 					} as unknown as ProjectView
 				}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 				trendingScan={true}
 				act={async () => true}
 				openTask={() => {}}
@@ -1902,6 +1910,7 @@ describe("Project switch cards", () => {
 			<ProjectSettingsForm
 				project={project()}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 				trendingScan={true}
 				act={async (fn) => {
 					await fn();
@@ -2465,6 +2474,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 			<ProjectSettingsForm
 				project={project(trendingScout)}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 				trendingScan={trendingScan}
 				trendingStatus={trendingStatus}
 				act={async (fn) => {
@@ -2845,6 +2855,7 @@ async function mountPage(
 			<SettingsPage
 				projects={options.projects ?? []}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 				maxTotal={null}
 				reviewCheck={false}
 				workCheck={false}
@@ -4460,6 +4471,7 @@ async function mountProjectForm(
 		<ProjectSettingsForm
 			project={project}
 			tasks={tasks}
+			cardIndex={buildCardIndex(tasks)}
 			trendingScan={true}
 			act={async (fn) => {
 				await fn();
@@ -4486,6 +4498,7 @@ async function mountProjectFormFetch(
 		<ProjectSettingsForm
 			project={project}
 			tasks={[]}
+			cardIndex={buildCardIndex([])}
 			trendingScan={true}
 			act={async (fn) => {
 				await fn();
@@ -6557,6 +6570,7 @@ describe("SetupRulesSection rules action", () => {
 	}): string =>
 		renderToStaticMarkup(
 			<SetupRulesSection
+				project="proj"
 				gitless={props.gitless ?? false}
 				hasRules={false}
 				rulesTask={props.rulesTask ?? null}
@@ -7165,6 +7179,7 @@ describe("Error-Says-Fix messages", () => {
 			<ProjectSettingsForm
 				project={project}
 				tasks={[]}
+				cardIndex={buildCardIndex([])}
 				trendingScan={false}
 				act={
 					report
@@ -7348,6 +7363,7 @@ describe("Error-Says-Fix messages", () => {
 				<ProjectSettingsForm
 					project={project}
 					tasks={[]}
+					cardIndex={buildCardIndex([])}
 					trendingScan={false}
 					act={async (fn) => {
 						await fn();

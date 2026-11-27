@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	type BoardState,
 	type Card,
+	type CardRef,
 	type Facts,
 	report,
 	resolveMergeHold,
@@ -36,6 +37,25 @@ const card = (x: Partial<Card>): Card => ({
 	cancelledAt: null,
 	followUpOf: null,
 	updatedAt: F.now - 60_000,
+	...x,
+});
+
+/** The frame's CardRef (OTTR-1255): the fixture's allCards rows mirror it. */
+const ref = (x: Partial<CardRef>): CardRef => ({
+	id: "T-1",
+	project: "p",
+	sessionTitle: "T",
+	kind: "task",
+	stage: "in_progress",
+	state: "running",
+	cancelledAt: null,
+	createdAt: F.now - 120_000,
+	updatedAt: F.now - 60_000,
+	doneAt: null,
+	followUpOf: null,
+	followUpOfProject: null,
+	asked: null,
+	dependsOn: [],
 	...x,
 });
 
@@ -468,61 +488,128 @@ describe("report", () => {
 	// names and nullability; wide TaskCard text fields are trimmed — the report
 	// reads none of them. No BoardState annotation: the fixture carries the real
 	// rows' unread fields, and assignability still checks what report() reads.
+	const rows = [
+		card({
+			id: "T-1",
+			state: "needs_you",
+			asked: [
+				{
+					question: "Which base for the rebase?",
+					options: [{ label: "origin/main" }, { label: "local main" }],
+					multi: false,
+					recommended: 1,
+				},
+			],
+		}),
+		card({
+			id: "T-2",
+			state: "needs_you",
+			needsReason:
+				"Update card: read the summary, then reply to approve the merge.",
+		}),
+		card({
+			id: "T-3",
+			stage: "queued",
+			state: "queued",
+			dependsOn: ["T-9", "T-12", "Q-1"],
+		}),
+		card({ id: "T-4" }),
+		card({
+			id: "T-5",
+			stage: "merging",
+			state: "queued",
+			project: "br-fixt-a1",
+			kind: "task",
+			releaseVersion: null,
+		}),
+		card({
+			id: "T-6",
+			stage: "merging",
+			state: "idle",
+			needsReason: "waiting for the review's findings to be implemented",
+			project: "br-fixt-a1",
+			kind: "review",
+			releaseVersion: null,
+			// The findings hold anchors at doneAt, else createdAt (OTTR-1253): the
+			// note names the review and the held time.
+			createdAt: F.now - 3_600_000,
+		}),
+		card({
+			id: "T-11",
+			stage: "merging",
+			state: "running",
+			project: "br-fixt-a1",
+			kind: "task",
+			releaseVersion: null,
+		}),
+		card({ id: "T-7", stage: "in_progress", state: "idle" }),
+		card({ id: "T-8", stage: "done", state: "idle" }),
+		card({ id: "T-10", stage: "in_progress", state: "idle", cancelledAt: 5 }),
+		card({ id: "RM-1", project: "iso", stage: "merging", state: "queued" }),
+	];
+	// The compact index (OTTR-1255): every card, no Done window. It carries the
+	// rows above plus T-12, a done card the windowed tasks left out — T-3's
+	// dependsOn names it, so depsOpen must resolve it as done from allCards.
 	const s = {
-		tasks: [
-			card({
-				id: "T-1",
-				state: "needs_you",
-				asked: [
-					{
-						question: "Which base for the rebase?",
-						options: [{ label: "origin/main" }, { label: "local main" }],
-						multi: false,
-						recommended: 1,
-					},
-				],
-			}),
-			card({
-				id: "T-2",
-				state: "needs_you",
-				needsReason:
-					"Update card: read the summary, then reply to approve the merge.",
-			}),
-			card({ id: "T-3", stage: "queued", state: "queued", dependsOn: ["T-9"] }),
-			card({ id: "T-4" }),
-			card({
-				id: "T-5",
-				stage: "merging",
-				state: "queued",
-				project: "br-fixt-a1",
-				kind: "task",
-				releaseVersion: null,
-			}),
-			card({
-				id: "T-6",
-				stage: "merging",
+		tasks: rows,
+		allCards: [
+			...rows.map((t) => ref(t)),
+			ref({ id: "T-12", stage: "done", state: "idle", doneAt: F.now - 30_000 }),
+			// A same-id done card of another project: the project-scoped dep
+			// lookup (OTTR-1255) must keep the local open T-9 dependency open.
+			ref({
+				id: "T-9",
+				project: "zz",
+				stage: "done",
 				state: "idle",
-				needsReason: "waiting for the review's findings to be implemented",
-				project: "br-fixt-a1",
+				doneAt: F.now - 40_000,
+			}),
+			// A valid foreign done dependency: its prefix Q exists only on the
+			// qq project, so the OTTR-708 walk must resolve it as done
+			// (send-back 3, round 3).
+			// An older qq card whose id prefix (A) differs from qq's configured
+			// handle (Q): the resolver must read the configured handle, never
+			// the first card id (send-back 3).
+			ref({
+				id: "A-1",
+				project: "qq",
+				stage: "done",
+				state: "idle",
+				doneAt: F.now - 44_000,
+			}),
+			ref({
+				id: "Q-1",
+				project: "qq",
+				stage: "done",
+				state: "idle",
+				doneAt: F.now - 45_000,
+			}),
+			// A done review R with an open finding K, both outside the window:
+			// the merging card RM-1 stays held by the review's findings.
+			ref({
+				id: "RT-1",
+				project: "iso",
 				kind: "review",
 				releaseVersion: null,
 				createdAt: F.now - 3_600_000,
+				stage: "done",
+				state: "idle",
+				doneAt: F.now - 20_000,
 			}),
-			card({
-				id: "T-11",
-				stage: "merging",
-				state: "running",
-				project: "br-fixt-a1",
-				kind: "task",
-				releaseVersion: null,
+			ref({
+				id: "RK-1",
+				project: "iso",
+				followUpOf: "RT-1",
+				followUpOfProject: "iso",
+				stage: "todo",
+				state: "queued",
+				doneAt: null,
 			}),
-			card({ id: "T-7", stage: "in_progress", state: "idle" }),
-			card({ id: "T-8", stage: "done", state: "idle" }),
-			card({ id: "T-10", stage: "in_progress", state: "idle", cancelledAt: 5 }),
 		],
 		projects: [
 			{
 				name: "gp",
+				taskPrefix: "GP",
 				icon: null,
 				remote: null,
 				path: join(tmp, "unused"),
@@ -537,6 +624,7 @@ describe("report", () => {
 			},
 			{
 				name: "ahead-proj",
+				taskPrefix: "AP",
 				icon: null,
 				remote: null,
 				path: join(tmp, "ahead"),
@@ -551,6 +639,7 @@ describe("report", () => {
 			},
 			{
 				name: "dirty-proj",
+				taskPrefix: "DP",
 				icon: null,
 				remote: null,
 				path: join(tmp, "dirty"),
@@ -563,6 +652,21 @@ describe("report", () => {
 				mainUnpushed: false,
 				github: null,
 			},
+			{
+				name: "qq",
+				taskPrefix: "Q",
+				icon: null,
+				remote: null,
+				path: join(tmp, "unused"),
+				sessionsDir: join(tmp, "unused", ".tasks", "sessions"),
+				hasRules: true,
+				target: null,
+				gitless: true,
+				dirty: false,
+				mainBranch: null,
+				mainUnpushed: false,
+				github: null,
+			},
 		],
 		maxTotal: 3,
 		drainUntil: null,
@@ -572,7 +676,7 @@ describe("report", () => {
 		const out = await report(s, F.now);
 		// Header with the open count (8 open: T-8 done and T-10 cancelled drop out).
 		expect(out).toContain(
-			"Board at 2025-10-09T08:53:20.000Z: 8 open, 2 running, maxTotal 3, drain none.",
+			"Board at 2025-10-09T08:53:20.000Z: 9 open, 2 running, maxTotal 3, drain none.",
 		);
 		// No warning: mergeHold resolved through the real scheduler.
 		expect(out).not.toContain("WARNING:");
@@ -588,9 +692,25 @@ describe("report", () => {
 		expect(out).toContain(
 			"| br-fixt-a1/T-6 T | merging/idle | OK | release waits for its findings | waiting for the review's findings",
 		);
+		// T-3's dep T-12 is done and lives only in allCards (OTTR-1255): depsOpen
+		// resolves it as done, so the note names only the everywhere-missing T-9.
+		// A done T-9 of another project rides in allCards too: the project-scoped
+		// lookup must keep the local open T-9 dependency open (OTTR-1255).
+		expect(out).toContain("OK | waits for T-9 |  |");
+		// RM-1 merges while the done review RT-1 still has the open finding RK-1
+		// outside the window: the complete graph keeps the findings hold. The
+		// "iso" project holds no other review, so only the hidden pair can
+		// produce this row's hold.
+		// No "; a merge runs" suffix: T-11 runs in another project, which also
+		// proves the isolation — the hold comes from the hidden pair alone.
+		expect(out).toContain(
+			"| iso/RM-1 T | merging/queued | OK | waiting for the review's findings to be implemented (review RT-1, held 0m, cap frees at 2025-10-11T08:53:00.000Z) |  |",
+		);
+		expect(out).not.toContain("waits for T-9,T-12");
 		// Done and cancelled cards never render.
 		expect(out).not.toContain("T-8 ");
 		expect(out).not.toContain("T-10 ");
+		expect(out).not.toContain("T-12 ");
 		// The question section lists the asked card with its options, recommended starred.
 		expect(out).toContain("## Questions");
 		expect(out).toContain("### p/T-1: T");
@@ -665,7 +785,15 @@ describe("report", () => {
 			});
 			const state: BoardState = {
 				tasks: [review, release, merge],
-				projects: [{ name: "br", path: "/tmp/unused-br", gitless: true }],
+				allCards: [],
+				projects: [
+					{
+						name: "br",
+						path: "/tmp/unused-br",
+						gitless: true,
+						taskPrefix: "BR",
+					},
+				],
 				maxTotal: 2,
 				drainUntil: null,
 			};

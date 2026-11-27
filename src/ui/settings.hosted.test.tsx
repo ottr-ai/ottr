@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { ProjectView, StateResponse } from "../types.ts";
+import { buildCardIndex } from "./cardIndex.ts";
 import type { TocGroup } from "./settings.tsx";
 
 // Hosted mode, docs/specs/hosted-mode.md section 7: the UI hides the host-level surfaces.
@@ -161,6 +162,7 @@ const page = (view: string, hosted?: boolean) => (
 	<SettingsPage
 		projects={[project()]}
 		tasks={[]}
+		cardIndex={buildCardIndex([])}
 		maxTotal={null}
 		reviewCheck={false}
 		workCheck={false}
@@ -850,6 +852,7 @@ describe("hosted app shell", () => {
 				<Overview
 					projects={boardState(false).projects}
 					tasks={[]}
+					cardIndex={buildCardIndex([])}
 					compose={() => {}}
 					onAdd={() => {}}
 					openTask={() => {}}

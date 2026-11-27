@@ -1323,12 +1323,6 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	 * first. This card's Work steps show their turns; each finding stays a card of its own.
 	 * Absent without findings. */
 	findings?: FindingView[];
-	/** Drawer detail only (OTTR-1198): every card that names this card as its followUpOf
-	 * source, across every project's board, oldest first. Refs only — the drawer fetches
-	 * each card from its own tasks route, so the Lineage shows children the state's Done
-	 * windows dropped (an older done child, or one filed into another project). Absent on
-	 * older servers. */
-	children?: { project: string; id: string; createdAt: number }[];
 }
 
 /** A retro card as its source card's drawer shows it: the facts its Work steps entry reads. */
@@ -1431,6 +1425,31 @@ export type TaskCard = Omit<
 	/** Lowercase `owner/repo` when this card is a trending scout's proposal; the cancel dialog then asks for a reason. */
 	trendingRepo?: string;
 };
+
+/** The compact card index the state ships next to the windowed tasks (OTTR-1255):
+ * every card of every project, done and cancelled included, with no Done window.
+ * Lookups, links, counts and decisions read it; it never feeds a rendered list. */
+export type CardRef = Pick<
+	TaskCard,
+	| "id"
+	| "project"
+	| "sessionTitle"
+	| "kind"
+	| "stage"
+	| "state"
+	| "cancelledAt"
+	| "createdAt"
+	| "updatedAt"
+	| "doneAt"
+	| "followUpOf"
+	| "followUpOfProject"
+	| "asked"
+	| "dependsOn"
+	| "commits"
+	| "releaseVersion"
+	| "queuedAt"
+	| "leadAtDone"
+> & { prOccurrence?: TaskCard["prOccurrence"]; lead?: TaskCard["lead"] };
 
 /** OTTR-488: harvested at settle — 'yes' when the report carries a `## Recommended steps` heading, 'no' when a harvested report carries none, 'unknown' when no report was harvested (legacy rows). Views resolve 'unknown' against the stored report at read time (app.ts viewSteps, ui/queue.ts researchSteps). */
 export type ResearchSteps = "yes" | "no" | "unknown";
@@ -1592,6 +1611,10 @@ export interface StateResponse {
 	 * done and cancelled cards and every pinned one, all projects newest first. Older
 	 * settled cards leave the frame; GET /api/projects/<p>/done?page=N serves them. */
 	tasks: TaskCard[];
+	/** OTTR-1255: the compact index of every card of every project — no Done window,
+	 * so lookups see settled cards the tasks window left out. Lookups and decisions
+	 * read it; the lanes, the Done lane and search keep reading tasks. */
+	allCards: CardRef[];
 	/** Global cap of concurrently running omp processes; null = no cap. */
 	maxTotal: number | null;
 	/** The scheduler's own live slot count at frame assembly: the distinct running and
@@ -1637,7 +1660,13 @@ export interface StateResponse {
 	orphansError: string | null;
 	/** Cancelled cards still holding a kept worktree: held total, stale past the keptWorktreeDays threshold,
 	 *  cards naming each held card so the advisory can link it (absent on frames from an older server). */
-	keptWorktrees: { held: number; stale: number; cards?: string[] };
+	keptWorktrees: {
+		held: number;
+		stale: number;
+		/** The held cards with their projects, so the advisory's click opens the
+		 * right twin when ids repeat across projects (OTTR-1255). */
+		cards?: Array<{ id: string; project: string }>;
+	};
 	/** While an update holds new turns (POST /api/drain): when the hold lapses unless the update renews it; null otherwise. */
 	drainUntil: number | null;
 	/** Commit subjects the pending update brings (POST /api/drain), sanitized; null when no hold. */

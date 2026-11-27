@@ -156,9 +156,25 @@ const tasks: TaskCard[] = [
 		followUpOfProject: "alpha",
 	}),
 ];
+// The hidden foreign twin (OTTR-1255 send-back 3): a done BE-2 in alpha sorts
+// ahead of beta's open BE-2 in allCards, so a bare-id lookup opens the twin
+// instead of the card the advisory names.
+const alphaTwin = card({
+	id: "BE-2",
+	title: "Alpha done twin",
+	sessionTitle: "Alpha done twin",
+	project: "alpha",
+	stage: "done",
+	state: "idle",
+	createdAt: 5,
+	doneAt: 6,
+});
 const state = {
 	projects,
 	tasks,
+	// The server puts every card in the index (OTTR-1255); the fixture's index
+	// leads with the twin, exactly like the server's project-then-id sort.
+	allCards: [alphaTwin, ...tasks],
 	maxTotal: null,
 	reviewCheck: false,
 	workCheck: false,
@@ -184,6 +200,12 @@ const state = {
 	seedFailed: null,
 	alateProvisionError: null,
 } as unknown as StateResponse;
+const setTasks = (rows: TaskCard[]): void => {
+	// The frame's window and its index update together (OTTR-1255): the drawer
+	// reads the index, so a card pushed into the fixture lands in both.
+	state.tasks = rows;
+	state.allCards = [alphaTwin, ...rows];
+};
 
 // --- per-test overrides -------------------------------------------------------
 // The shared answers above stay fixed; a test swaps the frame the poll reads or
@@ -518,7 +540,11 @@ test("the bell opens another project's card and the board follows it", async () 
 test("the kept-worktree advisory names its card and the link opens it", async () => {
 	const before = state.keptWorktrees;
 	// One cancelled card holds a worktree; the frame names it so the line can link it.
-	state.keptWorktrees = { held: 1, stale: 0, cards: ["BE-2"] };
+	state.keptWorktrees = {
+		held: 1,
+		stale: 0,
+		cards: [{ id: "BE-2", project: "beta" }],
+	};
 	await mountAt("/projects/alpha");
 	try {
 		const line = document.querySelector('[data-inbox-key^="kept:"]');
@@ -583,7 +609,8 @@ test("a cross-project child in its own project's window nests in the source card
 // card's lineage still nests it, and the proposal's drawer still reads the chain.
 const pushRetroProposal = (): number => {
 	const base = state.tasks.length;
-	state.tasks.push(
+	setTasks([
+		...state.tasks,
 		card({
 			id: "SR-1",
 			title: "Alpha retro",
@@ -606,7 +633,7 @@ const pushRetroProposal = (): number => {
 			followUpOfProject: "alpha",
 			createdAt: 3000,
 		}),
-	);
+	]);
 	return base;
 };
 
@@ -737,7 +764,7 @@ test("an old pinned task stays open when its state row disappears", async () => 
 	const pendingDetail = Promise.withResolvers<Response>();
 	const releaseDetail = pendingDetail.resolve;
 	const previousTasks = state.tasks;
-	state.tasks = [...previousTasks, pinned];
+	setTasks([...previousTasks, pinned]);
 	try {
 		await withOldTaskFixture(
 			(attempt) =>
@@ -770,7 +797,7 @@ test("an old pinned task stays open when its state row disappears", async () => 
 					};
 
 					const before = stateRequests();
-					state.tasks = previousTasks;
+					setTasks(previousTasks);
 					await act(async () => {
 						refreshState();
 						const { promise, resolve } = Promise.withResolvers<void>();
@@ -796,7 +823,7 @@ test("an old pinned task stays open when its state row disappears", async () => 
 			},
 		);
 	} finally {
-		state.tasks = previousTasks;
+		setTasks(previousTasks);
 	}
 });
 
@@ -894,7 +921,7 @@ test("a current state task keeps its title over a late old detail", async () => 
 				await openOlderDoneCard();
 				await waitFor(() => detailRequests() === 1);
 				const before = stateRequests();
-				state.tasks.push(currentTask);
+				setTasks([...state.tasks, currentTask]);
 				await act(async () => {
 					refreshState();
 					const { promise, resolve } = Promise.withResolvers<void>();
@@ -957,7 +984,7 @@ test("a newer current row stays selected after an old task leaves state", async 
 					currentDetail = currentTaskView;
 
 					const before = stateRequests();
-					state.tasks = [...previousTasks, currentTask];
+					setTasks([...previousTasks, currentTask]);
 					await act(async () => {
 						refreshState();
 						const { promise, resolve } = Promise.withResolvers<void>();
@@ -971,7 +998,7 @@ test("a newer current row stays selected after an old task leaves state", async 
 					const detailsBeforeEviction = detailRequests();
 					const stateBeforeEviction = stateRequests();
 					afterEviction = true;
-					state.tasks = previousTasks;
+					setTasks(previousTasks);
 					await act(async () => {
 						refreshState();
 						const { promise, resolve } = Promise.withResolvers<void>();
@@ -996,7 +1023,7 @@ test("a newer current row stays selected after an old task leaves state", async 
 			},
 		);
 	} finally {
-		state.tasks = previousTasks;
+		setTasks(previousTasks);
 	}
 });
 
@@ -1134,7 +1161,7 @@ test("a failed read mark rolls back: the card counts as unread again", async () 
 		doneAt: 1000,
 		answered: true,
 	});
-	state.tasks.push(answered);
+	setTasks([...state.tasks, answered]);
 	const realFetch = host.fetch;
 	host.fetch = (async (input: RequestInfo | URL) => {
 		if (String(input) === "/api/seen")
@@ -1171,7 +1198,7 @@ test("a failed mark-unread rolls back: the card counts as read again", async () 
 		doneAt: 1000,
 		answered: true,
 	});
-	state.tasks.push(answered);
+	setTasks([...state.tasks, answered]);
 	// The server frame confirms the read with both keys (OTTR-827: the plain id and
 	// the completion key), so the local mark is not the only thing keeping the badge off.
 	state.seenAnswers = ["AL-10", "AL-10@1000"];
@@ -1226,7 +1253,7 @@ test("a failed read mark recovers on the next explicit open", async () => {
 		doneAt: 1000,
 		answered: true,
 	});
-	state.tasks.push(answered);
+	setTasks([...state.tasks, answered]);
 	let seenPosts = 0;
 	let failSeen = true;
 	const realFetch = host.fetch;
@@ -1284,7 +1311,7 @@ test("a card the baseline reads offers no Mark unread control", async () => {
 		doneAt: 500,
 		answered: true,
 	});
-	state.tasks.push(answered);
+	setTasks([...state.tasks, answered]);
 	state.seenDoneSince = 1000;
 	let seenPosts = 0;
 	const realFetch = host.fetch;
@@ -1324,7 +1351,7 @@ test("an opened post-baseline card offers Mark unread", async () => {
 		doneAt: 500,
 		answered: true,
 	});
-	state.tasks.push(answered);
+	setTasks([...state.tasks, answered]);
 	try {
 		await mountAt("/projects/alpha/tasks/AL-14");
 		await waitFor(drawerOpen);
@@ -2024,7 +2051,8 @@ test("a non-running card's session context is fetched once, never polled", async
 			input,
 		);
 	}) as typeof fetch;
-	state.tasks.push(
+	setTasks([
+		...state.tasks,
 		card({
 			id: "DO-9",
 			title: "Done card",
@@ -2033,7 +2061,7 @@ test("a non-running card's session context is fetched once, never polled", async
 			state: "idle",
 			doneAt: 1000,
 		}),
-	);
+	]);
 	try {
 		await mountAt("/projects/alpha/tasks/DO-9");
 		await waitFor(drawerOpen);
@@ -2062,7 +2090,8 @@ test("a running card's session context re-polls on the 5 s interval", async () =
 			input,
 		);
 	}) as typeof fetch;
-	state.tasks.push(
+	setTasks([
+		...state.tasks,
 		card({
 			id: "RU-9",
 			title: "Running card",
@@ -2070,7 +2099,7 @@ test("a running card's session context re-polls on the 5 s interval", async () =
 			stage: "in_progress",
 			state: "running",
 		}),
-	);
+	]);
 	try {
 		await mountAt("/projects/alpha/tasks/RU-9");
 		await waitFor(drawerOpen);
@@ -2102,17 +2131,16 @@ function seedOttr(ids: string[]): () => void {
 	const baseRestart = state.restartWait;
 	const taskLen = state.tasks.length;
 	state.projects = [...baseProjects, project("ottr", "Ottr")];
-	state.tasks.push(
-		...ids.map((id, i) =>
-			card({
-				id,
-				title: `Card ${id}`,
-				sessionTitle: `Card ${id}`,
-				project: "ottr",
-				createdAt: 5000 + i,
-			}),
-		),
+	const seeded = ids.map((id, i) =>
+		card({
+			id,
+			title: `Card ${id}`,
+			sessionTitle: `Card ${id}`,
+			project: "ottr",
+			createdAt: 5000 + i,
+		}),
 	);
+	setTasks([...state.tasks, ...seeded]);
 	state.warnings = [];
 	state.restartWait = null;
 	return () => {

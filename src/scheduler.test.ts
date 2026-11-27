@@ -75,7 +75,9 @@ import {
 } from "./scheduler.ts";
 import { type NewCodeScanAlert, ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
-import type { Task, WorkCheckRun } from "./types.ts";
+import type { CardRef, Task, WorkCheckRun } from "./types.ts";
+import { buildCardIndex } from "./ui/cardIndex.ts";
+import { projectGraph } from "./ui/status.ts";
 import { modelVendor } from "./vendor.ts";
 
 describe("silentSince", () => {
@@ -1086,6 +1088,84 @@ describe("pickRunnable", () => {
 			queuedAt: 900,
 		};
 		expect(mergeHold([review, ready, other], other)).toBeNull();
+	});
+
+	test("the board's card graph keeps leadAtDone, so a promoted lead holds nothing (OTTR-1255 send-back 13)", () => {
+		// The board's hold gates read projectGraph rows built from the state
+		// frame's CardRef list. The adapter must carry the store's leadAtDone
+		// flag verbatim: inventing false re-held every merge behind a promoted
+		// lead once its review had finished (OTTR-963's exact incident, through
+		// the new path).
+		const cref = (p: Partial<CardRef>): CardRef => ({
+			id: "x",
+			project: "p",
+			sessionTitle: "t",
+			kind: "work",
+			stage: "done",
+			state: "idle",
+			cancelledAt: null,
+			createdAt: 100,
+			updatedAt: 200,
+			doneAt: null,
+			followUpOf: null,
+			followUpOfProject: null,
+			asked: null,
+			dependsOn: [],
+			commits: 0,
+			releaseVersion: null,
+			queuedAt: null,
+			leadAtDone: false,
+			...p,
+		});
+		const review = cref({
+			id: "R-1",
+			kind: "review",
+			releaseVersion: "v0.4.0",
+			stage: "done",
+			doneAt: 500,
+		});
+		const promoted = cref({
+			id: "F-1",
+			followUpOf: "R-1",
+			followUpOfProject: "p",
+			stage: "in_progress",
+			state: "running",
+			createdAt: 310,
+			doneAt: null,
+			leadAtDone: true,
+		});
+		const other = cref({ id: "M-1", stage: "merging" });
+		const index = buildCardIndex([review, promoted, other]);
+		const graph = projectGraph(index, "p");
+		// The flag survives the adapter verbatim.
+		expect(graph.find((r) => r.id === "F-1")?.leadAtDone).toBe(true);
+		const mergeRow = {
+			id: "M-1",
+			stage: "merging" as const,
+			state: "queued" as const,
+			pushRetries: 0,
+			pendingBy: null,
+		};
+		expect(mergeHold(graph, mergeRow)).toBeNull();
+		// The negative control: an open finding that was NOT a lead at doneAt
+		// still holds the merge, so the flag is read, not merely absent.
+		const commitment = cref({
+			id: "F-1",
+			followUpOf: "R-1",
+			followUpOfProject: "p",
+			stage: "in_progress",
+			state: "running",
+			createdAt: 310,
+			doneAt: null,
+			leadAtDone: false,
+		});
+		const holding = projectGraph(
+			buildCardIndex([review, commitment, other]),
+			"p",
+		);
+		expect(mergeHold(holding, mergeRow)).toBe(
+			"waiting for the review's findings to be implemented",
+		);
 	});
 
 	test("a done release's open non-lead finding still holds other merges (OTTR-963)", () => {

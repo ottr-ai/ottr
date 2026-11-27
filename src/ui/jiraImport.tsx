@@ -66,7 +66,7 @@ export function JiraImportDialog({
 }: {
 	project: ProjectView;
 	onClose: () => void;
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const base = `/api/projects/${encodeURIComponent(project.name)}/jira`;
 	const [jql, setJql] = useState(project.settings.jiraLastJql ?? "");
@@ -273,7 +273,9 @@ export function JiraImportDialog({
 									onToggle={(on) => toggle(r.key, on)}
 									openCard={(id) => {
 										onClose();
-										openTask(id);
+										// The import names the project it filed into
+										// (send-back 7): the click must open that card.
+										openTask(id, project.name);
 									}}
 								/>
 							))}

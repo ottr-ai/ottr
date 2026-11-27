@@ -20,6 +20,7 @@ describe("parseServerMessage", () => {
 					type: "state",
 					state: {
 						tasks: [],
+						allCards: [],
 						projects: [],
 						maxTotal: 3,
 						reviewCheck: true,
@@ -59,6 +60,7 @@ describe("parseServerMessage", () => {
 			type: "state",
 			state: {
 				tasks: [],
+				allCards: [],
 				projects: [],
 				maxTotal: 3,
 				reviewCheck: true,

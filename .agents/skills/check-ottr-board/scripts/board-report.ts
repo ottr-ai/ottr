@@ -38,11 +38,45 @@ export type Card = {
 	sandboxLead?: true;
 };
 
-export type Project = { name: string; path: string; gitless?: boolean };
+export type Project = {
+	name: string;
+	path: string;
+	gitless?: boolean;
+	/** The project's configured id handle (src/types.ts taskPrefix): the fact
+	 * the dependency resolver matches, never inferred from card ids. */
+	taskPrefix: string;
+};
+
+/** The compact card index the state ships next to tasks: every card
+ * of every project, done and cancelled included, with no Done window. The field
+ * list mirrors the frame's CardRef (src/types.ts), minus prOccurrence, which
+ * this report never reads. depsOpen resolves against it; the report's other
+ * reads stay on the windowed tasks. */
+export type CardRef = {
+	id: string;
+	project: string;
+	sessionTitle: string;
+	kind: string;
+	stage: string;
+	state: string;
+	releaseVersion?: string | null;
+	lead?: true;
+	leadAtDone?: boolean;
+	cancelledAt?: number | null;
+	createdAt: number;
+	updatedAt: number;
+	doneAt?: number | null;
+	followUpOf?: string | null;
+	followUpOfProject?: string | null;
+	asked?: Asked[] | null;
+	dependsOn?: string[];
+};
 
 /** The fields of GET /api/state the report reads; the real answer carries more. */
 export type BoardState = {
 	tasks: Card[];
+	/** Every card of every project, no Done window. */
+	allCards: CardRef[];
 	projects: Project[];
 	maxTotal: number | null;
 	drainUntil: number | null;
@@ -395,10 +429,29 @@ function leadHoldFor(c: Card, leadHold: LeadHold | null): string | null {
 	}
 }
 
-/** The card's dependencies that are neither done nor cancelled, unknown ids included. */
-function openDeps(c: Card, byId: Map<string, Card>): string[] {
+/** The card's dependencies that are neither done nor cancelled, unknown ids included,
+ * resolved against allCards project-qualified: ids are unique per project, so a same-id
+ * card in another project never
+ * answers a local dependency, and a done dep outside the windowed tasks never reads
+ * as open. A miss falls to the configured id-handle walk, so a foreign done
+ * dependency counts as done. */
+function openDeps(
+	c: Card,
+	byId: Map<string, CardRef>,
+	prefixOf: Map<string, string>,
+): string[] {
 	return (c.dependsOn ?? []).filter((d) => {
-		const t = byId.get(d);
+		let t = byId.get(`${c.project}\u0000${d}`);
+		if (t === undefined) {
+			const m = /^([A-Z0-9]{1,8})-(\d+)$/.exec(d);
+			const prefix = m === null ? undefined : m[1];
+			if (prefix !== undefined) {
+				const foreign = [...prefixOf].find(
+					([name, pfx]) => pfx === prefix && name !== c.project,
+				);
+				if (foreign !== undefined) t = byId.get(`${foreign[0]}\u0000${d}`);
+			}
+		}
 		return t === undefined || (t.stage !== "done" && t.cancelledAt === null);
 	});
 }
@@ -466,7 +519,18 @@ export async function report(s: BoardState, now: number): Promise<string> {
 		(t) =>
 			t.cancelledAt === null && t.stage !== "done" && t.stage !== "backlog",
 	);
-	const byId = new Map(s.tasks.map((t) => [t.id, t]));
+	// Dependency ids resolve against allCards, project-qualified: ids are
+	// unique per project, so a same-id card in another project must never answer a
+	// local dependency, and a done dep outside the windowed tasks must not read as open.
+	const byId = new Map(s.allCards.map((t) => [`${t.project}\u0000${t.id}`, t]));
+	// The prefix walk matches each project's CONFIGURED id handle (taskPrefix
+	// on s.projects, the same facts the UI's resolver reads): a project's
+	// older card ids never redefine its handle.
+	const prefixOf = new Map<string, string>();
+	for (const p of s.projects) {
+		if (p.taskPrefix !== undefined && !prefixOf.has(p.name))
+			prefixOf.set(p.name, p.taskPrefix);
+	}
 	const {
 		mergeHold,
 		leadHold: leadHoldOf,
@@ -496,7 +560,23 @@ export async function report(s: BoardState, now: number): Promise<string> {
 	>();
 	const rows = open
 		.map((c) => {
-			const sameProject = s.tasks.filter((t) => t.project === c.project);
+			// The complete project set from allCards, shaped for
+			// mergeHold's review reads: a done release or finding outside the
+			// window neither holds nor frees by accident, and leadAtDone rides
+			// real (a promoted lead holds nothing after its review finished). The
+			// loaded rows come first and win, so open cards keep their wide fields.
+			const loaded = s.tasks.filter((t) => t.project === c.project);
+			const loadedIds = new Set(loaded.map((t) => t.id));
+			const sameProject: Card[] = [
+				...loaded,
+				...s.allCards
+					.filter((t) => t.project === c.project && !loadedIds.has(t.id))
+					.map((t) => ({
+						...t,
+						title: t.sessionTitle,
+						leadAtDone: t.leadAtDone ?? false,
+					})),
+			];
 			const hold =
 				mergeHold !== null && c.stage === "merging"
 					? holdNote(
@@ -513,7 +593,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 				logAgeS: logAgeSeconds(c, now),
 				hold,
 				leadHold: leadHoldFor(c, leadHoldOf),
-				depsOpen: openDeps(c, byId),
+				depsOpen: openDeps(c, byId, prefixOf),
 				drain,
 				capFull: s.maxTotal !== null && running >= s.maxTotal,
 				cards: s.tasks,

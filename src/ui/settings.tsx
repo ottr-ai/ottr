@@ -37,6 +37,7 @@ import type {
 	TrendingStatus,
 } from "../types.ts";
 import { TRENDING_TOKEN_HINT } from "../types.ts";
+import { type CardIndex, lookupCardIn } from "./cardIndex.ts";
 import {
 	type Act,
 	BusyButton,
@@ -241,6 +242,7 @@ export function SetupRulesSection({
 	hasRules,
 	rulesTask,
 	rulesQueued,
+	project,
 	openTask,
 	onClose,
 	initRepo,
@@ -251,7 +253,8 @@ export function SetupRulesSection({
 	hasRules: boolean;
 	rulesTask: string | null;
 	rulesQueued: boolean;
-	openTask?: (id: string) => void;
+	project: string;
+	openTask?: (id: string, project?: string) => void;
 	onClose: () => void;
 	initRepo: () => Promise<boolean>;
 	alignRules: () => Promise<boolean>;
@@ -289,7 +292,7 @@ export function SetupRulesSection({
 						<BusyButton
 							run={async () => {
 								onClose();
-								openTask(rulesTask);
+								openTask(rulesTask, project);
 								return true;
 							}}
 						>
@@ -706,7 +709,7 @@ export function ProjectSetupSteps({
 	 * offers "Open rules task" instead of a second "Discuss rules" that would only queue. */
 	rulesTask?: string | null;
 	/** Opens the rules card in the board drawer; the "Open rules task" button needs it. */
-	openTask?: (id: string) => void;
+	openTask?: (id: string, project?: string) => void;
 	act: Act;
 	onNotice?: (message: string) => void;
 	onClose: () => void;
@@ -933,6 +936,7 @@ export function ProjectSetupSteps({
 					hasRules={view.hasRules}
 					rulesTask={rulesTask}
 					rulesQueued={rulesQueued}
+					project={project.name}
 					openTask={openTask}
 					onClose={onClose}
 					// Creating the repo moves to the first unsettled settings step: the
@@ -8849,6 +8853,7 @@ function GeneralSettingsContent({
 export function SettingsPage({
 	projects,
 	tasks,
+	cardIndex,
 	maxTotal,
 	reviewCheck,
 	workCheck,
@@ -8863,6 +8868,9 @@ export function SettingsPage({
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
+	/** Every card of every project (OTTR-1255); the Reviews card's counter finds its
+	 * review card here, outside the Done window included. */
+	cardIndex: CardIndex;
 	maxTotal: number | null;
 	reviewCheck: boolean;
 	workCheck: boolean;
@@ -8873,7 +8881,7 @@ export function SettingsPage({
 	act: Act;
 	view: string;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	/** Hosted mode (docs/specs/hosted-mode.md): the host-level cards are hidden. */
 	hosted?: boolean;
 }) {
@@ -9115,6 +9123,7 @@ export function SettingsPage({
 							key={project.name}
 							project={project}
 							tasks={tasks}
+							cardIndex={cardIndex}
 							trendingScan={trendingScan}
 							trendingStatus={trendingStatus}
 							act={act}
@@ -9134,17 +9143,21 @@ export function SettingsPage({
 function ReviewCounter({
 	review,
 	github,
-	tasks,
+	cardIndex,
+	project,
 	openTask,
 }: {
 	review: ArchReview;
 	github: string | null;
-	tasks: TaskCard[];
-	openTask: (id: string) => void;
+	cardIndex: CardIndex;
+	project: string;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const cardId = review.reviewCardId;
+	// OTTR-1255: the review card can sit outside the Done window; the index finds
+	// it, project-scoped so a foreign twin cannot answer the doneAt or the drawer.
 	const card =
-		cardId === null ? null : (tasks.find((t) => t.id === cardId) ?? null);
+		cardId === null ? null : lookupCardIn(cardIndex, cardId, project);
 	return (
 		<>
 			{review.base === null ? (
@@ -9172,7 +9185,7 @@ function ReviewCounter({
 					<button
 						type="button"
 						className="ghost"
-						onClick={() => openTask(cardId)}
+						onClick={() => openTask(cardId, project)}
 						aria-label={`Open review card #${cardId}`}
 					>
 						#{cardId}
@@ -10299,7 +10312,7 @@ function ProjectReviewsCards({
 	cap,
 	setCap,
 	reviewCap,
-	tasks,
+	cardIndex,
 	openTask,
 }: {
 	project: ProjectView;
@@ -10321,8 +10334,8 @@ function ProjectReviewsCards({
 	cap: string;
 	setCap: (v: string) => void;
 	reviewCap: number;
-	tasks: TaskCard[];
-	openTask: (id: string) => void;
+	cardIndex: CardIndex;
+	openTask: (id: string, project?: string) => void;
 }) {
 	const nppLines = npp
 		.split("\n")
@@ -10513,7 +10526,8 @@ function ProjectReviewsCards({
 								<ReviewCounter
 									review={project.archReview}
 									github={project.github}
-									tasks={tasks}
+									cardIndex={cardIndex}
+									project={project.name}
 									openTask={openTask}
 								/>
 							</p>
@@ -10529,6 +10543,7 @@ function ProjectReviewsCards({
 export function ProjectSettingsForm({
 	project,
 	tasks,
+	cardIndex,
 	trendingScan,
 	trendingStatus,
 	act,
@@ -10537,6 +10552,9 @@ export function ProjectSettingsForm({
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
+	/** Every card of every project (OTTR-1255); the Reviews card's counter finds its
+	 * review card here, outside the Done window included. */
+	cardIndex: CardIndex;
 	/** The board's general "Weekly trending scan" switch: a project's Trending scout
 	 *  never runs while it is off, so the row shows that state. */
 	trendingScan: boolean;
@@ -10545,7 +10563,7 @@ export function ProjectSettingsForm({
 	trendingStatus?: TrendingStatus;
 	act: Act;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
-	openTask: (id: string) => void;
+	openTask: (id: string, project?: string) => void;
 	/** Hosted mode (docs/specs/hosted-mode.md): the merge, watch and proposal cards are hidden. */
 	hosted?: boolean;
 }) {
@@ -10730,7 +10748,7 @@ export function ProjectSettingsForm({
 					cap={cap}
 					setCap={setCap}
 					reviewCap={reviewCap}
-					tasks={tasks}
+					cardIndex={cardIndex}
 					openTask={openTask}
 				/>
 			</section>

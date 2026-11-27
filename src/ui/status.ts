@@ -9,10 +9,12 @@ import {
 	PUSH_HOLD,
 	queueOrder,
 	type ReviewTask,
+	resolveDep,
 	reviewFindings,
 	waitingOn,
 } from "../scheduler.ts";
-import type { ProjectView, Task, TaskCard } from "../types.ts";
+import type { CardRef, ProjectView, Task, TaskCard } from "../types.ts";
+import type { CardIndex } from "./cardIndex.ts";
 import { duration, until } from "./time.ts";
 
 /** "about X left" for a live turn against its project/kind/model median turn length, in the
@@ -74,14 +76,33 @@ export function strykerStats(rest: string): Array<{
 }
 
 /** "k of N findings done" while a review or release card runs: counts how many of the
- * review's findings (reviewFindings) have already landed (done) or been cancelled. null
- * when t is not a running review or no finding is filed yet — the plain "running" stays. */
+ * review's findings (reviewFindings) have already landed (done) or been cancelled. The
+ * findings scan reads the whole board's index (OTTR-1255): a finding already done left
+ * the Done window, so the windowed list undercounted. null when t is not a running
+ * review or no finding is filed yet — the plain "running" stays. */
 export function reviewProgress(
-	tasks: readonly (ReviewTask & Pick<Task, "title">)[],
-	t: Pick<Task, "id" | "kind" | "releaseVersion" | "doneAt" | "state">,
+	index: CardIndex,
+	t: Pick<
+		Task,
+		"id" | "project" | "kind" | "releaseVersion" | "doneAt" | "state"
+	>,
 ): string | null {
 	if (t.state !== "running" || !isReview(t)) return null;
-	const findings = reviewFindings(tasks, t);
+	// The findings scan reads the review's own project from the index (send-back 20):
+	// a foreign twin's child must never join the count. reviewFindings reads
+	// review-task fields the index does not carry; the neutral fills below never
+	// change its result, which reads followUpOf, createdAt, id, dependsOn and kind
+	// only, and the lead mark rides the spread without a prompt key (isLead reads
+	// the prompt first when the key exists).
+	const findings = reviewFindings(
+		projectGraph(index, t.project).map((c) => ({
+			...c,
+			title: "",
+			releaseVersion: null,
+			leadAtDone: c.leadAtDone,
+		})),
+		t,
+	);
 	const n = findings.length;
 	if (n === 0) return null;
 	const done = findings.filter(
@@ -316,6 +337,111 @@ function idleLine(
 	return t.needsReason ?? "done";
 }
 
+/** One whole-project row the hold machinery consumes: the index's compact card plus the
+ * title the hold text names and the neutral fills for the windowed-card fields the
+ * readers touch. The fills never change a hold: a settled ref carries no hold stamps,
+ * PR facts or pending prompt (those ride only open cards, which the caller passes whole). */
+export type GraphTask = StatusTasks &
+	Pick<
+		Task,
+		| "project"
+		| "commits"
+		| "pendingPrompt"
+		| "prNumber"
+		| "pushSha"
+		| "priority"
+		| "model"
+	> & { heldMerges?: string[]; progress?: string };
+
+/** The whole project's cards from the card index, shaped for mergeHold, holdFor and
+ * reviewFindings (OTTR-1255): a settled card outside the Done window must hold or free
+ * exactly as the scheduler's own complete lists do, so a hidden done finding neither
+ * holds an open descendant nor hides behind the window cut. */
+export function projectGraph(index: CardIndex, project: string): GraphTask[] {
+	const rows: GraphTask[] = [];
+	for (const bucket of index.values())
+		for (const c of bucket) {
+			if (c.project !== project) continue;
+			rows.push({
+				...c,
+				title: c.sessionTitle,
+				leadAtDone: c.leadAtDone,
+				queuedAt: c.queuedAt,
+				needsReason: null,
+				pendingPrompt: null,
+				holdUntil: null,
+				prNumber: null,
+				pushSha: null,
+				pushRetries: 0,
+				pendingBy: null,
+				priority: null,
+				model: null,
+				validatedAt: null,
+				commits: c.commits,
+				progress: undefined,
+			});
+		}
+	return rows;
+}
+
+/** One index row adapted to the wide card shape the drawer's context rows render with
+ * (OTTR-1255): the neutral fills mirror projectGraph — the row renders its live state
+ * and title, never a hold stamp or PR fact, which only open cards carry. */
+export function refRow(c: CardRef): TaskCard {
+	return {
+		...c,
+		title: c.sessionTitle,
+		leadAtDone: c.leadAtDone,
+		queuedAt: c.queuedAt,
+		needsReason: null,
+		pendingPrompt: null,
+		holdUntil: null,
+		prNumber: null,
+		pushSha: null,
+		pushRetries: 0,
+		pendingBy: null,
+		priority: null,
+		model: null,
+		progress: undefined,
+		// The fill is deliberate and the consumers' field list is closed (see above);
+		// the double cast keeps that contract explicit instead of structural.
+	} as unknown as TaskCard;
+}
+
+/** One resolved dependency row: the DepCard facts plus the project it came from, so
+ * a foreign hold can re-read the full index row. */
+export type DepRow = DepCard & { project: string };
+
+/** The OTTR-708 resolver over the card index: own-project ids win before the
+ * `PREFIX-n` walk, and a hidden done local card beats a foreign open twin. */
+export function indexDepIndex(
+	index: CardIndex,
+	projects: readonly { name: string; prefix: string }[],
+	own: string,
+): ((id: string) => DepRow | null) | undefined {
+	const cards = new Map<string, DepRow>();
+	for (const bucket of index.values())
+		for (const c of bucket)
+			cards.set(`${c.project}\u0000${c.id}`, {
+				id: c.id,
+				project: c.project,
+				title: c.sessionTitle,
+				stage: c.stage,
+				cancelledAt: c.cancelledAt,
+			});
+	const list = projects.map((p) => ({
+		name: p.name,
+		prefix: p.prefix,
+		getTask: (id: string) => cards.get(`${p.name}\u0000${id}`) ?? null,
+	}));
+	const ownProj = list.find((p) => p.name === own);
+	if (ownProj === undefined) return undefined;
+	return (id) => {
+		const r = resolveDep(id, list, ownProj);
+		return "task" in r ? { ...r.task, project: r.project } : null;
+	};
+}
+
 export function statusLine(
 	t: Pick<
 		TaskCard,
@@ -331,6 +457,7 @@ export function statusLine(
 		| "releaseVersion"
 		| "doneAt"
 		| "id"
+		| "project"
 		| "prNumber"
 		| "pushSha"
 		| "validatedAt"
@@ -355,6 +482,9 @@ export function statusLine(
 	 * resolver — so a foreign dependency's hold reads its own project. Absent keeps
 	 * the plain wording for foreign dependencies. */
 	foreignHolds?: (id: string) => DepHoldContext | null,
+	/** The board's card index (OTTR-1255): counts a running review's findings
+	 * (reviewProgress) over every card, done ones included. */
+	index?: CardIndex,
 ): string {
 	// A cancelled card is final; the card's "Cancelled" chip carries the time.
 	if (t.cancelledAt !== null) return "cancelled";
@@ -363,7 +493,11 @@ export function statusLine(
 		return queuedLine(t, hasRules, hold, drain, tasks, foreign, foreignHolds);
 	if (t.state === "preparing") return "preparing";
 	if (t.state === "running")
-		return t.progress ?? reviewProgress(tasks ?? [], t) ?? "running";
+		return (
+			t.progress ??
+			reviewProgress(index ?? new Map<string, CardRef[]>(), t) ??
+			"running"
+		);
 	if (t.state === "needs_you")
 		return t.asked !== null ? "question asked" : "action required";
 	// A review card parked while its findings land: the reason is the status.
@@ -372,9 +506,14 @@ export function statusLine(
 }
 
 /** The card's state mark. A card idle short of done (a review parked while its findings land)
- * waits like a queued one: only a done card earns the check; a cancelled card earns the x. */
+ * waits like a queued one: only a done card earns the check; a cancelled card earns the x.
+ * needsReason is optional so an index ref (OTTR-1255) works too: without it the proposal
+ * check cannot match, which only a retro/fork proposal needs — a ref row of that kind
+ * reads as its live state, like every other card. */
 export function cardMark(
-	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked" | "needsReason">,
+	t: Pick<Task, "cancelledAt" | "state" | "stage" | "asked"> & {
+		needsReason?: string | null;
+	},
 ):
 	| "needs"
 	| "asked"
@@ -385,7 +524,14 @@ export function cardMark(
 	| "cancelled" {
 	if (t.cancelledAt !== null) return "cancelled";
 	// A proposal is a suggestion, not a fault: it waits like a card not started yet.
-	if (isProposal(t)) return "queued";
+	if (
+		isProposal({
+			state: t.state,
+			cancelledAt: t.cancelledAt,
+			needsReason: t.needsReason ?? null,
+		})
+	)
+		return "queued";
 	if (t.state === "needs_you") return t.asked !== null ? "asked" : "needs";
 	if (t.state === "running" || t.state === "preparing") return t.state;
 	return t.state === "queued" || t.stage !== "done" ? "queued" : "done";
@@ -501,26 +647,30 @@ export function splitAlarms(tasks: readonly TaskCard[]): {
 /** The bell's rows for PR review cards: plain needs-you cards, unseen comment stamps,
  *  and the board's own posted-review stamps, minus projects whose PR review notifications
  *  are off (docs/specs/pr-review-auto-post.md). `needs` is splitAlarms' needs split, still
- *  to quiet-filter. */
+ *  to quiet-filter. The activity and posted scans read the board's card index
+ *  (OTTR-1255): a PR review card with a stamp can sit outside the Done window, which the
+ *  windowed scan missed. */
 export function bellAlarms(
-	tasks: readonly TaskCard[],
+	index: CardIndex,
 	needs: readonly TaskCard[],
 	projects: readonly ProjectView[],
-): { needsShown: TaskCard[]; activity: TaskCard[]; posted: TaskCard[] } {
-	const quiet = (t: TaskCard): boolean =>
+): { needsShown: TaskCard[]; activity: CardRef[]; posted: CardRef[] } {
+	const quiet = (t: CardRef): boolean =>
 		t.kind === "pr_review" &&
 		projects.find((p) => p.name === t.project)?.settings.prReviewNotify ===
 			false;
+	const activity: CardRef[] = [];
+	const posted: CardRef[] = [];
+	for (const bucket of index.values())
+		for (const t of bucket) {
+			if (t.kind !== "pr_review" || quiet(t)) continue;
+			if (t.prOccurrence?.comments != null) activity.push(t);
+			if (t.prOccurrence?.posted != null) posted.push(t);
+		}
 	return {
 		needsShown: needs.filter((t) => !quiet(t)),
-		activity: tasks.filter(
-			(t) =>
-				t.kind === "pr_review" && t.prOccurrence?.comments != null && !quiet(t),
-		),
-		posted: tasks.filter(
-			(t) =>
-				t.kind === "pr_review" && t.prOccurrence?.posted != null && !quiet(t),
-		),
+		activity,
+		posted,
 	};
 }
 
