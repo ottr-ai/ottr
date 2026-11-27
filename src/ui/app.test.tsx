@@ -1565,6 +1565,7 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			verdict: "done",
 			evidence: "The fix landed in card w7; git log names 1a2b3c4.",
 			applied: false,
+			linkedCards: [],
 			drafts: [],
 			proposed: "clear",
 			stale: false,
@@ -1578,6 +1579,7 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			verdict: "partial",
 			evidence: "Step 2 has no child card.",
 			applied: false,
+			linkedCards: [],
 			drafts: ["Rewrite the queue page"],
 			proposed: "implement",
 			stale: false,
@@ -1591,6 +1593,7 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			verdict: "none",
 			evidence: "No step is done.",
 			applied: false,
+			linkedCards: [],
 			drafts: ["Draft the first step"],
 			proposed: "implement",
 			stale: true,
@@ -1761,18 +1764,18 @@ describe("Inbox sweep (OTTR-1259)", () => {
 	});
 
 	test("evidence renders card ids and commit hashes as links", () => {
-		// Blocker 7: the operator can open the cited evidence. The card id links
-		// only when the board lists the card; the commit links to the project's
-		// GitHub commit when the project has one.
+		// Blocker 7: the operator can open the cited evidence. The view ships the
+		// cited ids that exist (linkedCards) — the loaded card window cannot
+		// decide it — and the commit links to the project's GitHub commit.
 		const base = {
 			...drawerBase,
 			project: { ...drawerProject, github: "https://github.com/ottr/ottr" },
-			tasks: [cardFixture({ id: "OTHER-1", title: "the pairing fix" })],
 		};
 		const rows = [
 			{
 				...sweepRows()[0]!,
 				evidence: "Commit 1a2b3c4 landed it; see OTHER-1 and 5f5e5d5c.",
+				linkedCards: ["OTHER-1"],
 			},
 		];
 		const html = renderToStaticMarkup(
@@ -1786,6 +1789,17 @@ describe("Inbox sweep (OTTR-1259)", () => {
 		).toBe(true);
 		// The card id links through the task path (its drawer opens from there).
 		expect(html).toContain("/projects/proj/tasks/OTHER-1");
+		// An id the view did not verify stays plain text (no empty-drawer links).
+		const unlinked = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={sweepCard(
+					sweepView([{ ...rows[0]!, linkedCards: [], evidence: "see GONE-1" }]),
+				)}
+			/>,
+		);
+		expect(unlinked).not.toContain("/projects/proj/tasks/GONE-1");
+		expect(unlinked).toContain("GONE-1");
 	});
 
 	// happy-dom's dispatched clicks never reach React's event plugin: call the

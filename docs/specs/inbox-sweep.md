@@ -107,6 +107,7 @@ interface SweepRowView {
   proposed: "clear" | "implement";
   stale: boolean;
   applied: boolean;        // the row's durable applied marker exists
+  linkedCards: string[];   // cited evidence ids that exist in the store
   stage: Stage;
   state: RunState;
   cancelled: boolean;
@@ -135,13 +136,15 @@ an answer, finish or cancellation landing on an existing one alike.
   proposal card — backlog stage, `needs_you`, `promptAuthor: "board"`,
   `needsReason: sweepProposedReason(run card)` (`"Inbox sweep proposal from #<run>."
   + the action sentence`) — then marks the target seen. A draft that already
-  filed for this run skips (identical draft text files once), and a row whose
-  durable applied marker exists answers `skipped: "already applied"` — the
-  marker is a review finding on the run card (`Sweep applied: #<card>
-  <action>`, idempotent by the findings table's conflict rule), so repeated
-  and concurrent applies create no duplicate cards and the record survives
-  proposal edits; the whole apply runs in one store transaction, so concurrent
-  requests serialize. Marks use the completion key
+  filed for this run skips (identical draft text files once per run — across
+  rows, requests, and proposal edits; the filed text rides durable findings on
+  the run card, `Sweep draft: <text>` beside `Sweep applied: #<card> <action>`,
+  both idempotent by the findings table's conflict rule), and a row whose
+  applied marker exists answers `skipped: "already applied"`. Repeated rows in
+  one request collapse. The whole apply runs in one store transaction, so
+  concurrent requests serialize; the seen write happens after the transaction
+  commits (it reads every project's store, and holding it inside would
+  deadlock two projects' applies against each other). Marks use the completion key
   (`<id>@<doneAt>`), the Inbox's own mark. An implement row with no drafts only
   marks seen. Response: `{ results: Array<{ card, applied, skipped? }> }`.
 

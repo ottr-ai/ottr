@@ -2227,15 +2227,23 @@ export async function applyInboxSweepRows(o: {
 	results: { card: string; applied: boolean; skipped?: string }[];
 }> {
 	const { store, run } = o;
-	return await store.transaction(async () => {
+	// The seen write reads every project's store (seenableIds); held inside this
+	// project's transaction, two concurrent applies for different projects would
+	// await each other's queues and deadlock. The transaction returns the keys;
+	// the caller marks after it commits.
+	const { results, markSeen } = await store.transaction(async () => {
 		const applicable = run.cancelledAt === null && run.stage === "done";
 		const verdicts = new Map<string, SweepRecord>();
 		const appliedMarkers = new Set<string>();
+		const filedDrafts = new Set<string>();
+		const SWEEP_DRAFT_PREFIX = "Sweep draft: ";
 		if (applicable)
 			for (const finding of await store.listReviewFindings(run.id)) {
 				const parsed = sweepResult(finding.prompt);
 				if (parsed !== null && !verdicts.has(parsed.cardId))
 					verdicts.set(parsed.cardId, parsed);
+				if (finding.prompt.startsWith(SWEEP_DRAFT_PREFIX))
+					filedDrafts.add(finding.prompt.slice(SWEEP_DRAFT_PREFIX.length));
 				appliedMarkers.add(finding.prompt);
 			}
 		const tasks = await store.listTasks();
@@ -2247,7 +2255,15 @@ export async function applyInboxSweepRows(o: {
 			skipped?: string;
 		}[] = [];
 		const markSeen: string[] = [];
-		for (const row of o.rows) {
+		// One row per (card, action): the same row twice in one request applies
+		// once, like the same row across two requests.
+		const rows = o.rows.filter(
+			(row, i) =>
+				o.rows.findIndex(
+					(r) => sweepAppliedMarker(r) === sweepAppliedMarker(row),
+				) === i,
+		);
+		for (const row of rows) {
 			if (appliedMarkers.has(sweepAppliedMarker(row))) {
 				results.push({
 					card: row.card,
@@ -2274,11 +2290,25 @@ export async function applyInboxSweepRows(o: {
 				continue;
 			}
 			if (row.action === "implement") {
-				// Distinct drafts only: one verdict may repeat a draft, and one
-				// repetition must not file twice.
+				// Distinct drafts only, and identical draft text files once per run
+				// across rows and requests: the filed-draft markers carry the text,
+				// so an edited proposal cannot resurrect a duplicate either.
 				const drafts = [...new Set(verdict.drafts)];
 				for (const draft of drafts) {
+					if (filedDrafts.has(draft)) {
+						await o.log(
+							`- draft for #${row.card} already filed for this run; skipped`,
+						);
+						continue;
+					}
 					const proposal = await store.createTask(draft);
+					filedDrafts.add(draft);
+					await store.appendReviewFinding(run.id, {
+						prompt: `${SWEEP_DRAFT_PREFIX}${draft}`,
+						model: null,
+						rank: null,
+						security: null,
+					});
 					await store.updateTask(proposal.id, {
 						followUpOf: run.id,
 						promptAuthor: "board",
@@ -2290,12 +2320,15 @@ export async function applyInboxSweepRows(o: {
 					await o.log(`- filed proposal ${proposal.id} for #${row.card}`);
 				}
 			}
+			const marker = sweepAppliedMarker(row);
 			await store.appendReviewFinding(run.id, {
-				prompt: sweepAppliedMarker(row),
+				prompt: marker,
 				model: null,
 				rank: null,
 				security: null,
 			});
+			// In-request duplicate rows read this marker through the set.
+			appliedMarkers.add(marker);
 			// `clear` marks seen; `implement` marks seen after the drafts filed. The
 			// completion key matches the Inbox's own mark (OTTR-566), so the pin
 			// clears; the caller's write keeps the shared decay rules.
@@ -2303,9 +2336,10 @@ export async function applyInboxSweepRows(o: {
 				markSeen.push(doneReadKey({ id: target.id, doneAt: target.doneAt }));
 			results.push({ card: row.card, applied: true });
 		}
-		await o.markSeen(markSeen);
-		return { results };
+		return { results, markSeen };
 	});
+	await o.markSeen(markSeen);
+	return { results };
 }
 
 /** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
@@ -7243,6 +7277,16 @@ export async function createApp(deps: AppDeps) {
 				[...verdicts.values()].map(async (v) => {
 					const target = tasks.find((t) => t.id === v.cardId);
 					if (target === undefined) return null;
+					// The evidence's cited card ids that exist in the store: the
+					// drawer links exactly these (the loaded card window omits older
+					// done cards, so the client list cannot decide this).
+					const linkedCards = [
+						...new Set(
+							[...v.evidence.matchAll(/\b[A-Z0-9]{1,8}-\d+\b/g)].map(
+								(m) => m[0],
+							),
+						),
+					].filter((id) => tasks.some((t) => t.id === id));
 					const action =
 						v.verdict === "done" || v.verdict === "info"
 							? ("clear" as const)
@@ -7257,6 +7301,7 @@ export async function createApp(deps: AppDeps) {
 						applied: applied.has(
 							sweepAppliedMarker({ card: v.cardId, action }),
 						),
+						linkedCards,
 						stale: sweepRowStale(
 							target,
 							collectDescendants(tasks, v.cardId),

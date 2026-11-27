@@ -11939,22 +11939,42 @@ function DrawerPrSec(p: {
 function SweepEvidence(p: {
 	evidence: string;
 	selfProject: string;
-	tasks: TaskCard[];
+	/** The cited card ids that exist in the store, shipped by the sweep view —
+	 * the loaded card window omits older done cards, so the client list cannot
+	 * decide this. */
+	linkedCards: ReadonlySet<string>;
 	github: string | null;
 	onOpenTask: (id: string) => void;
 }) {
 	const parts: ReactNode[] = [];
+	// Commits first (lowercase hex, never a card handle), then the card ids in
+	// the remaining text — linked only when the view verified they exist, so a
+	// link never opens an empty drawer.
 	const re = /\b[0-9a-f]{7,40}\b/g;
 	let last = 0;
-	const cardLinks = (text: string, key: string): ReactNode => (
-		<CardIdLinks
-			text={text}
-			selfProject={p.selfProject}
-			tasks={p.tasks}
-			onOpenTask={p.onOpenTask}
+	const cardLink = (id: string, key: string): ReactNode => (
+		<a
 			key={key}
-		/>
+			className="reason-card-link"
+			href={taskPath(p.selfProject, id)}
+			onClick={(e) => navClick(e, () => p.onOpenTask(id))}
+		>
+			{id}
+		</a>
 	);
+	const cardLinks = (text: string, key: string): ReactNode => {
+		const segs: ReactNode[] = [];
+		const idRe = /\b[A-Z0-9]{1,8}-\d+\b/g;
+		let at = 0;
+		for (const m of text.matchAll(idRe)) {
+			if (m.index > at) segs.push(text.slice(at, m.index));
+			const id = m[0];
+			segs.push(p.linkedCards.has(id) ? cardLink(id, `${key}-${id}`) : id);
+			at = m.index + id.length;
+		}
+		segs.push(text.slice(at));
+		return <Fragment key={key}>{segs}</Fragment>;
+	};
 	for (const m of p.evidence.matchAll(re)) {
 		if (m.index > last)
 			parts.push(cardLinks(p.evidence.slice(last, m.index), `t${m.index}`));
@@ -11984,7 +12004,6 @@ function DrawerSweep(p: {
 	task: TaskView;
 	act: Act;
 	setDetail: React.Dispatch<React.SetStateAction<TaskView | null>>;
-	tasks: TaskCard[];
 	project: ProjectView;
 	onOpenTask: (id: string) => void;
 }) {
@@ -12067,7 +12086,7 @@ function DrawerSweep(p: {
 										<SweepEvidence
 											evidence={row.evidence}
 											selfProject={task.project}
-											tasks={p.tasks}
+											linkedCards={new Set(row.linkedCards)}
 											github={p.project.github}
 											onOpenTask={p.onOpenTask}
 										/>
@@ -16391,7 +16410,6 @@ export function Drawer({
 						task={task}
 						act={act}
 						setDetail={setDetail}
-						tasks={tasks}
 						project={project}
 						onOpenTask={onOpenTask}
 					/>

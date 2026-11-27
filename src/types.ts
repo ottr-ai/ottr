@@ -1362,6 +1362,9 @@ export interface SweepRowView {
 	/** True when this row's action already applied (the run's durable applied
 	 * marker exists): the checkbox renders done and nothing re-applies. */
 	applied: boolean;
+	/** The board card ids the evidence cites that exist in the store — the ids
+	 * the drawer links (the loaded card window omits older done cards). */
+	linkedCards: string[];
 	/** The target card's live row fields. */
 	stage: Stage;
 	state: RunState;

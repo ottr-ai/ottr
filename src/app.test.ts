@@ -14289,6 +14289,124 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		expect(proposals).toHaveLength(1);
 	});
 
+	test("the same implement row twice in one request files one proposal", async () => {
+		const target = await pinnedResearch(
+			"same row card",
+			"# R\n## Recommended steps\n- one open step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> partial\nopen step\n${SWEEP_DRAFT_SEP}\nSame row draft`,
+			},
+		]);
+		const rows = [{ card: target.id, action: "implement" as const }];
+		const res = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows: [...rows, ...rows],
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			results: { card: string; applied: boolean }[];
+		};
+		// The duplicate row collapses before any work: one result, one proposal.
+		expect(b.results).toHaveLength(1);
+		expect(
+			(await store3.listTasks()).filter((t) => t.followUpOf === run.id),
+		).toHaveLength(1);
+	});
+
+	test("two cards with the same draft file it once per run", async () => {
+		const one = await pinnedResearch(
+			"shared draft one",
+			"# R\n## Recommended steps\n- the shared step",
+		);
+		const two = await pinnedResearch(
+			"shared draft two",
+			"# R\n## Recommended steps\n- the shared step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: one.id,
+				record: `Sweep: #<CARD> none\nopen\n${SWEEP_DRAFT_SEP}\nThe shared draft text`,
+			},
+			{
+				cardId: two.id,
+				record: `Sweep: #<CARD> none\nopen\n${SWEEP_DRAFT_SEP}\nThe shared draft text`,
+			},
+		]);
+		const res = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows: [
+				{ card: one.id, action: "implement" as const },
+				{ card: two.id, action: "implement" as const },
+			],
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			results: { card: string; applied: boolean }[];
+		};
+		// Both rows apply; the shared draft text files once.
+		expect(b.results).toEqual([
+			{ card: one.id, applied: true },
+			{ card: two.id, applied: true },
+		]);
+		const proposals = (await store3.listTasks()).filter(
+			(t) => t.followUpOf === run.id,
+		);
+		expect(proposals).toHaveLength(1);
+		expect(proposals[0]!.prompt).toBe("The shared draft text");
+	});
+
+	test("the same draft across separate requests files once per run", async () => {
+		const one = await pinnedResearch(
+			"cross request one",
+			"# R\n## Recommended steps\n- the shared step",
+		);
+		const two = await pinnedResearch(
+			"cross request two",
+			"# R\n## Recommended steps\n- the shared step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: one.id,
+				record: `Sweep: #<CARD> none\nopen\n${SWEEP_DRAFT_SEP}\nThe cross request draft`,
+			},
+			{
+				cardId: two.id,
+				record: `Sweep: #<CARD> none\nopen\n${SWEEP_DRAFT_SEP}\nThe cross request draft`,
+			},
+		]);
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: run.id,
+					rows: [{ card: one.id, action: "implement" as const }],
+				})
+			).status,
+		).toBe(200);
+		const second = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows: [{ card: two.id, action: "implement" as const }],
+		});
+		const b = (await second.json()) as {
+			results: { card: string; applied: boolean }[];
+		};
+		expect(b.results).toEqual([{ card: two.id, applied: true }]);
+		expect(
+			(await store3.listTasks()).filter((t) => t.followUpOf === run.id),
+		).toHaveLength(1);
+	});
+
+	test("the production loop ops wire the sweep's seen seam", () => {
+		// The wiring is a literal inside server.ts's createTurnLoop call; the
+		// only way to observe it without booting the full server is this source
+		// contract (the app-side accessors are behavior-tested above).
+		const src = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+		expect(src).toContain("seenIds: () => app.seenIds()");
+		expect(src).toContain("seenSince: async () => await app.seenSince()");
+	});
+
 	test("a stale row, a no-verdict row and a cancelled run apply nothing", async () => {
 		const fresh = await pinnedResearch(
 			"stale target card",
@@ -14386,8 +14504,19 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 			"# R\n## Recommended steps\n- b",
 		);
 		const info = await pinnedResearch("view card c", "# R\nno steps", "no");
+		// a's step is implemented by a done child card; the evidence names it and
+		// the view ships the id as linkable (it exists in the store).
+		const child = await store3.createTask("implement a's step");
+		await store3.updateTask(child.id, {
+			followUpOf: a.id,
+			stage: "done",
+			state: "idle",
+		});
 		const run = await doneSweep([
-			{ cardId: a.id, record: "Sweep: #<CARD> done\ncard #x did it" },
+			{
+				cardId: a.id,
+				record: `Sweep: #<CARD> done\nimplemented by #${child.id}`,
+			},
 			{
 				cardId: b.id,
 				record: `Sweep: #<CARD> none\neverything open\n${SWEEP_DRAFT_SEP}\ndraft one`,
@@ -14411,6 +14540,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 					verdict: string;
 					evidence: string;
 					applied: boolean;
+					linkedCards: string[];
 					proposed: string;
 					stale: boolean;
 					drafts: string[];
@@ -14426,8 +14556,9 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 				card: a.id,
 				title: a.title,
 				verdict: "done",
-				evidence: "card #x did it",
+				evidence: `implemented by #${child.id}`,
 				applied: false,
+				linkedCards: [child.id],
 				proposed: "clear",
 				stale: false,
 				drafts: [],
@@ -14441,6 +14572,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 				verdict: "none",
 				evidence: "everything open",
 				applied: false,
+				linkedCards: [],
 				proposed: "implement",
 				stale: true,
 				drafts: ["draft one"],
@@ -14454,6 +14586,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 				verdict: "info",
 				evidence: "info only",
 				applied: false,
+				linkedCards: [],
 				proposed: "clear",
 				stale: false,
 				drafts: [],
