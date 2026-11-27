@@ -243,9 +243,10 @@ try {
       assert.deepEqual(Array.from(await leadDb.query("SELECT id, stage, state, waits_validation, queued_at, validated_at FROM tasks WHERE id IN ('legacy-answered', 'legacy-blocked', 'legacy-dup-keep', 'legacy-foreign-keep', 'legacy-foreign-wait', 'legacy-grilled-blocked', 'legacy-grilled-confirmed', 'legacy-lead', 'legacy-parked', 'legacy-plain') ORDER BY id").all()), [
         { id: 'legacy-answered', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: null },
         // legacy-blocked carries its blocked outcome only as a details segment
-        // (no recorded finding): the reset can only act on findings, so the
-        // convergence keeps it decided backlog work instead of locking it.
-        { id: 'legacy-blocked', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 750 },
+        // (no recorded finding): the reset reads the segment too (OTTR-1252
+        // send-back 7), so the convergence waits on it and Validate now's
+        // scoped reset can still unlock it.
+        { id: 'legacy-blocked', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 700, validated_at: 750 },
         { id: 'legacy-dup-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 930 },
         { id: 'legacy-foreign-keep', stage: 'backlog', state: 'idle', waits_validation: 0, queued_at: null, validated_at: 945 },
         { id: 'legacy-foreign-wait', stage: 'todo', state: 'queued', waits_validation: 1, queued_at: 1000, validated_at: 940 },

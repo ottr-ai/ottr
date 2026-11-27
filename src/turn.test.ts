@@ -32116,6 +32116,127 @@ describe("stored review findings", () => {
 		expect(run.prompt).toContain(`#${lead.id}`);
 	});
 
+	// Send-back 7's regression, both halves on ONE lead: a legacy database
+	// carries the details-only blocked lead (the outcome the started-lead
+	// branch recorded, which keeps no findings) parked in backlog with its
+	// validatedAt preserved and the details text later wiped. The real
+	// ProjectStore.open runs the migration, which moves the lead into the
+	// waiting form while keeping the stamp; the real filing path then resets
+	// that stamp (resetValidatedLeads reads the details segment) and files
+	// the batch with the lead first. Before the findings-only outcome read
+	// and the details-aware reset, the migration left the lead in backlog
+	// startable as normal work and every filing returned 409.
+	test("the migration converges a details-blocked legacy lead and the filing path resets and files it", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "turn-migrate-file-"));
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.exec(`CREATE TABLE IF NOT EXISTS tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done','backlog')),
+			state TEXT NOT NULL CHECK (state IN ('queued','preparing','running','needs_you','idle')),
+			needs_reason TEXT,
+			pending_prompt TEXT,
+			branch TEXT,
+			base TEXT,
+			worktree TEXT,
+			session_id TEXT,
+			summary TEXT,
+			details TEXT,
+			report TEXT,
+			research INTEGER NOT NULL DEFAULT 0,
+			research_steps TEXT NOT NULL DEFAULT 'unknown',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			queued_at INTEGER,
+			cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]',
+			pending_images TEXT NOT NULL DEFAULT '[]',
+			shots TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT,
+			release_notes TEXT,
+			session_title TEXT,
+			asked TEXT,
+			model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]',
+			follow_up_of TEXT,
+			push_sha TEXT,
+			update_ids TEXT NOT NULL DEFAULT '[]',
+			update_merge_approved INTEGER NOT NULL DEFAULT 0,
+			done_at INTEGER,
+			kind TEXT NOT NULL DEFAULT 'work',
+			findings_checked_at INTEGER,
+			validated_at INTEGER
+		)`);
+		raw.exec(`CREATE TABLE IF NOT EXISTS events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			at INTEGER NOT NULL,
+			task_id TEXT,
+			kind TEXT NOT NULL CHECK (kind IN ('create','stage','state','error')),
+			from_value TEXT,
+			to_value TEXT,
+			detail TEXT
+		)`);
+		raw.exec(`CREATE TABLE IF NOT EXISTS review_findings (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			card_id TEXT NOT NULL,
+			prompt TEXT NOT NULL,
+			model TEXT,
+			rank INTEGER,
+			security TEXT,
+			created_at INTEGER NOT NULL,
+			UNIQUE(card_id, prompt)
+		)`);
+		raw.exec(`INSERT INTO tasks
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, done_at)
+			VALUES
+				('R', 'own review', 'review of the case', 'done', 'idle', 'review', 10, 10, NULL, 15),
+				('V', 'validation run', 'Batch validation of 1 lead(s) of review.', 'done', 'idle', 'validation', 20, 25, 'R', 26)`);
+		raw.exec(`INSERT INTO tasks
+			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
+			VALUES
+				('L', 'lead card', 'Needs validation: details-only legacy lead\nBlocker: sandbox run: control', 'backlog', 'idle', 'work', 100, 120, 'R', NULL, 900, 'Grilled definition of ready')`);
+		raw.exec(
+			"INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('V', 'Validation: #L blocked', 30)",
+		);
+		raw.close();
+
+		// The real migration: ProjectStore.open runs the convergence pass on
+		// the legacy schema.
+		const store = await ProjectStore.open(dir);
+		stores.push(store);
+		const migrated = (await store.getTask("L"))!;
+		expect(migrated.stage).toBe("todo");
+		expect(migrated.state).toBe("queued");
+		expect(migrated.waitsValidation).toBe(true);
+		expect(migrated.validatedAt).toBe(900);
+
+		// The real filing path on the migrated store: Validate now's
+		// again-and-file call.
+		const projects = new Map([[store.name, fakeProject(store)]]);
+		const loop = holdFollowUps(projects, fakeOps(baseRecord()));
+		const filed = await loop.filePendingValidationRun(
+			projects.get(store.name)!,
+			"R",
+			true,
+			{ before: Date.now() + 1 },
+		);
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error("no validation run filed");
+		// The preserved stamp was reset (the details segment read), and the
+		// batch carries the lead first.
+		const after = (await store.getTask("L"))!;
+		expect(after.validatedAt).toBeNull();
+		expect(filed.reset).toEqual(["L"]);
+		const run = (await store.getTask(filed.id))!;
+		expect(run.prompt).toContain("#L");
+		// Drain the loop's async tails like the settle test above.
+		await loop.schedule();
+		await flushPromises();
+		await store.close();
+	});
+
 	// Send-back 7's second half: the details-only blocked lead — the outcome
 	// recorded by the started-lead branch, which keeps no findings. Its
 	// converged waiting form carries the preserved validatedAt and the details
