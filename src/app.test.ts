@@ -20517,7 +20517,12 @@ describe("update cycle control (OTTR-752)", () => {
 	const stores: ProjectStore[] = [];
 	let fixture = 0;
 	afterAll(async () => {
-		for (const s of stores) await closeTestStore(s);
+		// One close per board is real work (server stop, in-flight request drain,
+		// db checkpoint), so the closes run together: the boards are independent
+		// servers on separate SQLite files, and closeTestApp is idempotent, so
+		// both stores of a board can race its single app close. A serial chain
+		// of these crosses any hook budget under load (OTTR-1330).
+		await Promise.all(stores.map((s) => closeTestStore(s)));
 	}, 60_000);
 
 	const heartbeat = (
