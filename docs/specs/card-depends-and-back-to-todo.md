@@ -67,27 +67,27 @@ The existing route gains a second source: a stage `in_progress` card in state
 - Before any state write the route refuses 409 when a reply or steer is still
   queued (`pendingPrompt`), or when the state is `queued` or `running`. A
   `preparing` card is refused unless it carries the move's own reservation
-  marker (the reclaim path above).
-- The route reserves the card before it touches git, and the whole move runs
-  under a per-card lock. The reservation is state `preparing` under the
-  move's needsReason marker ("Moving back to todo..."): `preparing` is the
-  one run state no dispatcher starts from — `pickRunnable` picks `queued`,
-  the merge slots pick `queued`/`merging`, merge-anyway refuses `preparing`,
-  replies and restarts want `needs_you` — so the reservation holds against
-  every dispatch path, present or future, without per-path guards, and a
-  reply, restart, or steer that lands during the git work fails its
-  revision/state guard. The guarded row the reservation write returns drives
-  the rest of the move. A second Back to todo request waits on the per-card
-  lock; its re-read inside the lock meets the moved row and answers 409
-  without reserving. A crashed move leaves the card in its own preparing
-  reservation; the marker proves the claim is the move's, so a later move
-  reclaims it instead of stranding the card (cancel stays the other way
-  out).
-- The api wrapper refuses every mutating request that names a card inside the
-  move (409, "the card is being moved back to todo"): one guard covers steer,
-  reply, star, triage, model, unmark-research, and every per-task route that
-  ships later. The move's own route and cancel (the escape hatch) pass, and
-  GETs never reach the guard.
+  marker.
+- The route reserves the card before it touches git. All per-card API mutations
+  use the same shared/exclusive lock. Backlog moves take exclusive access.
+  Other mutations take shared access and retain their current concurrency rules.
+  The lock covers the reservation check, the body read, and the complete handler.
+  A delayed body cannot let a mutation write during disposal.
+- The reservation uses state `preparing` and the needsReason marker
+  "Moving back to todo...". No dispatcher starts from this state.
+  The snapshot from the reservation write drives the rest of the move.
+- The API wrapper checks reservations after authentication in desktop and
+  hosted modes. The lock and the handler use Bun's decoded `req.params`.
+  Percent escapes cannot select a different card for the guard.
+- Other writes that arrive during the reservation receive 409 with
+  "the card is being moved back to todo". Backlog moves and cancel also use
+  the lock, but they can pass the reservation check. A second move waits for
+  the first move, then receives 409 without another removal attempt.
+- Mutations that hold shared access before a move complete first. A slow body
+  delays the move on that card. Ordinary mutations can still overlap, so
+  a reply or a PR post cannot block its own concurrent-request guard.
+- A crashed move leaves its reservation marker. With no active request, a
+  later move can reclaim the card. Cancel remains an alternative.
 - Allowed only when the card holds no work: the worktree, if one exists, must
   be clean (`git status` empty) and hold no commits past its base/target
   (`unsavedWork` in `src/worktree.ts`). A husk (unlinked or missing worktree
@@ -147,6 +147,9 @@ The existing route gains a second source: a stage `in_progress` card in state
    file answers 409 and keeps its worktree.
 4. UI test and screenshots (light and dark) of the drawer editor and the
    action.
+5. Reservation regressions: delayed star and steer bodies cannot race disposal.
+   Hosted requests receive the same reservation refusal after authentication.
+   Percent-encoded project names and card ids cannot bypass the guard.
 
 ## Alternatives considered
 
@@ -179,7 +182,6 @@ The existing route gains a second source: a stage `in_progress` card in state
   snapshot before the other commits can still land a cycle; serializing it
   needs a store-level lock across processes (a schema or infrastructure
   change, out of this task's scope) and is accepted as residual.
-- A cancel that lands while the route holds the reservation fails the route's
-  final snapshot guard and answers 409; the worktree the route already
-  removed leaves cancel its husk path (branch verdict), which is the same
-  state a crashed turn leaves.
+- Cancel shares the mutation lock. It cannot change the row during disposal.
+  After the move completes, cancel reads the current card. A stale reservation
+  does not prevent cancel when no move holds the lock.

@@ -1,3 +1,4 @@
+import type { BunRequest } from "bun";
 import { Database } from "bun:sqlite";
 import {
 	afterAll,
@@ -692,13 +693,9 @@ async function mount(
 		/** Gateway check seam for the deepen route; defaults to the real spawn. */
 		deepenCheck?: Parameters<typeof createApp>[0]["deepenCheck"];
 		/** OTTR-1318: awaited once a Back to todo move holds its reservation. */
-		backToTodoReserved?: Parameters<
-			typeof createApp
-		>[0]["backToTodoReserved"];
+		backToTodoReserved?: Parameters<typeof createApp>[0]["backToTodoReserved"];
 		/** OTTR-1318: awaited once a create request committed the card row. */
-		taskBirthRecorded?: Parameters<
-			typeof createApp
-		>[0]["taskBirthRecorded"];
+		taskBirthRecorded?: Parameters<typeof createApp>[0]["taskBirthRecorded"];
 		/** Gateway spawn seam for the release-summary route; defaults to the real spawn. */
 		releaseSummarySpawn?: Parameters<
 			typeof createApp
@@ -14609,7 +14606,10 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 	 * store and an entry wired for a fresh app mount; the disposal path must run through
 	 * real git, so no stubs here. cleanup removes the folders. An optional prefix sets
 	 * the store's taskIdPrefix, so createTask hands out PREFIX-n ids. */
-	const setup = async (name: string, prefix?: string): Promise<Dep1318Fixture> => {
+	const setup = async (
+		name: string,
+		prefix?: string,
+	): Promise<Dep1318Fixture> => {
 		const origin = join(root, `${name}-origin`);
 		const dir = join(root, name);
 		run(root, `git init -q --bare -b main ${origin}`);
@@ -14726,6 +14726,265 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 		return probe;
 	};
 
+	test.each([
+		{ action: "star" as const, body: { starred: true }, status: 200 },
+		{ action: "steer" as const, body: { text: "keep going" }, status: 409 },
+	])(
+		"a delayed $action body cannot race back-to-todo disposal",
+		async ({ action, body, status }) => {
+			const s = await setup(`p-dep1318-slow-${action}`);
+			const bodyRead = Promise.withResolvers<void>();
+			const sendBody = Promise.withResolvers<void>();
+			const reserved = Promise.withResolvers<void>();
+			const releaseMove = Promise.withResolvers<void>();
+			const requests: Promise<Response>[] = [];
+			let bodySent = false;
+			let earlyReservation = false;
+			try {
+				const key = crypto.randomUUID();
+				const g = await GlobalStore.open(
+					join(root, `g-dep1318-slow-${action}`),
+				);
+				mountStores.push(g);
+				await g.set("config", { apiKey: key });
+				const m = await mount({
+					projects: s.projects,
+					gstore: g,
+					backToTodoReserved: async () => {
+						earlyReservation = !bodySent;
+						reserved.resolve();
+						await releaseMove.promise;
+					},
+				});
+				const wt = s.worktree("card-slow");
+				const card = await parkCard(s, "slow request", wt, "card-slow");
+				const request = (action: string, body: BodyInit) =>
+					Object.assign(
+						new Request(
+							new URL(
+								`/api/projects/${s.entry.name}/tasks/${card.id}/${action}`,
+								m.server.url,
+							),
+							{
+								method: "POST",
+								headers: {
+									Host: "127.0.0.1:0",
+									Origin: "http://127.0.0.1:0",
+									"content-type": "application/json",
+									"x-api-key": key,
+								},
+								body,
+							},
+						),
+						{ params: { project: s.entry.name, id: card.id } },
+					) as BunRequest<"/api/projects/:project/tasks/:id/star">;
+				const stream = new ReadableStream<Uint8Array>(
+					{
+						async pull(controller) {
+							bodyRead.resolve();
+							await sendBody.promise;
+							bodySent = true;
+							controller.enqueue(
+								new TextEncoder().encode(JSON.stringify(body)),
+							);
+							controller.close();
+						},
+					},
+					{ highWaterMark: 0 },
+				);
+				// Call the registered routes with a controlled Request stream. The pull
+				// proves the handler passed the wrapper and now waits for body bytes.
+				const routes = m.app.serveOptions.routes;
+				const post = async (
+					action: "star" | "steer" | "backlog",
+					body: BodyInit,
+				): Promise<Response> => {
+					const route = routes[`/api/projects/:project/tasks/:id/${action}`];
+					if (
+						typeof route !== "object" ||
+						route === null ||
+						!("POST" in route) ||
+						typeof route.POST !== "function"
+					)
+						throw new Error(`The ${action} route has no POST handler.`);
+					const res = await route.POST(request(action, body), m.server);
+					if (!(res instanceof Response))
+						throw new Error(`The ${action} route returned no response.`);
+					return res;
+				};
+				const pending = post(action, stream);
+				requests.push(pending);
+				await Promise.race([
+					bodyRead.promise,
+					pending.then((res) => {
+						throw new Error(
+							`The handler returned ${res.status} before the body read.`,
+						);
+					}),
+				]);
+				const move = post("backlog", JSON.stringify({ to: "todo" }));
+				requests.push(move);
+				// Drain SQLite's promise callbacks, not a fixed real-clock delay.
+				const turn = Promise.withResolvers<void>();
+				setImmediate(turn.resolve);
+				await turn.promise;
+				sendBody.resolve();
+				const mutation = await pending;
+				expect(mutation.status).toBe(status);
+				await Promise.race([
+					reserved.promise,
+					move.then((res) => {
+						throw new Error(
+							`The move returned ${res.status} before the reservation.`,
+						);
+					}),
+				]);
+				expect(earlyReservation).toBe(false);
+				releaseMove.resolve();
+				expect((await move).status).toBe(200);
+				const after = (await s.store.getTask(card.id))!;
+				expect(after.stage).toBe("todo");
+				expect(after.state).toBe("queued");
+				expect(after.worktree).toBeNull();
+				expect(after.branch).toBeNull();
+				expect(after.pendingPrompt).toBeNull();
+				expect(after.starred).toBe(action === "star");
+				expect(existsSync(wt)).toBe(false);
+				expect(run(s.dir, "git for-each-ref refs/heads/card-slow")).toBe("");
+			} finally {
+				sendBody.resolve();
+				releaseMove.resolve();
+				await Promise.allSettled(requests);
+				s.cleanup();
+			}
+		},
+	);
+
+	test("hosted authentication precedes the shared reservation guard", async () => {
+		const s = await setup("p-dep1318-hosted");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let move: Promise<Response> | undefined;
+		try {
+			const secret = crypto.randomUUID();
+			const owner = () => ({
+				"x-ottr-identity": signIdentity(secret, "acme", "owner"),
+			});
+			const m = await mount({
+				projects: s.projects,
+				hosted: {
+					config: {
+						tenant: "acme",
+						secret,
+						controlUrl: "http://127.0.0.1:9",
+						wording: {
+							workSuffix: "",
+							mergeSuffix: "",
+							resumeSuffix: "",
+							creditReason: "No credit.",
+						},
+					},
+					hooks: {
+						reportUsage: () => {},
+						creditOk: async () => true,
+						gitToken: async () => null,
+					},
+					creditBalance: { balance: 12.5 },
+				},
+				backToTodoReserved: async () => {
+					entered.resolve();
+					await release.promise;
+				},
+			});
+			const wt = s.worktree("card-hosted");
+			const card = await parkCard(s, "hosted card", wt, "card-hosted");
+			const path = `/api/projects/${s.entry.name}/tasks/${card.id}`;
+			move = m.call(`${path}/backlog`, { to: "todo" }, owner());
+			await entered.promise;
+			expect((await m.call(`${path}/star`, { starred: true })).status).toBe(
+				401,
+			);
+			const probe = await m.call(`${path}/star`, { starred: true }, owner());
+			expect(probe.status).toBe(409);
+			expect(await errorOf(probe)).toBe("the card is being moved back to todo");
+			release.resolve();
+			expect((await move).status).toBe(200);
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("todo");
+			expect(after.worktree).toBeNull();
+			expect(after.branch).toBeNull();
+			expect(after.starred).toBe(false);
+			expect(existsSync(wt)).toBe(false);
+		} finally {
+			release.resolve();
+			if (move !== undefined) await move;
+			s.cleanup();
+		}
+	});
+
+	test("percent-encoded route parameters cannot bypass a reservation", async () => {
+		const s = await setup("p-dep1318-encoded", "P");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let move: Promise<Response> | undefined;
+		try {
+			const m = await mount({
+				projects: s.projects,
+				backToTodoReserved: async () => {
+					entered.resolve();
+					await release.promise;
+				},
+			});
+			const card = await parkCard(s, "encoded card", null, null);
+			move = m.call(`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`, {
+				to: "todo",
+			});
+			await entered.promise;
+			const reserved = (await s.store.getTask(card.id))!;
+			await fc.assert(
+				fc.asyncProperty(
+					fc.array(fc.boolean(), {
+						minLength: s.entry.name.length + card.id.length,
+						maxLength: s.entry.name.length + card.id.length,
+					}),
+					async (mask) => {
+						const encode = (value: string, offset: number): string =>
+							[...value]
+								.map((c, i) =>
+									mask[offset + i]
+										? `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`
+										: c,
+								)
+								.join("");
+						const project = encode(s.entry.name, 0);
+						const id = encode(card.id, s.entry.name.length);
+						const probe = await m.call(
+							`/api/projects/${project}/tasks/${id}/star`,
+							{ starred: true },
+						);
+						expect(probe.status).toBe(409);
+						expect(await errorOf(probe)).toBe(
+							"the card is being moved back to todo",
+						);
+						expect((await s.store.getTask(card.id))!.revision).toBe(
+							reserved.revision,
+						);
+					},
+				),
+				{
+					examples: [[Array(s.entry.name.length + card.id.length).fill(true)]],
+				},
+			);
+			release.resolve();
+			expect((await move).status).toBe(200);
+			expect((await s.store.getTask(card.id))!.starred).toBe(false);
+		} finally {
+			release.resolve();
+			if (move !== undefined) await move;
+			s.cleanup();
+		}
+	});
+
 	test("the depends-on route stores a replaced list on a parked in-progress card", async () => {
 		const s = await setup("p-dep1318-edit");
 		try {
@@ -14739,9 +14998,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 			const body = (await res.json()) as { dependsOn: string[] };
 			// The list replaces (and dedupes): the card waits for the blocker.
 			expect(body.dependsOn).toEqual([blocker.id]);
-			expect((await s.store.getTask(card.id))?.dependsOn).toEqual([
-				blocker.id,
-			]);
+			expect((await s.store.getTask(card.id))?.dependsOn).toEqual([blocker.id]);
 			// The drawer's read-back sees the stored list too.
 			const got = await m.call(
 				`/api/projects/${s.entry.name}/tasks/${card.id}`,
@@ -15153,9 +15410,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				{ reason: "ship it" },
 			);
 			expect(merge.status).toBe(409);
-			expect(await errorOf(merge)).toBe(
-				"the card is being moved back to todo",
-			);
+			expect(await errorOf(merge)).toBe("the card is being moved back to todo");
 			release.resolve();
 			const res = await move;
 			expect(res.status).toBe(200);
@@ -15174,9 +15429,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				text: "keep going",
 			});
 			expect(probe.status).toBe(409);
-			expect(await errorOf(probe)).toBe(
-				"the card is being moved back to todo",
-			);
+			expect(await errorOf(probe)).toBe("the card is being moved back to todo");
 		} finally {
 			s.cleanup();
 		}
@@ -15189,9 +15442,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				starred: true,
 			});
 			expect(probe.status).toBe(409);
-			expect(await errorOf(probe)).toBe(
-				"the card is being moved back to todo",
-			);
+			expect(await errorOf(probe)).toBe("the card is being moved back to todo");
 		} finally {
 			s.cleanup();
 		}
@@ -15204,9 +15455,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				priority: "P1",
 			});
 			expect(probe.status).toBe(409);
-			expect(await errorOf(probe)).toBe(
-				"the card is being moved back to todo",
-			);
+			expect(await errorOf(probe)).toBe("the card is being moved back to todo");
 		} finally {
 			s.cleanup();
 		}
@@ -15219,9 +15468,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				model: "zai/glm-5.3-flash",
 			});
 			expect(probe.status).toBe(409);
-			expect(await errorOf(probe)).toBe(
-				"the card is being moved back to todo",
-			);
+			expect(await errorOf(probe)).toBe("the card is being moved back to todo");
 		} finally {
 			s.cleanup();
 		}
@@ -15232,9 +15479,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 		try {
 			const probe = await probeDuringReservation(s, "unmark-research");
 			expect(probe.status).toBe(409);
-			expect(await errorOf(probe)).toBe(
-				"the card is being moved back to todo",
-			);
+			expect(await errorOf(probe)).toBe("the card is being moved back to todo");
 		} finally {
 			s.cleanup();
 		}
@@ -15316,10 +15561,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 				m.call(dependsOnRoute(s.entry.name, id), { dependsOn: [dep] });
 			// The walk and the write share the route's lock, so the second edit reads
 			// the first edit's write and refuses, whatever order the requests land in.
-			const [r1, r2] = await Promise.all([
-				edit(a.id, b.id),
-				edit(b.id, a.id),
-			]);
+			const [r1, r2] = await Promise.all([edit(a.id, b.id), edit(b.id, a.id)]);
 			const statuses = [r1.status, r2.status].sort();
 			expect(statuses).toEqual([200, 400]);
 			const winner = r1.status === 200 ? a.id : b.id;
@@ -15365,9 +15607,7 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 			release.resolve();
 			const created = await create;
 			expect(created.status).toBe(200);
-			expect((await s.store.getTask("P-2"))?.dependsOn).toEqual([
-				blocker.id,
-			]);
+			expect((await s.store.getTask("P-2"))?.dependsOn).toEqual([blocker.id]);
 			// The graph stays acyclic: the blocker never gained the created card.
 			expect((await s.store.getTask(blocker.id))?.dependsOn).toEqual([]);
 		} finally {

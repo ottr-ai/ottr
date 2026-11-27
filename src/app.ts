@@ -5781,18 +5781,18 @@ export async function createApp(deps: AppDeps) {
 
 	/** Guards every /api request (host allowlist + auth wall); wraps handlers so unexpected errors become 500. */
 	function api(
-		req: Request,
+		req: BunRequest,
 		fn: () => Promise<Response>,
-		opts: { costly?: boolean } = {},
+		opts: { costly?: boolean; reservation?: "move" | "cancel" } = {},
 	): Promise<Response> {
 		if (closing) return Promise.resolve(json({ error: "app is closed" }, 503));
 		return trackWork("api request", serveApi(req, fn, opts));
 	}
 
 	async function serveApi(
-		req: Request,
+		req: BunRequest,
 		fn: () => Promise<Response>,
-		opts: { costly?: boolean } = {},
+		opts: { costly?: boolean; reservation?: "move" | "cancel" } = {},
 	): Promise<Response> {
 		// OTTR-715: a handler that runs at least slowApiMs logs one line with its route
 		// pattern (`api slow: GET /api/projects/:project/tasks/:id/log took 612ms`), so a
@@ -5801,7 +5801,9 @@ export async function createApp(deps: AppDeps) {
 		// (error 500, publishSoon) is chained onto unchanged.
 		const timed = () => {
 			const started = performance.now();
-			return guarded(req, fn).finally(() => {
+			return guarded(req, () =>
+				withTaskMutation(req, fn, opts.reservation),
+			).finally(() => {
 				const ms = performance.now() - started;
 				if (ms >= slowApiMs)
 					console.warn(
@@ -5811,30 +5813,22 @@ export async function createApp(deps: AppDeps) {
 		};
 		if (deps.hosted !== undefined) {
 			const refused = hostedRefusal(deps.hosted, req);
-			return refused !== null ? Promise.resolve(refused) : timed();
+			if (refused !== null) return refused;
+		} else {
+			// Wrong-origin requests must fail before the auth or reservation checks.
+			if (req.method !== "GET") {
+				const originRefused = originWall(req);
+				if (originRefused !== null) return originRefused;
+			}
+			const wall = await wallRefusal(req, req.headers.get("host"));
+			if (wall !== null) return wall;
+			// Unauthorized traffic must not consume the costly-route cap.
+			if (opts.costly === true) {
+				const limited = costlyRefusal(req);
+				if (limited !== null) return limited;
+			}
 		}
-		// Mutations pass the Origin wall first (R1-2): a cross-site POST must never reach a
-		// handler, and a request that fails both checks answers "forbidden origin".
-		if (req.method !== "GET") {
-			const originRefused = originWall(req);
-			if (originRefused !== null) return Promise.resolve(originRefused);
-		}
-		// OTTR-1318: a mutating request that targets a card inside a Back to todo move
-		// answers 409 instead of racing the move's git work. One guard in the wrapper —
-		// the move's own route and cancel (the escape hatch) pass; every other per-task
-		// route, present or future, waits for the move to finish.
-		if (req.method !== "GET") {
-			const reservedRefused = await reservedTaskRefusal(req);
-			if (reservedRefused !== null) return Promise.resolve(reservedRefused);
-		}
-		const wall = await wallRefusal(req, req.headers.get("host"));
-		if (wall !== null) return Promise.resolve(wall);
-		// The costly-route cap runs after every wall: unauthorized or wrong-origin traffic
-		// burns nothing, and a blocked request never reaches the handler.
-		if (opts.costly === true) {
-			const limited = costlyRefusal(req);
-			if (limited !== null) return Promise.resolve(limited);
-		}
+		// Both auth modes reach the same mutation lock and reservation check.
 		return timed();
 	}
 
@@ -12553,229 +12547,254 @@ export async function createApp(deps: AppDeps) {
 	 * future, without per-path guards. The marker distinguishes the move's own claim
 	 * from a scheduler claim, so a crashed move can be reclaimed. */
 	const BACK_TO_TODO_RESERVE = "Moving back to todo...";
-	/** OTTR-1318: the api wrapper's reservation guard. A mutating request that names a
-	 * card inside a Back to todo move answers 409: the move is between its reservation
-	 * and its final write, so any write here invalidates the guarded row and races the
-	 * disposal. The move's own route and cancel (the escape hatch) pass; every other
-	 * per-task route — steer, reply, star, triage, model, and whatever ships next —
-	 * waits for the move to finish. GETs never reach this. */
-	async function reservedTaskRefusal(req: Request): Promise<Response | null> {
-		const m = /^\/api\/projects\/([^/]+)\/tasks\/([^/]+)(?:\/([^/]+))?/.exec(
-			new URL(req.url).pathname,
+	/** Reject active reservations before the queue, then check inside the lock.
+	 * Bun supplies the same decoded parameters to the guard and handler. */
+	async function withTaskMutation(
+		req: BunRequest,
+		work: () => Promise<Response>,
+		reservation: "move" | "cancel" | undefined,
+	): Promise<Response> {
+		const { project, id } = req.params;
+		if (req.method === "GET" || project === undefined || id === undefined)
+			return await work();
+		const e = deps.projects.get(project);
+		if (e === undefined) return await work();
+		if (reservation === undefined) {
+			const refused = reservedTaskRefusal(await e.store.getTask(id));
+			if (refused !== null) return refused;
+		}
+		return await withTaskMutationLock(
+			`${e.store.name}/${id}`,
+			reservation === "move",
+			async () => {
+				if (reservation === undefined) {
+					const refused = reservedTaskRefusal(await e.store.getTask(id));
+					if (refused !== null) return refused;
+				}
+				return await work();
+			},
 		);
-		if (m === null) return null;
-		const [, project, id, action] = m;
-		if (action === undefined || action === "backlog" || action === "cancel")
-			return null;
-		const found = await resolveTask(
-			decodeURIComponent(project ?? ""),
-			id ?? "",
-		);
-		if (found instanceof Response) return null;
-		const { task } = found;
-		if (task.state === "preparing" && task.needsReason === BACK_TO_TODO_RESERVE)
-			return json({ error: "the card is being moved back to todo" }, 409);
-		return null;
 	}
-	/** OTTR-1318: one Back to todo move at a time per card. The lock makes the
-	 * reservation exclusive: a second request that arrives while the first holds the
-	 * card waits here, and its re-read inside the lock meets the moved row and answers
-	 * 409 without touching git. */
-	const backToTodoTails = new Map<string, Promise<unknown>>();
-	const withBackToTodoLock = <T>(
+	function reservedTaskRefusal(task: Task | null): Response | null {
+		return task?.state === "preparing" &&
+			task.needsReason === BACK_TO_TODO_RESERVE
+			? json({ error: "the card is being moved back to todo" }, 409)
+			: null;
+	}
+	/** Moves have exclusive access; ordinary mutations can overlap. Each writer
+	 * waits for earlier readers, and later readers wait for that writer. */
+	const taskMutationLocks = new Map<
+		string,
+		{
+			writer: Promise<unknown>;
+			readers: Set<Promise<unknown>>;
+			pending: number;
+		}
+	>();
+	const withTaskMutationLock = <T>(
 		key: string,
+		exclusive: boolean,
 		work: () => Promise<T>,
 	): Promise<T> => {
-		const run = (backToTodoTails.get(key) ?? Promise.resolve()).then(
-			work,
-			work,
-		);
-		const tail = run.catch(() => undefined);
-		backToTodoTails.set(key, tail);
-		void tail.then(() => {
-			if (backToTodoTails.get(key) === tail) backToTodoTails.delete(key);
+		const lock = taskMutationLocks.get(key) ?? {
+			writer: Promise.resolve(),
+			readers: new Set<Promise<unknown>>(),
+			pending: 0,
+		};
+		taskMutationLocks.set(key, lock);
+		lock.pending++;
+		const prior = exclusive
+			? Promise.all([lock.writer, ...lock.readers])
+			: lock.writer;
+		const run = prior.then(work);
+		const settled = run.catch(() => undefined);
+		if (exclusive) {
+			lock.writer = settled;
+			lock.readers.clear();
+		} else lock.readers.add(settled);
+		void settled.then(() => {
+			lock.readers.delete(settled);
+			if (--lock.pending === 0) taskMutationLocks.delete(key);
 		});
 		return run;
 	};
 	/** OTTR-1318: moves a parked in-progress card back to the todo lane. It runs only when
 	 * the card holds no work: the worktree must be clean and hold no commits past its
-	 * target, else the card keeps its worktree and cancel stays the path. The per-card
-	 * lock holds the whole move, and the route reserves the card (state `idle`, a revision
-	 * bump) before it touches git, so a reply, restart, or steer that lands during the git
-	 * work fails its guard and no run can claim the worktree. Disposal must prove itself
+	 * target, else the card keeps its worktree and cancel stays the path. The API
+	 * wrapper holds the mutation lock across the whole move. The reservation uses
+	 * `preparing`, which prevents a dispatcher from starting another run.
+	 * Disposal must prove itself
 	 * before the row clears the fields: a husk's leftover files and its branch get a
 	 * clean-state proof and cancel's kept-worktree verdict, and a failed removal answers
 	 * with an error instead of queueing a card that still owns a directory or a branch.
 	 * On success the card queues as a fresh work turn in a fresh session. */
 	async function inProgressToTodo(e: Entry, task: Task): Promise<Response> {
-		return await withBackToTodoLock(`${e.store.name}/${task.id}`, async () => {
-			// Fresh read inside the lock: a concurrent move may have finished already.
-			const live = await e.store.getTask(task.id);
-			if (
-				live === null ||
-				live.cancelledAt !== null ||
-				live.stage !== "in_progress"
-			)
-				return json(
-					{ error: "only a parked in-progress task can move back to todo" },
-					409,
-				);
-			// A crashed move leaves the card in its own preparing reservation; the
-			// marker (and the free per-card lock) prove it, so the move reclaims it
-			// instead of stranding the card.
-			const reclaim =
-				live.state === "preparing" && live.needsReason === BACK_TO_TODO_RESERVE;
-			if (live.state !== "needs_you" && live.state !== "idle" && !reclaim)
-				return json(
-					{ error: `a ${live.state} task cannot move back to todo` },
-					409,
-				);
-			if (live.pendingPrompt !== null)
-				return json({ error: "a reply or steer is still queued" }, 409);
-			// Reserve before disposal: the card flips to `preparing` under the move's
-			// marker (a reply's guard reads state and revision through withTask, and no
-			// dispatcher starts from `preparing`). The worktree stays until the checks
-			// below pass, so a refusal leaves the card parked and retryable. The
-			// returned snapshot is the guarded row the rest of the move writes against.
-			const reserved = await updateSnapshot(e, live, {
-				state: "preparing",
-				needsReason: BACK_TO_TODO_RESERVE,
-			});
-			// Test/instrumentation seam: the reservation is held; the pause point every
-			// serialization proof below gates on.
-			if (deps.backToTodoReserved !== undefined)
-				await deps.backToTodoReserved(task.id);
-			// A refused or failed move puts the card back the way the operator found
-			// it; best-effort, because a writer that landed meanwhile owns the row.
-			const restore = async (): Promise<void> => {
-				try {
-					await updateSnapshot(e, reserved, {
-						state: live.state === "preparing" ? "needs_you" : live.state,
-						needsReason: live.state === "preparing" ? null : live.needsReason,
-					});
-				} catch {
-					// the row moved: its writer decides the state
-				}
-			};
-			const into = e.target ?? reserved.base ?? "HEAD";
-			if (reserved.worktree !== null) {
-				// unsavedWork returns null for a missing or unlinked worktree without
-				// looking at what is left on disk: a husk that still holds files has no git
-				// to prove them clean, so the move refuses unless nothing remains. The
-				// husk's branch gets cancel's kept-worktree verdict, so removeWorktree
-				// never deletes a branch that holds unmerged commits.
-				const husk = await worktreeHusk(reserved.worktree);
-				if (husk) {
-					const leftover =
-						existsSync(reserved.worktree) &&
-						readdirSync(reserved.worktree).length > 0;
-					if (leftover) {
-						await restore();
-						return json(
-							{
-								error:
-									"cannot move back to todo, the husk worktree still holds files with no clean-state proof",
-							},
-							409,
-						);
-					}
-					if (
-						reserved.branch !== null &&
-						!(await branchMergedOrGone(e.path, reserved.branch, into))
-					) {
-						await restore();
-						return json(
-							{
-								error: `cannot move back to todo, branch ${reserved.branch} holds commits that never reached ${into}`,
-							},
-							409,
-						);
-					}
-				} else {
-					const reason = await unsavedWork(reserved.worktree, into);
-					if (reason !== null) {
-						await restore();
-						return json(
-							{
-								error: `cannot move back to todo, the worktree holds work: ${reason}`,
-							},
-							409,
-						);
-					}
-				}
-				try {
-					await appendLog(
-						e.store,
-						task.id,
-						"+ back to todo: removing the worktree",
-					);
-					await removeWorktree({
-						mainPath: e.path,
-						worktreePath: reserved.worktree,
-						branch: reserved.branch,
-						log: (line) => appendLog(e.store, task.id, line),
-					});
-				} catch (err) {
-					await appendLog(
-						e.store,
-						task.id,
-						`! back to todo removeWorktree: ${errmsg(err)}`,
-					);
+		// Fresh read inside the lock: a concurrent move may have finished already.
+		const live = await e.store.getTask(task.id);
+		if (
+			live === null ||
+			live.cancelledAt !== null ||
+			live.stage !== "in_progress"
+		)
+			return json(
+				{ error: "only a parked in-progress task can move back to todo" },
+				409,
+			);
+		// A crashed move leaves the card in its own preparing reservation; the
+		// marker (and the free per-card lock) prove it, so the move reclaims it
+		// instead of stranding the card.
+		const reclaim =
+			live.state === "preparing" && live.needsReason === BACK_TO_TODO_RESERVE;
+		if (live.state !== "needs_you" && live.state !== "idle" && !reclaim)
+			return json(
+				{ error: `a ${live.state} task cannot move back to todo` },
+				409,
+			);
+		if (live.pendingPrompt !== null)
+			return json({ error: "a reply or steer is still queued" }, 409);
+		// Reserve before disposal: the card flips to `preparing` under the move's
+		// marker (a reply's guard reads state and revision through withTask, and no
+		// dispatcher starts from `preparing`). The worktree stays until the checks
+		// below pass, so a refusal leaves the card parked and retryable. The
+		// returned snapshot is the guarded row the rest of the move writes against.
+		const reserved = await updateSnapshot(e, live, {
+			state: "preparing",
+			needsReason: BACK_TO_TODO_RESERVE,
+		});
+		// Test/instrumentation seam: the reservation is held; the pause point every
+		// serialization proof below gates on.
+		if (deps.backToTodoReserved !== undefined)
+			await deps.backToTodoReserved(task.id);
+		// A refused or failed move puts the card back the way the operator found
+		// it; best-effort, because a writer that landed meanwhile owns the row.
+		const restore = async (): Promise<void> => {
+			try {
+				await updateSnapshot(e, reserved, {
+					state: live.state === "preparing" ? "needs_you" : live.state,
+					needsReason: live.state === "preparing" ? null : live.needsReason,
+				});
+			} catch {
+				// the row moved: its writer decides the state
+			}
+		};
+		const into = e.target ?? reserved.base ?? "HEAD";
+		if (reserved.worktree !== null) {
+			// unsavedWork returns null for a missing or unlinked worktree without
+			// looking at what is left on disk: a husk that still holds files has no git
+			// to prove them clean, so the move refuses unless nothing remains. The
+			// husk's branch gets cancel's kept-worktree verdict, so removeWorktree
+			// never deletes a branch that holds unmerged commits.
+			const husk = await worktreeHusk(reserved.worktree);
+			if (husk) {
+				const leftover =
+					existsSync(reserved.worktree) &&
+					readdirSync(reserved.worktree).length > 0;
+				if (leftover) {
 					await restore();
 					return json(
-						{ error: `cannot remove the worktree: ${errmsg(err)}` },
-						500,
+						{
+							error:
+								"cannot move back to todo, the husk worktree still holds files with no clean-state proof",
+						},
+						409,
 					);
 				}
-				// removeWorktree is best-effort inside: prove the disposal landed before the
-				// row forgets the fields, so the card never queues while it still owns a
-				// directory or a branch.
-				const branchGone =
-					reserved.branch === null ||
-					(
-						await git(
-							["rev-parse", "--verify", "--quiet", reserved.branch],
-							e.path,
-						)
-					).code !== 0;
-				if (existsSync(reserved.worktree) || !branchGone) {
+				if (
+					reserved.branch !== null &&
+					!(await branchMergedOrGone(e.path, reserved.branch, into))
+				) {
 					await restore();
 					return json(
-						{ error: "the worktree or its branch could not be removed" },
-						500,
+						{
+							error: `cannot move back to todo, branch ${reserved.branch} holds commits that never reached ${into}`,
+						},
+						409,
+					);
+				}
+			} else {
+				const reason = await unsavedWork(reserved.worktree, into);
+				if (reason !== null) {
+					await restore();
+					return json(
+						{
+							error: `cannot move back to todo, the worktree holds work: ${reason}`,
+						},
+						409,
 					);
 				}
 			}
-			// A fresh work turn in a fresh session: sessionId null keeps resumePlan from
-			// resuming the parked turn's session. The stale base clears too: runTurn reads
-			// task.base for the fresh worktree (`base ?? current target head`), so keeping
-			// it would branch from an old sha and miss a dependency that merged meanwhile.
-			// A review card reviews its frozen base, and release, update, fork, and hold
-			// cards anchor their heads to it, so they keep it.
-			const keepBase =
-				isReview(reserved) ||
-				reserved.updateMergeHead !== null ||
-				reserved.forkMergeHead !== null ||
-				reserved.holdHead !== null;
-			await updateSnapshot(e, reserved, {
-				stage: "todo",
-				state: "queued",
-				queuedAt: Date.now(),
-				holdUntil: null,
-				needsReason: null,
-				asked: null,
-				sessionId: null,
-				worktree: null,
-				branch: null,
-				keptFiles: [],
-				workCheckSendbacks: 0,
-				workCheckHead: null,
-				workCheckReport: null,
-				...(keepBase ? {} : { base: null }),
-			});
-			await deps.schedule();
-			return await taskResponse(e, task.id);
+			try {
+				await appendLog(
+					e.store,
+					task.id,
+					"+ back to todo: removing the worktree",
+				);
+				await removeWorktree({
+					mainPath: e.path,
+					worktreePath: reserved.worktree,
+					branch: reserved.branch,
+					log: (line) => appendLog(e.store, task.id, line),
+				});
+			} catch (err) {
+				await appendLog(
+					e.store,
+					task.id,
+					`! back to todo removeWorktree: ${errmsg(err)}`,
+				);
+				await restore();
+				return json(
+					{ error: `cannot remove the worktree: ${errmsg(err)}` },
+					500,
+				);
+			}
+			// removeWorktree is best-effort inside: prove the disposal landed before the
+			// row forgets the fields, so the card never queues while it still owns a
+			// directory or a branch.
+			const branchGone =
+				reserved.branch === null ||
+				(
+					await git(
+						["rev-parse", "--verify", "--quiet", reserved.branch],
+						e.path,
+					)
+				).code !== 0;
+			if (existsSync(reserved.worktree) || !branchGone) {
+				await restore();
+				return json(
+					{ error: "the worktree or its branch could not be removed" },
+					500,
+				);
+			}
+		}
+		// A fresh work turn in a fresh session: sessionId null keeps resumePlan from
+		// resuming the parked turn's session. The stale base clears too: runTurn reads
+		// task.base for the fresh worktree (`base ?? current target head`), so keeping
+		// it would branch from an old sha and miss a dependency that merged meanwhile.
+		// A review card reviews its frozen base, and release, update, fork, and hold
+		// cards anchor their heads to it, so they keep it.
+		const keepBase =
+			isReview(reserved) ||
+			reserved.updateMergeHead !== null ||
+			reserved.forkMergeHead !== null ||
+			reserved.holdHead !== null;
+		await updateSnapshot(e, reserved, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			holdUntil: null,
+			needsReason: null,
+			asked: null,
+			sessionId: null,
+			worktree: null,
+			branch: null,
+			keptFiles: [],
+			workCheckSendbacks: 0,
+			workCheckHead: null,
+			workCheckReport: null,
+			...(keepBase ? {} : { base: null }),
 		});
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 	/** OTTR-1318: replaces a card's dependsOn list. The edited card stays; only its wait
 	 * graph changes, and the new list must keep the graph acyclic. */
@@ -17136,6 +17155,7 @@ export async function createApp(deps: AppDeps) {
 					async () => await handlePOSTProjectsTasksBacklogByProjectAndId(req),
 					{
 						costly: true,
+						reservation: "move",
 					},
 				),
 		},
@@ -17166,6 +17186,7 @@ export async function createApp(deps: AppDeps) {
 				await api(
 					req,
 					async () => await handlePOSTProjectsTasksCancelByProjectAndId(req),
+					{ reservation: "cancel" },
 				),
 		},
 		"/api/projects/:project/tasks/:id/refile": {
