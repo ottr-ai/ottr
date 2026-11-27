@@ -133,6 +133,9 @@ import type {
 	Task,
 	WorkCheckRun,
 } from "./types.ts";
+import { applyInboxSweepRows } from "./app.ts";
+import { SWEEP_DRAFT_SEP } from "./inboxSweep.ts";
+import { doneReadKey } from "./types.ts";
 import { resetVmState, vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import type { DetachedRun, WorkerTarget } from "./workers.ts";
@@ -32338,7 +32341,9 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			stage: "done",
 			state: "idle",
 		});
-		return t;
+		// The fresh row: the done patch stamped doneAt, which the seen-key
+		// fixtures read.
+		return (await store.getTask(t.id))!;
 	};
 
 	/** One sweep fixture: each run records the next queued batch of per-card
@@ -32348,6 +32353,9 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		const batches: RecordedFinding[][] = [];
 		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
+			// The fixtures' cards all land after the baseline, so only the seen
+			// marks decide candidacy (the app wires the real stamp).
+			seenSince: async () => 0,
 			startRun: async (o: StartOpts) => {
 				record.runs.push(o);
 				await o.onSession?.("sess");
@@ -32401,7 +32409,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			"read research",
 			"# R\n## Recommended steps\n- x",
 		);
-		seen.push(readCard.id);
+		seen.push(doneReadKey({ id: readCard.id, doneAt: readCard.doneAt! }));
 		const cancelled = await pinnedCard(
 			store,
 			"cancelled research",
@@ -32483,7 +32491,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		});
 		const a = await pinnedCard(store, "a", "# R\n## Recommended steps\n- a");
 		const b = await pinnedCard(store, "b", "# R\n## Recommended steps\n- b");
-		seen.push(a.id);
+		seen.push(doneReadKey({ id: a.id, doneAt: a.doneAt! }));
 		const filed = await loop.filePendingSweepRun(entryOf(projects, store));
 		expect("id" in filed).toBe(true);
 		if (!("id" in filed)) throw new Error("no sweep filed");
@@ -32497,7 +32505,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		expect(
 			await loop.filePendingSweepRun(
 				entryOf(projects, store),
-				new Set([b.id]),
+				new Set([doneReadKey({ id: b.id, doneAt: b.doneAt! })]),
 			),
 		).toEqual({ error: "no pinned research cards", status: 409 });
 	});
@@ -32561,6 +32569,107 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			expect(run2.prompt).toContain(`id="#${card.id}"`);
 		for (const card of pinned.slice(0, 10))
 			expect(run2.prompt).not.toContain(`id="#${card.id}"`);
+	});
+
+	test("the acceptance sequence: settle records the three verdicts and the preselected rows apply", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await sweepCase(record);
+		// Card a's step is already implemented by a done child card; b's step is
+		// open; c is pure info. The three verdicts the spec's acceptance names.
+		const a = await pinnedCard(
+			store,
+			"rate limit the API",
+			"# R\n## Recommended steps\n- add the limiter",
+		);
+		const child = await store.createTask("add the limiter");
+		await store.updateTask(child.id, {
+			followUpOf: a.id,
+			stage: "done",
+			state: "idle",
+		});
+		const b = await pinnedCard(
+			store,
+			"extract the retry helper",
+			"# R\n## Recommended steps\n- extract the retry helper",
+		);
+		const c = await pinnedCard(store, "queue depths", "# R\nno steps", "no");
+		// The filing's evidence for a names the done child in its descendants.
+		const filed = await loop.filePendingSweepRun(entryOf(projects, store));
+		expect("id" in filed).toBe(true);
+		if (!("id" in filed)) throw new Error("no sweep filed");
+		const run = (await store.getTask(filed.id))!;
+		expect(run.prompt).toContain(`id="#${a.id}"`);
+		expect(run.prompt).toContain(`#${child.id}`);
+		// The run records one verdict per card; the settle parses them with the
+		// real reader and lands done.
+		batches.push([
+			mkFinding(`Sweep: #${a.id} done\n#${child.id} added the limiter`),
+			mkFinding(
+				`Sweep: #${b.id} partial\nthe helper is still inline\n${SWEEP_DRAFT_SEP}\nExtract the retry helper\n\nChange: move the retry loop out of src/http.ts. Check: the retry unit test passes.`,
+			),
+			mkFinding(`Sweep: #${c.id} info\nno steps in the report`),
+		]);
+		await loop.runTurn(store.name, filed.id);
+		const done = await settled(store, filed.id);
+		expect(done.stage).toBe("done");
+		const log = await logText(store, filed.id);
+		for (const card of [a, b, c])
+			expect(log).toContain(`- sweep verdict for #${card.id}`);
+		// The preselected rows apply through the real core: a and c clear (their
+		// completion keys reach the seen set), b's draft files as one proposal.
+		const gstore = await GlobalStore.open(
+			mkdtempSync(join(tmpdir(), "sweep-seq-seen-")),
+		);
+		try {
+			const applied = await applyInboxSweepRows({
+				store,
+				run: (await store.getTask(filed.id))!,
+				rows: [
+					{ card: a.id, action: "clear" },
+					{ card: b.id, action: "implement" },
+					{ card: c.id, action: "clear" },
+				],
+				markSeen: async (keys) => {
+					await gstore.set("seen_answers", keys);
+				},
+				log: async () => {},
+			});
+			expect(applied.results).toEqual([
+				{ card: a.id, applied: true },
+				{ card: b.id, applied: true },
+				{ card: c.id, applied: true },
+			]);
+			const seenKeys = (await gstore.get<string[]>("seen_answers")) ?? [];
+			// All three rows clear their pin: clear rows directly, the implement
+			// row after its draft filed (the drawer's Implement steps does the
+			// same), so the applied cards leave the Inbox either way.
+			expect(seenKeys).toContain(doneReadKey({ id: a.id, doneAt: a.doneAt! }));
+			expect(seenKeys).toContain(doneReadKey({ id: b.id, doneAt: b.doneAt! }));
+			expect(seenKeys).toContain(doneReadKey({ id: c.id, doneAt: c.doneAt! }));
+			const proposals = (await store.listTasks()).filter(
+				(t) => t.followUpOf === filed.id,
+			);
+			expect(proposals).toHaveLength(1);
+			expect(proposals[0]!.stage).toBe("backlog");
+			expect(proposals[0]!.state).toBe("needs_you");
+			expect(proposals[0]!.prompt).toContain("Extract the retry helper");
+			// A repeated apply files no duplicate: the draft already filed.
+			const again = await applyInboxSweepRows({
+				store,
+				run: (await store.getTask(filed.id))!,
+				rows: [{ card: b.id, action: "implement" }],
+				markSeen: async () => {},
+				log: async () => {},
+			});
+			expect(again.results).toEqual([
+				{ card: b.id, applied: false, skipped: "already applied" },
+			]);
+			expect(
+				(await store.listTasks()).filter((t) => t.followUpOf === filed.id),
+			).toHaveLength(1);
+		} finally {
+			await gstore.close();
+		}
 	});
 
 	test("a verdict for a card that no live sweep covers re-sweeps only the uncovered remainder", async () => {

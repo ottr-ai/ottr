@@ -34,8 +34,11 @@ A pinned research card of project p joins the sweep when all hold:
 - `t.research && t.stage === "done" && t.cancelledAt === null`
 - the resolved steps value (`viewSteps`) is not `"unknown"` — both steps reports and
   pure-info cards count (pure-info cards get the `info` verdict)
-- the card id is not in the seen set (the board's read marks, the ops seen ids
-  unioned with the explicit `seen` override; the same set the Inbox group reads)
+- the card's completion key (`<id>@<doneAt>`, OTTR-566) is not in the seen set
+  and the card landed after the seen baseline — the same rule the Inbox's unread
+  check runs, so a card done again after an older read stays a candidate while
+  every read card outside today's Inbox drops out (the ops seen ids, unioned
+  with the explicit `seen` override, carry the keys)
 - no live sweep card (kind `"sweep"`, not cancelled) already records a verdict for
   it — a chained or re-started sweep never re-sweeps a covered card
 
@@ -54,8 +57,9 @@ cards"`. An open sweep: `409 "a sweep run is already open"`.
   loaded window does not matter server-side). Per child: id, title, kind, stage,
   state, cancelled mark. Cap 30 rows, then one `(+N more)` line.
 - Related cards: other cards of the project whose title, prompt or details contain a
-  path-like token the report names. Tokens: repo-relative path-looking strings from
-  the report text, cap 20 tokens. Cap 10 related cards, 1 line each.
+  path-like token or a board card id the report names (`CLIP-64`, the TASK_ID_RE
+  handle shape, word-bounded). Tokens: repo-relative path-looking strings and id
+  handles from the report text, cap 20 each. Cap 10 related cards, 1 line each.
 - Git log: for the named path tokens, `git log --since=<card createdAt> --name-only
   --format="%h %s" -- <paths>` in the project's main checkout, capped at 30 commit
   lines. Skipped when the project is gitless or git fails. Limits: unmerged card
@@ -110,10 +114,12 @@ interface SweepView { rows: SweepRowView[]; pending: number }
 ```
 
 `pending`: pinned cards of the project this run does not cover (the chain's
-remainder, filed by the settle). Stale rule (computed live against the sweep card's
-`updatedAt` stamp T): the target's `updatedAt > T`, or the target is cancelled at
-`> T`, or any transitive descendant of the target has `createdAt > T` (a new child
-or a new answer after the sweep).
+remainder, filed by the settle). Stale rule (computed live against the run's
+filing stamp T — the run card's immutable `createdAt`, because the evidence was
+read at filing and the settle later advances `updatedAt`): the target's
+`updatedAt > T`, or the target is cancelled at `> T`, or any transitive
+descendant of the target has `updatedAt > T` — a stamp covers a new child and
+an answer, finish or cancellation landing on an existing one alike.
 
 ## Routes (src/app.ts)
 
@@ -127,8 +133,12 @@ or a new answer after the sweep).
   path: seenable-gated, decayed). `implement` files each recorded draft as a held
   proposal card — backlog stage, `needs_you`, `promptAuthor: "board"`,
   `needsReason: sweepProposedReason(run card)` (`"Inbox sweep proposal from #<run>."
-  + the action sentence`) — then marks the target seen. An implement row with no
-  drafts only marks seen. Response: `{ results: Array<{ card, applied, skipped? }> }`.
+  + the action sentence`) — then marks the target seen. A draft that already
+  filed for this run (a card linked to the run with the same prompt) skips, and
+  a row whose drafts all filed answers `skipped: "already applied"` — a
+  repeated apply creates no duplicate cards. Marks use the completion key
+  (`<id>@<doneAt>`), the Inbox's own mark. An implement row with no drafts only
+  marks seen. Response: `{ results: Array<{ card, applied, skipped? }> }`.
 
 ## Turn plumbing (src/turn.ts, extension/tracker.ts)
 

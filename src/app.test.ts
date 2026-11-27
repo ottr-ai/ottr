@@ -13999,7 +13999,8 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 			stage: "done",
 			state: "idle",
 		});
-		return t;
+		// The fresh row: the done patch stamped doneAt (the seen key reads it).
+		return (await store3.getTask(t.id))!;
 	};
 
 	/** A done sweep run card with one recorded verdict per given prompt. */
@@ -14111,9 +14112,12 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 			{ card: info.id, applied: true },
 		]);
 		// clear marks seen; implement files one held proposal card and marks seen.
+		// The route marks the completion key (OTTR-566), the Inbox's own mark.
 		const seen = (await gstore.get<unknown>("seen_answers")) as string[];
-		for (const id of [clear.id, implement.id, info.id])
-			expect(seen.includes(id)).toBe(true);
+		for (const t of [clear, implement, info])
+			expect(seen.includes(doneReadKey({ id: t.id, doneAt: t.doneAt! }))).toBe(
+				true,
+			);
 		const proposals = (await store3.listTasks()).filter(
 			(t) => t.followUpOf === run.id,
 		);
@@ -14127,6 +14131,42 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		expect(proposal.needsReason).toBe(
 			`Inbox sweep proposal from #${run.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
+	});
+
+	test("a repeated apply files no duplicate proposals", async () => {
+		const target = await pinnedResearch(
+			"repeat apply card",
+			"# R\n## Recommended steps\n- one open step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> partial\nopen step\n${SWEEP_DRAFT_SEP}\nDraft one prompt`,
+			},
+		]);
+		const rows = [{ card: target.id, action: "implement" as const }];
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: run.id,
+					rows,
+				})
+			).status,
+		).toBe(200);
+		const second = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows,
+		});
+		expect(second.status).toBe(200);
+		const b = (await second.json()) as {
+			results: { card: string; applied: boolean; skipped?: string }[];
+		};
+		expect(b.results).toEqual([
+			{ card: target.id, applied: false, skipped: "already applied" },
+		]);
+		expect(
+			(await store3.listTasks()).filter((t) => t.followUpOf === run.id),
+		).toHaveLength(1);
 	});
 
 	test("a stale row, a no-verdict row and a cancelled run apply nothing", async () => {

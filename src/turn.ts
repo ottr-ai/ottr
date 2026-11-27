@@ -60,6 +60,7 @@ import {
 	descendantLines,
 	relatedByTokens,
 	relatedLines,
+	reportIdTokens,
 	reportPathTokens,
 	SWEEP_BATCH_SIZE,
 	type SweepRecord,
@@ -991,6 +992,10 @@ export interface TurnOps {
 	 * inbox sweep's candidates and the settle's chain skip already-read cards. Absent in
 	 * narrow test fakes: the seen set then reads as empty. */
 	seenIds?: () => Promise<string[]>;
+	/** The board's seen baseline (OTTR-566): a done card done at or before it
+	 * counts read without a mark, so the inbox sweep's candidates read the same
+	 * Inbox the operator sees. Wired with seenIds. */
+	seenSince?: () => Promise<number>;
 	stopping?: () => boolean;
 	/** OTTR-454: true while a per-runner hold covers this runner id (a worker hostname or "local"). */
 	drainedRunner(id: string): boolean;
@@ -10488,6 +10493,7 @@ export function createTurnLoop(
 				...((await ops.seenIds?.().catch(() => [])) ?? []),
 				...(seen ?? []),
 			]);
+			const since = await ops.seenSince?.().catch(() => 0);
 			// The list rows lack the wide report column, so the steps resolution
 			// (and every evidence read below) reads the full card, like the seen
 			// set's own resolution does.
@@ -10498,7 +10504,12 @@ export function createTurnLoop(
 				const full = await e.store.getTask(row.id);
 				if (full !== null && sweepSteps(full) !== "unknown") fulls.push(full);
 			}
-			const candidates = sweepCandidateRows(fulls, seenSet, covered);
+			const candidates = sweepCandidateRows(
+				fulls,
+				seenSet,
+				since ?? 0,
+				covered,
+			);
 			if (candidates.length === 0)
 				return { error: "no pinned research cards", status: 409 };
 			const batch = candidates.slice(0, SWEEP_BATCH_SIZE);
@@ -10506,10 +10517,12 @@ export function createTurnLoop(
 			for (const card of batch) {
 				const report = card.report ?? "";
 				const tokens = reportPathTokens(report);
+				const idTokens = reportIdTokens(report);
 				const descendants = collectDescendants(tasks, card.id);
 				const related = await relatedByTokens(
 					tasks,
 					tokens,
+					idTokens,
 					card.id,
 					async (id) => (await e.store.getTask(id))?.details ?? null,
 				);

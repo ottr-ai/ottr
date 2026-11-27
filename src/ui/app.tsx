@@ -11939,21 +11939,31 @@ function DrawerSweep(p: {
 	const { task, act, setDetail } = p;
 	const sweep = task.sweep;
 	// Checked rows, keyed by the target card id. Stale rows never join: their
-	// checkbox is disabled, so an apply cannot carry them either.
+	// checkbox is disabled, so an apply cannot carry them either. Applied rows
+	// (this drawer session's own applies, plus rows the server answers
+	// "already applied" for) drop out of every reset, so a refresh never
+	// re-selects work that filed.
 	const [checked, setChecked] = useState<ReadonlySet<string>>(
 		() =>
 			new Set((sweep?.rows ?? []).filter((r) => !r.stale).map((r) => r.card)),
 	);
+	const applied = useRef(new Set<string>());
 	const [error, setError] = useState<string | null>(null);
 	// An apply refetches the detail (and the state refresh re-renders the drawer):
-	// the fresh rows reset the checks to their defaults, like PrReviewSection's
-	// draft reset. Render-phase guard on the rows array identity.
+	// the fresh rows reset the checks to their defaults minus the applied ones,
+	// like PrReviewSection's draft reset. Render-phase guard on the rows identity.
 	const lastRows = useRef(sweep?.rows);
 	if (sweep !== undefined && sweep.rows !== lastRows.current) {
 		lastRows.current = sweep.rows;
-		setChecked(new Set(sweep.rows.filter((r) => !r.stale).map((r) => r.card)));
+		setChecked(
+			new Set(
+				sweep.rows
+					.filter((r) => !r.stale && !applied.current.has(r.card))
+					.map((r) => r.card),
+			),
+		);
 	}
-	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
+	const applyUrl = `/api/projects/${encodeURIComponent(task.project)}/inbox/sweep/apply`;
 	return (
 		<>
 			{" "}
@@ -12024,13 +12034,24 @@ function DrawerSweep(p: {
 										const rows = sweep.rows
 											.filter((r) => !r.stale && checked.has(r.card))
 											.map((r) => ({ card: r.card, action: r.proposed }));
-										await post(`${taskUrl}/inbox/sweep/apply`, {
-											run: task.id,
-											rows,
-										});
+										const appliedRows = await post<{
+											results: { card: string; skipped?: string }[];
+										}>(applyUrl, { run: task.id, rows });
+										// Rows the server answers "already applied" (their drafts
+										// filed on an earlier apply) join the applied set with the
+										// rows this apply carried, so no reset re-selects them.
+										for (const r of appliedRows.results)
+											applied.current.add(r.card);
 										// The applied rows changed seen marks and filed drafts:
 										// refetch this card's detail, act refreshes the board state.
-										setDetail(await readDetail(taskUrl));
+										setDetail(
+											await readDetail(
+												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`,
+											),
+										);
+										// Nothing stays checked after an apply: the applied rows
+										// leave the defaults, so a second click cannot re-send work.
+										setChecked(new Set());
 									}, setError)
 								}
 							>

@@ -2190,6 +2190,102 @@ const settingParsers: FieldParser[] = [
 	parseJiraSettings,
 ];
 
+/** One apply row the request body parsed into (the route's own shape; exported
+ * with applyInboxSweepRows for the sequence test). */
+export type SweepApplyRow = { card: string; action: "clear" | "implement" };
+
+/** The inbox sweep apply's core (OTTR-1259; the POST route delegates): per row,
+ * the run card must carry a parsed verdict for the card, else `skipped: "no
+ * verdict"`; a stale row never applies (`skipped: "stale"`), whatever the body
+ * asks — the stamp is the run's immutable filing time (`createdAt`), because
+ * the evidence was gathered at filing and a settle later advances `updatedAt`.
+ * `clear` hands the card's completion key to `markSeen`; `implement` files each
+ * recorded draft as a held proposal card — a draft that already filed for this
+ * run (followUpOf the run, same prompt) skips, so a repeated apply creates no
+ * duplicate cards — then hands the completion key over. An implement row with
+ * no drafts only marks seen. The caller owns the mark semantics (the route
+ * runs the shared /api/seen path). */
+export async function applyInboxSweepRows(o: {
+	store: ProjectStore;
+	run: Task;
+	rows: ReadonlyArray<SweepApplyRow>;
+	markSeen: (keys: string[]) => Promise<void>;
+	log: (line: string) => Promise<void>;
+}): Promise<{
+	results: { card: string; applied: boolean; skipped?: string }[];
+}> {
+	const { store, run } = o;
+	const applicable = run.cancelledAt === null && run.stage === "done";
+	const verdicts = new Map<string, SweepRecord>();
+	if (applicable)
+		for (const finding of await store.listReviewFindings(run.id)) {
+			const parsed = sweepResult(finding.prompt);
+			if (parsed !== null && !verdicts.has(parsed.cardId))
+				verdicts.set(parsed.cardId, parsed);
+		}
+	const tasks = await store.listTasks();
+	// The evidence was read at filing time; the run's own createdAt stamps it.
+	const stamp = run.createdAt;
+	const existing = new Set(
+		tasks
+			.filter((t) => t.followUpOf === run.id)
+			.map((t) => `${t.followUpOf}\u0000${t.prompt}`),
+	);
+	const results: { card: string; applied: boolean; skipped?: string }[] = [];
+	const markSeen: string[] = [];
+	for (const row of o.rows) {
+		const verdict = verdicts.get(row.card);
+		if (verdict === undefined) {
+			results.push({ card: row.card, applied: false, skipped: "no verdict" });
+			continue;
+		}
+		const target = tasks.find((t) => t.id === row.card);
+		if (
+			target === undefined ||
+			sweepRowStale(target, collectDescendants(tasks, row.card), stamp)
+		) {
+			results.push({ card: row.card, applied: false, skipped: "stale" });
+			continue;
+		}
+		if (row.action === "implement") {
+			const fresh = verdict.drafts.filter(
+				(draft) => !existing.has(`${run.id}\u0000${draft}`),
+			);
+			for (const draft of fresh) {
+				const proposal = await store.createTask(draft);
+				// In-request dedupe too: two rows carrying the same draft file it once.
+				existing.add(`${run.id}\u0000${draft}`);
+				await store.updateTask(proposal.id, {
+					followUpOf: run.id,
+					promptAuthor: "board",
+					stage: "backlog",
+					state: "needs_you",
+					queuedAt: null,
+					needsReason: sweepProposedReason({ id: run.id }),
+				});
+				await o.log(`- filed proposal ${proposal.id} for #${row.card}`);
+			}
+			if (verdict.drafts.length > 0 && fresh.length === 0) {
+				// Every draft filed on an earlier apply: the row applied already.
+				results.push({
+					card: row.card,
+					applied: false,
+					skipped: "already applied",
+				});
+				continue;
+			}
+		}
+		// `clear` marks seen; `implement` marks seen after the drafts filed. The
+		// completion key matches the Inbox's own mark (OTTR-566), so the pin
+		// clears; the caller's write keeps the shared decay rules.
+		if (target.doneAt !== null)
+			markSeen.push(doneReadKey({ id: target.id, doneAt: target.doneAt }));
+		results.push({ card: row.card, applied: true });
+	}
+	await o.markSeen(markSeen);
+	return { results };
+}
+
 /** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
 export type App = Awaited<ReturnType<typeof createApp>>;
 export type AppServeOptions = App["serveOptions"];
@@ -7122,8 +7218,9 @@ export async function createApp(deps: AppDeps) {
 	}
 
 	/** The sweep section a kind "sweep" card's drawer shows (OTTR-1259): one row
-	 * per recorded verdict, stale computed live against the run card's updatedAt
-	 * stamp, plus the pinned cards no live sweep covers (the chain's remainder). */
+	 * per recorded verdict, stale computed live against the run's immutable
+	 * filing stamp (createdAt — the evidence was read then), plus the pinned
+	 * cards no live sweep covers (the chain's remainder). */
 	async function sweepView(e: Entry, run: Task): Promise<SweepView> {
 		const tasks = await e.store.listTasks();
 		const verdicts = await sweepVerdicts(
@@ -7131,7 +7228,7 @@ export async function createApp(deps: AppDeps) {
 			run.id,
 			run.cancelledAt === null,
 		);
-		const stamp = run.updatedAt;
+		const stamp = run.createdAt;
 		const rows = (
 			await Promise.all(
 				[...verdicts.values()].map(async (v) => {
@@ -7172,7 +7269,10 @@ export async function createApp(deps: AppDeps) {
 			const full = await e.store.getTask(row.id);
 			if (full !== null && viewSteps(full) !== "unknown") fulls.push(full);
 		}
-		return { rows, pending: sweepCandidateRows(fulls, seen, covered).length };
+		return {
+			rows,
+			pending: sweepCandidateRows(fulls, seen, seenDoneSince, covered).length,
+		};
 	}
 
 	/** One task with its turns for the drawer; turns ship without the prompt text and the raw
@@ -13393,60 +13493,24 @@ export async function createApp(deps: AppDeps) {
 			if ((await e.store.getTask(row.card)) === null)
 				return json({ error: "unknown task" }, 404);
 		// "The run must be live and done": a cancelled or unfinished sweep's
-		// verdicts apply nowhere, whatever they recorded.
-		const verdicts = await sweepVerdicts(
-			e.store,
-			run.id,
-			run.cancelledAt === null && run.stage === "done",
-		);
-		const tasks = await e.store.listTasks();
-		const stamp = run.updatedAt;
-		const results: { card: string; applied: boolean; skipped?: string }[] = [];
-		const markSeen: string[] = [];
-		for (const row of rows) {
-			const verdict = verdicts.get(row.card);
-			if (verdict === undefined) {
-				results.push({ card: row.card, applied: false, skipped: "no verdict" });
-				continue;
-			}
-			const target = tasks.find((t) => t.id === row.card);
-			if (
-				target === undefined ||
-				sweepRowStale(target, collectDescendants(tasks, row.card), stamp)
-			) {
-				results.push({ card: row.card, applied: false, skipped: "stale" });
-				continue;
-			}
-			if (row.action === "implement")
-				for (const draft of verdict.drafts) {
-					const proposal = await e.store.createTask(draft);
-					await e.store.updateTask(proposal.id, {
-						followUpOf: run.id,
-						promptAuthor: "board",
-						stage: "backlog",
-						state: "needs_you",
-						queuedAt: null,
-						needsReason: sweepProposedReason({ id: run.id }),
-					});
-					await appendLog(
-						e.store,
-						run.id,
-						`- filed proposal ${proposal.id} for #${row.card}`,
+		// verdicts apply nowhere, whatever they recorded. The core owns the
+		// stamp, the dedupe and the completion keys; the mark runs the shared
+		// /api/seen path (seenable-gated, decayed).
+		return json(
+			await applyInboxSweepRows({
+				store: e.store,
+				run,
+				rows,
+				markSeen: async (keys) => {
+					if (keys.length === 0) return;
+					const live = await seenableIds();
+					await updateSeen((current) =>
+						[...current, ...keys].filter((id) => live.has(id)),
 					);
-				}
-			// `clear` marks seen; `implement` marks seen after the drafts filed. The
-			// seenable-gated write decays a card that stopped being seenable (the
-			// shared /api/seen rule), it never re-pins.
-			markSeen.push(row.card);
-			results.push({ card: row.card, applied: true });
-		}
-		if (markSeen.length > 0) {
-			const live = await seenableIds();
-			await updateSeen((current) =>
-				[...current, ...markSeen].filter((id) => live.has(id)),
-			);
-		}
-		return json({ results });
+				},
+				log: (line) => appendLog(e.store, run.id, line),
+			}),
+		);
 	}
 
 	/** The steering refusal for a card not in flight; null lets the steer queue. */
@@ -17944,6 +18008,7 @@ export async function createApp(deps: AppDeps) {
 		// OTTR-1259: the board's sorted seen ids; the turn loop reads them per inbox
 		// sweep filing (candidates skip already-read cards).
 		seenIds: loadSeen,
+		seenSince: () => seenDoneSince,
 		// OTTR-882: the release identity (the configured GitHub app's contents-write token,
 		// else the GH_TOKEN user token with a warning); the turn loop asks it at publish.
 		releaseIdentity,

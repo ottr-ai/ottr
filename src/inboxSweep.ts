@@ -6,7 +6,7 @@
 // them into behavior, and a verdict whose first line is not exact reads as null.
 
 import type { ListedTask, ResearchSteps, Task } from "./types.ts";
-import { recommendsSteps } from "./types.ts";
+import { doneReadKey, recommendsSteps } from "./types.ts";
 
 /** The board's cheap model role plans the batch; this is its card cap (module
  * constant by the spec, no new setting in v1). */
@@ -109,6 +109,19 @@ export function reportPathTokens(report: string): string[] {
 	return found;
 }
 
+/** The board card ids a report names (`CLIP-64`, the TASK_ID_RE handle shape,
+ * upper case, word-bounded so `XCLIP-64` never yields `CLIP-64`), capped at 20.
+ * The task names ids as evidence sources beside file paths. */
+export function reportIdTokens(report: string): string[] {
+	const found: string[] = [];
+	for (const m of report.matchAll(/\b[A-Z0-9]{1,8}-\d+\b/g)) {
+		const token = m[0];
+		if (!found.includes(token)) found.push(token);
+		if (found.length === 20) break;
+	}
+	return found;
+}
+
 /** Every transitive `followUpOf` child of one card, oldest first (id tiebreak).
  * The store list is complete, so one pass over the rows walks the whole tree;
  * a cycle guard keeps a corrupt chain from looping. */
@@ -152,10 +165,15 @@ export function descendantLines(children: ReadonlyArray<ListedTask>): string[] {
 export async function relatedByTokens(
 	tasks: ReadonlyArray<ListedTask>,
 	tokens: ReadonlyArray<string>,
+	idTokens: ReadonlyArray<string>,
 	targetId: string,
 	detailsOf: (id: string) => Promise<string | null>,
 ): Promise<ListedTask[]> {
-	if (tokens.length === 0) return [];
+	if (tokens.length === 0 && idTokens.length === 0) return [];
+	// Path tokens match as substrings (they carry separators); an id token needs
+	// its word boundaries, so `CLIP-6` never matches `CLIP-64`.
+	const idRe =
+		idTokens.length > 0 ? new RegExp(`\\b(?:${idTokens.join("|")})\\b`) : null;
 	const names = (t: {
 		title: string;
 		prompt: string;
@@ -166,7 +184,11 @@ export async function relatedByTokens(
 				t.title.includes(tok) ||
 				t.prompt.includes(tok) ||
 				(t.details ?? "").includes(tok),
-		);
+		) ||
+		(idRe !== null &&
+			(idRe.test(t.title) ||
+				idRe.test(t.prompt) ||
+				idRe.test(t.details ?? "")));
 	const others = tasks
 		.filter((t) => t.id !== targetId)
 		.sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
@@ -197,18 +219,20 @@ export function relatedLines(cards: ReadonlyArray<ListedTask>): string[] {
 	return head;
 }
 
-/** The stale rule, computed live against the sweep card's `updatedAt` stamp T
- * (the same rule the view and the apply route run): the target's `updatedAt > T`,
- * or the target is cancelled at `> T`, or any transitive descendant of the
- * target has `createdAt > T` (a new child, or a new answer after the sweep). */
+/** The stale rule, computed live against the sweep run's filing stamp T (the
+ * run card's immutable `createdAt`; the same rule the view and the apply route
+ * run): the target's `updatedAt > T`, or the target is cancelled at `> T`, or
+ * any transitive descendant of the target changed after T — its `updatedAt`
+ * covers a new child (createdAt ≤ updatedAt always) and an answer, finish or
+ * cancellation landing on an existing one. */
 export function sweepRowStale(
 	target: Pick<ListedTask, "updatedAt" | "cancelledAt">,
-	descendants: ReadonlyArray<Pick<ListedTask, "createdAt">>,
+	descendants: ReadonlyArray<Pick<ListedTask, "updatedAt">>,
 	stamp: number,
 ): boolean {
 	if (target.updatedAt > stamp) return true;
 	if (target.cancelledAt !== null && target.cancelledAt > stamp) return true;
-	return descendants.some((d) => d.createdAt > stamp);
+	return descendants.some((d) => d.updatedAt > stamp);
 }
 
 /** The card ids every live sweep card (kind "sweep", not cancelled) already
@@ -229,13 +253,19 @@ export async function sweepCoveredCards(
 	return covered;
 }
 
-/** The sweep's candidate rows: pinned research cards (done, not cancelled) that
- * are not in the seen set and that no live sweep covers, oldest `createdAt`
- * first, id tiebreak. The steps resolution (`sweepSteps` or the view's
- * `viewSteps`) filters before this call: rows are full cards there. */
+/** The sweep's candidate rows: the Inbox's pinned research cards — done, not
+ * cancelled, done after the seen baseline, whose completion key is not in the
+ * seen set, and that no live sweep covers — oldest `createdAt` first, id
+ * tiebreak. The seen rule mirrors the Inbox's own unread rule (queue.ts
+ * isUnread, OTTR-566): a done card reads via its `<id>@<doneAt>` completion
+ * key only, so a card done again after an older read stays a candidate while
+ * every read card outside today's Inbox drops out. The steps resolution
+ * (`sweepSteps` or the view's `viewSteps`) filters before this call: rows are
+ * full cards there. */
 export function sweepCandidateRows<T extends ListedTask>(
 	tasks: ReadonlyArray<T>,
 	seen: ReadonlySet<string>,
+	since: number,
 	covered: ReadonlySet<string>,
 ): T[] {
 	return tasks
@@ -244,7 +274,9 @@ export function sweepCandidateRows<T extends ListedTask>(
 				t.research &&
 				t.stage === "done" &&
 				t.cancelledAt === null &&
-				!seen.has(t.id) &&
+				t.doneAt !== null &&
+				t.doneAt > since &&
+				!seen.has(doneReadKey({ id: t.id, doneAt: t.doneAt })) &&
 				!covered.has(t.id),
 		)
 		.sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));

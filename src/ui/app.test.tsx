@@ -1506,6 +1506,10 @@ describe("done lane star section", () => {
 describe("Inbox sweep (OTTR-1259)", () => {
 	const base = laneColBase;
 
+	// The mounted apply test needs the client globals; the static-markup tests
+	// parse markup independently of them.
+	installDrawerClientGlobals();
+
 	// LaneCol props every test here passes on top of the shared laneColBase.
 	const lane = (
 		tasks: TaskCard[],
@@ -1594,10 +1598,12 @@ describe("Inbox sweep (OTTR-1259)", () => {
 	];
 	// The sweep run card fixture: kind "sweep" and the sweep view ride the same
 	// short cast drawerFields uses (the server's TaskKind gain lands in parallel).
+	// The prompt rides the detail response (the drawer renders it as markdown).
 	const sweepCard = (sweep: SweepView): TaskCard =>
 		cardFixture({
 			...drawerFields,
 			id: "S-1",
+			prompt: "Inbox sweep for proj",
 			kind: "sweep",
 			stage: "done",
 			state: "idle",
@@ -1721,6 +1727,61 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			<Drawer {...drawerBase} task={cardFixture({ ...drawerFields })} />,
 		);
 		expect(html).not.toContain("Sweep results");
+	});
+
+	// happy-dom's dispatched clicks never reach React's event plugin: call the
+	// production onClick the mount rendered onto the node (the rerun tests' gap).
+	const mountedApplyButton = (container: HTMLDivElement): Element => {
+		for (const node of container.querySelectorAll("button"))
+			if (node.textContent?.includes("Apply selected")) return node;
+		throw new Error("no Apply selected button");
+	};
+
+	test("Apply selected POSTs the checked rows to the project's apply route", async () => {
+		// The fixture carries the sweep view through the same short cast the
+		// static tests use; the detail fetch answers it back with the sweep.
+		const card = sweepCard(sweepView(sweepRows()));
+		// A real act: the fixture's no-op act never runs the apply callback.
+		const applyBase = {
+			...drawerBase,
+			act: async (fn: () => Promise<unknown>) => {
+				await fn();
+				return true;
+			},
+		} as unknown as Parameters<typeof Drawer>[0];
+		await withDrawerRoute(
+			applyBase,
+			card,
+			"/inbox/sweep/apply",
+			{
+				status: 200,
+				body: { results: [{ card: "r1" }, { card: "r2" }] },
+			},
+			async ({ posts, container }) => {
+				await act(async () => {
+					onClickOf(mountedApplyButton(container))({});
+				});
+				await act(async () => {});
+				await act(async () => {});
+				const post = posts.at(-1);
+				// The route hangs off the project — never under the run card's
+				// tasks path (a wrong URL 404s every apply).
+				expect(post?.url.endsWith("/inbox/sweep/apply")).toBe(true);
+				expect(post?.url).not.toContain("/tasks/");
+				expect(post?.body).toEqual({
+					run: "S-1",
+					rows: [
+						{ card: "r1", action: "clear" },
+						{ card: "r2", action: "implement" },
+					],
+				});
+				// After the apply nothing stays checked: the applied rows leave
+				// the defaults, so a second click cannot re-send the work.
+				expect(
+					mountedApplyButton(container).getAttribute("disabled"),
+				).not.toBeNull();
+			},
+		);
 	});
 });
 

@@ -9,6 +9,7 @@ import {
 	descendantLines,
 	relatedByTokens,
 	relatedLines,
+	reportIdTokens,
 	reportPathTokens,
 	SWEEP_BATCH_SIZE,
 	SWEEP_DRAFT_SEP,
@@ -270,6 +271,43 @@ describe("collectDescendants and descendantLines", () => {
 });
 
 describe("relatedByTokens and relatedLines", () => {
+	test("reportIdTokens reads the board handle shape, word-bounded", () => {
+		expect(reportIdTokens("CLIP-64 did it, see also CLIP-70.")).toEqual([
+			"CLIP-64",
+			"CLIP-70",
+		]);
+		// A longer prefix keeps its own id: XCLIP-64 never yields CLIP-64.
+		expect(reportIdTokens("XCLIP-64 and clip-64 stay out")).toEqual([
+			"XCLIP-64",
+		]);
+		expect(reportIdTokens("no handles here")).toEqual([]);
+	});
+
+	test("an id-named card matches without any path token", async () => {
+		const hit = await relatedByTokens(
+			[
+				row({ id: "OTHER-9", title: "unrelated" }),
+				row({ id: "CLIP-64", title: "the pairing fix" }),
+			],
+			[],
+			["CLIP-64"],
+			"target",
+			async () => null,
+		);
+		expect(hit.map((h) => h.id)).toEqual(["CLIP-64"]);
+	});
+
+	test("an id prefix boundary never matches a longer id", async () => {
+		const hit = await relatedByTokens(
+			[row({ id: "CLIP-64", title: "the pairing fix" })],
+			[],
+			["CLIP-6"],
+			"target",
+			async () => null,
+		);
+		expect(hit).toEqual([]);
+	});
+
 	test("title or prompt hits need no details read", async () => {
 		let reads = 0;
 		const hit = await relatedByTokens(
@@ -279,6 +317,7 @@ describe("relatedByTokens and relatedLines", () => {
 				row({ id: "n" }),
 			],
 			["src/a.ts"],
+			[],
 			"target",
 			async () => {
 				reads++;
@@ -294,6 +333,7 @@ describe("relatedByTokens and relatedLines", () => {
 		const hit = await relatedByTokens(
 			[row({ id: "d" })],
 			["src/a.ts"],
+			[],
 			"target",
 			async () => "mentions src/a.ts",
 		);
@@ -304,12 +344,13 @@ describe("relatedByTokens and relatedLines", () => {
 		const hit = await relatedByTokens(
 			[row({ id: "target", title: "src/a.ts" })],
 			["src/a.ts"],
+			[],
 			"target",
 			async () => null,
 		);
 		expect(hit).toEqual([]);
 		expect(
-			await relatedByTokens([row({ id: "x" })], [], "t", async () => "x"),
+			await relatedByTokens([row({ id: "x" })], [], [], "t", async () => "x"),
 		).toEqual([]);
 	});
 
@@ -347,14 +388,14 @@ describe("sweepRowStale", () => {
 		expect(
 			sweepRowStale(
 				{ updatedAt: 900, cancelledAt: null },
-				[{ createdAt: 1_001 }],
+				[{ updatedAt: 1_001 }],
 				stamp,
 			),
 		).toBe(true);
 		expect(
 			sweepRowStale(
 				{ updatedAt: 900, cancelledAt: null },
-				[{ createdAt: 1_000 }],
+				[{ updatedAt: 1_000 }],
 				stamp,
 			),
 		).toBe(false);
@@ -382,22 +423,34 @@ describe("sweepCoveredCards", () => {
 describe("sweepCandidateRows", () => {
 	test("pinned research cards only, oldest first, id tiebreak", () => {
 		const tasks = [
-			row({ id: "late", research: true, createdAt: 3_000 }),
-			row({ id: "early", research: true, createdAt: 1_000 }),
-			row({ id: "tie-b", research: true, createdAt: 2_000 }),
-			row({ id: "tie-a", research: true, createdAt: 2_000 }),
-			row({ id: "seen", research: true, createdAt: 500 }),
-			row({ id: "covered", research: true, createdAt: 600 }),
-			row({ id: "cancelled", research: true, cancelledAt: 700 }),
-			row({ id: "running", research: true, stage: "in_progress" }),
+			row({ id: "late", research: true, createdAt: 3_000, doneAt: 5_000 }),
+			row({ id: "early", research: true, createdAt: 1_000, doneAt: 5_000 }),
+			row({ id: "tie-b", research: true, createdAt: 2_000, doneAt: 5_000 }),
+			row({ id: "tie-a", research: true, createdAt: 2_000, doneAt: 5_000 }),
+			row({ id: "seen", research: true, createdAt: 500, doneAt: 5_000 }),
+			row({ id: "covered", research: true, createdAt: 600, doneAt: 5_000 }),
+			row({ id: "cancelled", research: true, cancelledAt: 700, doneAt: 5_000 }),
+			row({
+				id: "running",
+				research: true,
+				stage: "in_progress",
+				doneAt: 5_000,
+			}),
 			row({ id: "plain" }),
+			// Read by an older completion's mark: the card is done again (new
+			// doneAt), so its new completion key is absent and it stays a
+			// candidate, while the read card's own key excludes it.
+			row({ id: "redone", research: true, createdAt: 800, doneAt: 6_000 }),
+			row({ id: "prebaseline", research: true, createdAt: 100, doneAt: 999 }),
 		];
 		const picked = sweepCandidateRows(
 			tasks,
-			new Set(["seen"]),
+			new Set(["seen@5000", "redone@5_500"]),
+			1_000,
 			new Set(["covered"]),
 		);
 		expect(picked.map((p) => p.id)).toEqual([
+			"redone",
 			"early",
 			"tie-a",
 			"tie-b",
