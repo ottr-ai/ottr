@@ -764,6 +764,64 @@ export function depHold(
 		: `waiting for ${waiting.map((d) => `#${d.id} ${d.title}`).join(", ")}`;
 }
 
+/** The dependency writers' in-process lock (OTTR-1318): the depends-on route and the
+ * settle block's reported-deps write serialize their cycle validation with their write,
+ * so two writers in one process cannot each validate against the other's pre-write
+ * snapshot. Writers in different processes coordinate by validating their own final
+ * list against fresh snapshots and dropping the edges that close a cycle; a cross-process
+ * interleave that still lands a cycle is the documented residual (spec Risks). */
+let depWriteTail: Promise<unknown> = Promise.resolve();
+export function withDepWriteLock<T>(work: () => Promise<T>): Promise<T> {
+	const run = depWriteTail.then(work, work);
+	depWriteTail = run.catch(() => undefined);
+	return run;
+}
+
+/** The ids in `candidate` whose inclusion closes a dependency cycle through the card:
+ * from each id, following the committed dependsOn links of every resolvable card in the
+ * project whose card names it (the hold's own resolution rule) must never reach the card
+ * again. `depsOf` reads a card's committed list in its project; an id the resolver
+ * cannot reach stops that walk the same way the satisfied rule stops a hold. Pure. */
+export function cyclicDepIds(
+	candidate: readonly string[],
+	ownId: string,
+	ownProject: string,
+	projects: Iterable<DepProject>,
+	depsOf: (project: string, id: string) => readonly string[] | undefined,
+): string[] {
+	const all = [...projects];
+	const cyclic: string[] = [];
+	for (const id of candidate) {
+		const frontier: { id: string; project: string }[] = [
+			{ id, project: ownProject },
+		];
+		const walked = new Set<string>();
+		let closes = false;
+		while (frontier.length > 0) {
+			const step = frontier.pop();
+			if (step === undefined) break;
+			const own = all.find((p) => p.name === step.project);
+			if (own === undefined) continue;
+			const dep = resolveDep(step.id, all, own);
+			if (!("task" in dep)) continue;
+			const key = `${dep.project}/${dep.task.id}`;
+			if (key === `${ownProject}/${ownId}`) {
+				closes = true;
+				break;
+			}
+			if (walked.has(key)) continue;
+			walked.add(key);
+			const links = depsOf(dep.project, dep.task.id);
+			if (links !== undefined)
+				frontier.push(
+					...links.map((next) => ({ id: next, project: dep.project })),
+				);
+		}
+		if (closes) cyclic.push(id);
+	}
+	return cyclic;
+}
+
 /** Options of the per-project pickers (pickRunnable, pickLowPriority). */
 export interface PickOptions {
 	/** Null = no cap: as many runs as queued cards need. */

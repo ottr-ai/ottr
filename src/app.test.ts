@@ -15024,30 +15024,61 @@ describe("dependsOn edit and back to todo (OTTR-1318)", () => {
 		}
 	});
 
-	test("two concurrent back-to-todo moves cannot both win or lose the worktree", async () => {
+	test("two concurrent back-to-todo moves answer exactly one 200 and one 409", async () => {
 		const s = await setup("p-dep1318-race");
 		try {
 			const m = await mount({ projects: s.projects });
 			const wt = s.worktree("card-race");
 			const card = await parkCard(s, "raced card", wt, "card-race");
+			const baseline = (await s.store.getTask(card.id))!.revision;
 			const move = (): Promise<Response> =>
 				m.call(`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`, {
 					to: "todo",
 				});
+			// The per-card lock makes the reservation exclusive: the second request waits
+			// out the first, re-reads the moved row inside the lock, and answers 409
+			// without reserving or touching git.
 			const [r1, r2] = await Promise.all([move(), move()]);
-			// The reservation lets one move finish; the other meets the moved row and
-			// answers 409. No outcome may claim success twice while git ran once.
-			for (const r of [r1, r2]) {
-				expect([200, 409]).toContain(r.status);
-				if (r.status !== 200) await r.body?.cancel();
-			}
-			expect([r1.status, r2.status]).toContain(200);
+			expect([r1.status, r2.status].sort()).toEqual([200, 409]);
 			const after = (await s.store.getTask(card.id))!;
 			expect(after.stage).toBe("todo");
 			expect(after.state).toBe("queued");
 			expect(after.worktree).toBeNull();
+			// Exactly two guarded writes happened (reserve, final): the loser wrote
+			// nothing, so disposal ran once.
+			expect(after.revision).toBe(baseline + 2);
 			expect(existsSync(wt)).toBe(false);
 			expect(run(s.dir, "git for-each-ref refs/heads/card-race")).toBe("");
+		} finally {
+			s.cleanup();
+		}
+	});
+
+	test("back to todo refuses a husk that still holds files without a clean-state proof", async () => {
+		const s = await setup("p-dep1318-huskfile");
+		try {
+			const m = await mount({ projects: s.projects });
+			const wt = s.worktree("card-huskfile");
+			const card = await parkCard(s, "husk with drafts", wt, "card-huskfile");
+			// The worktree directory is gone; what remains is an unlinked directory with
+			// a draft in it. No git lives there, so nothing proves the draft clean.
+			rmSync(wt, { recursive: true, force: true });
+			mkdirSync(wt, { recursive: true });
+			writeFileSync(join(wt, "draft.txt"), "half written");
+			const res = await m.call(
+				`/api/projects/${s.entry.name}/tasks/${card.id}/backlog`,
+				{ to: "todo" },
+			);
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"cannot move back to todo, the husk worktree still holds files with no clean-state proof",
+			);
+			// The draft survives and the card stays parked and retryable.
+			expect(readFileSync(join(wt, "draft.txt"), "utf8")).toBe("half written");
+			const after = (await s.store.getTask(card.id))!;
+			expect(after.stage).toBe("in_progress");
+			expect(after.state).toBe("needs_you");
+			expect(after.worktree).toBe(wt);
 		} finally {
 			s.cleanup();
 		}

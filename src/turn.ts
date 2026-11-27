@@ -144,6 +144,7 @@ import {
 	checkModelWarning,
 	checkRoleFor,
 	checkRoutingNote,
+	cyclicDepIds,
 	demoteUnquoted,
 	depHold,
 	depProjectOf,
@@ -174,6 +175,7 @@ import {
 	UNCHECKED_FINDINGS_HOLD,
 	validatableReview,
 	WORK_CHECK_ASK_BLOCK,
+	withDepWriteLock,
 	workCheckAccountingError,
 	workCheckAsk,
 	workCheckBlockerCounts,
@@ -9634,22 +9636,71 @@ export function createTurnLoop(
 		const ownDep = await depProjectOf(st.store);
 		const bad = badDep(reportedDeps, depProjects, ownDep, st.id);
 		if (bad !== null) return parkBadDep(next, bad.reason);
-		return await st.store.transaction(async () => {
-			const current = await st.store.getTask(st.id);
-			if (
-				current === null ||
-				current.cancelledAt !== null ||
-				(current.state !== "running" && current.state !== "preparing")
-			)
-				return next;
-			const merged = [...new Set([...current.dependsOn, ...reportedDeps])];
-			if (
-				merged.length !== current.dependsOn.length ||
-				reportedDeps.some((d, i) => current.dependsOn[i] !== d)
-			)
-				await st.store.updateTask(st.id, { dependsOn: merged });
-			return await queueDepHold(st, next, outcome, merged, depProjects, ownDep);
-		});
+		// OTTR-1318: the reported-deps write joins the dependency writers' lock, so its
+		// cycle check serializes with the depends-on route's walk and write.
+		return await withDepWriteLock(() =>
+			st.store.transaction(async () => {
+				const current = await st.store.getTask(st.id);
+				if (
+					current === null ||
+					current.cancelledAt !== null ||
+					(current.state !== "running" && current.state !== "preparing")
+				)
+					return next;
+				// badDep checks existence and self references, not cycles: a reported id
+				// that closes a cycle through this card is dropped and the rest kept,
+				// else both cards queue for ever. The card log names the drop.
+				const full = new Map<string, Map<string, ListedTask>>();
+				for (const project of projects.values()) {
+					full.set(
+						project.store.name,
+						new Map((await project.store.listTasks()).map((t) => [t.id, t])),
+					);
+				}
+				const cyclic = cyclicDepIds(
+					reportedDeps,
+					st.id,
+					st.store.name,
+					depProjects,
+					(project, id) => full.get(project)?.get(id)?.dependsOn,
+				);
+				if (cyclic.length > 0) {
+					await appendLog(
+						st.store,
+						st.id,
+						`! report_outcome's dependsOn closed a cycle through this card; dropped ${cyclic.join(", ")}`,
+					);
+					const keptNow = reportedDeps.filter((id) => !cyclic.includes(id));
+					if (keptNow.length === 0) {
+						// Nothing survived the prune: queueing would re-run the agent into
+						// the same refusal, so the card parks on the reason instead.
+						return parkBadDep(
+							next,
+							`report_outcome's dependsOn closed a cycle through this card; dropped ${cyclic.join(", ")}. Reply to continue, or cancel the card.`,
+						);
+					}
+				}
+				const merged = [
+					...new Set([
+						...current.dependsOn,
+						...reportedDeps.filter((id) => !cyclic.includes(id)),
+					]),
+				];
+				if (
+					merged.length !== current.dependsOn.length ||
+					merged.some((d, i) => current.dependsOn[i] !== d)
+				)
+					await st.store.updateTask(st.id, { dependsOn: merged });
+				return await queueDepHold(
+					st,
+					next,
+					outcome,
+					merged,
+					depProjects,
+					ownDep,
+				);
+			}),
+		);
 	}
 
 	/** A bad id parks needs_you naming it; the ids are not recorded. */

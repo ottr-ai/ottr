@@ -17496,6 +17496,56 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 		expect(after.pendingPrompt).toBe(DEP_HELD_PROMPT);
 	});
 
+	test("a reported dependsOn id that closes a cycle is dropped, the rest kept", async () => {
+		let reported = "";
+		const { store, loop } = await depCase(() => reported.split(" "));
+		const task = await store.createTask("work please");
+		const cyclicBlocker = await store.createTask("the cyclic blocker");
+		const openBlocker = await store.createTask("the open blocker");
+		// The cyclic blocker already waits for this card: recording it would close
+		// task → cyclicBlocker → task and queue both cards for ever.
+		await store.updateTask(cyclicBlocker.id, { dependsOn: [task.id] });
+		reported = `${cyclicBlocker.id} ${openBlocker.id}`;
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// The cyclic edge never lands; the open blocker is kept and holds the card.
+		expect(after.dependsOn).toEqual([openBlocker.id]);
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBe(
+			`waiting for #${openBlocker.id} the open blocker`,
+		);
+		expect(after.pendingPrompt).toBe(DEP_HELD_PROMPT);
+		const log = readFileSync(await store.logPath(task.id), "utf8");
+		expect(log).toContain(
+			`! report_outcome's dependsOn closed a cycle through this card; dropped ${cyclicBlocker.id}`,
+		);
+		expect(log).not.toContain(`dropped ${openBlocker.id}`);
+	});
+
+	test("a report whose every dependsOn id closes a cycle parks on the reason", async () => {
+		let depId = "";
+		const { store, loop } = await depCase(() => [depId]);
+		const task = await store.createTask("work please");
+		const blocker = await store.createTask("the cyclic blocker");
+		await store.updateTask(blocker.id, { dependsOn: [task.id] });
+		depId = blocker.id;
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		// Nothing survived the prune, so queueing would re-run the agent into the
+		// same refusal: the card parks needs_you with nothing recorded.
+		expect(after.dependsOn).toEqual([]);
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("closed a cycle through this card");
+		expect(after.needsReason).toContain(`dropped ${blocker.id}`);
+		expect(after.pendingPrompt).toBeNull();
+		const log = readFileSync(await store.logPath(task.id), "utf8");
+		expect(log).toContain(`dropped ${blocker.id}`);
+	});
+
 	test("a merge-kind card requeues at merging the same way", async () => {
 		let depId = "";
 		const { store, loop } = await depCase(() => [depId]);

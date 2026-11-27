@@ -9,6 +9,7 @@ import {
 	fstatSync,
 	lstatSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	readSync,
 	type Stats,
@@ -331,7 +332,7 @@ import {
 } from "./sandboxRun.ts";
 import {
 	archReviewDue,
-	type DepProject,
+	cyclicDepIds,
 	type DepResolution,
 	depProjectOf,
 	depProjectsOf,
@@ -367,6 +368,7 @@ import {
 	WORK_CHECK_ASK_MERGE,
 	WORK_CHECK_ASK_NEW_APPROACH,
 	WORK_CHECK_ASK_SEND_BACK,
+	withDepWriteLock,
 	workCheckBlockerCounts,
 } from "./scheduler.ts";
 import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
@@ -12529,146 +12531,186 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}
-	/** OTTR-1318: the depends-on route's cycle walk and write serialize across
-	 * requests; a lost race against a worker's report_outcome write parks instead
-	 * of merging (spec Risks). */
-	let depEditTail: Promise<unknown> = Promise.resolve();
-	const withDepEditLock = async <T>(work: () => Promise<T>): Promise<T> => {
-		const run = depEditTail.then(work, work);
-		depEditTail = run.catch(() => undefined);
+	/** OTTR-1318: one Back to todo move at a time per card. The lock makes the
+	 * reservation exclusive: a second request that arrives while the first holds the
+	 * card waits here, and its re-read inside the lock meets the moved row and answers
+	 * 409 without touching git. */
+	const backToTodoTails = new Map<string, Promise<unknown>>();
+	const withBackToTodoLock = <T>(
+		key: string,
+		work: () => Promise<T>,
+	): Promise<T> => {
+		const run = (backToTodoTails.get(key) ?? Promise.resolve()).then(
+			work,
+			work,
+		);
+		const tail = run.catch(() => undefined);
+		backToTodoTails.set(key, tail);
+		void tail.then(() => {
+			if (backToTodoTails.get(key) === tail) backToTodoTails.delete(key);
+		});
 		return run;
 	};
 	/** OTTR-1318: moves a parked in-progress card back to the todo lane. It runs only when
 	 * the card holds no work: the worktree must be clean and hold no commits past its
-	 * target, else the card keeps its worktree and cancel stays the path. The route
-	 * reserves the card (state `idle`, a revision bump) before it touches git, so a
-	 * reply, restart, or steer that lands during the git work fails its guard and no run
-	 * can claim the worktree. Disposal must prove itself before the row clears the
-	 * fields: a husk's branch gets cancel's kept-worktree verdict, and a failed removal
-	 * answers with an error instead of queueing a card that still owns a directory or a
-	 * branch. On success the card queues as a fresh work turn in a fresh session. */
+	 * target, else the card keeps its worktree and cancel stays the path. The per-card
+	 * lock holds the whole move, and the route reserves the card (state `idle`, a revision
+	 * bump) before it touches git, so a reply, restart, or steer that lands during the git
+	 * work fails its guard and no run can claim the worktree. Disposal must prove itself
+	 * before the row clears the fields: a husk's leftover files and its branch get a
+	 * clean-state proof and cancel's kept-worktree verdict, and a failed removal answers
+	 * with an error instead of queueing a card that still owns a directory or a branch.
+	 * On success the card queues as a fresh work turn in a fresh session. */
 	async function inProgressToTodo(e: Entry, task: Task): Promise<Response> {
-		if (task.state !== "needs_you" && task.state !== "idle")
-			return json(
-				{ error: `a ${task.state} task cannot move back to todo` },
-				409,
-			);
-		if (task.pendingPrompt !== null)
-			return json({ error: "a reply or steer is still queued" }, 409);
-		// Reserve before disposal: needs_you flips to idle (a reply's guard reads state
-		// and revision through withTask), an already-idle card bumps its revision, and
-		// the scheduler skips idle. The worktree stays until the checks below pass, so
-		// a refusal leaves the card parked and retryable.
-		await updateSnapshot(e, task, { state: "idle" });
-		const reserved = (await e.store.getTask(task.id)) ?? task;
-		// A refused or failed move puts a needs-you card back the way the operator found
-		// it; best-effort, because a writer that landed meanwhile owns the row now.
-		const restore = async (): Promise<void> => {
-			if (task.state !== "needs_you") return;
-			try {
-				await updateSnapshot(e, reserved, { state: "needs_you" });
-			} catch {
-				// the row moved: its writer decides the state
-			}
-		};
-		const into = e.target ?? reserved.base ?? "HEAD";
-		if (reserved.worktree !== null) {
-			// unsavedWork returns null for a missing or unlinked worktree without looking
-			// at the branch: check the husk's branch like cancel's kept-worktree verdict,
-			// so removeWorktree never deletes a branch that holds unmerged commits.
-			const husk = await worktreeHusk(reserved.worktree);
+		return await withBackToTodoLock(`${e.store.name}/${task.id}`, async () => {
+			// Fresh read inside the lock: a concurrent move may have finished already.
+			const live = await e.store.getTask(task.id);
 			if (
-				husk &&
-				reserved.branch !== null &&
-				!(await branchMergedOrGone(e.path, reserved.branch, into))
-			) {
-				await restore();
+				live === null ||
+				live.cancelledAt !== null ||
+				live.stage !== "in_progress"
+			)
 				return json(
-					{
-						error: `cannot move back to todo, branch ${reserved.branch} holds commits that never reached ${into}`,
-					},
+					{ error: "only a parked in-progress task can move back to todo" },
 					409,
 				);
-			}
-			if (!husk) {
-				const reason = await unsavedWork(reserved.worktree, into);
-				if (reason !== null) {
+			if (live.state !== "needs_you" && live.state !== "idle")
+				return json(
+					{ error: `a ${live.state} task cannot move back to todo` },
+					409,
+				);
+			if (live.pendingPrompt !== null)
+				return json({ error: "a reply or steer is still queued" }, 409);
+			// Reserve before disposal: needs_you flips to idle (a reply's guard reads state
+			// and revision through withTask), an already-idle card bumps its revision, and
+			// the scheduler skips idle. The worktree stays until the checks below pass, so
+			// a refusal leaves the card parked and retryable. The returned snapshot is the
+			// guarded row the rest of the move writes against.
+			const reserved = await updateSnapshot(e, live, { state: "idle" });
+			// A refused or failed move puts a needs-you card back the way the operator
+			// found it; best-effort, because a writer that landed meanwhile owns the row.
+			const restore = async (): Promise<void> => {
+				if (live.state !== "needs_you") return;
+				try {
+					await updateSnapshot(e, reserved, { state: "needs_you" });
+				} catch {
+					// the row moved: its writer decides the state
+				}
+			};
+			const into = e.target ?? reserved.base ?? "HEAD";
+			if (reserved.worktree !== null) {
+				// unsavedWork returns null for a missing or unlinked worktree without
+				// looking at what is left on disk: a husk that still holds files has no git
+				// to prove them clean, so the move refuses unless nothing remains. The
+				// husk's branch gets cancel's kept-worktree verdict, so removeWorktree
+				// never deletes a branch that holds unmerged commits.
+				const husk = await worktreeHusk(reserved.worktree);
+				if (husk) {
+					const leftover =
+						existsSync(reserved.worktree) &&
+						readdirSync(reserved.worktree).length > 0;
+					if (leftover) {
+						await restore();
+						return json(
+							{
+								error:
+									"cannot move back to todo, the husk worktree still holds files with no clean-state proof",
+							},
+							409,
+						);
+					}
+					if (
+						reserved.branch !== null &&
+						!(await branchMergedOrGone(e.path, reserved.branch, into))
+					) {
+						await restore();
+						return json(
+							{
+								error: `cannot move back to todo, branch ${reserved.branch} holds commits that never reached ${into}`,
+							},
+							409,
+						);
+					}
+				} else {
+					const reason = await unsavedWork(reserved.worktree, into);
+					if (reason !== null) {
+						await restore();
+						return json(
+							{
+								error: `cannot move back to todo, the worktree holds work: ${reason}`,
+							},
+							409,
+						);
+					}
+				}
+				try {
+					await removeWorktree({
+						mainPath: e.path,
+						worktreePath: reserved.worktree,
+						branch: reserved.branch,
+						log: (line) => appendLog(e.store, task.id, line),
+					});
+				} catch (err) {
+					await appendLog(
+						e.store,
+						task.id,
+						`! back to todo removeWorktree: ${errmsg(err)}`,
+					);
 					await restore();
 					return json(
-						{
-							error: `cannot move back to todo, the worktree holds work: ${reason}`,
-						},
-						409,
+						{ error: `cannot remove the worktree: ${errmsg(err)}` },
+						500,
+					);
+				}
+				// removeWorktree is best-effort inside: prove the disposal landed before the
+				// row forgets the fields, so the card never queues while it still owns a
+				// directory or a branch.
+				const branchGone =
+					reserved.branch === null ||
+					(
+						await git(
+							["rev-parse", "--verify", "--quiet", reserved.branch],
+							e.path,
+						)
+					).code !== 0;
+				if (existsSync(reserved.worktree) || !branchGone) {
+					await restore();
+					return json(
+						{ error: "the worktree or its branch could not be removed" },
+						500,
 					);
 				}
 			}
-			try {
-				await removeWorktree({
-					mainPath: e.path,
-					worktreePath: reserved.worktree,
-					branch: reserved.branch,
-					log: (line) => appendLog(e.store, task.id, line),
-				});
-			} catch (err) {
-				await appendLog(
-					e.store,
-					task.id,
-					`! back to todo removeWorktree: ${errmsg(err)}`,
-				);
-				await restore();
-				return json(
-					{ error: `cannot remove the worktree: ${errmsg(err)}` },
-					500,
-				);
-			}
-			// removeWorktree is best-effort inside: prove the disposal landed before the
-			// row forgets the fields, so the card never queues while it still owns a
-			// directory or a branch.
-			const branchGone =
-				reserved.branch === null ||
-				(
-					await git(
-						["rev-parse", "--verify", "--quiet", reserved.branch],
-						e.path,
-					)
-				).code !== 0;
-			if (existsSync(reserved.worktree) || !branchGone) {
-				await restore();
-				return json(
-					{ error: "the worktree or its branch could not be removed" },
-					500,
-				);
-			}
-		}
-		// A fresh work turn in a fresh session: sessionId null keeps resumePlan from
-		// resuming the parked turn's session. The stale base clears too: runTurn reads
-		// task.base for the fresh worktree (`base ?? current target head`), so keeping
-		// it would branch from an old sha and miss a dependency that merged meanwhile.
-		// A review card reviews its frozen base, and release, update, fork, and hold
-		// cards anchor their heads to it, so they keep it.
-		const keepBase =
-			isReview(task) ||
-			task.updateMergeHead !== null ||
-			task.forkMergeHead !== null ||
-			task.holdHead !== null;
-		await updateSnapshot(e, reserved, {
-			stage: "todo",
-			state: "queued",
-			queuedAt: Date.now(),
-			holdUntil: null,
-			needsReason: null,
-			asked: null,
-			sessionId: null,
-			worktree: null,
-			branch: null,
-			keptFiles: [],
-			workCheckSendbacks: 0,
-			workCheckHead: null,
-			workCheckReport: null,
-			...(keepBase ? {} : { base: null }),
+			// A fresh work turn in a fresh session: sessionId null keeps resumePlan from
+			// resuming the parked turn's session. The stale base clears too: runTurn reads
+			// task.base for the fresh worktree (`base ?? current target head`), so keeping
+			// it would branch from an old sha and miss a dependency that merged meanwhile.
+			// A review card reviews its frozen base, and release, update, fork, and hold
+			// cards anchor their heads to it, so they keep it.
+			const keepBase =
+				isReview(reserved) ||
+				reserved.updateMergeHead !== null ||
+				reserved.forkMergeHead !== null ||
+				reserved.holdHead !== null;
+			await updateSnapshot(e, reserved, {
+				stage: "todo",
+				state: "queued",
+				queuedAt: Date.now(),
+				holdUntil: null,
+				needsReason: null,
+				asked: null,
+				sessionId: null,
+				worktree: null,
+				branch: null,
+				keptFiles: [],
+				workCheckSendbacks: 0,
+				workCheckHead: null,
+				workCheckReport: null,
+				...(keepBase ? {} : { base: null }),
+			});
+			await deps.schedule();
+			return await taskResponse(e, task.id);
 		});
-		await deps.schedule();
-		return await taskResponse(e, task.id);
 	}
 	/** OTTR-1318: replaces a card's dependsOn list. The edited card stays; only its wait
 	 * graph changes, and the new list must keep the graph acyclic. */
@@ -12700,48 +12742,30 @@ export async function createApp(deps: AppDeps) {
 		}
 		if (ids.includes(task.id))
 			return json({ error: "dependsOn cannot include the task itself" }, 400);
-		// The cycle walk and the write share one process-wide lock: two concurrent edits
-		// of two parked cards must not each read the other's pre-write snapshot and
+		// The cycle walk and the write share the dependency writers' lock: two concurrent
+		// edits of two parked cards must not each read the other's pre-write snapshot and
 		// together form a cycle their separate revisions never catch.
-		const refused = await withDepEditLock(async () => {
-			// Acyclic check: from the new list, following the dependsOn links of every
-			// resolvable card must never reach this card. An id that names no card counts
-			// as satisfied at scheduling, so the walk stops there the same way.
+		const refused = await withDepWriteLock(async () => {
+			// Acyclic check: from the new list, following the committed dependsOn links of
+			// every resolvable card must never reach this card. An id that names no card
+			// counts as satisfied at scheduling, so the walk stops there the same way.
 			const depProjects = await depProjectsOf(deps.projects.values());
-			const ownViews = new Map<string, DepProject>();
 			const full = new Map<string, Map<string, ListedTask>>();
 			for (const p of deps.projects.values()) {
-				ownViews.set(p.store.name, await depProjectOf(p.store));
 				full.set(
 					p.store.name,
 					new Map((await p.store.listTasks()).map((t) => [t.id, t])),
 				);
 			}
-			const ownKey = `${e.store.name}/${task.id}`;
-			const seen = new Set<string>([ownKey]);
-			// Each id resolves in the project whose card names it, own project first —
-			// the same rule the scheduler applies at the hold. A foreign card's local
-			// legacy id therefore resolves in its own project, and a cycle through it is
-			// still caught.
-			const frontier = ids.map((id) => ({ id, project: e.store.name }));
-			while (frontier.length > 0) {
-				const step = frontier.pop();
-				if (step === undefined) break;
-				const own = ownViews.get(step.project);
-				if (own === undefined) continue;
-				const dep = resolveDep(step.id, depProjects, own);
-				if (!("task" in dep)) continue;
-				const key = `${dep.project}/${dep.task.id}`;
-				if (key === ownKey)
-					return json({ error: "dependsOn would form a cycle" }, 400);
-				if (seen.has(key)) continue;
-				seen.add(key);
-				const card = full.get(dep.project)?.get(dep.task.id);
-				if (card !== undefined)
-					frontier.push(
-						...card.dependsOn.map((id) => ({ id, project: dep.project })),
-					);
-			}
+			const cyclic = cyclicDepIds(
+				ids,
+				task.id,
+				e.store.name,
+				depProjects,
+				(project, id) => full.get(project)?.get(id)?.dependsOn,
+			);
+			if (cyclic.length > 0)
+				return json({ error: "dependsOn would form a cycle" }, 400);
 			await updateSnapshot(e, task, { dependsOn: ids });
 			return null;
 		});
