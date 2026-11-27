@@ -170,7 +170,7 @@ try {
       return rows;
     })();
   const indexRows = backend === 'postgres'
-    ? (await store.db.query('SELECT indexname, indexdef FROM pg_catalog.pg_indexes WHERE schemaname = ? AND tablename = ? ORDER BY indexname').all(store.db.schema, 'code_scan_alert')).map(row => ({ name: row.indexname, sql: row.indexdef }))
+    ? (await store.db.query('SELECT i.indexname, i.indexdef FROM pg_catalog.pg_indexes i JOIN pg_catalog.pg_class c ON c.relname = i.indexname JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace AND n.nspname = i.schemaname LEFT JOIN pg_catalog.pg_constraint con ON con.conindid = c.oid WHERE i.schemaname = ? AND i.tablename = ? AND con.oid IS NULL ORDER BY i.indexname').all(store.db.schema, 'code_scan_alert')).map(row => ({ name: row.indexname, sql: row.indexdef }))
     : await store.db.query("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'code_scan_alert' AND sql IS NOT NULL ORDER BY name").all();
   if (backend === 'postgres') {
     const upgradeDb = await getPostgresDatabase(projectSchemaName('legacy migration upgrade'));

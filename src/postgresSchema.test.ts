@@ -102,17 +102,37 @@ class MigrationProbeDb {
 	readonly executed: string[] = [];
 	readonly applied = new Set<number>();
 
-	/** The indexdef the pg_catalog.pg_indexes probe reports. The default plays
-	 *  the OTTR-1331 wrong-shape state (the card_filed index created on
-	 *  (task_id)); null plays an absent index. */
+	/** The stub's indexdef state for the card_filed index, null when absent.
+	 *  The default plays the OTTR-1331 wrong-shape state (the card_filed index
+	 *  created on (task_id)) as an already-migrated database carries it. exec
+	 *  tracks the repair statements, so a test can read the definition the
+	 *  migration run leaves behind. */
+	cardFiledIndexdef: string | null;
+
 	constructor(
-		private readonly cardFiledIndexdef:
+		cardFiledIndexdef:
 			| string
 			| null = 'CREATE INDEX idx_code_scan_alert_card_filed ON "p_probe_000000000000".code_scan_alert USING btree (task_id)',
-	) {}
+	) {
+		this.cardFiledIndexdef = cardFiledIndexdef;
+	}
 
 	exec(statement: string): void {
 		this.executed.push(statement);
+		// Track the one index the repair step owns so a test can read the
+		// definition the migration run leaves behind.
+		if (
+			statement ===
+			`DROP INDEX "${this.schema}"."idx_code_scan_alert_card_filed"`
+		)
+			this.cardFiledIndexdef = null;
+		if (
+			statement ===
+				"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)" ||
+			statement ===
+				"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (task_id)"
+		)
+			this.cardFiledIndexdef = statement;
 	}
 
 	run(statement: string, args?: unknown[]): void {
@@ -130,9 +150,9 @@ class MigrationProbeDb {
 	} {
 		return {
 			get: async (...params: unknown[]) => {
-				// The pg_indexes probe gets the scripted indexdef: the stub cannot
-				// run pg_catalog, so the repair step's reader decision is staged
-				// here instead.
+				// The pg_indexes probe reads the stub's tracked index state: the
+				// stub cannot run pg_catalog, so the repair step's reader decision
+				// runs against this staged state.
 				if (sql.includes("pg_catalog.pg_indexes"))
 					return this.cardFiledIndexdef === null
 						? null
@@ -209,12 +229,11 @@ describe("PostgreSQL migration surface", () => {
 		expect(db.executed).toContain(
 			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
 		);
-		// The repair step really ran against the stub's wrong-shape answer: a
-		// step that skips the rebuild keeps the duplicated (task_id) index, and
-		// this fails.
-		expect(db.executed).toContain(
-			`DROP INDEX "${db.schema}"."idx_code_scan_alert_card_filed"`,
-		);
+		// A fresh install reaches the repair step with step 4's correct shape
+		// already in place: the repair must skip, not rebuild.
+		expect(
+			db.executed.filter((statement) => statement.startsWith("DROP INDEX")),
+		).toEqual([]);
 		// Step 1's schema ran ahead of step 2's convergence.
 		const alter = db.executed.indexOf(
 			"ALTER TABLE pr_review ADD COLUMN posted_via text",
@@ -243,28 +262,54 @@ describe("PostgreSQL migration surface", () => {
 		).toEqual([]);
 	});
 
-	test("the repair skips a database whose card_filed index is correct or absent", async () => {
-		const correct = new MigrationProbeDb(
+	test("the repair skips an already-migrated database whose index is correct or absent", async () => {
+		const migrated = (indexdef: string | null) => {
+			const db = new MigrationProbeDb(indexdef);
+			// Versions 1..6 recorded before the repair step existed: every
+			// earlier step skips and only the repair's decision runs.
+			for (let version = 1; version < projectMigrationCount; version++)
+				db.run("INSERT INTO schema_migrations (version) VALUES (?)", [version]);
+			return db;
+		};
+		const correct = migrated(
 			'CREATE INDEX idx_code_scan_alert_card_filed ON "p_probe_000000000000".code_scan_alert USING btree (card_filed_at)',
 		);
 		await applyPostgresMigrations(correct.asDatabase(), projectMigrations);
 		expect(
-			correct.executed.filter((statement) =>
-				statement.startsWith("DROP INDEX"),
+			correct.executed.filter(
+				(statement) =>
+					statement.startsWith("DROP INDEX") ||
+					statement.startsWith("CREATE INDEX"),
 			),
 		).toEqual([]);
-		// Step 4 created the index once; the repair added no second create.
-		expect(
-			correct.executed.filter((statement) =>
-				statement.startsWith(
-					"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert",
-				),
-			),
-		).toHaveLength(1);
-		const absent = new MigrationProbeDb(null);
+		const absent = migrated(null);
 		await applyPostgresMigrations(absent.asDatabase(), projectMigrations);
 		expect(
 			absent.executed.filter((statement) => statement.startsWith("DROP INDEX")),
 		).toEqual([]);
+	});
+
+	test("the repair rebuilds an already-migrated database onto the deployed shape", async () => {
+		const db = new MigrationProbeDb(
+			'CREATE INDEX idx_code_scan_alert_card_filed ON "p_probe_000000000000".code_scan_alert USING btree (task_id)',
+		);
+		for (let version = 1; version < projectMigrationCount; version++)
+			db.run("INSERT INTO schema_migrations (version) VALUES (?)", [version]);
+		// The seeding itself is not part of the migration run under test.
+		db.executed.length = 0;
+		await applyPostgresMigrations(db.asDatabase(), projectMigrations);
+		// Exact run: the migrations table, then the drop, then the deployed
+		// definition, then the step's version record. A repair that drops
+		// without recreating, recreates the wrong columns, or recreates before
+		// the drop, fails this.
+		expect(db.executed).toEqual([
+			"CREATE TABLE IF NOT EXISTS schema_migrations (version bigint PRIMARY KEY)",
+			`DROP INDEX "${db.schema}"."idx_code_scan_alert_card_filed"`,
+			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
+			"INSERT INTO schema_migrations (version) VALUES (?)",
+		]);
+		expect(db.cardFiledIndexdef).toBe(
+			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
+		);
 	});
 });
