@@ -10171,12 +10171,43 @@ export function createTurnLoop(
 		const first = new Map<string, SweepRecord>();
 		for (const result of results)
 			if (!first.has(result.cardId)) first.set(result.cardId, result);
-		for (const [cardId, result] of first)
+		// Membership: a verdict names progress only when its card is a pinned
+		// research card of this project. A verdict for an unknown or foreign id
+		// covers nothing, so counting it as progress would let wrong ids chain
+		// the same batch forever.
+		const tasks = await st.store.listTasks();
+		// Pinned research cards, resolved like the filing's candidates: the list
+		// rows lack the report column, so the resolution reads the full card.
+		const pinned = new Set<string>();
+		for (const t of tasks) {
+			if (!t.research || t.stage !== "done" || t.cancelledAt !== null) continue;
+			const full = await st.store.getTask(t.id);
+			if (full !== null && sweepSteps(full) !== "unknown") pinned.add(t.id);
+		}
+		let progress = 0;
+		for (const [cardId, result] of first) {
+			if (!pinned.has(cardId)) {
+				await st.log(
+					`- sweep verdict for #${cardId}: not a pinned card of this project; not counted as progress`,
+				);
+				continue;
+			}
+			progress += 1;
 			await st.log(
 				`- sweep verdict for #${cardId}: ${result.verdict}${result.drafts.length > 0 ? ` (${result.drafts.length} draft(s))` : ""}`,
 			);
+		}
+		// Progress gate: with no verdict naming a pinned card the run made no
+		// progress, so landing done would chain the same batch forever.
+		if (progress === 0)
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason:
+					"None of the sweep's verdicts name a pinned card of this project",
+			};
 		await st.log(
-			`- sweep results: ${first.size} card(s) recorded, the table and the apply route read them from this card`,
+			`- sweep results: ${progress} card(s) recorded, the table and the apply route read them from this card`,
 		);
 		return next;
 	}

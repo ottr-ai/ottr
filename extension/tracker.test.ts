@@ -23,7 +23,10 @@ import { applyEvent, newEventState } from "../src/runner.ts";
 import { ProjectStore } from "../src/store.ts";
 import { CARD_ENV_NOTE } from "../src/tokens.ts";
 import { VM_VALIDATE } from "../src/vmValidateShared.ts";
-import createTracker, { hasAcceptanceSection } from "./tracker.ts";
+import createTracker, {
+	hasAcceptanceSection,
+	sweepRecordValidationError,
+} from "./tracker.ts";
 
 // Hermeticity: every named omp session exports OTTR_SESSION_NAME into its child shells, and an
 // ambient value would flip the refusal tests below into the pinned-name path. tracker.ts reads
@@ -1034,6 +1037,28 @@ describe("hasAcceptanceSection", () => {
 		expect(hasAcceptanceSection("no acceptance here")).toBe(false);
 		expect(hasAcceptanceSection("## Acceptance\n## Follow-up")).toBe(false);
 		expect(hasAcceptanceSection("## Acceptance\n\n   \n")).toBe(false);
+	});
+});
+
+describe("sweepRecordValidationError", () => {
+	test("the board's own marker namespaces refuse; verdict records pass", () => {
+		// The applied and filed-draft markers are board-written records on the
+		// run card. A model-recorded prompt in either namespace would forge
+		// board state: a forged applied marker disables the row in the drawer
+		// without an operator click, and a forged draft marker suppresses
+		// filing that draft.
+		expect(
+			sweepRecordValidationError(
+				"Sweep applied: #P1-1 implement\nthe model's text",
+			),
+		).toContain("board-written sweep records");
+		expect(
+			sweepRecordValidationError("Sweep draft: the model's draft text"),
+		).toContain("board-written sweep records");
+		expect(
+			sweepRecordValidationError("Sweep: #P1-1 done\nevidence"),
+		).toBeNull();
+		expect(sweepRecordValidationError("A plain finding text")).toBeNull();
 	});
 });
 

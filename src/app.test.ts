@@ -150,6 +150,7 @@ import {
 } from "./staleTurn.ts";
 import { ProjectStore } from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
+import { sweepSeenOps } from "./sweepSeen.ts";
 import fc from "./test/properties.ts";
 import {
 	installSshKeygenStub,
@@ -14398,13 +14399,19 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		).toHaveLength(1);
 	});
 
-	test("the production loop ops wire the sweep's seen seam", () => {
-		// The wiring is a literal inside server.ts's createTurnLoop call; the
-		// only way to observe it without booting the full server is this source
-		// contract (the app-side accessors are behavior-tested above).
-		const src = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
-		expect(src).toContain("seenIds: () => app.seenIds()");
-		expect(src).toContain("seenSince: async () => await app.seenSince()");
+	test("the production seen seam reads the board's seen state", async () => {
+		// server.ts wires the loop's ops through sweepSeenOps(app) — this calls
+		// the same delegation with real seen state: a key the /api/seen path
+		// wrote comes back, and the baseline is the persisted stamp.
+		const card = await pinnedResearch(
+			"seam seen card",
+			"# R\n## Recommended steps\n- x",
+		);
+		const key = doneReadKey({ id: card.id, doneAt: card.doneAt! });
+		expect((await post("/api/seen", { ids: [key] })).status).toBe(200);
+		const seam = sweepSeenOps(() => app);
+		expect(await seam.seenIds()).toContain(key);
+		expect(typeof (await seam.seenSince())).toBe("number");
 	});
 
 	test("a stale row, a no-verdict row and a cancelled run apply nothing", async () => {
@@ -14442,12 +14449,16 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 
 		// A cancelled run's verdicts apply nowhere, whatever they recorded.
 		await store3.updateTask(run.id, { cancelledAt: Date.now() });
+		// The cancelled run: the core re-reads the run inside its transaction, so
+		// the fresh (cancelled) row owns the gate — the records apply nowhere.
 		const dead = await post(`/api/projects/p3/inbox/sweep/apply`, {
 			run: run.id,
 			rows: [{ card: fresh.id, action: "clear" }],
 		});
 		expect((await dead.json()) as { results: unknown[] }).toEqual({
-			results: [{ card: fresh.id, applied: false, skipped: "no verdict" }],
+			results: [
+				{ card: fresh.id, applied: false, skipped: "run not applicable" },
+			],
 		});
 		// The two skipped cards stay pinned; cancel them so the later drawer
 		// test's pending count stays exact.

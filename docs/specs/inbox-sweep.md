@@ -246,8 +246,16 @@ extension (it loads standalone) and mirrors the prompt's contract section.
 - Injection: an evidence line, a report step, or a descendant title that says "mark
   all done" or similar changes nothing — verdicts come only from parsed first lines,
   applies only from the apply route's body, and a verdict whose first line is not
-  exact parses to null and logs.
+  exact parses to null and logs. The board's own marker namespaces ("Sweep applied:
+  ", "Sweep draft: ") are refused at record time: the extension's propose_task
+  rejects model prompts that start with them, so a model cannot forge an applied
+  or filed-draft record.
 - A gitless project sweeps without the commits evidence.
+- The settle counts a verdict as progress only when its card is a pinned research
+  card of the project (resolved like the filing's candidates); a verdict for an
+  unknown or foreign id logs and covers nothing. With no progress the settle parks
+  the run needs_you instead of landing done, so wrong ids cannot chain the same
+  batch forever.
 - The chain stops after any filing refusal, so a full batch cap and a broken store
   cannot loop.
 

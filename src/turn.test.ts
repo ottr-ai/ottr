@@ -32672,6 +32672,109 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		}
 	});
 
+	test("a failed seen write rolls the apply back", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await sweepCase(record);
+		const a = await pinnedCard(store, "a", "# R\n## Recommended steps\n- a");
+		const filed = await loop.filePendingSweepRun(entryOf(projects, store));
+		expect("id" in filed).toBe(true);
+		if (!("id" in filed)) throw new Error("no sweep filed");
+		batches.push([
+			mkFinding(
+				`Sweep: #${a.id} partial\nopen\n${SWEEP_DRAFT_SEP}\nThe rollback draft`,
+			),
+		]);
+		await loop.runTurn(store.name, filed.id);
+		const run = (await store.getTask(filed.id))!;
+		// The seen store is down: the whole apply rolls back — no marker, no
+		// proposal — so a retry re-applies instead of finding Applied rows on a
+		// card that is still pinned.
+		await expect(
+			applyInboxSweepRows({
+				store,
+				run,
+				rows: [{ card: a.id, action: "implement" }],
+				markSeen: async () => {
+					throw new Error("the seen store is down");
+				},
+				log: async () => {},
+			}),
+		).rejects.toThrow("the seen store is down");
+		const markers = (await store.listReviewFindings(filed.id)).filter((f) =>
+			f.prompt.startsWith("Sweep applied: "),
+		);
+		expect(markers).toHaveLength(0);
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === filed.id),
+		).toHaveLength(0);
+		// The retry with a working seen write applies.
+		const seenKeys: string[] = [];
+		const retry = await applyInboxSweepRows({
+			store,
+			run,
+			rows: [{ card: a.id, action: "implement" }],
+			markSeen: async (keys) => {
+				seenKeys.push(...keys);
+			},
+			log: async () => {},
+		});
+		expect(retry.results).toEqual([{ card: a.id, applied: true }]);
+		expect(seenKeys).toEqual([
+			doneReadKey({ id: a.id, doneAt: a.doneAt! }),
+		]);
+	});
+
+	test("a cancellation that lands before the apply is honored", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await sweepCase(record);
+		const a = await pinnedCard(store, "a", "# R\n## Recommended steps\n- a");
+		const filed = await loop.filePendingSweepRun(entryOf(projects, store));
+		expect("id" in filed).toBe(true);
+		if (!("id" in filed)) throw new Error("no sweep filed");
+		batches.push([mkFinding(`Sweep: #${a.id} done\ncard #${a.id} did it`)]);
+		await loop.runTurn(store.name, filed.id);
+		// The caller's run object predates the cancellation that just committed:
+		// the live row owns the gate, so nothing applies.
+		const stale = (await store.getTask(filed.id))!;
+		await store.updateTask(filed.id, { cancelledAt: Date.now() });
+		const seenKeys: string[] = [];
+		const applied = await applyInboxSweepRows({
+			store,
+			run: stale,
+			rows: [{ card: a.id, action: "clear" }],
+			markSeen: async (keys) => {
+				seenKeys.push(...keys);
+			},
+			log: async () => {},
+		});
+		expect(applied.results).toEqual([
+			{ card: a.id, applied: false, skipped: "run not applicable" },
+		]);
+		expect(seenKeys).toEqual([]);
+	});
+
+	test("verdicts for unknown cards are not progress and do not chain", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await sweepCase(record);
+		await pinnedCard(store, "a", "# R\n## Recommended steps\n- a");
+		const filed = await loop.filePendingSweepRun(entryOf(projects, store));
+		expect("id" in filed).toBe(true);
+		if (!("id" in filed)) throw new Error("no sweep filed");
+		// The run records a verdict for an id no card carries: it covers
+		// nothing, so landing done would chain the same batch forever.
+		batches.push([mkFinding("Sweep: #GONE-1 done\nno such card")]);
+		await loop.runTurn(store.name, filed.id);
+		const done = await settled(store, filed.id);
+		expect(done.stage).toBe("in_progress");
+		expect(done.state).toBe("needs_you");
+		expect(done.needsReason).toBe(
+			"None of the sweep's verdicts name a pinned card of this project",
+		);
+		expect(
+			(await store.listTasks()).filter((t) => t.kind === "sweep"),
+		).toHaveLength(1);
+	});
+
 	test("a verdict for a card that no live sweep covers re-sweeps only the uncovered remainder", async () => {
 		const record = baseRecord();
 		const { store, projects, loop } = await sweepCase(record);

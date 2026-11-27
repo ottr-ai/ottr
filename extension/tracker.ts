@@ -356,6 +356,24 @@ function acceptanceError(prompt: string, tool: string): string | null {
 		: `Error: the prompt needs an "Acceptance" section with at least one observable check (a command to run or a result to see). Add it and call ${tool} again.`;
 }
 
+// The board's own sweep record namespaces (src/app.ts): applied and filed-draft
+// markers are board-written records on the run card. A model-recorded prompt in
+// one of these namespaces would forge board state — a forged applied marker
+// disables the row in the drawer without an operator click, and a forged draft
+// marker suppresses filing that draft. Sweep verdict records use "Sweep: " and
+// stay the only model-writable namespace.
+const SWEEP_RESERVED_PREFIXES = ["Sweep applied: ", "Sweep draft: "];
+
+export function sweepRecordValidationError(prompt: unknown): string | null {
+	if (typeof prompt !== "string") return null;
+	const hit = SWEEP_RESERVED_PREFIXES.find((prefix) =>
+		prompt.startsWith(prefix),
+	);
+	return hit === undefined
+		? null
+		: `Error: prompts starting with "${hit.trim()}" are board-written sweep records and refuse here. Record verdicts with a first line of "Sweep: #<card id> <verdict>".`;
+}
+
 // Shared validation of propose_task params; returns the error text or null.
 // The prompt/model messages keep the propose_task wording (not create_task's).
 function proposeValidationError(
@@ -1138,7 +1156,8 @@ export default function (pi: Pi) {
 				// applies, only the prompt shape (the drafts inside are data the
 				// operator's apply step files, never automatic cards).
 				const error = sweepMode
-					? promptValidationError(params)
+					? (promptValidationError(params) ??
+						sweepRecordValidationError(params.prompt))
 					: proposeValidationError(params, reviewMode, retroKnownProjects());
 				if (error !== null) return textResult(error);
 				if (retroMode) proposed = true;

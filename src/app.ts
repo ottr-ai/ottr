@@ -169,6 +169,7 @@ import {
 	sweepCoveredCards,
 	sweepResult,
 	sweepRowStale,
+	sweepSteps,
 } from "./inboxSweep.ts";
 import { createIssueWatcher } from "./issues.ts";
 import { assertAllowedHost, JiraError, type JiraNet } from "./jira.ts";
@@ -2226,18 +2227,27 @@ export async function applyInboxSweepRows(o: {
 }): Promise<{
 	results: { card: string; applied: boolean; skipped?: string }[];
 }> {
-	const { store, run } = o;
-	// The seen write reads every project's store (seenableIds); held inside this
-	// project's transaction, two concurrent applies for different projects would
-	// await each other's queues and deadlock. The transaction returns the keys;
-	// the caller marks after it commits.
-	const { results, markSeen } = await store.transaction(async () => {
-		const applicable = run.cancelledAt === null && run.stage === "done";
+	const { store } = o;
+	// The whole apply — markers, proposals, and the seen keys — is one store
+	// transaction: a failed seen write rolls the markers back, so a retry
+	// re-applies instead of finding rows stuck at Applied with the card still
+	// pinned. The seen write is a plain append of keys this transaction just
+	// re-verified; it never reads another project's store, so two projects'
+	// concurrent applies cannot deadlock against each other's queues.
+	return await store.transaction(async () => {
+		// The live row owns the gate: the caller's run object may predate a
+		// cancellation that committed while the request was in flight.
+		const run = await store.getTask(o.run.id);
+		const applicable =
+			run !== null &&
+			run.kind === "sweep" &&
+			run.cancelledAt === null &&
+			run.stage === "done";
 		const verdicts = new Map<string, SweepRecord>();
 		const appliedMarkers = new Set<string>();
 		const filedDrafts = new Set<string>();
 		const SWEEP_DRAFT_PREFIX = "Sweep draft: ";
-		if (applicable)
+		if (applicable && run !== null)
 			for (const finding of await store.listReviewFindings(run.id)) {
 				const parsed = sweepResult(finding.prompt);
 				if (parsed !== null && !verdicts.has(parsed.cardId))
@@ -2248,7 +2258,7 @@ export async function applyInboxSweepRows(o: {
 			}
 		const tasks = await store.listTasks();
 		// The evidence was read at filing time; the run's own createdAt stamps it.
-		const stamp = run.createdAt;
+		const stamp = run === null ? 0 : run.createdAt;
 		const results: {
 			card: string;
 			applied: boolean;
@@ -2277,7 +2287,7 @@ export async function applyInboxSweepRows(o: {
 				results.push({
 					card: row.card,
 					applied: false,
-					skipped: "no verdict",
+					skipped: applicable ? "no verdict" : "run not applicable",
 				});
 				continue;
 			}
@@ -2287,6 +2297,22 @@ export async function applyInboxSweepRows(o: {
 				sweepRowStale(target, collectDescendants(tasks, row.card), stamp)
 			) {
 				results.push({ card: row.card, applied: false, skipped: "stale" });
+				continue;
+			}
+			// Still pinned? A card that stopped being seenable (cancelled,
+			// un-researched) keeps no pin, so its key would decay anyway: skip.
+			if (
+				!target.research ||
+				target.stage !== "done" ||
+				target.cancelledAt !== null ||
+				target.doneAt === null ||
+				sweepSteps(target) === "unknown"
+			) {
+				results.push({
+					card: row.card,
+					applied: false,
+					skipped: "no longer pinned",
+				});
 				continue;
 			}
 			if (row.action === "implement") {
@@ -2303,25 +2329,25 @@ export async function applyInboxSweepRows(o: {
 					}
 					const proposal = await store.createTask(draft);
 					filedDrafts.add(draft);
-					await store.appendReviewFinding(run.id, {
+					await store.appendReviewFinding(run!.id, {
 						prompt: `${SWEEP_DRAFT_PREFIX}${draft}`,
 						model: null,
 						rank: null,
 						security: null,
 					});
 					await store.updateTask(proposal.id, {
-						followUpOf: run.id,
+						followUpOf: run!.id,
 						promptAuthor: "board",
 						stage: "backlog",
 						state: "needs_you",
 						queuedAt: null,
-						needsReason: sweepProposedReason({ id: run.id }),
+						needsReason: sweepProposedReason({ id: run!.id }),
 					});
 					await o.log(`- filed proposal ${proposal.id} for #${row.card}`);
 				}
 			}
 			const marker = sweepAppliedMarker(row);
-			await store.appendReviewFinding(run.id, {
+			await store.appendReviewFinding(run!.id, {
 				prompt: marker,
 				model: null,
 				rank: null,
@@ -2329,17 +2355,15 @@ export async function applyInboxSweepRows(o: {
 			});
 			// In-request duplicate rows read this marker through the set.
 			appliedMarkers.add(marker);
-			// `clear` marks seen; `implement` marks seen after the drafts filed. The
-			// completion key matches the Inbox's own mark (OTTR-566), so the pin
-			// clears; the caller's write keeps the shared decay rules.
-			if (target.doneAt !== null)
-				markSeen.push(doneReadKey({ id: target.id, doneAt: target.doneAt }));
+			// The completion key matches the Inbox's own mark (OTTR-566), so the
+			// pin clears; the append commits with the markers, so a failed seen
+			// write rolls the whole row back and a retry re-applies.
+			markSeen.push(doneReadKey({ id: target.id, doneAt: target.doneAt }));
 			results.push({ card: row.card, applied: true });
 		}
-		return { results, markSeen };
+		await o.markSeen(markSeen);
+		return { results };
 	});
-	await o.markSeen(markSeen);
-	return { results };
 }
 
 /** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
@@ -13556,12 +13580,17 @@ export async function createApp(deps: AppDeps) {
 				store: e.store,
 				run,
 				rows,
+				// A plain atomic append: the core re-verified each key's card
+				// inside its transaction, and a seenableIds scan here would read
+				// every project's store inside the transaction — the cross-project
+				// deadlock this route must not reintroduce.
 				markSeen: async (keys) => {
 					if (keys.length === 0) return;
-					const live = await seenableIds();
-					await updateSeen((current) =>
-						[...current, ...keys].filter((id) => live.has(id)),
-					);
+					await updateSeen((current) => {
+						const set = new Set(current);
+						for (const key of keys) set.add(key);
+						return [...set];
+					});
 				},
 				log: (line) => appendLog(e.store, run.id, line),
 			}),

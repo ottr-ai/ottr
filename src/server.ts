@@ -107,6 +107,7 @@ import {
 	ProjectStore,
 } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
+import { sweepSeenOps } from "./sweepSeen.ts";
 import { sweepTmpDirsLogged } from "./tmpsweep.ts";
 import { turnEnv } from "./tokens.ts";
 import {
@@ -871,6 +872,7 @@ const demoProgress = demoData ? await demoData.demoProgressMap(projects) : null;
 
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
 // the loop's publish/log plumbing is late-bound to createApp's handles (both exist by boot).
+
 const loop = createTurnLoop(projects, {
 	extensionPath: EXTENSION,
 	board,
@@ -953,8 +955,7 @@ const loop = createTurnLoop(projects, {
 	// OTTR-1259: the board's seen keys and baseline; the inbox sweep's filing
 	// reads them per start so its candidates are exactly the unread Inbox
 	// (late-bound like turnReadToken — app exists below the loop).
-	seenIds: () => app.seenIds(),
-	seenSince: async () => await app.seenSince(),
+	...sweepSeenOps(() => app),
 	// OTTR-882: the release identity (the configured GitHub app's contents-write token, else
 	// the GH_TOKEN user token with a warning); late-bound like turnReadToken above.
 	releaseIdentity: (owner, repo) => app.releaseIdentity(owner, repo),
