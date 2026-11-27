@@ -2862,11 +2862,10 @@ type CreateArgs = {
 };
 
 /** OTTR-1337: the creates in flight, for the boards' placeholders.
- * `taken`: ids of creates that settled and dropped, so pairCreates never pairs them again. */
+ * A placeholder pairs only with the card its own POST answer names (pairCreates). */
 export const PendingContext = createContext<{
 	pending: PendingCreate[];
-	taken: ReadonlySet<string>;
-}>({ pending: [], taken: new Set() });
+}>({ pending: [] });
 
 /** How long a failed placeholder's exit plays before App drops the create. */
 const PENDING_EXIT_MS = 170;
@@ -4899,18 +4898,13 @@ export function ProjectBoard({
 	navigate?: (path: string) => void;
 }) {
 	const hosted = useContext(HostedContext);
-	// OTTR-1337: a create in flight draws its placeholder in the todo lane until a real card
-	// pairs with it; the pairing only drops placeholders and never hides a real card. The
-	// board holds one project's cards, and pairCreates pairs only within a create's project.
-	const { pending, taken } = useContext(PendingContext);
+	// OTTR-1337: a create in flight draws its placeholder in the todo lane until the card its
+	// own POST answer names is on the board; no real card is ever hidden.
+	const { pending } = useContext(PendingContext);
 	const pendingCards = useMemo(
 		() =>
-			projectPlaceholders(
-				pending,
-				project.name,
-				pairCreates(pending, tasks, taken),
-			),
-		[pending, project.name, tasks, taken],
+			projectPlaceholders(pending, project.name, pairCreates(pending, tasks)),
+		[pending, project.name, tasks],
 	);
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
@@ -5709,11 +5703,8 @@ export function Overview({
 }) {
 	const hosted = useContext(HostedContext);
 	// OTTR-1337: a create in flight shows as a chip in its project's Todo cell until its card lands.
-	const { pending, taken } = useContext(PendingContext);
-	const pairs = useMemo(
-		() => pairCreates(pending, tasks, taken),
-		[pending, tasks, taken],
-	);
+	const { pending } = useContext(PendingContext);
+	const pairs = useMemo(() => pairCreates(pending, tasks), [pending, tasks]);
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
 	// The provisioning poll lives in App: the Setup tab reads it here, and the skill-gap
@@ -18905,9 +18896,6 @@ export function App() {
 	const pendingRef = useRef(pendingCreates);
 	pendingRef.current = pendingCreates;
 	const pendingSeq = useRef(0);
-	/** Ids of creates that settled and dropped: pairCreates never pairs them with a placeholder
-	 * again. Replaced, never mutated, so the context value changes with it. */
-	const takenRef = useRef<ReadonlySet<string>>(new Set());
 	/** Failed creates, oldest first: each puts its input back into its project's New task
 	 * dialog on an open whose cached draft is blank. A second failure queues, never overwrites. */
 	const [composeRestores, setComposeRestores] = useState<
@@ -19263,7 +19251,7 @@ export function App() {
 		applyOriginFlight(origin, flights, els, prev, next);
 		// The server's card takes the placeholder's place: no entrance, a flight only when it lands elsewhere.
 		for (const [id, f] of placeholderFlights(
-			pairCreates(pendingRef.current, state.tasks, takenRef.current),
+			pairCreates(pendingRef.current, state.tasks),
 			prev,
 			next,
 		)) {
@@ -19294,14 +19282,11 @@ export function App() {
 		[], // stable: setError and refreshState never change between renders
 	);
 
-	const stateRef = useRef(state);
-	stateRef.current = state;
 	// OTTR-1337: the dialog closes at once and a placeholder stands in while the POST runs.
 	const createTask = useCallback(
 		(project: string, args: CreateArgs): void => {
 			const key = `pending:${++pendingSeq.current}`;
 			const { text, images, model, files, from } = args;
-			const before = new Set((stateRef.current?.tasks ?? []).map((t) => t.id));
 			const mark = (patch: Partial<PendingCreate>): void =>
 				setPendingCreates((list) =>
 					list.map((p) => (p.key === key ? { ...p, ...patch } : p)),
@@ -19315,7 +19300,6 @@ export function App() {
 					model,
 					images,
 					files,
-					before,
 					id: null,
 					failed: false,
 					from,
@@ -19358,8 +19342,7 @@ export function App() {
 	const dropRestore = useCallback((key: string): void => {
 		setComposeRestores((queue) => queue.filter((r) => r.key !== key));
 	}, []);
-	// A create whose card the state carries is done: its placeholder drops, and its id joins
-	// `taken`, so no later create pairs with that card.
+	// A create whose card the state carries is done: its placeholder drops.
 	useEffect(() => {
 		if (state === null || pendingCreates.length === 0) return;
 		const done = settledKeys(
@@ -19367,18 +19350,10 @@ export function App() {
 			new Set(state.tasks.map((t) => t.id)),
 		);
 		if (done.size === 0) return;
-		const taken = new Set(takenRef.current);
-		for (const p of pendingCreates)
-			if (done.has(p.key) && p.id !== null) taken.add(p.id);
-		takenRef.current = taken;
 		setPendingCreates((list) => list.filter((p) => !done.has(p.key)));
 	}, [state, pendingCreates]);
-	// takenRef changes only in the settle effect, which also changes pendingCreates.
 	const pendingValue = useMemo(
-		() => ({
-			pending: pendingCreates,
-			taken: takenRef.current,
-		}),
+		() => ({ pending: pendingCreates }),
 		[pendingCreates],
 	);
 

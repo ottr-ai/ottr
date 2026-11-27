@@ -2630,8 +2630,15 @@ test("a new task closes its dialog at once and a placeholder holds the todo lane
 		expect(bodies[0]!.prompt).toBe(newTaskText);
 		expect(cardCount("AL-9")).toBe(0);
 
+		// The answer names AL-9 first; the frame that carries it follows (act's own refresh).
+		// Only the answer pairs, so a frame ahead of it would show both by design (next test).
+		await act(async () => {
+			answer(jsonResponse(newCard));
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 0);
+			await promise;
+		});
 		setFrame(frameWithNewCard());
-		answer(jsonResponse(newCard));
 		refreshState();
 		// Every sampled render shows the placeholder or the card, never both.
 		let overlap = false;
@@ -2649,28 +2656,43 @@ test("a new task closes its dialog at once and a placeholder holds the todo lane
 	});
 });
 
-test("a frame that carries the new card before the POST answers shows the card in place of the placeholder", async () => {
+test("a frame that carries the new card before the POST answers shows the card, and the placeholder holds until the answer", async () => {
 	await withCreatePost(async ({ answer }) => {
 		await mountAt("/projects/alpha");
 		await addTask(newTaskText);
 		expectPlaceholder();
 
-		// No real card is held back: the frame's new card of this project, titled as the
-		// server titles this prompt ("Ship the lane"), stands in for the placeholder before
-		// the POST names its id. Never both, never a duplicate.
+		// No real card is held back: AL-9 renders as soon as a frame carries it. Only the
+		// POST's own answer names it as this create's card, so until then the placeholder
+		// holds the lane beside it.
+		let answered = false;
+		let broken = false;
+		const sample = (): void => {
+			if (cardCount("AL-9") > 1) broken = true;
+			if (!answered && todoPendingCards().length !== 1) broken = true;
+		};
 		setFrame(frameWithNewCard());
 		refreshState();
-		let overlap = false;
+		await waitFor(() => {
+			sample();
+			return cardCount("AL-9") === 1;
+		});
+		await holdsFor(() => {
+			sample();
+			return cardCount("AL-9") === 1 && todoPendingCards().length === 1;
+		});
+		expect(broken).toBe(false);
+
+		answered = true;
+		answer(jsonResponse(newCard));
+		refreshState();
 		const once = (): boolean => {
-			if (cardCount("AL-9") > 0 && pendingCards().length > 0) overlap = true;
+			sample();
 			return cardCount("AL-9") === 1 && pendingCards().length === 0;
 		};
 		await waitFor(once);
-
-		answer(jsonResponse(newCard));
-		refreshState();
 		await holdsFor(once);
-		expect(overlap).toBe(false);
+		expect(broken).toBe(false);
 	});
 });
 
@@ -2720,8 +2742,8 @@ test("a card from another tab shows at once while a local create runs, and the p
 		await addTask(newTaskText);
 		expectPlaceholder();
 
-		// Another tab adds AL-7 while this tab's POST runs. Its title is not this prompt's,
-		// so the placeholder never takes it for its own card: from the moment AL-7 renders,
+		// Another tab adds AL-7 while this tab's POST runs. Only the POST's answer pairs the
+		// placeholder, so it never takes AL-7 for its own card: from the moment AL-7 renders,
 		// both stand on the board in every sampled render until AL-9 lands.
 		const foreign = card({
 			id: "AL-7",
@@ -2764,6 +2786,63 @@ test("a card from another tab shows at once while a local create runs, and the p
 		});
 		expect(broken).toBe(false);
 		expect(cardCount("AL-7")).toBe(1);
+	});
+});
+
+test("another tab's card titled as the local prompt never stands in for the running create's placeholder", async () => {
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		expectPlaceholder();
+
+		// Another tab adds AL-7 with the very title the server gives this prompt. Only the
+		// POST's answer pairs a placeholder, so AL-7 renders beside the placeholder.
+		const foreign = card({
+			id: "AL-7",
+			title: "Ship the lane",
+			sessionTitle: "Ship the lane",
+			createdAt: 3,
+		});
+		let answered = false;
+		let seen = false;
+		let broken = false;
+		const sample = (): void => {
+			if (cardCount("AL-7") === 1) seen = true;
+			else if (seen) broken = true;
+			if (!answered && todoPendingCards().length !== 1) broken = true;
+		};
+		setFrame(frameWith(foreign));
+		refreshState();
+		await waitFor(() => {
+			sample();
+			return seen;
+		});
+		await holdsFor(() => {
+			sample();
+			return cardCount("AL-7") === 1 && todoPendingCards().length === 1;
+		});
+		refreshState();
+		await holdsFor(() => {
+			sample();
+			return cardCount("AL-7") === 1 && todoPendingCards().length === 1;
+		});
+		expect(broken).toBe(false);
+
+		answered = true;
+		answer(jsonResponse(newCard));
+		setFrame(frameWith(foreign, newCard));
+		refreshState();
+		const landed = (): boolean => {
+			sample();
+			return (
+				cardCount("AL-7") === 1 &&
+				cardCount("AL-9") === 1 &&
+				pendingCards().length === 0
+			);
+		};
+		await waitFor(landed);
+		await holdsFor(landed);
+		expect(broken).toBe(false);
 	});
 });
 
@@ -2814,6 +2893,60 @@ test("two creates each keep their own placeholder until their own card lands", a
 				cardCount("AL-10") === 1 &&
 				pendingCards().length === 0,
 		);
+	});
+});
+
+test("two creates that share a first line each keep their placeholder until their own answer pairs it", async () => {
+	await withCreatePosts(async ({ answer, bodies }) => {
+		await mountAt("/projects/alpha");
+		await addTask("Ship the lane\nfirst body");
+		await addTask("Ship the lane\nsecond body");
+		expect(bodies.map((b) => b.prompt)).toEqual([
+			"Ship the lane\nfirst body",
+			"Ship the lane\nsecond body",
+		]);
+		expect(todoPendingCards().length).toBe(2);
+		const first = card({
+			id: "AL-9",
+			title: "Ship the lane",
+			sessionTitle: "Ship the lane",
+			createdAt: 5,
+		});
+		const second = card({
+			id: "AL-10",
+			title: "Ship the lane",
+			sessionTitle: "Ship the lane",
+			createdAt: 6,
+		});
+
+		// The first create's card lands before its POST answers: it renders, and neither
+		// unanswered create takes it, though both prompts share its title.
+		setFrame(frameWith(first));
+		refreshState();
+		await waitFor(() => cardCount("AL-9") === 1);
+		await holdsFor(
+			() => cardCount("AL-9") === 1 && todoPendingCards().length === 2,
+		);
+
+		// The answer pairs AL-9 with the first create; the second keeps its placeholder.
+		answer(0, jsonResponse(first));
+		refreshState();
+		const firstLanded = (): boolean =>
+			cardCount("AL-9") === 1 && todoPendingCards().length === 1;
+		await waitFor(firstLanded);
+		await holdsFor(firstLanded);
+		refreshState();
+		await holdsFor(firstLanded);
+
+		answer(1, jsonResponse(second));
+		setFrame(frameWith(first, second));
+		refreshState();
+		const bothLanded = (): boolean =>
+			cardCount("AL-9") === 1 &&
+			cardCount("AL-10") === 1 &&
+			pendingCards().length === 0;
+		await waitFor(bothLanded);
+		await holdsFor(bothLanded);
 	});
 });
 

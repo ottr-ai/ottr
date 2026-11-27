@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import { deriveTitle } from "../title.ts";
 import {
 	type PendingCreate,
 	pairCreates,
@@ -16,15 +15,13 @@ const create = (over: Partial<PendingCreate>): PendingCreate => ({
 	model: "",
 	images: [],
 	files: [],
-	before: new Set(["AL-1"]),
 	id: null,
 	failed: false,
 	from: null,
 	...over,
 });
 
-// The default title is the one the server gives the default create's text, so a
-// test that only varies ids, projects or ages keeps every card a title match.
+// The default title matches the default create's prompt: pairing must ignore titles.
 const task = (
 	id: string,
 	project = "alpha",
@@ -72,193 +69,57 @@ test("placeholderTitle measures the trimmed line, not the padding", () => {
 
 test("pairCreates pairs an answered create only once the state carries its id", () => {
 	const p = create({ id: "AL-9" });
-	expect(pairCreates([p], [task("AL-1")], new Set())).toEqual(new Map());
-	expect(pairCreates([p], [task("AL-1"), task("AL-9")], new Set())).toEqual(
+	expect(pairCreates([p], [task("AL-1")])).toEqual(new Map());
+	expect(pairCreates([p], [task("AL-1"), task("AL-9")])).toEqual(
 		new Map([["p1", "AL-9"]]),
 	);
 });
 
 test("pairCreates pairs an answered create with its own id, never with another new card", () => {
 	const p = create({ id: "AL-10" });
-	expect(
-		pairCreates([p], [task("AL-1"), task("AL-9", "alpha", 5)], new Set()),
-	).toEqual(new Map());
-});
-
-test("pairCreates pairs an unanswered create with the oldest new card of its own project", () => {
-	const p = create({});
-	const pairs = pairCreates(
-		[p],
-		[
-			task("AL-1"),
-			task("AL-12", "alpha", 30),
-			task("BE-5", "beta", 5),
-			task("AL-9", "alpha", 10),
-		],
-		new Set(),
+	expect(pairCreates([p], [task("AL-1"), task("AL-9", "alpha", 5)])).toEqual(
+		new Map(),
 	);
-	expect(pairs).toEqual(new Map([["p1", "AL-9"]]));
 });
 
-test("pairCreates never pairs an unanswered create with a new card titled for another prompt", () => {
-	// Another tab's task lands while this create runs: same project, new since
-	// submit, unclaimed, but not this prompt's card.
-	const p = create({});
-	expect(
-		pairCreates(
-			[p],
-			[task("AL-1"), task("AL-7", "alpha", 3, "Another tab's task")],
-			new Set(),
-		),
-	).toEqual(new Map());
-});
-
-test("pairCreates pairs an unanswered create with its title match even when an unrelated card is older", () => {
-	const p = create({});
+test("pairCreates never pairs an unanswered create, even with a new card titled as its prompt", () => {
+	// Another tab's card of the same project, new since submit, titled exactly as this
+	// prompt's first line: only the create's own answer may pair it.
+	const p = create({ text: "Ship the lane\nwith the details below" });
 	expect(
 		pairCreates(
 			[p],
 			[
 				task("AL-1"),
-				task("AL-7", "alpha", 3, "Another tab's task"),
-				task("AL-9", "alpha", 10),
+				task("AL-7", "alpha", 3, "Ship the lane"),
+				task("AL-9", "alpha", 10, "Ship the lane"),
 			],
-			new Set(),
-		),
-	).toEqual(new Map([["p1", "AL-9"]]));
-});
-
-test("pairCreates matches the title the server derives from a multi-line or headed prompt", () => {
-	const multiLine = "\n  Ship the lane  \nwith the details below";
-	const headed =
-		"# Goal\nMove the retry button into the drawer\n\n# Acceptance\nIt shows";
-	for (const text of [multiLine, headed]) {
-		// Older decoys titled with the whole prompt and with its raw first line: only the
-		// server's own title for this prompt pairs.
-		const trimmed = text.trim();
-		expect(
-			pairCreates(
-				[create({ text })],
-				[
-					task("AL-1"),
-					task("AL-7", "alpha", 2, trimmed),
-					task("AL-8", "alpha", 3, trimmed.split("\n")[0]),
-					task("AL-9", "alpha", 10, deriveTitle(trimmed)),
-				],
-				new Set(),
-			),
-		).toEqual(new Map([["p1", "AL-9"]]));
-	}
-});
-
-test("pairCreates never pairs a card that was on the board at submit", () => {
-	const p = create({ before: new Set(["AL-1", "AL-9"]) });
-	expect(
-		pairCreates([p], [task("AL-1"), task("AL-9", "alpha", 5)], new Set()),
-	).toEqual(new Map());
-});
-
-test("pairCreates never pairs a card that another create's id claims", () => {
-	// The answered create comes later in submit order: its claim still holds.
-	const running = create({ key: "a" });
-	const answered = create({ key: "b", id: "AL-9" });
-	expect(
-		pairCreates(
-			[running, answered],
-			[task("AL-1"), task("AL-9", "alpha", 5)],
-			new Set(),
-		),
-	).toEqual(new Map([["b", "AL-9"]]));
-	// The running create skips the older card the later answered create claims.
-	expect(
-		pairCreates(
-			[running, create({ key: "b", id: "AL-10" })],
-			[task("AL-1"), task("AL-10", "alpha", 5), task("AL-11", "alpha", 9)],
-			new Set(),
-		),
-	).toEqual(
-		new Map([
-			["b", "AL-10"],
-			["a", "AL-11"],
-		]),
-	);
-});
-
-test("pairCreates never pairs a card of a settled create", () => {
-	const p = create({});
-	expect(
-		pairCreates(
-			[p],
-			[task("AL-1"), task("AL-9", "alpha", 5)],
-			new Set(["AL-9"]),
 		),
 	).toEqual(new Map());
 });
 
-test("pairCreates never pairs a card of another project", () => {
-	const p = create({});
-	expect(
-		pairCreates([p], [task("AL-1"), task("BE-5", "beta", 5)], new Set()),
-	).toEqual(new Map());
+test("pairCreates pairs two creates that share a first line only with their own answered ids", () => {
+	const a = create({ key: "a", text: "Ship the lane\nfirst body", id: "AL-9" });
+	const b = create({ key: "b", text: "Ship the lane\nsecond body" });
+	const tasks = [
+		task("AL-1"),
+		task("AL-9", "alpha", 5, "Ship the lane"),
+		task("AL-10", "alpha", 6, "Ship the lane"),
+	];
+	expect(pairCreates([a, b], tasks)).toEqual(new Map([["a", "AL-9"]]));
+	// Submit order does not matter either.
+	expect(pairCreates([b, a], tasks)).toEqual(new Map([["a", "AL-9"]]));
 });
 
-test("pairCreates pairs two unanswered creates with two different cards in submit order", () => {
-	const a = create({ key: "a" });
-	const b = create({ key: "b" });
-	expect(
-		pairCreates(
-			[a, b],
-			[task("AL-1"), task("AL-10", "alpha", 20), task("AL-9", "alpha", 10)],
-			new Set(),
-		),
-	).toEqual(
-		new Map([
-			["a", "AL-9"],
-			["b", "AL-10"],
-		]),
-	);
-	// One new card: only the first create pairs.
-	expect(
-		pairCreates([a, b], [task("AL-1"), task("AL-9", "alpha", 10)], new Set()),
-	).toEqual(new Map([["a", "AL-9"]]));
-});
-
-test("pairCreates never pairs a failed create, and the failed create claims nothing", () => {
+test("pairCreates never pairs a failed create", () => {
 	const failed = create({ key: "f", failed: true });
 	expect(
-		pairCreates([failed], [task("AL-1"), task("AL-9", "alpha", 5)], new Set()),
+		pairCreates([failed], [task("AL-1"), task("AL-9", "alpha", 5)]),
 	).toEqual(new Map());
-	expect(
-		pairCreates(
-			[failed, create({ key: "r" })],
-			[task("AL-1"), task("AL-9", "alpha", 5)],
-			new Set(),
-		),
-	).toEqual(new Map([["r", "AL-9"]]));
-});
-
-test("pairCreates keeps a settled create's card from the next unanswered create", () => {
-	// Create A answered AL-9, its card landed and A dropped; create B still runs and
-	// its snapshot predates AL-9. AL-9 is A's card, so B keeps its placeholder.
-	const b = create({ key: "b", before: new Set(["AL-1"]) });
-	const taken = new Set(["AL-9"]);
-	expect(
-		pairCreates([b], [task("AL-1"), task("AL-9", "alpha", 5)], taken),
-	).toEqual(new Map());
-	// B's own card can still pair once a frame carries it.
-	expect(
-		pairCreates(
-			[b],
-			[task("AL-1"), task("AL-9", "alpha", 5), task("AL-10", "alpha", 9)],
-			taken,
-		),
-	).toEqual(new Map([["b", "AL-10"]]));
 });
 
 test("pairCreates is empty with no creates", () => {
-	expect(pairCreates([], [task("AL-1"), task("AL-9")], new Set())).toEqual(
-		new Map(),
-	);
+	expect(pairCreates([], [task("AL-1"), task("AL-9")])).toEqual(new Map());
 });
 
 // --- projectPlaceholders ----------------------------------------------------

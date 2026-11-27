@@ -2,8 +2,6 @@
 // placeholder card holds the todo lane until the server's card arrives. Pure helpers,
 // so the board wiring in app.tsx stays thin and the rules stay unit-tested.
 
-import { deriveTitle } from "../title.ts";
-
 /** A viewport rect: the dialog the placeholder morphs out of. */
 export interface Rect {
 	left: number;
@@ -23,8 +21,6 @@ export interface PendingCreate {
 	images: string[];
 	/** The attached files, so a failed create can restore them into the reopened dialog. */
 	files: File[];
-	/** Every task id the state held at submit: a card outside it is new since the submit. */
-	before: ReadonlySet<string>;
 	/** The server's id once the POST answered; null while it runs. */
 	id: string | null;
 	/** The POST failed: the placeholder plays its exit, then drops. */
@@ -44,49 +40,19 @@ export function placeholderTitle(text: string, max = 140): string {
 }
 
 /**
- * Pairs each create with the real card that stands for it, keyed by the create's key.
- * The pairing never hides a real card: it only decides which placeholders still draw.
- * - An answered create pairs with its own id, once the state carries that card.
- * - An unanswered create can meet its card first: a live frame can carry the card before
- *   the POST answers. It then pairs only with a card that matches its own request: same
- *   project, new since its submit, unclaimed, and titled as the server titles this prompt
- *   (deriveTitle over the trimmed text). Among several matches the oldest wins, in submit
- *   order. An unrelated arrival never matches, so the placeholder stays until its answer.
- * `taken`: ids of creates that already settled and dropped; they never pair again.
+ * Pairs each create with its real card, keyed by the create's client key. A placeholder
+ * pairs only through its own request: once the POST answered with an id and the state
+ * carries that card. No other card (another tab's, one with the same first line) ever
+ * stands in for it, so an unanswered create keeps its placeholder.
  */
 export function pairCreates(
 	pending: readonly PendingCreate[],
-	tasks: readonly {
-		id: string;
-		project: string;
-		title: string;
-		createdAt: number;
-	}[],
-	taken: ReadonlySet<string>,
+	tasks: readonly { id: string }[],
 ): Map<string, string> {
 	const ids = new Set(tasks.map((t) => t.id));
 	const pairs = new Map<string, string>();
-	const claimed = new Set(taken);
 	for (const p of pending)
-		if (p.id !== null) {
-			claimed.add(p.id);
-			if (ids.has(p.id)) pairs.set(p.key, p.id);
-		}
-	const oldest = [...tasks].sort((a, b) => a.createdAt - b.createdAt);
-	for (const p of pending) {
-		if (p.id !== null || p.failed) continue;
-		const title = deriveTitle(p.text.trim());
-		const hit = oldest.find(
-			(t) =>
-				t.project === p.project &&
-				t.title === title &&
-				!p.before.has(t.id) &&
-				!claimed.has(t.id),
-		);
-		if (hit === undefined) continue;
-		claimed.add(hit.id);
-		pairs.set(p.key, hit.id);
-	}
+		if (p.id !== null && ids.has(p.id)) pairs.set(p.key, p.id);
 	return pairs;
 }
 
