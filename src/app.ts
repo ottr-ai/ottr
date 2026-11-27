@@ -324,7 +324,11 @@ import {
 	upgradeRefusal,
 } from "./requestGuards.ts";
 import type { RunTokens } from "./runTokens.ts";
-import { runSandboxJob, sandboxRequestError } from "./sandboxRun.ts";
+import {
+	type ProcSpawn,
+	runSandboxJob,
+	sandboxRequestError,
+} from "./sandboxRun.ts";
 import {
 	archReviewDue,
 	type DepResolution,
@@ -811,6 +815,12 @@ interface AppDeps {
 	scanSessionUsage?: (
 		sessionsDir: string,
 	) => OmpStatsAnswer | Promise<OmpStatsAnswer>;
+	/** Only for tests: the omp probe's fetch and process seams, so the app-level probe
+	 * test can serve the npm packument, the candidate tarball and a fake vm-runner
+	 * without a registry, an install or a VM. Absent = globalThis.fetch and a real
+	 * Bun.spawn runner. */
+	probeFetchImpl?: typeof fetch;
+	probeSpawnImpl?: ProcSpawn;
 	/**
 	 * Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
 	 * the proxy listener's port (null + error when disabled) and the on-demand dashboard that
@@ -3889,11 +3899,16 @@ export async function createApp(deps: AppDeps) {
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
 		signIns: activeSignInProviders,
-		// The candidate probe dispatches to the worker containers (OTTR_WORKER_URLS): the
-		// same isolation agent turns get. With no target configured, or a worker
-		// unreachable, the transport throws, the watch logs the warning, and the watch
-		// files normal 7-day bump cards (docs/specs/omp-watch.md).
-		probeTransport: createOmpProbeTransport({ target: deps.workerTarget }),
+		// The candidate probe dispatches through the vm-runner's validation channel: a
+		// fresh microVM holds no board mounts, the job env is a fixed three-name
+		// allowlist, and the result drive is written by the guest's init after the job
+		// exits (docs/specs/microvm-validation-mode.md). With no runner configured, or
+		// one unreachable, the transport throws, the watch logs the warning, and the
+		// watch files normal 7-day bump cards (docs/specs/omp-watch.md).
+		probeTransport: createOmpProbeTransport({
+			fetchImpl: deps.probeFetchImpl,
+			spawnImpl: deps.probeSpawnImpl,
+		}),
 	});
 
 	/**

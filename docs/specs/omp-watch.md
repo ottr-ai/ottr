@@ -90,25 +90,29 @@ omp 19.1.1 (2026-11-23) added gpt-6.2-sol and gpt-6.2-astra for openai-codex, an
 gate would have held the board's access to them until 2026-11-30. The operator filed the
 bump card by hand (OTTR-1286). A static search of the package text finds no model ids, so
 the model set comes from running omp itself. On 2026-11-27 the user decided the probe may
-run only inside the worker/VM isolation (below): a same-UID run on the server host is not
-an acceptable boundary for unapproved code.
+run only inside the VM isolation the vm-runner provides (below): a same-UID run on the
+server host is not an acceptable boundary for unapproved code.
 
 ### The model set of one version
 
 - The user decided on 2026-11-27 (OTTR-1287 security review): the candidate is unapproved
   code, so it never executes on the server host. The probe runs only through
-  `deps.probeTransport`, inside the worker or VM isolation the board uses for untrusted
-  code (docs/WORKERS.md); the server wiring passes the worker/VM dispatch as the
-  transport. The transport runs
-  `bunx @oh-my-pi/pi-coding-agent@<version> models --json` in a fresh scratch HOME on the
-  worker or guest, with none of the board's identity, credential or configuration env.
-  The scratch dies with the run, and nothing live mounts into it. `modelSet` returns null
-  without a transport; a transport that fails or returns unusable output only loses the
+  `deps.probeTransport`, and production wires the vm-runner's validation channel
+  (docs/specs/microvm-validation-mode.md): a fresh microVM holds none of the board's
+  mounts, the job env is exactly PATH, HOME and LANG, the job runs as an unprivileged
+  guest user, and the result drive is written by the guest's init after the job exits.
+  The transport pins the candidate's npm tarball against the packument's integrity,
+  installs it into the job payload, and ships a redacted copy of the pinned credential
+  store beside it: the copy holds the signed-in providers and every data key shape, with
+  every value a placeholder, so the candidate lists the board's providers' catalogs
+  without holding one secret (verified against the real CLI). The job stamps the copy
+  into its HOME before omp runs. `modelsTimeoutMs` bounds the whole call: past it the
+  transport aborts, which kills the VM. The stdout the watcher parses is the guest's
+  64 KiB stdout tail. A transport that fails or returns unusable output only loses the
   fast track (below), and the failure is a warning, never a `lastError`.
-  `modelsTimeoutMs` bounds one transport run.
 - When a review ends with `pass`, the watcher asks the transport for that version's model
-  list and stores the set. The transport runs `omp models --json` for that exact version
-  on the worker. A failed review never probes: a failed version can never be the target.
+  list and stores the set. The transport runs `omp models --json` for that exact version.
+  A failed review never probes: a failed version can never be the target.
 - The output is untrusted data. `parseModelSet` accepts only a JSON object whose `models`
   value is an array. Each entry needs a provider id that matches `PROVIDER_ID`
   (`src/login.ts`) and a model id in the strict segment grammar: 1 to 3 non-empty

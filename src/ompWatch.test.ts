@@ -150,13 +150,14 @@ function fakeModel() {
 			stderr: "",
 		};
 	};
-	/** The fake worker/VM transport: same answers the probe tests assert against. */
+	/** The fake vm-runner transport: same answers the probe tests assert against. */
 	const probeTransport = async (
+		project: string,
 		version: string,
 		timeoutMs: number,
 	): Promise<{ code: number; stdout: string; stderr: string }> => {
 		expect(timeoutMs).toBe(OMP_WATCH_GATES.modelsTimeoutMs);
-		modelsAskedFor.push(version);
+		modelsAskedFor.push(`${project}@${version}`);
 		const thrown = modelsThrown.get(version);
 		if (thrown !== undefined) throw new Error(thrown);
 		const code = modelsCodes.get(version);
@@ -1031,7 +1032,10 @@ describe("createOmpWatcher", () => {
 		// glm-5 is not an added model: the pin already has it.
 		expect(cards[0]!.prompt).not.toContain("glm-5");
 		// One probe per version: the release at its review, the pin in the backfill.
-		expect(w.model.modelsAsked()).toEqual(["18.16.0", PIN]);
+		expect(w.model.modelsAsked()).toEqual([
+			`${w.project.name}@18.16.0`,
+			`${w.project.name}@${PIN}`,
+		]);
 		expect(w.scheduled()).toBe(1);
 
 		await w.watcher.tick();
@@ -1084,7 +1088,10 @@ describe("createOmpWatcher", () => {
 		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
 		expect(cards[0]!.priority).toBeNull();
 		// The pin's set is recorded once; the aged tick runs no models list.
-		expect(w.model.modelsAsked()).toEqual(["18.16.0", PIN]);
+		expect(w.model.modelsAsked()).toEqual([
+			`${w.project.name}@18.16.0`,
+			`${w.project.name}@${PIN}`,
+		]);
 	});
 
 	test("an added model for a provider without a sign-in keeps the 7-day wait", async () => {
@@ -1217,11 +1224,11 @@ describe("createOmpWatcher", () => {
 		});
 		// The stale empty snapshots were re-read under the current context.
 		expect(w.model.modelsAsked()).toEqual([
-			"18.16.0",
-			PIN,
-			"18.17.0",
-			PIN,
-			"18.16.0",
+			`${w.project.name}@18.16.0`,
+			`${w.project.name}@${PIN}`,
+			`${w.project.name}@18.17.0`,
+			`${w.project.name}@${PIN}`,
+			`${w.project.name}@18.16.0`,
 		]);
 		expect(w.state().modelSets["18.16.0"]).toEqual({
 			providers: ["zai"],

@@ -486,10 +486,15 @@ export function createOmpWatcher(deps: {
 	 * inside the worker/VM isolation the board uses for untrusted code (docs/WORKERS.md),
 	 * and returns its exit code and stdout. The candidate is unapproved code, so it never
 	 * executes on the server host (OTTR-1287 security review). Production wires the
-	 * worker/VM dispatch; a throw (no worker reachable) or a failed run only loses the
-	 * fast track. `timeoutMs` bounds the run.
+	 * vm-runner's validation channel: a fresh microVM holds no board mounts, the job env
+	 * is a fixed three-name allowlist, and the result drive is written by the guest's
+	 * init after the job exits. `project` names the watched project: the probe's payload
+	 * (the candidate's install tree and the redacted credential copy) lives and dies
+	 * under that project's data dir. A throw (no runner configured, runner unreachable)
+	 * or a failed run only loses the fast track. `timeoutMs` bounds the whole call.
 	 */
 	probeTransport?: (
+		project: string,
 		version: string,
 		timeoutMs: number,
 	) => Promise<{ code: number; stdout: string; stderr: string }>;
@@ -555,6 +560,7 @@ export function createOmpWatcher(deps: {
 	 * cannot block or retry the review.
 	 */
 	async function modelSet(
+		project: string,
 		version: string,
 		warn: (reason: string) => void,
 	): Promise<string[] | null> {
@@ -562,7 +568,7 @@ export function createOmpWatcher(deps: {
 		if (transport === undefined) return null;
 		let res: { code: number; stdout: string; stderr: string };
 		try {
-			res = await transport(version, OMP_WATCH_GATES.modelsTimeoutMs);
+			res = await transport(project, version, OMP_WATCH_GATES.modelsTimeoutMs);
 		} catch (e) {
 			warn(`omp ${version}: models list not run: ${errText(e)}`);
 			return null;
@@ -587,12 +593,13 @@ export function createOmpWatcher(deps: {
 
 	/** Runs and records the version's model set when the state has none (OTTR-1287). */
 	async function recordModelSet(
+		project: string,
 		state: OmpWatchState,
 		version: string,
 		warn: (reason: string) => void,
 	): Promise<void> {
 		if (state.modelSets[version] !== undefined) return;
-		const pairs = await modelSet(version, warn);
+		const pairs = await modelSet(project, version, warn);
 		if (pairs !== null)
 			state.modelSets[version] = { providers: signedInProviders(), pairs };
 	}
@@ -690,7 +697,9 @@ export function createOmpWatcher(deps: {
 				};
 				deps.log(`${tag}: omp ${r.version} passed the review`);
 				// The model set feeds the fast track; a failed run only loses it (OTTR-1287).
-				await recordModelSet(state, r.version, (m) => deps.log(`${tag}: ${m}`));
+				await recordModelSet(tag, state, r.version, (m) =>
+					deps.log(`${tag}: ${m}`),
+				);
 				continue;
 			}
 			filed += await fileFailCard(store, state, r, pin, v, t, tag, fail);
@@ -782,7 +791,7 @@ export function createOmpWatcher(deps: {
 		if (state.modelSets[pin] === undefined) need.unshift(pin);
 		for (const version of need.slice(0, OMP_WATCH_GATES.modelsPerTick)) {
 			if (!(await watching())) return 0;
-			await recordModelSet(state, version, (m) =>
+			await recordModelSet(project.name, state, version, (m) =>
 				deps.log(`${project.name}: ${m}`),
 			);
 		}

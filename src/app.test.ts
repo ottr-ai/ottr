@@ -120,6 +120,7 @@ import {
 import { forModel, tightestFor, usageReset } from "./quota.ts";
 import { createRunSink, type RunLauncher, startRun } from "./runner.ts";
 import { RunTokens } from "./runTokens.ts";
+import type { ProcSpawn } from "./sandboxRun.ts";
 import {
 	archReviewDue,
 	LEAD_APPLIES_OPTION,
@@ -27945,41 +27946,137 @@ describe("worker sign-in warnings", () => {
 	});
 });
 
-/** OTTR-1334: the server wiring of the candidate probe (OTTR-1287 fast track). The tick
- * reaches the fake worker only through deps.probeTransport, so the recorded POST /run
- * bodies witness the probe never spawns on the server host. */
+/** OTTR-1334: the server wiring of the candidate probe (OTTR-1287 fast track). The
+ * tick reaches the vm-runner's validate channel only through deps.probeTransport, so
+ * the recorded POST /validate bodies witness the probe never spawns on the server
+ * host: the transport the app constructs is the one the tick drives. */
 describe("omp watch probe wiring", () => {
-	test("the wired omp watch probes the candidate on a worker and fast-tracks the P1 bump card", async () => {
-		// The stand-in worker: every POST /run body is recorded, and the answer streams
-		// the models JSON line, then the done sentinel (src/workers.ts parseSentinel).
-		const probeRequests: { path: string; probe: unknown; argv: string[] }[] = [];
-		let candidateModels = '{"models":[{"provider":"zai","id":"glm-6.2"}]}';
-		const fakeWorker = Bun.serve({
+	test("the wired omp watch probes through the vm-runner validate channel", async () => {
+		// The candidate's fixed tarball bytes, and the packument integrity that pins
+		// them: the transport refuses a tarball the registry did not describe.
+		const tarballBytes = new TextEncoder().encode("fake omp candidate tarball");
+		const tarballIntegrity =
+			"sha512-" +
+			Buffer.from(
+				await crypto.subtle.digest("SHA-512", tarballBytes),
+			).toString("base64");
+		const candidateModels = '{"models":[{"provider":"zai","id":"glm-6.2"}]}';
+
+		// The stand-in vm-runner: every POST /validate body is recorded, and the
+		// answer's stdoutTail carries the models JSON. The watcher probes the pin's
+		// baseline first, so the served counter answers the first call with the pin's
+		// empty catalog and the later calls with the candidate's; the assertions
+		// below never depend on the order beyond that counter.
+		const WIRE_TOKEN = "wire-token-redacted";
+		const validateCalls: {
+			url: string;
+			token: string | null;
+			// The existence fact, taken at dispatch time: the transport removes its
+			// runDir after the answer returns, so a later check sees nothing.
+			tarExisted: boolean;
+			body: {
+				id: string;
+				project: string;
+				targetTar: string;
+				job: { argv: string[]; cwd: string };
+			};
+		}[] = [];
+		let served = 0;
+		let emptyCatalogOnly = false;
+		const fakeRunner = Bun.serve({
 			port: 0,
 			fetch: async (req) => {
 				const url = new URL(req.url);
-				if (req.method !== "POST" || url.pathname !== "/run")
+				if (req.method !== "POST" || url.pathname !== "/validate")
 					return new Response("not found", { status: 404 });
 				const body = (await req.json()) as {
-					probe?: unknown;
-					argv?: unknown;
+					id: string;
+					project: string;
+					targetTar: string;
+					job: { argv: string[]; cwd: string };
 				};
-				const argv = Array.isArray(body.argv)
-					? body.argv.map((a) => String(a))
-					: [];
-				probeRequests.push({ path: url.pathname, probe: body.probe, argv });
-				const version = /@(\d+\.\d+\.\d+)$/.exec(argv[1] ?? "")?.[1] ?? "";
-				const models =
-					version === "18.16.0" ? candidateModels : '{"models":[]}';
-				const lines = [
-					models,
-					JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }),
-				];
-				return new Response(`${lines.join("\n")}\n`, {
-					headers: { "content-type": "text/plain" },
+				validateCalls.push({
+					url: req.url,
+					token: req.headers.get("x-otwr-token"),
+					tarExisted: existsSync(body.targetTar),
+					body,
 				});
+				const models =
+					emptyCatalogOnly || served++ === 0
+						? '{"models":[]}'
+						: candidateModels;
+				const answer: ValidateResponse = {
+					id: body.id,
+					selfCheck: null,
+					missingControl: null,
+					job: {
+						argv: [],
+						cwd: "/target",
+						exitCode: 0,
+						signal: null,
+						timedOut: false,
+						stdoutTail: models,
+						stderrTail: "",
+					},
+					artifacts: [],
+					limits: { ...VM_VALIDATE },
+					bootMs: null,
+					totalMs: 1,
+					logTail: "",
+					resultSource: "guest",
+				};
+				return Response.json(answer);
 			},
 		});
+
+		// The transport's process seams: the "tar" extract lays the candidate's
+		// package.json into the extraction dir, the "bun add" install lays the
+		// package (bin and cli) into the payload, and the "tar" pack touches the
+		// payload tar. Every invocation is recorded.
+		const spawnCalls: string[][] = [];
+		const PKG_JSON = JSON.stringify({
+			name: "@oh-my-pi/pi-coding-agent",
+			bin: { omp: "dist/cli.js" },
+			version: "18.16.0",
+		});
+		const valueAfter = (argv: string[], flag: string): string | undefined => {
+			const i = argv.indexOf(flag);
+			return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+		};
+		const probeSpawn: ProcSpawn = async (argv) => {
+			spawnCalls.push([...argv]);
+			if (argv[0] === "tar" && argv.includes("-xzf")) {
+				const dir = valueAfter(argv, "-C") ?? argv[argv.length - 1]!;
+				mkdirSync(join(dir, "package"), { recursive: true });
+				writeFileSync(join(dir, "package", "package.json"), PKG_JSON);
+				return { code: 0, stdout: new Uint8Array(), stderr: "" };
+			}
+			if (argv[0] === "bun" && argv.includes("add")) {
+				const dir = valueAfter(argv, "--cwd") ?? argv[argv.length - 1]!;
+				writeFileSync(
+					join(dir, "package.json"),
+					JSON.stringify({ name: "omp-probe-payload", private: true }),
+				);
+				const pkgDir = join(
+					dir,
+					"node_modules",
+					"@oh-my-pi",
+					"pi-coding-agent",
+				);
+				mkdirSync(join(pkgDir, "dist"), { recursive: true });
+				writeFileSync(join(pkgDir, "package.json"), PKG_JSON);
+				writeFileSync(join(pkgDir, "dist", "cli.js"), "// candidate omp cli\n");
+				return { code: 0, stdout: new Uint8Array(), stderr: "" };
+			}
+			if (argv[0] === "tar" && argv.includes("-cf")) {
+				const out = valueAfter(argv, "-cf") ?? argv[argv.length - 1]!;
+				mkdirSync(dirname(out), { recursive: true });
+				writeFileSync(out, "");
+				return { code: 0, stdout: new Uint8Array(), stderr: "" };
+			}
+			return { code: 0, stdout: new Uint8Array(), stderr: "" };
+		};
+
 		// A private project board per scenario, like the OTTR-965 slim boards: the pin
 		// line in Dockerfile.worker opts the project in.
 		const ompBoard = async (dirName: string) => {
@@ -28007,21 +28104,45 @@ describe("omp watch probe wiring", () => {
 			};
 			return { st, projects: new Map([[dirName, entry]]) };
 		};
-		// One active zai sign-in in the board's agent store: the fast track only counts
-		// providers the board can sign in with (src/login.ts signIns).
+		// The pass verdict is seeded, so no review model call ever runs; the empty
+		// model sets make the tick probe the pin's baseline and the candidate.
+		const passState = () => ({
+			verdicts: {
+				"18.16.0": {
+					verdict: "pass",
+					reasons: [],
+					cardId: null,
+					at: Date.now(),
+				},
+			},
+			modelSets: {},
+			bumpCard: null,
+			lastError: null,
+		});
+
+		// The agent-store fixture: one active zai api_key row — the board's sign-ins
+		// and the transport's pinned store read the same db — plus the schema and
+		// revision tables the store versioning expects.
 		const agentTmp = mkdtempSync(join(tmpdir(), "ottr-omp-probe"));
 		const db = new Database(join(agentTmp, "agent.db"));
 		db.exec(`CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY,
 			provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
 			disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`);
 		db.exec(`INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES
-			('zai', 'api_key', '{"key":"k"}', NULL, 1, 1)`);
+			('zai', 'api_key', '{"key":"k","source":"t"}', NULL, 1, 1)`);
+		db.exec(`CREATE TABLE auth_schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL)`);
+		db.exec(`INSERT INTO auth_schema_version (id, value) VALUES (1, 8)`);
+		db.exec(`CREATE TABLE auth_change_revision (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL)`);
+		db.exec(`INSERT INTO auth_change_revision (id, value) VALUES (1, 1)`);
 		db.close();
-		const savedAgent = process.env.PI_CODING_AGENT_DIR;
-		process.env.PI_CODING_AGENT_DIR = agentTmp;
-		// npm serves the packument only; every other URL (the worker POST /run) passes
-		// through to the real fetch. The candidate published 1 day ago: only the fast
-		// track files a card this young (the age gate waits 7 days).
+
+		// The transport writes the job payloads under the board's data dir.
+		const dataTmp = mkdtempSync(join(tmpdir(), "ottr-omp-probe-data"));
+
+		// npm serves the packument and the pinned tarball bytes; the vm-runner POST
+		// goes to the fake runner; every other URL passes through to the real fetch.
+		// The candidate published 1 day ago: only the fast track files a card this
+		// young (the age gate waits 7 days).
 		const DAY = 86_400_000;
 		const packument = () => ({
 			name: "@oh-my-pi/pi-coding-agent",
@@ -28035,30 +28156,69 @@ describe("omp watch probe wiring", () => {
 				"18.15.0": new Date(Date.now() - 60 * DAY).toISOString(),
 				"18.16.0": new Date(Date.now() - 1 * DAY).toISOString(),
 			},
-			versions: { "18.15.0": {}, "18.16.0": {} },
+			versions: {
+				"18.15.0": {
+					dist: {
+						tarball: "https://registry.test/pkg/-/pkg-18.15.0.tgz",
+						integrity: tarballIntegrity,
+					},
+				},
+				"18.16.0": {
+					dist: {
+						tarball: "https://registry.test/pkg/-/pkg-18.16.0.tgz",
+						integrity: tarballIntegrity,
+					},
+				},
+			},
 		});
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-			if (String(input) === OMP_PACKAGE_URL) return Response.json(packument());
+			const url = String(input);
+			if (url === OMP_PACKAGE_URL) return Response.json(packument());
+			if (url.startsWith("https://registry.test/pkg/-/"))
+				return new Response(tarballBytes);
+			if (url.startsWith(String(fakeRunner.url)))
+				return fakeRunner.fetch(new Request(url, init));
 			return realFetch(input, init);
 		}) as typeof fetch;
+
+		// The transport reads its whole configuration from env per call.
+		const savedEnv = new Map<string, string | undefined>();
+		const setEnv = (name: string, value: string | undefined) => {
+			if (!savedEnv.has(name)) savedEnv.set(name, process.env[name]);
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		};
+		setEnv("OTTR_DATA_DIR", dataTmp);
+		setEnv("OTTR_WORKER_TOKEN", WIRE_TOKEN);
+		setEnv("OTTR_PINNED_AGENT_DB", join(agentTmp, "agent.db"));
+		setEnv("PI_CODING_AGENT_DIR", agentTmp);
+
+		// Console capture: the watch's warnings ride deps.log, and the no-runner
+		// scenario asserts the warning text while no scenario may log the wire token.
+		const logs: string[] = [];
+		const tickWithLogs = async (app: {
+			ompWatchTick: () => Promise<unknown>;
+		}) => {
+			const log = spyOn(console, "log").mockImplementation((...args) =>
+				logs.push(args.map((a) => String(a)).join(" ")),
+			);
+			try {
+				await app.ompWatchTick();
+			} finally {
+				log.mockRestore();
+			}
+		};
+
 		try {
-			// Scenario 1: the candidate adds a signed-in model, the card files at P1.
-			// The pass verdict is seeded, so no review model call ever runs.
+			// Scenario 1: no runner configured. The transport throws, the watch logs
+			// the warning, and the fast track stays off: no probe, no card, no
+			// lastError. On the pre-wiring code no probeTransport existed at all —
+			// no warning and no probe — so the warning line is the wiring
+			// discriminator.
+			setEnv("OTTR_VM_RUNNER_URL", "");
 			const p1 = await ompBoard("omp-probe-a");
-			await gstore.set("ompWatch:omp-probe-a", {
-				verdicts: {
-					"18.16.0": {
-						verdict: "pass",
-						reasons: [],
-						cardId: null,
-						at: Date.now(),
-					},
-				},
-				modelSets: {},
-				bumpCard: null,
-				lastError: null,
-			});
+			await gstore.set("ompWatch:omp-probe-a", passState());
 			const workerApp = await createTestApp({
 				gstore,
 				defaultDir: root,
@@ -28083,53 +28243,89 @@ describe("omp watch probe wiring", () => {
 					projectOrder: [],
 				},
 				serverRef: { current: undefined },
-				workerTarget: {
-					urls: [`http://127.0.0.1:${fakeWorker.port}`],
-					token: "tok",
-				},
+				probeFetchImpl: globalThis.fetch,
+				probeSpawnImpl: probeSpawn,
 			});
-			await workerApp.ompWatchTick();
+			await tickWithLogs(workerApp);
+			expect(
+				(await p1.st.listTasks()).some((t) =>
+					t.title.startsWith("Bump omp to"),
+				),
+			).toBe(false);
+			expect(
+				logs.some(
+					(l) =>
+						l.includes("models list not run") &&
+						l.includes("OTTR_VM_RUNNER_URL"),
+				),
+			).toBe(true);
+			const s1 = (await gstore.get("ompWatch:omp-probe-a")) as {
+				lastError: unknown;
+			};
+			expect(s1.lastError).toBeNull();
+			expect(validateCalls).toHaveLength(0);
+
+			// Scenario 2: the fast track end to end. The pin's baseline and the
+			// candidate's catalog are both read through the validate channel, and
+			// the P1 bump card files.
+			setEnv("OTTR_VM_RUNNER_URL", String(fakeRunner.url));
+			await tickWithLogs(workerApp);
 			const bump = (await p1.st.listTasks()).find(
 				(t) => t.title === "Bump omp to 18.16.0",
 			);
 			expect(bump).toBeDefined();
 			expect(bump!.topic).toBe("omp");
 			expect(bump!.priority).toBe("P1");
-			// Both model sets were read on the worker (the pin's baseline, then the
-			// candidate), never spawned on the server: every body carries probe true.
-			const argvs = probeRequests.map((r) => r.argv);
-			expect(argvs).toHaveLength(2);
-			expect(argvs).toContainEqual([
-				"bunx",
-				"@oh-my-pi/pi-coding-agent@18.15.0",
-				"models",
-				"--json",
-			]);
-			expect(argvs).toContainEqual([
-				"bunx",
-				"@oh-my-pi/pi-coding-agent@18.16.0",
-				"models",
-				"--json",
-			]);
+			// Exactly two probes: the pin's baseline, then the candidate.
+			expect(validateCalls).toHaveLength(2);
+			for (const call of validateCalls) {
+				const body = call.body;
+				expect(body.id.startsWith("omp-probe-")).toBe(true);
+				expect(body.project).toBe("omp-probe-a");
+				expect(
+					body.targetTar.endsWith(`omp-probe-jobs/${body.id}/target.tar`),
+				).toBe(true);
+				expect(body.targetTar.startsWith(dataTmp)).toBe(true);
+				// The tar exists at dispatch time; the runner reads it from this path.
+				expect(call.tarExisted).toBe(true);
+				expect(
+					Object.keys(body.job).every((k) => ["argv", "cwd"].includes(k)),
+				).toBe(true);
+				expect(body.job.argv[0]).toBe("/bin/sh");
+				// The job script stamps the secret-free catalog copy into its HOME
+				// and runs the candidate cli's models list from the payload.
+				expect(body.job.argv[2]).toContain("cp /target/store/agent.db");
+				expect(body.job.argv[2]).toContain("models --json");
+				expect(body.job.argv[2]).toContain(
+					"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/",
+				);
+				expect(body.job.cwd).toBe("/target");
+				// The wire token rode the header only: never in the URL, never in
+				// any logged or thrown text.
+				expect(call.token).toBe(WIRE_TOKEN);
+				expect(call.url.includes(WIRE_TOKEN)).toBe(false);
+			}
+			expect(spawnCalls.some((a) => a[0] === "bun" && a.includes("add"))).toBe(
+				true,
+			);
+			expect(spawnCalls.some((a) => a[0] === "tar" && a.includes("-xzf"))).toBe(
+				true,
+			);
+			expect(spawnCalls.some((a) => a[0] === "tar" && a.includes("-cf"))).toBe(
+				true,
+			);
+			expect(
+				spawnCalls.filter((a) => a[0] === "tar").length,
+			).toBeGreaterThanOrEqual(2);
+			expect(logs.every((l) => !l.includes(WIRE_TOKEN))).toBe(true);
 
-			// Scenario 2: the candidate's catalog is identical to the pin's — the
+			// Scenario 3: the candidate's catalog is identical to the pin's — the
 			// regression mirrors src/ompWatch.test.ts "the same model set keeps the
 			// 7-day wait". No card files for the identical catalog.
-			candidateModels = '{"models":[]}';
+			emptyCatalogOnly = true;
+			const aCalls = validateCalls.length;
 			const p1b = await ompBoard("omp-probe-b");
-			await gstore.set("ompWatch:omp-probe-b", {
-				verdicts: {
-					"18.16.0": {
-						verdict: "pass",
-						reasons: [],
-						cardId: null,
-						at: Date.now(),
-					},
-				},
-				modelSets: {},
-				bumpCard: null,
-				lastError: null,
-			});
+			await gstore.set("ompWatch:omp-probe-b", passState());
 			const workerApp2 = await createTestApp({
 				gstore,
 				defaultDir: root,
@@ -28154,27 +28350,29 @@ describe("omp watch probe wiring", () => {
 					projectOrder: [],
 				},
 				serverRef: { current: undefined },
-				workerTarget: {
-					urls: [`http://127.0.0.1:${fakeWorker.port}`],
-					token: "tok",
-				},
+				probeFetchImpl: globalThis.fetch,
+				probeSpawnImpl: probeSpawn,
 			});
-			await workerApp2.ompWatchTick();
+			await tickWithLogs(workerApp2);
 			expect(
 				(await p1b.st.listTasks()).some((t) =>
 					t.title.startsWith("Bump omp to"),
 				),
 			).toBe(false);
-			// Every probe of both scenarios reached the worker through POST /run.
-			expect(
-				probeRequests.every((r) => r.path === "/run" && r.probe === true),
-			).toBe(true);
+			// Both probes of this scenario reached the validate channel for
+			// omp-probe-b only.
+			const bCalls = validateCalls.slice(aCalls);
+			expect(bCalls).toHaveLength(2);
+			expect(bCalls.every((c) => c.body.project === "omp-probe-b")).toBe(true);
 		} finally {
-			fakeWorker.stop(true);
+			fakeRunner.stop(true);
 			globalThis.fetch = realFetch;
-			if (savedAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
-			else process.env.PI_CODING_AGENT_DIR = savedAgent;
+			for (const [name, value] of savedEnv) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
 			rmSync(agentTmp, { recursive: true, force: true });
+			rmSync(dataTmp, { recursive: true, force: true });
 		}
 	});
 });
