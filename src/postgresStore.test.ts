@@ -169,6 +169,9 @@ try {
       }
       return rows;
     })();
+  const indexRows = backend === 'postgres'
+    ? (await store.db.query('SELECT indexname, indexdef FROM pg_catalog.pg_indexes WHERE schemaname = ? AND tablename = ? ORDER BY indexname').all(store.db.schema, 'code_scan_alert')).map(row => ({ name: row.indexname, sql: row.indexdef }))
+    : await store.db.query("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'code_scan_alert' AND sql IS NOT NULL ORDER BY name").all();
   if (backend === 'postgres') {
     const upgradeDb = await getPostgresDatabase(projectSchemaName('legacy migration upgrade'));
     try {
@@ -252,7 +255,7 @@ try {
   assert.equal(findingInsert.changes, 1);
   assert.ok(BigInt(findingInsert.lastInsertRowid) > 6001n);
   assert.equal((await importedDb.query("SELECT id FROM review_findings WHERE prompt = 'after imported finding'").get()).id, findingInsert.lastInsertRowid);
-  console.log(JSON.stringify({ schemaRows, tasks: (await store.listTasks()).length }));
+  console.log(JSON.stringify({ schemaRows, indexRows, tasks: (await store.listTasks()).length }));
 } finally {
   await store.close();
   await global.close();
@@ -269,6 +272,7 @@ interface SchemaRow {
 }
 interface ScenarioResult {
 	schemaRows: SchemaRow[];
+	indexRows: { name: string; sql: string }[];
 	tasks: number;
 }
 
@@ -363,6 +367,20 @@ function schemaMap(rows: SchemaRow[]): ApplicationSchema {
 	return result;
 }
 
+/** Sorted lowercase column list from the trailing paren group of one index
+ *  definition (SQLite sqlite_master.sql or PostgreSQL pg_indexes.indexdef). */
+function indexColumns(definition: string): string[] {
+	const open = definition.lastIndexOf("(");
+	const close = definition.lastIndexOf(")");
+	if (open === -1 || close < open)
+		throw new Error(`Unparsed index definition: ${definition}`);
+	return definition
+		.slice(open + 1, close)
+		.split(",")
+		.map((column) => column.trim().toLowerCase())
+		.sort();
+}
+
 function normalizedDefault(value: string | null): string | null {
 	return (
 		value
@@ -429,6 +447,29 @@ describe("shared real-driver store behavior", () => {
 						normalizedDefault(column.column_default),
 					);
 				}
+				// OTTR-1331: index definitions participate in the parity too; the
+				// card_filed index once landed on (task_id) on fresh PostgreSQL
+				// installs while SQLite carried (card_filed_at).
+				const sqliteIndexes = new Map(
+					sqlite.indexRows.map((row): [string, string[]] => [
+						row.name,
+						indexColumns(row.sql),
+					]),
+				);
+				const postgresIndexes = new Map(
+					postgres.indexRows.map((row): [string, string[]] => [
+						row.name,
+						indexColumns(row.sql),
+					]),
+				);
+				expect([...sqliteIndexes.keys()].sort()).toEqual([
+					"idx_code_scan_alert_card_filed",
+					"idx_code_scan_alert_task",
+				]);
+				expect(postgresIndexes).toEqual(sqliteIndexes);
+				expect(postgresIndexes.get("idx_code_scan_alert_card_filed")).toEqual([
+					"card_filed_at",
+				]);
 				const schema = projectSchemaName("Mixed CASE λ project");
 				const catalogQuery =
 					"SELECT table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = $1 ORDER BY table_name, ordinal_position";

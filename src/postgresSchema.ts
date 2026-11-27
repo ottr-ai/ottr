@@ -234,31 +234,12 @@ export const projectMigrations: readonly PostgresMigration[] = [
 	// Preserve versions 1–3; converge both fresh and existing project schemas with
 	// SQLite's outside-issue provenance and code-scanning alert storage. LIMIT 1
 	// matches SQLite's scalar lookup when multiple imports reference one card.
+	// OTTR-1331: the numbered step carries the deployed index shape —
+	// idx_code_scan_alert_task on (task_id) and idx_code_scan_alert_card_filed
+	// on (card_filed_at); the repair step at the end of this list rebuilds
+	// databases created while the second index was mis-shaped onto (task_id).
 	async (db) => {
-		await db.exec("ALTER TABLE tasks ADD COLUMN source_issue text");
-		await db.run(`UPDATE tasks SET source_issue = (
-			SELECT CAST(w.number AS text) FROM issue_watch w WHERE w.task_id = tasks.id
-			LIMIT 1
-		) WHERE source_issue IS NULL
-			AND EXISTS (SELECT 1 FROM issue_watch w WHERE w.task_id = tasks.id)`);
-		await db.run(`UPDATE tasks SET source_issue = (
-			SELECT j.issue_key FROM jira_imports j WHERE j.task_id = tasks.id
-			LIMIT 1
-		) WHERE source_issue IS NULL
-			AND EXISTS (SELECT 1 FROM jira_imports j WHERE j.task_id = tasks.id)`);
-		await db.exec(`CREATE TABLE code_scan_alert (
-			number bigint PRIMARY KEY, rule text NOT NULL, task_id text NOT NULL,
-			severity text NOT NULL, path text NOT NULL, line bigint NOT NULL,
-			url text NOT NULL, message text NOT NULL,
-			skipped bigint NOT NULL DEFAULT 0 CHECK (skipped IN (0,1)),
-			filed_at bigint NOT NULL, card_filed_at bigint NOT NULL
-		)`);
-		await db.exec(
-			"CREATE INDEX idx_code_scan_alert_task ON code_scan_alert (task_id)",
-		);
-		await db.exec(
-			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (task_id)",
-		);
+		for (const statement of projectStepFour) await db.exec(statement);
 	},
 	// OTTR-1267 agent-data sync gate records (docs/specs/agent-data-sync-gate.md):
 	// the same additive convergence the SQLite ProjectStore.addColumn path runs.
@@ -276,6 +257,25 @@ export const projectMigrations: readonly PostgresMigration[] = [
 	async (db) => {
 		await db.exec("ALTER TABLE pr_review ADD COLUMN fixed_threads text");
 	},
+	// OTTR-1331: databases created or upgraded while step 4 mis-shaped
+	// idx_code_scan_alert_card_filed onto (task_id) carry the task index twice
+	// and lack the card_filed_at index. Rebuild only that wrong shape; deployed
+	// databases with the correct definition skip the drop, and fresh installs
+	// reach this step with the correct shape already in place.
+	async (db) => {
+		const wrong = await db
+			.query<{ indexdef: string }, [string]>(
+				"SELECT indexdef FROM pg_catalog.pg_indexes WHERE schemaname = ? AND indexname = 'idx_code_scan_alert_card_filed'",
+			)
+			.get(db.schema);
+		if (wrong === null || !wrong.indexdef.includes("(task_id)")) return;
+		await db.exec(
+			`DROP INDEX ${quotedSchema(db.schema)}."idx_code_scan_alert_card_filed"`,
+		);
+		await db.exec(
+			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
+		);
+	},
 ];
 
 /** How many versioned steps the store's own project migrations carry. The PG
@@ -285,6 +285,32 @@ export const projectMigrationCount = projectMigrations.length;
 
 export const projectStepTwo: readonly string[] = [
 	"ALTER TABLE pr_review ADD COLUMN posted_via text",
+];
+
+// Step 4's convergence statements: outside-issue provenance plus the
+// code_scan_alert table with the deployed index shape (OTTR-1331). Kept as
+// data so src/postgresSchema.test.ts can scan the surface it converges on.
+export const projectStepFour: readonly string[] = [
+	`ALTER TABLE tasks ADD COLUMN source_issue text`,
+	`UPDATE tasks SET source_issue = (
+		SELECT CAST(w.number AS text) FROM issue_watch w WHERE w.task_id = tasks.id
+		LIMIT 1
+	) WHERE source_issue IS NULL
+		AND EXISTS (SELECT 1 FROM issue_watch w WHERE w.task_id = tasks.id)`,
+	`UPDATE tasks SET source_issue = (
+		SELECT j.issue_key FROM jira_imports j WHERE j.task_id = tasks.id
+		LIMIT 1
+	) WHERE source_issue IS NULL
+		AND EXISTS (SELECT 1 FROM jira_imports j WHERE j.task_id = tasks.id)`,
+	`CREATE TABLE code_scan_alert (
+		number bigint PRIMARY KEY, rule text NOT NULL, task_id text NOT NULL,
+		severity text NOT NULL, path text NOT NULL, line bigint NOT NULL,
+		url text NOT NULL, message text NOT NULL,
+		skipped bigint NOT NULL DEFAULT 0 CHECK (skipped IN (0,1)),
+		filed_at bigint NOT NULL, card_filed_at bigint NOT NULL
+	)`,
+	"CREATE INDEX idx_code_scan_alert_task ON code_scan_alert (task_id)",
+	"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
 ];
 
 // Step 1 maps the fully opened d4a617f SQLite oracle plus insertion_ordinal.
