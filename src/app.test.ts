@@ -13,8 +13,8 @@ import {
 	spyOn,
 	test,
 } from "bun:test";
-import { execSync } from "node:child_process";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import {
 	accessSync,
 	appendFileSync,
@@ -206,7 +206,6 @@ import { WORKER_DONE, type WorkerRequest } from "./workers.ts";
 import {
 	archReviewDelta,
 	git,
-	githubUrlFromPin,
 	gitSecrets,
 	networkGitAuth,
 	setGitSecrets,
@@ -14967,18 +14966,34 @@ describe("registration pins before refreshRemote (OTTR-1004)", () => {
 	test("a registered clone stamps the pin-derived identity and probes branch rules", async () => {
 		const savedToken = process.env.GH_TOKEN;
 		const savedHost = process.env.OTTR_GITHUB_HOST;
-		makeFixture("reg-pin");
-		// A fixture pin is a file:// path, so no real GitHub host matches it. With the
-		// configured host set to the fixture dir's own name, the pin is identity-bearing
-		// (https://fixture-repos/reg-pin), and registration must stamp that identity and
-		// run the branch-rules probe before it answers. The probe stops while the
-		// identity is null, so the old order — remote refresh first, pin after — leaves
-		// github null at registration, skips the probe, and fails these checks. The
-		// label sits at the pin's last segment, so the environment's ancestors sit
-		// before the match; the oracle below reuses the parser instead of a second
-		// match rule, so an ancestor that differs only by case cannot split them.
-		const pinHost = fixtureRepos.split("/").at(-1)!;
-		process.env.OTTR_GITHUB_HOST = pinHost;
+		// A fixture pin is a file:// path, so no real GitHub host matches it. The test
+		// plants a unique host label segment into the clone path: a per-run insteadOf
+		// rewrite (git's longest match wins) maps the unique owner segment
+		// octo-<label> onto a nested fixture dir, so the pin carries exactly one
+		// case-insensitive boundary for the configured host and the identity is the
+		// constant https://<label>/reg-pin under any TMPDIR — no environment segment,
+		// case variant, or dot-leading layer reaches it. Registration must stamp that
+		// identity and run the branch-rules probe before it answers. The probe stops
+		// while the identity is null, so the old order — remote refresh first, pin
+		// after — leaves github null at registration, skips the probe, and fails
+		// these checks. The rewrite key holds this run's random label, so it cannot
+		// prefix-match any other test's URL; the file-scope config rewrite erases it
+		// on the next run.
+		const pinLabel = `pin-host-${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+		makeFixture(`${pinLabel}/reg-pin`);
+		execFileSync(
+			"git",
+			[
+				"config",
+				"--file",
+				gitConfigGlobal,
+				"--add",
+				`url.file://${fixtureRepos}/${pinLabel}.insteadOf`,
+				`https://github.com/octo-${pinLabel}`,
+			],
+			{ stdio: "ignore" },
+		);
+		process.env.OTTR_GITHUB_HOST = pinLabel;
 		process.env.GH_TOKEN = "ghs_test_0000";
 		let probes = 0;
 		const regProjects = new Map<string, Entry>();
@@ -14993,24 +15008,20 @@ describe("registration pins before refreshRemote (OTTR-1004)", () => {
 		});
 		try {
 			const add = await m.call("/api/projects", {
-				url: "https://github.com/octo/reg-pin",
+				url: `https://github.com/octo-${pinLabel}/reg-pin`,
 			});
 			expect(add.status).toBe(200);
 			const e = regProjects.get("reg-pin")!;
 			// The identity is derived from the stored pin — a file:// URL no remote read
 			// would ever produce — and the probe ran inside registration.
 			const pin = (await e.store.getSettings()).originUrl ?? "";
-			expect(pin).toBe(`file://${fixtureRepos}/reg-pin`);
-			// The identity is the pin under the configured host. The expected value comes
-			// from githubUrlFromPin itself — one source of truth for the match rule (the
-			// leftmost case-insensitive boundary) — so the oracle can never pick a
-			// different segment than the parser, whatever the suite's tmpdir nests. The
-			// two provenance checks hold whatever segment wins: the identity rides under
-			// the configured host and ends at the fixture repo.
-			const fromPin = githubUrlFromPin(pin, pinHost);
+			expect(pin).toBe(`file://${fixtureRepos}/${pinLabel}/reg-pin`);
+			// The planted label is unique per run, so the pin holds exactly one host
+			// boundary and the parser can only land on it: the identity is this
+			// constant, on any TMPDIR, whatever the environment nests above the suite
+			// scratch.
+			const fromPin = `https://${pinLabel}/reg-pin`;
 			expect(e.github).toBe(fromPin);
-			expect(e.github?.startsWith(`https://${pinHost}/`)).toBe(true);
-			expect(e.github?.endsWith("/reg-pin")).toBe(true);
 			expect(e.protectedTarget).toBe(true);
 			expect(probes).toBe(1);
 			const view = (await add.json()) as {
