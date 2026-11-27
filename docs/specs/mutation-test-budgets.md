@@ -14,6 +14,8 @@ A timeout remains a failure.
 Preserve the asserted behavior and property run counts.
 Keep production behavior unchanged.
 The registration fixture uses a unique host label and a fixture-local Git `insteadOf` rule, independent of TMPDIR.
+The report fixture supplies `createdAt` and checks the review and merge identifiers.
+The Git fixture checks ambient configuration separately from the explicit auth environment.
 
 ## Boundaries
 

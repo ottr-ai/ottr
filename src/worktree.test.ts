@@ -5900,6 +5900,7 @@ describe("gitEnv", () => {
 	});
 
 	test("gitEnv merges its auth env for a fetch; local subcommands get none of it", () => {
+		const ambientCount = process.env.GIT_CONFIG_COUNT;
 		// git() resolves the resolver and passes it here; gitEnv only merges what it gets.
 		const env = gitEnv(["fetch", "origin"], {
 			GIT_SSH_COMMAND: "ssh -i /resolver-key",
@@ -5912,7 +5913,7 @@ describe("gitEnv", () => {
 			GIT_SSH_COMMAND: "ssh -i /explicit-key",
 		});
 		expect(explicit.GIT_SSH_COMMAND).toBe("ssh -i /explicit-key");
-		expect(explicit).not.toHaveProperty("GIT_CONFIG_COUNT");
+		expect(explicit.GIT_CONFIG_COUNT).toBe(ambientCount);
 	});
 
 	test("gitEnv for local subcommands strips every credential name even from the boot env", () => {

@@ -506,6 +506,7 @@ describe("report", () => {
 				project: "br-fixt-a1",
 				kind: "review",
 				releaseVersion: null,
+				createdAt: F.now - 3_600_000,
 			}),
 			card({
 				id: "T-11",
@@ -577,12 +578,13 @@ describe("report", () => {
 		expect(out).not.toContain("WARNING:");
 		// Stuck rows sort first; the question row follows the stuck one.
 		expect(out.indexOf("p/T-7")).toBeLessThan(out.indexOf("p/T-1"));
-		// T-5 is a queued merge behind the review parked at merging: the real
-		// mergeHold names the findings hold in its note, and T-11's merge turn
-		// of the same project adds the merge-slot hold.
-		expect(out).toContain(
-			"| br-fixt-a1/T-5 T | merging/queued | OK | waiting for the review's findings to be implemented; a merge runs: T-11 |  |",
-		);
+		// The queued merge names both the review hold and the active merge slot.
+		const mergeRow = out
+			.split("\n")
+			.find((row) => row.startsWith("| br-fixt-a1/T-5 T |"));
+		expect(mergeRow).toContain("| merging/queued | OK |");
+		expect(mergeRow).toContain("review T-6");
+		expect(mergeRow).toContain("T-11");
 		expect(out).toContain(
 			"| br-fixt-a1/T-6 T | merging/idle | OK | release waits for its findings | waiting for the review's findings",
 		);
