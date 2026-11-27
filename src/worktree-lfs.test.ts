@@ -845,12 +845,17 @@ describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
 		}
 	});
 
-	test("an operator-set lfs.url skips the pins, and git-lfs follows it", async () => {
+	test("an operator-set lfs.url is pinned for the call, and git-lfs follows it", async () => {
 		const repo = await repoAt("https://github.com/octo/repo");
 		try {
 			await run(repo, "config", "lfs.url", "https://lfs.example.com/api/octo");
 			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
-			expect(pins).toEqual([]);
+			expect(pins).toEqual([
+				"-c",
+				"lfs.url=https://lfs.example.com/api/octo",
+				"-c",
+				"lfs.https://lfs.example.com/api/octo.locksverify=false",
+			]);
 			expect(await pushEnvEndpoint(repo, pins)).toBe(
 				"https://lfs.example.com/api/octo (auth=none)",
 			);
@@ -859,9 +864,38 @@ describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
 		}
 	});
 
+	test("planted custom-transfer drivers are pinned empty for the call", async () => {
+		// Security review of the integration: a hostile endpoint's batch can name a
+		// transfer adapter whose driver comes from planted repo config — a process
+		// spawn next to the push's credentials. Every planted driver is cleared on the
+		// same command line, so naming one fails the push instead of starting code.
+		const repo = await repoAt("https://github.com/octo/repo");
+		try {
+			await run(repo, "config", "lfs.url", "https://lfs.example.com/api/octo");
+			await run(
+				repo,
+				"config",
+				"lfs.customtransfer.evil.driver",
+				"/workspace/ottr/payload.sh",
+			);
+			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
+			expect(pins).toEqual([
+				"-c",
+				"lfs.customtransfer.evil.driver=",
+				"-c",
+				"lfs.url=https://lfs.example.com/api/octo",
+				"-c",
+				"lfs.https://lfs.example.com/api/octo.locksverify=false",
+			]);
+		} finally {
+			rmSync(join(repo, ".."), { recursive: true, force: true });
+		}
+	});
+
 	test("an operator-set remote.origin.lfsurl skips the pins too (the mixed-key case)", async () => {
 		// git-lfs 3.6.1 resolves lfs.url above remote.<remote>.lfsurl, so with both set
-		// the push follows lfs.url: no pins at all, whatever they would have said.
+		// the carried endpoint is the lfs.url value: the push follows lfs.url, whatever
+		// the remote-scoped value says.
 		const repo = await repoAt("https://github.com/octo/repo");
 		try {
 			await run(
@@ -877,7 +911,12 @@ describe("lfsEndpointPin (OTTR-1283, store nothing)", () => {
 				"https://github.com/octo/repo/info/lfs",
 			);
 			const pins = await lfsEndpointPin(repo, "https://github.com/octo/repo");
-			expect(pins).toEqual([]);
+			expect(pins).toEqual([
+				"-c",
+				"lfs.url=https://github.com/octo/repo/info/lfs",
+				"-c",
+				"lfs.https://github.com/octo/repo/info/lfs.locksverify=false",
+			]);
 			expect(await pushEnvEndpoint(repo, pins)).toBe(
 				"https://github.com/octo/repo/info/lfs (auth=none)",
 			);

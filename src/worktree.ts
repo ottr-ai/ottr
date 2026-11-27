@@ -2500,16 +2500,19 @@ async function catFileBatch(
  * fail an upload whose batch works.
  *
  * OTTR-1283 (operator decision): an operator's own `lfs.url` or
- * `remote.origin.lfsurl` in the repo config must win. On a GitHub-host origin (the
- * board's isGithubRepoHost rule), a `lfs.url` value skips both pins — git-lfs resolves
- * it above every other source, so the upload follows it, lock behavior included. A
- * `remote.origin.lfsurl` value without `lfs.url` is carried on the command line as
- * `lfs.url` for this call: a URL-based `git lfs push` (the upload's first argument is
- * the pinned URL, not the remote name) ignores the remote-scoped key entirely and
- * would derive the origin's own endpoint instead of the operator's. Either way
- * nothing is stored, and a config a work turn planted in the shared workspace would
- * win with the operator's rule; that trade is the operator's call. Non-GitHub
- * http(s) hosts keep the unconditional pin: today's behavior.
+ * `remote.origin.lfsurl` in the repo config must win, without persistent config. On a
+ * GitHub-host origin (the board's isGithubRepoHost rule), the operator's value is read
+ * from repo config and carried on the command line as `lfs.url` for this call; with
+ * neither key set, the derived origin endpoint is pinned. Two recorded decisions shape
+ * this: git-lfs resolves `lfs.url` above every other source, so an `lfs.url` value
+ * wins as the config holds it; and a URL-based `git lfs push` (the upload's first
+ * argument is the pinned URL, not the remote name) ignores the remote-scoped key
+ * entirely, so that value must ride the command line. Because the followed endpoint
+ * can be worker-planted (R5-1 treats the repo config as hostile), every planted
+ * custom-transfer driver is pinned empty on the same command line: a hostile batch can
+ * then name such an adapter only into a failed push, not into a process spawn next to
+ * the push's credentials (review finding on OTTR-1058). Non-GitHub http(s) hosts keep
+ * the unconditional derived pin: today's behavior.
  */
 export async function lfsEndpointPin(
 	mainPath: string,
@@ -2518,22 +2521,16 @@ export async function lfsEndpointPin(
 	if (!/^https?:\/\//i.test(originUrl)) return [];
 	const u = new URL(originUrl);
 	if (isGithubRepoHost(u.host, githubHost().host)) {
-		const lfsUrl = await git(["config", "lfs.url"], mainPath).catch(() => null);
-		if (lfsUrl !== null && lfsUrl.code === 0 && lfsUrl.stdout.trim() !== "")
-			return [];
-		const remote = await git(
-			["config", "remote.origin.lfsurl"],
-			mainPath,
-		).catch(() => null);
-		if (remote !== null && remote.code === 0 && remote.stdout.trim() !== "") {
-			const endpoint = remote.stdout.trim();
-			return [
-				"-c",
-				`lfs.url=${endpoint}`,
-				"-c",
-				`lfs.${endpoint}.locksverify=false`,
-			];
-		}
+		const endpoint =
+			(await operatorEndpoint(mainPath)) ?? lfsEndpointFor(originUrl);
+		if (endpoint === null) return [];
+		return [
+			...(await deadAdapterPins(mainPath)),
+			"-c",
+			`lfs.url=${endpoint}`,
+			"-c",
+			`lfs.${endpoint}.locksverify=false`,
+		];
 	}
 	const endpoint = lfsEndpointFor(originUrl);
 	if (endpoint === null) return [];
@@ -2543,6 +2540,38 @@ export async function lfsEndpointPin(
 		"-c",
 		`lfs.${endpoint}.locksverify=false`,
 	];
+}
+
+/** The operator's own LFS endpoint for this origin, read from repo config: an `lfs.url`
+ * value, else a `remote.origin.lfsurl` value; null when neither holds one. */
+async function operatorEndpoint(mainPath: string): Promise<string | null> {
+	for (const key of ["lfs.url", "remote.origin.lfsurl"]) {
+		const r = await git(["config", key], mainPath).catch(() => null);
+		if (r !== null && r.code === 0 && r.stdout.trim() !== "")
+			return r.stdout.trim();
+	}
+	return null;
+}
+
+/** One `-c` per planted custom-transfer driver, cleared on the command line: a hostile
+ * batch can then name such an adapter only into a failed push (an empty driver starts
+ * nothing), never into a process spawn next to the push's credentials. */
+async function deadAdapterPins(mainPath: string): Promise<readonly string[]> {
+	const r = await git(
+		["config", "--get-regexp", "^lfs\\.customtransfer\\..*\\.driver$"],
+		mainPath,
+	).catch(() => null);
+	if (r === null || r.code !== 0) return [];
+	const pins: string[] = [];
+	for (const line of r.stdout.split("\n")) {
+		const at = line.indexOf(" ");
+		if (at <= 0) continue;
+		const key = line.slice(0, at).trim();
+		if (/^lfs\.customtransfer\..*\.driver$/i.test(key)) {
+			pins.push("-c", `${key}=`);
+		}
+	}
+	return pins;
 }
 
 /** The LFS endpoint git-lfs derives for an http(s) origin URL; null for any other scheme. */
@@ -2559,9 +2588,11 @@ function lfsEndpointFor(originUrl: string): string | null {
  * GH008) unless the objects go first. No-op for a range without pointers: a repo
  * without LFS runs no git lfs command. The upload runs with the push's own credential
  * plumbing (git() classifies `lfs` as network git, so hosted mode mints the pinned
- * origin's token and self-hosted mode passes its resolver env) and pins the LFS
- * endpoint for an http(s) origin, so repo config a work turn planted (R5-1) cannot
- * move it; the URL argument means `remote.<name>.lfsurl` is never read. A local-path
+ * origin's token and self-hosted mode passes its resolver env) and resolves the LFS
+ * endpoint through lfsEndpointPin, which on a GitHub-host origin follows the repo
+ * config's own endpoint (lfs.url, else remote.origin.lfsurl) by carrying it on the
+ * command line, and otherwise pins the derived endpoint; planted custom-transfer
+ * drivers are pinned empty either way (OTTR-1283). A local-path
  * origin becomes a file:// URL: git-lfs's standalone file transfer ignores endpoint
  * config entirely and stores the objects in the bare repo itself. Any other scheme —
  * `ssh://` in particular — runs no LFS step at all: there the https endpoint git-lfs

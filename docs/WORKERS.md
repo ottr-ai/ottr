@@ -1470,17 +1470,20 @@ derives the endpoint from the origin it is given, in git-lfs's own derivation
 (`<originUrl>.git/info/lfs` when the URL lacks the `.git` suffix), and pins it
 on the upload's command line only — nothing lands in the project's git config,
 so an origin change re-derives at the next push and nothing can go stale. On a
-GitHub host (github.com, a `*.ghe.com` tenant, or the configured host) the pin
-is skipped when the repo config already holds `lfs.url`: the operator's own
-endpoint wins, its lock behavior included. A `remote.<remote>.lfsurl` value
-without `lfs.url` is pinned for the call instead, because a URL-based
-`git lfs push` ignores the remote-scoped key and would derive the origin's
-own endpoint. Nothing is stored either way. A config a work turn planted
-would win with the operator's rule; that trade is the operator's call.
-Non-GitHub hosts keep the unconditional pin: today's
-behavior. The pins outrank a planted `lfs.url` (an empty `-c lfs.url=` fails the push,
-verified against git-lfs 3.6.1), the URL argument means `remote.<name>.lfsurl`
-is never read, and the lock pin turns the locking API off: the board never uses
+GitHub host (github.com, a `*.ghe.com` tenant, or the configured host) the
+board reads the repo config's own endpoint (`lfs.url`, else
+`remote.<remote>.lfsurl`) and carries it on the command line as `lfs.url` for
+that call, because a URL-based `git lfs push` ignores the remote-scoped key
+and would derive the origin's own endpoint. Nothing is stored either way. A
+config a work turn planted wins with the operator's rule; the review accepted
+that endpoint-move trade and closes its execution chain: every planted
+`lfs.customtransfer.<name>.driver` is pinned empty on the same command line,
+so a hostile batch can name such an adapter only into a failed push, not into
+a process spawn next to the push's credentials. Non-GitHub hosts keep the
+unconditional pin: today's behavior, and with no operator value set the pins
+outrank planted config (an empty `-c lfs.url=` fails the push,
+verified against git-lfs 3.6.1). The lock pin turns the locking API off: the
+board never uses
 LFS locks, and on github hosts git-lfs verifies locks by default, so a locking
 endpoint's error response must not fail an upload whose batch endpoint works; a local-path origin becomes a `file://` URL and git-lfs's built-in
 standalone file transfer ignores endpoint config entirely, storing the objects
