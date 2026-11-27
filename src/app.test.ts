@@ -1,4 +1,3 @@
-import type { BunRequest } from "bun";
 import { Database } from "bun:sqlite";
 import {
 	afterAll,
@@ -36,7 +35,7 @@ import {
 import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import type { Server } from "bun";
+import type { BunRequest, Server } from "bun";
 import {
 	type App,
 	behindMain,
