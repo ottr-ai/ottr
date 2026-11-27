@@ -14973,9 +14973,12 @@ describe("registration pins before refreshRemote (OTTR-1004)", () => {
 			const pin = (await e.store.getSettings()).originUrl ?? "";
 			expect(pin).toBe(`file://${fixtureRepos}/reg-pin`);
 			// The identity is the pin under the configured host, wherever the suite's
-			// tmpdir nests it: the host match consumes the path through the first
-			// /tmp segment, so the label rides wherever the suite nests its scratch.
-			const fromPin = `https://tmp/${pin.slice(pin.indexOf("/tmp/") + "/tmp/".length)}`;
+			// tmpdir nests it and however it spells the host label: production cuts
+			// the pin at its first case-insensitive path segment named like the host
+			// (hostMatcher), not at a literal lowercase /tmp/ prefix.
+			const label = "/tmp/";
+			const at = pin.toLowerCase().indexOf(label);
+			const fromPin = `https://tmp/${pin.slice(at + label.length)}`;
 			expect(e.github).toBe(fromPin);
 			expect(e.protectedTarget).toBe(true);
 			expect(probes).toBe(1);
