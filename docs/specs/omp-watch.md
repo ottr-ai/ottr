@@ -101,21 +101,27 @@ server host is not an acceptable boundary for unapproved code.
   (docs/specs/microvm-validation-mode.md): a fresh microVM holds none of the board's
   mounts, the job env is exactly PATH, HOME and LANG, the job runs as an unprivileged
   guest user, and the result drive is written by the guest's init after the job exits.
-  The transport pins the candidate's npm tarball against the packument's integrity and
-  installs it into the job payload with `bun add --ignore-scripts`: no candidate-controlled
-  lifecycle hook ever runs on the server, and the install spawn's env is an allowlist
-  (build toggles, run-dir paths, PATH and LANG), never the daemon environment. The
-  credential copy comes from the board's own agent store — `agentDir()`, the same file
-  `signIns()` reads — and holds the signed-in providers with every data key shape and
-  the identity keys, each value a placeholder, so the candidate lists the board's
-  providers' catalogs without holding one secret or one piece of board identity data
-  (verified against the real CLI). The payload's trusted wrapper stamps the copy into
-  the job HOME, spawns the candidate under the three-name env, caps the candidate's
-  stdout at 2 MiB, and re-emits compact provider/id records: the whole list the parse
-  accepts survives the guest's 64 KiB stdout tail. `modelsTimeoutMs` arms before any
-  preparation: past it the transport aborts, which kills the VM, the preparation
-  runner kills its subprocesses, and every killed step surfaces as the one timeout
-  error. A transport that fails or returns unusable output only loses the fast track
+  The candidate is unapproved code, so its install tree never exists on the server
+  either. The server's share is bytes and metadata only: it pins the candidate's npm
+  tarball against the packument's integrity, reads the candidate's manifest member out
+  of the tarball to stdout, resolves the dependency graph metadata-only (`bun install
+  --lockfile-only` — bun writes the lockfile, never a node_modules tree), and ships
+  every resolved package as an integrity-verified tarball beside a generated
+  `file:`-dependency manifest. The credential copy comes from the board's own agent
+  store — `agentDir()`, the same file `signIns()` reads — and holds the signed-in
+  providers with every data key shape and the identity keys, each value a placeholder,
+  so the candidate lists the board's providers' catalogs without holding one secret or
+  one piece of board identity data (verified against the real CLI). The guest does the
+  rest: it installs the payload offline (`bun install --prefer-offline --ignore-scripts
+  --production`, dying with the VM), stamps the copy into the job HOME, and runs the
+  candidate under the three-name env. The payload's trusted wrapper caps the
+  candidate's stdout at 2 MiB and re-emits compact provider/id records under a byte
+  budget that fits the guest's 64 KiB stdout tail: catalogs beyond the budget lose
+  their tail entries (bounded, parseable) instead of failing the whole parse.
+  `modelsTimeoutMs` arms before any preparation: past it the transport aborts, which
+  kills the VM, the preparation runner kills its subprocesses, and every killed step
+  surfaces as the one timeout error — the deadline stays armed through the response
+  body. A transport that fails or returns unusable output only loses the fast track
   (below), and the failure is a warning, never a `lastError`.
 - When a review ends with `pass`, the watcher asks the transport for that version's model
   list and stores the set. The transport runs `omp models --json` for that exact version.

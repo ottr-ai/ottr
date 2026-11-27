@@ -28045,29 +28045,31 @@ describe("omp watch probe wiring", () => {
 		};
 		const probeSpawn: ProcSpawn = async (argv) => {
 			spawnCalls.push([...argv]);
-			if (argv[0] === "tar" && argv.includes("-xzf")) {
-				const dir = valueAfter(argv, "-C") ?? argv[argv.length - 1]!;
-				mkdirSync(join(dir, "package"), { recursive: true });
-				writeFileSync(join(dir, "package", "package.json"), PKG_JSON);
-				return { code: 0, stdout: new Uint8Array(), stderr: "" };
-			}
-			if (argv[0] === "bun" && argv.includes("add")) {
-				const dir = valueAfter(argv, "--cwd") ?? argv[argv.length - 1]!;
-				writeFileSync(
-					join(dir, "package.json"),
-					JSON.stringify({ name: "omp-probe-payload", private: true }),
-				);
-				const pkgDir = join(
-					dir,
-					"node_modules",
-					"@oh-my-pi",
-					"pi-coding-agent",
-				);
-				mkdirSync(join(pkgDir, "dist"), { recursive: true });
-				writeFileSync(join(pkgDir, "package.json"), PKG_JSON);
-				writeFileSync(join(pkgDir, "dist", "cli.js"), "// candidate omp cli\n");
-				return { code: 0, stdout: new Uint8Array(), stderr: "" };
-			}
+		if (argv[0] === "tar" && argv.includes("-xOzf")) {
+			// Member-only manifest read: the stdout carries package.json.
+			return {
+				code: 0,
+				stdout: new TextEncoder().encode(PKG_JSON),
+				stderr: "",
+			};
+		}
+		if (argv[0] === "bun" && argv.includes("--lockfile-only")) {
+			const dir = valueAfter(argv, "--cwd") ?? argv[argv.length - 1]!;
+			writeFileSync(
+				join(dir, "bun.lock"),
+				JSON.stringify({
+					lockfileVersion: 1,
+					packages: {
+						"@oh-my-pi/pi-coding-agent@18.16.0": [
+							"@oh-my-pi/pi-coding-agent@18.16.0",
+							"",
+							{},
+						],
+					},
+				}),
+			);
+			return { code: 0, stdout: new Uint8Array(), stderr: "" };
+		}
 			if (argv[0] === "tar" && argv.includes("-cf")) {
 				const out = valueAfter(argv, "-cf") ?? argv[argv.length - 1]!;
 				mkdirSync(dirname(out), { recursive: true });
@@ -28306,19 +28308,24 @@ describe("omp watch probe wiring", () => {
 				expect(call.token).toBe(WIRE_TOKEN);
 				expect(call.url.includes(WIRE_TOKEN)).toBe(false);
 			}
-			const addCall = spawnCalls.find((a) => a[0] === "bun" && a.includes("add"));
-			expect(addCall).toBeDefined();
-			// No candidate-controlled lifecycle hook ever runs on the server.
-			expect(addCall!.includes("--ignore-scripts")).toBe(true);
-			expect(spawnCalls.some((a) => a[0] === "tar" && a.includes("-xzf"))).toBe(
-				true,
-			);
+			// Metadata-only resolution on the server: a lockfile run, never an
+			// extract or an install — the candidate's tree exists only in the VM.
+			expect(
+				spawnCalls.some(
+					(a) =>
+						a[0] === "bun" &&
+						a.includes("install") &&
+						a.includes("--lockfile-only"),
+				),
+			).toBe(true);
+			// No tree extraction (tar -xzf -C) and no install: the candidate's
+			// dependency tree never exists on the server.
+			expect(
+				spawnCalls.some((a) => a.includes("add") || a.includes("-C")),
+			).toBe(false);
 			expect(spawnCalls.some((a) => a[0] === "tar" && a.includes("-cf"))).toBe(
 				true,
 			);
-			expect(
-				spawnCalls.filter((a) => a[0] === "tar").length,
-			).toBeGreaterThanOrEqual(2);
 			expect(logs.every((l) => !l.includes(WIRE_TOKEN))).toBe(true);
 
 			// Scenario 3: the candidate's catalog is identical to the pin's — the

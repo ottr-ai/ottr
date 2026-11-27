@@ -221,16 +221,21 @@ function redactData(
 }
 
 /** The trusted guest-side wrapper (written into the payload as
- * probe-wrapper.mjs): stamps the redacted copy into the job HOME, spawns the
- * candidate cli under the three-name env allowlist, caps the candidate's
- * stdout at 2 MiB, and re-emits compact provider/id records — the whole list
- * the parse accepts survives the guest's 64 KiB stdout tail. The candidate's
- * own stderr passes through to the job's stderr. Exit codes: the candidate's,
- * or 3 when the output is not a models catalog. `OMP_PROBE_STORE` overrides
- * the stamped store path for tests; the guest job env never carries that
- * name, so production always reads /target/store/agent.db. */
+ * probe-wrapper.mjs): installs the payload offline (every dependency is a
+ * `file:` tarball the transport integrity-pinned — the guest has no network),
+ * stamps the redacted copy into the job HOME, spawns the candidate cli under
+ * the three-name env allowlist, caps the candidate's stdout at 2 MiB, and
+ * re-emits compact provider/id records under a byte budget that fits the
+ * guest's 64 KiB stdout tail: catalogs beyond the budget lose their tail
+ * entries (bounded, parseable) instead of failing the whole parse. The
+ * candidate's own stderr passes through to the job's stderr. Exit codes: the
+ * candidate's, or 3 when the output is not a models catalog.
+ * `OMP_PROBE_STORE` and `OMP_PROBE_SKIP_INSTALL` override the stamped store
+ * path and the offline install for tests; the guest job env never carries
+ * either name. */
 export const probeWrapperSource = `import { copyFileSync, mkdirSync } from "node:fs";
 const cli = process.argv[2];
+const pkgDir = process.argv[3] ?? "/target/pkg";
 if (typeof cli !== "string" || cli === "") {
 	console.error("probe wrapper: no candidate cli path");
 	process.exit(3);
@@ -239,6 +244,24 @@ const home = process.env.HOME ?? "";
 if (home === "") {
 	console.error("probe wrapper: no HOME");
 	process.exit(3);
+}
+if (process.env.OMP_PROBE_SKIP_INSTALL !== "1") {
+	const inst = Bun.spawnSync(
+		[
+			process.execPath,
+			"install",
+			"--prefer-offline",
+			"--ignore-scripts",
+			"--production",
+			"--cwd",
+			pkgDir,
+		],
+		{ stdout: "pipe", stderr: "inherit", stdin: "ignore" },
+	);
+	if (inst.exitCode !== 0) {
+		console.error("probe wrapper: the offline install failed");
+		process.exit(inst.exitCode ?? 1);
+	}
 }
 mkdirSync(home + "/.omp/agent", { recursive: true });
 copyFileSync(
@@ -283,10 +306,21 @@ try {
 		!Array.isArray(parsed.models)
 	)
 		throw new Error("no models array");
-	const models = parsed.models.map((m) => ({
-		provider: typeof m === "object" && m !== null ? m.provider : undefined,
-		id: typeof m === "object" && m !== null ? m.id : undefined,
-	}));
+	// The compact records carry only provider and id, and stop before the
+	// guest's 64 KiB stdout tail would discard their head.
+	const TAIL_BUDGET = 48 * 1024;
+	const models = [];
+	let used = 0;
+	for (const m of parsed.models) {
+		const record = {
+			provider: typeof m === "object" && m !== null ? m.provider : undefined,
+			id: typeof m === "object" && m !== null ? m.id : undefined,
+		};
+		const cost = JSON.stringify(record).length + 1;
+		if (used + cost > TAIL_BUDGET) break;
+		models.push(record);
+		used += cost;
+	}
 	out = JSON.stringify({ models });
 } catch (err) {
 	console.error(
@@ -313,10 +347,6 @@ export function probeJobArgv(binRel: string): string[] {
 /** `omp-probe-<hex8>`: fits the ValidateRequest id rule and names the run dir. */
 const defaultId = (): string => `omp-probe-${randomBytes(4).toString("hex")}`;
 
-/** The package dir inside the payload tar, relative to payload/pkg: the job
- * command's bun entry path depends on it. */
-const PKG_PACKAGE_DIR = join("node_modules", "@oh-my-pi", "pi-coding-agent");
-
 /** binRel rule shared by both package.json reads: relative posix only, no
  * ".." and no leading "/", so the interpolated job command stays inside the
  * candidate's own package dir in the guest. */
@@ -330,18 +360,14 @@ function binRelError(binRel: string): string | null {
 	return null;
 }
 
-/** The package's bin entry (string, or {omp}) as a relative path, or the
- * exact reason it is unusable. */
-function readBinRel(packageJsonPath: string): string {
-	let raw: string;
-	try {
-		raw = readFileSync(packageJsonPath, "utf8");
-	} catch (err) {
-		const why = err instanceof Error ? err.message : String(err);
-		throw new Error(
-			`omp models probe: cannot read the candidate package.json at ${packageJsonPath} (${why})`,
-		);
-	}
+/** The candidate npm package's name: everything the watch's own URLs build
+ * on. It is the registry the packument fetches already target. */
+export const OMP_REGISTRY_ORIGIN = new URL(OMP_PACKAGE_URL).origin;
+export const PKG_NAME = "@oh-my-pi/pi-coding-agent";
+
+/** The bin entry inside a package.json manifest (string, or {omp}) as a
+ * relative path, or the exact reason it is unusable. */
+function binRelFromManifest(raw: string): string {
 	let manifest: unknown;
 	try {
 		manifest = JSON.parse(raw);
@@ -424,6 +450,116 @@ export function probePrepSpawn(
 			kill();
 		}
 	};
+}
+
+/** The bun text lockfile's package entries, narrowed to what the payload
+ * needs: exact name, exact version, and the checksum when the lockfile
+ * carries one. A malformed entry is skipped, not guessed. */
+function lockPackagesFrom(raw: string): {
+	name: string;
+	version: string;
+	integrity: string | null;
+}[] {
+	// The text lockfile is JSONC: trailing commas, no comments in practice.
+	const lock = JSON.parse(raw.replace(/,(\s*[}\]])/g, "$1")) as {
+		packages?: Record<string, unknown>;
+	};
+	const out: { name: string; version: string; integrity: string | null }[] = [];
+	for (const entry of Object.values(lock.packages ?? {})) {
+		if (!Array.isArray(entry) || typeof entry[0] !== "string") continue;
+		const resolved = entry[0];
+		const at = resolved.lastIndexOf("@");
+		if (at <= 0) continue;
+		const name = resolved.slice(0, at);
+		const version = resolved.slice(at + 1);
+		if (name === "" || version === "") continue;
+		out.push({
+			name,
+			version,
+			integrity: typeof entry[3] === "string" ? entry[3] : null,
+		});
+	}
+	return out;
+}
+
+/** One package's dist metadata from its registry packument, for the exact
+ * version. A missing version or dist is a hard error: the payload never
+ * ships an unverified tarball. */
+async function packumentDistFor(
+	name: string,
+	version: string,
+	fetchImpl: typeof fetch,
+	signal: AbortSignal,
+): Promise<{ tarball: string; integrity: string | null }> {
+	const url = `${OMP_REGISTRY_ORIGIN}/${name.startsWith("@") ? name.replace("/", "%2f") : name}`;
+	const res = await fetchImpl(url, {
+		headers: { accept: "application/json", "user-agent": "ottr" },
+		signal,
+	});
+	if (!res.ok)
+		throw new Error(
+			`omp models probe: the registry packument for ${name} failed: HTTP ${res.status}`,
+		);
+	const packument: unknown = await res.json();
+	const versions =
+		typeof packument === "object" &&
+		packument !== null &&
+		"versions" in packument &&
+		typeof packument.versions === "object" &&
+		packument.versions !== null
+			? (packument.versions as Record<string, unknown>)
+			: {};
+	const manifest: unknown = versions[version];
+	const dist: unknown =
+		typeof manifest === "object" && manifest !== null && "dist" in manifest
+			? manifest.dist
+			: undefined;
+	const tarball: unknown =
+		typeof dist === "object" && dist !== null && "tarball" in dist
+			? dist.tarball
+			: undefined;
+	const integrity: unknown =
+		typeof dist === "object" && dist !== null && "integrity" in dist
+			? dist.integrity
+			: undefined;
+	if (typeof tarball !== "string" || tarball === "")
+		throw new Error(
+			`omp models probe: ${name}@${version} declares no dist.tarball`,
+		);
+	return {
+		tarball,
+		integrity: typeof integrity === "string" ? integrity : null,
+	};
+}
+
+/** Downloads one tarball and verifies it against its sha512 integrity before
+ * the bytes leave this function: the payload only ever carries verified
+ * package files. */
+async function downloadVerified(
+	url: string,
+	integrity: string | null,
+	label: string,
+	fetchImpl: typeof fetch,
+	signal: AbortSignal,
+): Promise<Uint8Array> {
+	const res = await fetchImpl(url, { signal });
+	if (!res.ok)
+		throw new Error(
+			`omp models probe: the tarball fetch for ${label} failed: HTTP ${res.status}`,
+		);
+	const bytes = new Uint8Array(await res.arrayBuffer());
+	if (bytes.length > 64 * 1024 * 1024)
+		throw new Error(`omp models probe: the ${label} tarball is over 64 MiB`);
+	const expected =
+		typeof integrity === "string" && integrity.startsWith("sha512-")
+			? integrity.slice("sha512-".length)
+			: null;
+	if (expected === null)
+		throw new Error(`omp models probe: ${label} declares no sha512 integrity`);
+	const digest = new Bun.CryptoHasher("sha512").update(bytes).digest("base64");
+	if (digest !== expected)
+		throw new Error(`omp models probe: ${label} tarball integrity mismatch`);
+	return bytes;
 }
 
 export function createOmpProbeTransport(
@@ -545,51 +681,108 @@ export function createOmpProbeTransport(
 				.digest("base64");
 			if (digest !== integrity.slice("sha512-".length))
 				throw new Error(`candidate tarball integrity mismatch for ${version}`);
+			const candidateBytes = bytes;
 			const candidateTgz = join(runDir, "candidate.tgz");
 			writeFileSync(candidateTgz, bytes);
 
-			// 3. What does the tarball itself say its bin is? Read before the
-			// install, so a malformed candidate fails before bun touches it.
-			const rawDir = join(runDir, "raw");
-			mkdirSync(rawDir, { recursive: true });
-			const extract = await spawn(["tar", "-xzf", candidateTgz, "-C", rawDir]);
-			if (extract.code !== 0)
+			// 3. What does the tarball itself say its bin is? Member-only
+			// extraction to stdout: no candidate tree ever lands on the server.
+			const manifestRead = await spawn([
+				"tar",
+				"-xOzf",
+				candidateTgz,
+				"package/package.json",
+			]);
+			if (manifestRead.code !== 0)
 				throw new Error(
-					`candidate tarball extraction failed (exit ${extract.code}): ${extract.stderr.trim().slice(-500)}`,
+					`candidate manifest read failed (exit ${manifestRead.code}): ${manifestRead.stderr.trim().slice(-500)}`,
 				);
-			readBinRel(join(rawDir, "package", "package.json"));
+			const binRel = binRelFromManifest(
+				new TextDecoder().decode(manifestRead.stdout),
+			);
 
-			// 4. Install from the verified tarball: the guest gets a bun install
-			// tree, so the job runs `bun <cli>` with no network at job time.
+			// 4. Resolve the dependency graph — metadata only: bun writes the
+			// lockfile, never a node_modules tree, and no candidate-controlled
+			// code runs here. The install itself happens inside the guest.
+			const resolveDir = join(runDir, "resolution");
+			mkdirSync(resolveDir, { recursive: true });
+			writeFileSync(
+				join(resolveDir, "package.json"),
+				JSON.stringify({
+					name: "ottr-omp-probe",
+					private: true,
+					dependencies: { [PKG_NAME]: version },
+				}),
+			);
+			const lock = await spawn([
+				"bun",
+				"install",
+				"--lockfile-only",
+				"--ignore-scripts",
+				"--cwd",
+				resolveDir,
+			]);
+			if (lock.code !== 0)
+				throw new Error(
+					`candidate dependency resolution failed (exit ${lock.code}): ${lock.stderr.trim().slice(-500)}`,
+				);
+			const packages = lockPackagesFrom(
+				readFileSync(join(resolveDir, "bun.lock"), "utf8"),
+			);
+			if (packages.length === 0)
+				throw new Error(
+					"omp models probe: the dependency lockfile carries no packages",
+				);
+
+			// 5. Ship every package as integrity-verified bytes: the guest's
+			// install runs offline from these exact files, so no dependency
+			// tree ever exists on the server.
+			const registryDir = join(runDir, "payload", "registry");
+			mkdirSync(registryDir, { recursive: true });
+			const fileDeps: Record<string, string> = {};
+			for (const {
+				name,
+				version: depVersion,
+				integrity: lockIntegrity,
+			} of packages) {
+				const safe = name.replace(/[^A-Za-z0-9._-]/g, "_");
+				const relative = `registry/${safe}-${depVersion}.tgz`;
+				const target = join(runDir, "payload", relative);
+				if (name === PKG_NAME) {
+					// The candidate's bytes are already verified (step 2).
+					writeFileSync(target, candidateBytes);
+				} else {
+					const dist = await packumentDistFor(
+						name,
+						depVersion,
+						fetchImpl,
+						controller.signal,
+					);
+					const bytes = await downloadVerified(
+						dist.tarball,
+						dist.integrity ?? lockIntegrity,
+						`${name}@${depVersion}`,
+						fetchImpl,
+						controller.signal,
+					);
+					writeFileSync(target, bytes);
+				}
+				fileDeps[name] = `file:${relative}`;
+			}
+
+			// 6. The guest job installs the payload offline (inside the VM) and
+			// runs the wrapper: stamps the store, caps and compacts the
+			// candidate's stdout.
 			const pkgDir = join(runDir, "payload", "pkg");
 			mkdirSync(pkgDir, { recursive: true });
-			// 4. Install from the verified tarball: the guest gets a bun install
-			// tree, so the job runs `bun <cli>` with no network at job time.
-			// --ignore-scripts: the candidate and its dependency tree are
-			// untrusted, so no lifecycle hook of theirs ever executes on the
-			// server, and the spawn's env is the probeSpawnEnv allowlist.
 			writeFileSync(
 				join(pkgDir, "package.json"),
 				JSON.stringify({
 					name: "ottr-omp-probe",
 					private: true,
-					dependencies: { "@oh-my-pi/pi-coding-agent": version },
+					dependencies: fileDeps,
 				}),
 			);
-			const add = await spawn([
-				"bun",
-				"add",
-				"--ignore-scripts",
-				"--cwd",
-				pkgDir,
-				candidateTgz,
-			]);
-			if (add.code !== 0)
-				throw new Error(
-					`candidate install failed: ${add.stderr.trim().slice(-500)}`,
-				);
-			// The trusted wrapper: stamps the store, caps and compacts the
-			// candidate's stdout (probeJobArgv's bun entry runs it in the guest).
 			writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
 
 			// 5. Catalog context without secrets: the placeholder store drives the
@@ -616,16 +809,13 @@ export function createOmpProbeTransport(
 				"--directory",
 				join(runDir, "payload"),
 				"pkg",
+				"registry",
 				"store",
 			]);
 			if (pack.code !== 0)
 				throw new Error(
 					`candidate payload tar failed (exit ${pack.code}): ${pack.stderr.trim().slice(-500)}`,
 				);
-			// The installed tree is what the guest will run: re-read its bin and
-			// apply the same escape guard as the source read.
-			const binRel = readBinRel(join(pkgDir, PKG_PACKAGE_DIR, "package.json"));
-
 			// 7. Dispatch through /validate; the request carries no lists and no
 			// taskId, so the job gets nothing but the payload it packs. The
 			// deadline stays armed through the response body: fetch can return

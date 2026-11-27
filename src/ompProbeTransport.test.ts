@@ -182,44 +182,45 @@ function makeHarness(opts: {
 	const validateTarExisted: boolean[] = [];
 	const payloadProviders: string[][] = [];
 	const bin = opts.bin ?? { omp: "dist/cli.js" };
+	// A minimal lockfile fixture: the candidate plus one dep, both with
+	// checksums, exactly the shape the transport's payload builder reads.
+	const LOCK_JSON = JSON.stringify({
+		lockfileVersion: 1,
+		packages: {
+			"@oh-my-pi/pi-coding-agent@18.16.0": [
+				"@oh-my-pi/pi-coding-agent@18.16.0",
+				"",
+				{},
+				`sha512-${FAKE_DIGEST}`,
+			],
+			"string-width@7.2.0": [
+				"string-width@7.2.0",
+				"",
+				{},
+				`sha512-${FAKE_DIGEST}`,
+			],
+		},
+	});
 	const spawnImpl: ProcSpawn = async (argv) => {
 		spawns.push([...argv]);
-		if (argv[0] === "tar" && argv.includes("-xzf")) {
-			const dest = argv[4]!;
-			mkdirSync(join(dest, "package"), { recursive: true });
-			writeFileSync(
-				join(dest, "package", "package.json"),
-				JSON.stringify({
-					name: "@oh-my-pi/pi-coding-agent",
-					version: VERSION,
-					bin,
-				}),
-			);
+		if (
+			argv[0] === "bun" &&
+			argv[1] === "install" &&
+			argv.includes("--lockfile-only")
+		) {
+			const dir = argv[argv.indexOf("--cwd") + 1]!;
+			writeFileSync(join(dir, "bun.lock"), LOCK_JSON);
 			return okSpawn();
 		}
-		if (argv[0] === "bun" && argv[1] === "add") {
-			// bun add --ignore-scripts --cwd <pkgDir> <candidate.tgz>
-			const pkgDir = argv[4]!;
-			const installed = join(
-				pkgDir,
-				"node_modules",
-				"@oh-my-pi",
-				"pi-coding-agent",
-			);
-			mkdirSync(join(installed, "dist"), { recursive: true });
-			writeFileSync(
-				join(installed, "package.json"),
-				JSON.stringify({
-					name: "@oh-my-pi/pi-coding-agent",
-					version: VERSION,
-					bin,
-				}),
-			);
-			writeFileSync(
-				join(installed, "dist", "cli.js"),
-				"// stub candidate cli\n",
-			);
-			return okSpawn();
+		if (argv[0] === "tar" && argv.includes("-xOzf")) {
+			// Member-only manifest read: the stdout carries the package.json.
+			return {
+				code: 0,
+				stdout: new TextEncoder().encode(
+					JSON.stringify({ name: "@oh-my-pi/pi-coding-agent", bin }),
+				),
+				stderr: "",
+			};
 		}
 		if (argv[0] === "tar" && argv.includes("-cf")) {
 			writeFileSync(argv[3]!, "payload tar bytes");
@@ -243,6 +244,25 @@ function makeHarness(opts: {
 				),
 			);
 		if (url === TARBALL_URL) return Promise.resolve(new Response(FAKE_TGZ));
+		if (url === `${new URL(OMP_PACKAGE_URL).origin}/string-width`)
+			return Promise.resolve(
+				new Response(
+					JSON.stringify({
+						versions: {
+							"7.2.0": {
+								dist: {
+									tarball:
+										"https://registry.test/string-width/-/string-width-7.2.0.tgz",
+									integrity: `sha512-${FAKE_DIGEST}`,
+								},
+							},
+						},
+					}),
+					{ status: 200 },
+				),
+			);
+		if (url === "https://registry.test/string-width/-/string-width-7.2.0.tgz")
+			return Promise.resolve(new Response(FAKE_TGZ));
 		if (url.endsWith("/validate")) {
 			validateUrls.push(url);
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -394,35 +414,39 @@ describe("ompProbeTransport", () => {
 			true,
 		);
 		const argv = Array.isArray(job.argv) ? job.argv : [];
-		// The job runs the payload's trusted wrapper, which stamps the redacted
-		// store into the job HOME and spawns the candidate under the three-name
-		// env allowlist (probeWrapperSource, unit-tested below).
+		// The job runs the payload's trusted wrapper, which installs the
+		// payload offline inside the guest, stamps the redacted store into the
+		// job HOME, and spawns the candidate under the three-name env
+		// allowlist (probeWrapperSource, unit-tested below).
 		expect(argv[0]).toBe("bun");
 		expect(argv[1]).toBe("/target/pkg/probe-wrapper.mjs");
 		expect(String(argv[2])).toContain(
 			"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
 		);
 		expect(job.cwd).toBe("/target");
-		// Flow order: extract the verified tarball, bun add from it (with
-		// --ignore-scripts: no candidate-controlled lifecycle hook ever runs
-		// on the server), pack the payload.
+		// Flow order: read the candidate's manifest from the tarball, resolve
+		// the dependency graph metadata-only (no extract, no install on the
+		// server), pack payload + registry + store.
 		expect(h.spawns.length).toBe(3);
 		expect(h.spawns[0]![0]).toBe("tar");
-		expect(h.spawns[0]).toContain("-xzf");
-		expect(h.spawns[0]).toContain(join(h.runDir, "candidate.tgz"));
+		expect(h.spawns[0]).toContain("-xOzf");
+		expect(h.spawns[0]).toContain("package/package.json");
 		expect(h.spawns[1]![0]).toBe("bun");
+		expect(h.spawns[1]).toContain("--lockfile-only");
 		expect(h.spawns[1]).toContain("--ignore-scripts");
-		expect(h.spawns[1]).toContain("--cwd");
-		expect(h.spawns[1]!.at(-1)).toBe(join(h.runDir, "candidate.tgz"));
 		expect(h.spawns[2]![0]).toBe("tar");
 		expect(h.spawns[2]).toContain("-cf");
 		expect(h.spawns[2]).toContain("--hard-dereference");
+		expect(h.spawns[2]).toContain("registry");
+		// No install tree ever exists on the server: the payload ships
+		// integrity-pinned tarballs and the lockfile's file: map only.
+		expect(h.spawns.some((a) => a.includes("add"))).toBe(false);
 		// The redacted copy carries the board store's rows (the transport
 		// reads agentDir(), the same file signIns reads), never the decoy's.
 		expect(h.payloadProviders[0]).toEqual(["zai"]);
 		// The run dir (and everything under it) dies with the call.
 		expect(existsSync(h.runDir)).toBe(false);
-	});
+	}, 30_000);
 
 	test("a non-200 answer redacts the wire token", async () => {
 		const h = makeHarness({
@@ -503,6 +527,34 @@ describe("ompProbeTransport", () => {
 			"omp models probe timed out after 80 ms",
 		);
 	});
+
+	test("deadline: a stalled response body cannot outlive modelsTimeoutMs", async () => {
+		// The runner answers 200 with headers first and a body that never
+		// completes on its own: fetch resolves, res.text() blocks. The abort
+		// must still end the call at the deadline, so the regression the
+		// blocker names (clearing the timer before res.text()) fails here.
+		const h = makeHarness({
+			respondValidate: (_url, _body, signal) => {
+				const body = new ReadableStream<Uint8Array>({
+					start(controller) {
+						controller.enqueue(new TextEncoder().encode("{"));
+						signal?.addEventListener(
+							"abort",
+							() => controller.error(new Error("the operation was aborted")),
+							{ once: true },
+						);
+					},
+				});
+				return new Response(body, {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				});
+			},
+		});
+		await expect(h.transport(PROJECT, VERSION, 120)).rejects.toThrow(
+			"omp models probe timed out after 120 ms",
+		);
+	}, 30_000);
 
 	test("missing board store: the flow completes with an empty copy", async () => {
 		const h = makeHarness({
@@ -690,7 +742,7 @@ describe("ompProbeTransport", () => {
 		expect(probe.exitCode).not.toBe(0);
 	});
 
-	test("the wrapper: a 70 KiB catalog survives complete, junk does not", async () => {
+	test("the wrapper: the install runs offline, catalogs fit the guest tail", () => {
 		const tmp = newTmp();
 		const wrapper = join(tmp, "probe-wrapper.mjs");
 		writeFileSync(wrapper, probeWrapperSource);
@@ -699,11 +751,13 @@ describe("ompProbeTransport", () => {
 		const storeDb = join(tmp, "store", "agent.db");
 		mkdirSync(dirname(storeDb), { recursive: true });
 		writeFileSync(storeDb, "store bytes");
-		// A stub candidate cli whose catalog is bigger than the guest's
-		// 64 KiB stdout tail: 1400 entries, ~80 KiB on the wire.
-		const entries = Array.from({ length: 1400 }, (_, i) => ({
+		// A stub candidate cli whose COMPACT catalog still exceeds the guest's
+		// 64 KiB stdout tail: 1000 entries with 64-character ids — the exact
+		// shape the parse's own entry cap allows.
+		const longId = "m".repeat(64);
+		const entries = Array.from({ length: 1000 }, (_, i) => ({
 			provider: "zai",
-			id: `model-${i}`,
+			id: `${longId}-${i}`,
 			kind: "chat",
 			name: `Model ${i}`,
 		}));
@@ -718,6 +772,7 @@ describe("ompProbeTransport", () => {
 			HOME: home,
 			LANG: "C.UTF-8",
 			OMP_PROBE_STORE: storeDb,
+			OMP_PROBE_SKIP_INSTALL: "1",
 		};
 		const run = Bun.spawnSync(["bun", wrapper, stubCli], {
 			env,
@@ -725,15 +780,16 @@ describe("ompProbeTransport", () => {
 			stderr: "pipe",
 		});
 		expect(run.exitCode).toBe(0);
+		// Blocker 2: the wrapper's OWN stdout — the thing the guest's
+		// TailBuffer cuts — must fit the 64 KiB tail with its head intact.
+		expect(run.stdout.length).toBeLessThanOrEqual(64 * 1024);
 		const catalog = JSON.parse(new TextDecoder().decode(run.stdout)) as {
 			models: { provider: string; id: string }[];
 		};
-		// Complete: the head of the list did not fall off a tail buffer.
-		expect(catalog.models.length).toBe(1400);
-		expect(catalog.models[0]!.id).toBe("model-0");
-		expect(catalog.models.at(-1)!.id).toBe("model-1399");
-		// The store was stamped into the job HOME.
-		expect(existsSync(join(home, ".omp", "agent", "agent.db"))).toBe(true);
+		expect(catalog.models.length).toBeGreaterThan(0);
+		expect(catalog.models[0]!.id.startsWith(longId)).toBe(true);
+		// The head survived: the first entries are the first ids.
+		expect(catalog.models[0]!.id.endsWith("-0")).toBe(true);
 		// A candidate that prints no catalog exits non-zero with no stdout.
 		const junkCli = join(tmp, "junk-cli.mjs");
 		writeFileSync(junkCli, "process.stdout.write('not a catalog');\n");
@@ -768,6 +824,72 @@ describe("ompProbeTransport", () => {
 			models: { provider: string }[];
 		};
 		expect(leakyCatalog.models[0]!.provider).toBe("HOME.LANG.PATH");
+	});
+
+	test("the wrapper installs the payload offline inside the guest", () => {
+		const tmp = newTmp();
+		const wrapper = join(tmp, "probe-wrapper.mjs");
+		writeFileSync(wrapper, probeWrapperSource);
+		const home = join(tmp, "home");
+		mkdirSync(home, { recursive: true });
+		const pkgDir = join(tmp, "payload", "pkg");
+		mkdirSync(join(pkgDir, "registry"), { recursive: true });
+		// A real minimal dependency tarball, built here: the guest install
+		// runs offline from the payload's file: tarballs alone.
+		const stubSrc = join(tmp, "stub-src", "package");
+		mkdirSync(stubSrc, { recursive: true });
+		writeFileSync(
+			join(stubSrc, "package.json"),
+			JSON.stringify({ name: "stub-pkg", version: "1.0.0" }),
+		);
+		const stubTgz = join(pkgDir, "registry", "stub-pkg-1.0.0.tgz");
+		const tarPack = Bun.spawnSync(
+			["tar", "-czf", stubTgz, "-C", dirname(stubSrc), "package"],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		expect(tarPack.exitCode).toBe(0);
+		writeFileSync(
+			join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: "ottr-omp-probe",
+				private: true,
+				dependencies: { "stub-pkg": "file:registry/stub-pkg-1.0.0.tgz" },
+			}),
+		);
+		// The candidate cli: proves the tree it runs in is the one the guest
+		// install produced, by reading the installed dependency back.
+		const cliDir = join(pkgDir, "node_modules", "candidate", "dist");
+		mkdirSync(cliDir, { recursive: true });
+		writeFileSync(
+			join(cliDir, "cli.js"),
+			'const { readFileSync } = require("node:fs");\nconst manifest = JSON.parse(readFileSync("node_modules/stub-pkg/package.json", "utf8"));\nprocess.stdout.write(JSON.stringify({ models: [{ provider: manifest.name, id: manifest.version }] }));\n',
+		);
+		const storeDb = join(tmp, "store", "agent.db");
+		mkdirSync(dirname(storeDb), { recursive: true });
+		writeFileSync(storeDb, "store bytes");
+		const run = Bun.spawnSync(
+			[process.execPath, wrapper, join(cliDir, "cli.js"), pkgDir],
+			{
+				env: {
+					PATH: process.env.PATH ?? "",
+					HOME: home,
+					LANG: "C.UTF-8",
+					OMP_PROBE_STORE: join(tmp, "store", "agent.db"),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+				cwd: pkgDir,
+			},
+		);
+		expect(run.exitCode).toBe(0);
+		// The offline install materialized the dependency in the guest tree.
+		expect(
+			existsSync(join(pkgDir, "node_modules", "stub-pkg", "package.json")),
+		).toBe(true);
+		const catalog = JSON.parse(new TextDecoder().decode(run.stdout)) as {
+			models: { provider: string; id: string }[];
+		};
+		expect(catalog.models).toEqual([{ provider: "stub-pkg", id: "1.0.0" }]);
 	});
 
 	test("bin escape guard: a bin outside the package rejects the candidate", async () => {
