@@ -1091,8 +1091,7 @@ describe("stream line cap", () => {
 	// Fake omp: floods stdout with a newline-free 64 MiB line, then ends it and
 	// prints a normal event line. Validation #OTTR-1231 killed the guest at this
 	// shape with the unfixed accumulate-and-rescan reader. The flood is 16x the
-	// cap, so a reader that retains the whole line until its newline breaks the
-	// memory bound below, while streaming and after the run alike.
+	// cap. A separate test process keeps suite allocations out of its RSS samples.
 	const floodPath = join(dir, "flood-omp.js");
 	writeFileSync(
 		floodPath,
@@ -1102,45 +1101,96 @@ process.stdout.write("\\n");
 process.stdout.write('{"type":"after-flood"}\\n');`,
 	);
 
-	test("a newline-free stdout line over the cap settles with a drop notice, keeps the next line, and holds reader memory", async () => {
-		const url = start();
-		const bare = makeRemote("work");
-		const rssBefore = process.memoryUsage.rss();
-		// Peak RSS sampled while the flood streams: a reader that retains the whole
-		// line until its newline would spike here and shrink before the post-run
-		// sample, so the peak bounds the reader, not the leftovers. This observer
-		// needs real time — the guest pushes nothing to the response while it
-		// drains the flood, so no event in this process marks the flood's window.
-		let peak = rssBefore;
-		const sampler = setInterval(() => {
-			const rss = process.memoryUsage.rss();
-			if (rss > peak) peak = rss;
-		}, 50);
-		try {
-			const { lines, done } = await runTurn(url, {
-				gitUrl: bare,
-				branch: "work",
-				argv: [floodPath],
-			});
-			expect(done.exitCode).toBe(0);
-			expect(lines).toContain(lineDropNotice());
-			expect(lines).toContain('{"type":"after-flood"}');
-			expect(lines.some((l) => l.startsWith("a"))).toBe(false);
-			// Reader growth stays under the cap plus a margin (mirrors the worker
-			// stream cap test in workers.test.ts, with a wider margin: the peak
-			// sampled in a loaded suite carries allocator slop the post-run sample
-			// misses — measured 58 MiB in-suite). The bound sits at one raw
-			// byte-copy of the 64 MiB flood: a reader that retains the line holds
-			// the decoded UTF-16 text, twice that, so any retention fails it.
-			expect(peak - rssBefore).toBeLessThan(
-				MAX_STREAM_LINE_CHARS + 64 * 1024 * 1024,
-			);
-			const growth = process.memoryUsage.rss() - rssBefore;
-			expect(growth).toBeLessThan(MAX_STREAM_LINE_CHARS + 64 * 1024 * 1024);
-		} finally {
-			clearInterval(sampler);
-		}
-	}, 90_000);
+	const testName =
+		"a newline-free stdout line over the cap settles with a drop notice, keeps the next line, and holds reader memory";
+	// suiteEnv.ts preserves OTTR_TEST_* controls through its preload scrub.
+	const completed = "ottr-vmguest-stream-cap-child:passed";
+	const isolated = process.env.OTTR_TEST_VMGUEST_STREAM_CAP_CHILD === "1";
+	test(
+		testName,
+		async () => {
+			if (!isolated) {
+				const childTmp = fresh("stream-cap");
+				mkdirSync(childTmp);
+				const child = Bun.spawn(
+					[
+						process.execPath,
+						"test",
+						import.meta.path,
+						"--test-name-pattern",
+						`^stream line cap ${testName}$`,
+					],
+					{
+						env: {
+							...process.env,
+							TMPDIR: childTmp,
+							OTTR_TEST_VMGUEST_STREAM_CAP_CHILD: "1",
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+						timeout: 95_000,
+						killSignal: "SIGKILL",
+					},
+				);
+				try {
+					const [exitCode, stdout, stderr] = await Promise.all([
+						child.exited,
+						new Response(child.stdout).text(),
+						new Response(child.stderr).text(),
+					]);
+					expect(
+						exitCode,
+						`stream-cap child stdout:\n${stdout}\nstderr:\n${stderr}`,
+					).toBe(0);
+					expect(
+						stdout,
+						`stream-cap child stdout:\n${stdout}\nstderr:\n${stderr}`,
+					).toContain(completed);
+				} finally {
+					if (child.exitCode === null) child.kill("SIGKILL");
+					await child.exited;
+					rmSync(childTmp, { recursive: true, force: true });
+				}
+				return;
+			}
+			const url = start();
+			const bare = makeRemote("work");
+			const rssBefore = process.memoryUsage.rss();
+			// Peak RSS sampled while the flood streams: a reader that retains the whole
+			// line until its newline would spike here and shrink before the post-run
+			// sample, so the peak bounds the reader, not the leftovers. This observer
+			// needs real time — the guest pushes nothing to the response while it
+			// drains the flood, so no event in this process marks the flood's window.
+			let peak = rssBefore;
+			const sampler = setInterval(() => {
+				const rss = process.memoryUsage.rss();
+				if (rss > peak) peak = rss;
+			}, 50);
+			try {
+				const { lines, done } = await runTurn(url, {
+					gitUrl: bare,
+					branch: "work",
+					argv: [floodPath],
+				});
+				expect(done.exitCode).toBe(0);
+				expect(lines).toContain(lineDropNotice());
+				expect(lines).toContain('{"type":"after-flood"}');
+				expect(lines.some((l) => l.startsWith("a"))).toBe(false);
+				// Keep both peak and post-run growth below the same cap plus margin.
+				// String storage depends on the runtime, so this bounds observed RSS,
+				// not a presumed byte width for decoded ASCII.
+				expect(peak - rssBefore).toBeLessThan(
+					MAX_STREAM_LINE_CHARS + 64 * 1024 * 1024,
+				);
+				const growth = process.memoryUsage.rss() - rssBefore;
+				expect(growth).toBeLessThan(MAX_STREAM_LINE_CHARS + 64 * 1024 * 1024);
+				console.log(completed);
+			} finally {
+				clearInterval(sampler);
+			}
+		},
+		isolated ? 90_000 : 110_000,
+	);
 });
 
 describe("exec timeout", () => {
