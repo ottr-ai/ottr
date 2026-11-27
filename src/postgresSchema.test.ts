@@ -371,7 +371,7 @@ describe("PostgreSQL migration surface", () => {
 				const cardId = `${leadId}-run-${run.foreign ? "F" : "R"}-${run.createdAt}`;
 				run.results.forEach((outcome, order) => {
 					caseRows.push({
-						prompt: `Validation: #${leadId} ${outcome}${order > 0 ? ` repeat ${order}` : ""}`,
+						prompt: `Validation: #${leadId} ${outcome}${order > 0 ? `\nrepeat ${order}` : ""}`,
 						finding_order: (index + 1) * 10 + order,
 						card_id: cardId,
 						created_at: run.createdAt,

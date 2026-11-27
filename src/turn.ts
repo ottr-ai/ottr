@@ -158,6 +158,7 @@ import {
 	lastReviewBase,
 	leadBlocker,
 	leadValidationStartRefusal,
+	leadValidationOutcome,
 	mergeHold,
 	openWorkBlockers,
 	parseCheckVerdicts,
@@ -10096,17 +10097,30 @@ export function createTurnLoop(
 				leadBlocker(t.prompt).kind !== "sandbox"
 			)
 				continue;
-			const last = newest.get(t.id);
-			if (last === undefined || last.outcome !== "blocked") continue;
 			const full = await store.getTask(t.id);
 			if (full === null) continue;
+			// OTTR-1252 send-back 7: the outcome may live only in the details —
+			// the started-lead branch records there and keeps no findings, and
+			// the convergence waits on such leads (a blocked segment), so the
+			// reset must read them too or Validate now could never unlock the
+			// lead. Finding outcome first; the newest details segment answers
+			// for leads without one.
+			const last = newest.get(t.id);
+			const segment =
+				last === undefined ? leadValidationOutcome(full.details) : null;
+			if (last === undefined) {
+				if (segment !== "still blocked") continue;
+			} else if (last.outcome !== "blocked") {
+				continue;
+			}
 			// The settle's marker segment for the cleared run: from its last occurrence
 			// through the next `Validated by ` marker, or the end of the string. No
 			// marker leaves the details unchanged; an empty remainder stores null.
 			const text = full.details ?? "";
-			const start = text.lastIndexOf(
-				`\nValidated by validation run #${last.cardId}`,
-			);
+			const start =
+				last !== undefined
+					? text.lastIndexOf(`\nValidated by validation run #${last.cardId}`)
+					: text.lastIndexOf("\nValidated by ");
 			const patch: TaskPatch = { validatedAt: null };
 			if (start !== -1) {
 				const next = text.indexOf("\nValidated by ", start + 1);
@@ -10119,7 +10133,9 @@ export function createTurnLoop(
 			await appendLog(
 				store,
 				t.id,
-				`- validation result cleared for re-validation: was "still blocked" (validation run #${last.cardId})`,
+				last !== undefined
+					? `- validation result cleared for re-validation: was "still blocked" (validation run #${last.cardId})`
+					: `- validation result cleared for re-validation: was "still blocked" (recorded in the lead's details)`,
 			);
 			reset.push(t.id);
 		}

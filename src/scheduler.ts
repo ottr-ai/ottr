@@ -1745,30 +1745,28 @@ export function validationOutcomes(
  * applies answer rides its own marker in the prompt (`The user answered the
  * review's question`, written by the reply route), while a never-validated
  * lead, a still-blocked result, or an unanswered deployment result waits.
- * Details segments are deliberately NOT an outcome source here: a reset can
- * only act on recorded findings, so waiting on a details-only outcome would
- * lock work Validate now can never unlock (the send-back-7 drift class). A
- * validatedAt with no finding means the outcome was recorded through a path
- * that kept no findings (the started-lead details-only branch, later wiped
- * by a grill's details replacement) — the row stays decided, because
- * re-locking it would strand work that batching (validatedAt null) and the
- * reset (a blocked finding) can never unlock; a never-validated row waits:
- * for a lead, starting unvalidated work is the failure mode, and the
- * validate flows can still decide it later. Pure. */
+ * Details segments decide too (falling back behind the finding record):
+ * resetValidatedLeads reads them as well (OTTR-1252 send-back 7), so a
+ * waiting details-blocked lead stays unlockable by Validate now. A
+ * validatedAt with no readable outcome anywhere means the result was
+ * recorded through a path that kept no record and the text later went —
+ * the row stays decided, because re-locking it would strand work that
+ * batching (validatedAt null) and the reset can never unlock; a
+ * never-validated row waits: for a lead, starting unvalidated work is the
+ * failure mode, and the validate flows can still decide it later. Pure. */
 export function legacyLeadWaits(
 	prompt: string,
 	validatedAt: number | null,
+	details: string | null,
 	newestFindingOutcome: LeadFindingOutcome | null,
 ): boolean {
 	if (!prompt.startsWith("Needs validation")) return false;
 	if (prompt.includes("\nThe user answered the review's question"))
 		return false;
-	if (
-		newestFindingOutcome === "confirmed" ||
-		newestFindingOutcome === "refuted"
-	)
-		return false;
-	if (newestFindingOutcome !== null) return true;
+	const outcome =
+		newestFindingOutcome ?? leadValidationOutcome(details ?? null);
+	if (outcome === "confirmed" || outcome === "refuted") return false;
+	if (outcome !== null) return true;
 	return validatedAt === null;
 }
 

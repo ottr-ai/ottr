@@ -5,7 +5,6 @@ import {
 	type PostgresDatabase,
 } from "./postgresDriver.ts";
 import {
-	type LeadFindingOutcome,
 	legacyLeadWaits,
 	type ValidationOutcomeRow,
 	validationOutcomes,
@@ -317,12 +316,13 @@ export const projectMigrations: readonly PostgresMigration[] = [
 				{
 					id: string;
 					prompt: string;
+					details: string | null;
 					validated_at: number | null;
 					follow_up_of: string | null;
 				},
 				[]
 			>(
-				"SELECT id, prompt, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+				"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
 			)
 			.all();
 		const byReview = new Map<string, typeof legacy>();
@@ -339,6 +339,7 @@ export const projectMigrations: readonly PostgresMigration[] = [
 					legacyLeadWaits(
 						row.prompt,
 						row.validated_at,
+						row.details,
 						outcomes.get(row.id)?.outcome ?? null,
 					)
 				)
@@ -368,7 +369,7 @@ WHERE f.prompt LIKE 'Validation: #%'`;
 /** The database surface selectValidationOutcomeRows needs: both the SQLite
  * driver's Database and the PostgreSQL driver's Database satisfy it. */
 type OutcomeRowsDb = {
-	query<T, U>(sql: string): { all(): Promise<T[]> };
+	query<T>(sql: string): { all(): Promise<T[]> };
 };
 type ValidationOutcomeRowDb = {
 	prompt: string;
@@ -386,7 +387,7 @@ export async function selectValidationOutcomeRows(
 	db: OutcomeRowsDb,
 ): Promise<ValidationOutcomeRow[]> {
 	const rows = (await db
-		.query<ValidationOutcomeRowDb, []>(VALIDATION_OUTCOME_ROWS_SQL)
+		.query<ValidationOutcomeRowDb>(VALIDATION_OUTCOME_ROWS_SQL)
 		.all()) as ValidationOutcomeRowDb[];
 	return rows.map((row) => ({
 		prompt: row.prompt,

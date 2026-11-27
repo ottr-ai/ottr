@@ -31985,11 +31985,32 @@ describe("stored review findings", () => {
 			);
 			expect("error" in filed).toBe(false);
 			if ("error" in filed) throw new Error("no validation run filed");
-			batches.push([mkFinding(`Validation: #${lead.id} ${own}`)]);
+			// Send-back 7's weak-regression fix: the SETTLED run records the
+			// case's actual own-review results (duplicates included, evidence
+			// on a separate line), so the settle's first-result-per-lead
+			// selection is genuinely exercised — a settle that applied the
+			// last result instead of the first flips both one-run duplicate
+			// cases. Foreign runs stay on their own cards, which settlement
+			// never reads.
+			batches.push(
+				runs
+					.filter((run) => !run.foreign)
+					.flatMap((run) =>
+						run.results.map((outcome, order) =>
+							mkFinding(
+								`Validation: #${lead.id} ${outcome}${order > 0 ? `\nrepeat ${order}` : ""}`,
+							),
+						),
+					),
+			);
 			await loop.runTurn(store.name, filed.id);
 			const after = (await store.getTask(lead.id))!;
 			expect(after.waitsValidation).toBe(waits);
 			if (waits) expect(after.validatedAt).not.toBeNull();
+			// Drain the loop's async tails (the settle chain schedules) so no
+			// closed-store rejection leaks into a later test.
+			await loop.schedule();
+			await flushPromises();
 		},
 	);
 
@@ -32036,6 +32057,9 @@ describe("stored review findings", () => {
 				own === "blocked",
 			);
 			expect(own === "blocked").toBe(waits);
+			// Drain the loop's async tails like the settle test above.
+			await loop.schedule();
+			await flushPromises();
 		},
 	);
 
@@ -32090,6 +32114,49 @@ describe("stored review findings", () => {
 		expect(filed.reset).toEqual([lead.id]);
 		const run = (await store.getTask(filed.id))!;
 		expect(run.prompt).toContain(`#${lead.id}`);
+	});
+
+	// Send-back 7's second half: the details-only blocked lead — the outcome
+	// recorded by the started-lead branch, which keeps no findings. Its
+	// converged waiting form carries the preserved validatedAt and the details
+	// segment but no recorded finding, so a reset that read findings only
+	// would skip it and every filing would 409 (the drift that send-back 7
+	// fixed). The real filing path must clear the preserved stamp and file.
+	test("a details-only blocked lead resets through the real filing path", async () => {
+		const { store, projects, loop } = await validationCase(baseRecord());
+		const review = await doneReview(store, "details-only review");
+		const lead = await waitingLead(
+			store,
+			review.id,
+			"Needs validation: details-only blocker\nBlocker: sandbox run: control",
+		);
+		// The converged state: the migration kept the pre-migration stamp, and
+		// the only outcome record is the details segment — no findings anywhere.
+		await store.updateTask(lead.id, {
+			validatedAt: 900,
+			details:
+				"Unverified lead from review.\nValidated by validation run #old on 2026-11-20: still blocked — no retry control.",
+		});
+
+		const filed = await loop.filePendingValidationRun(
+			entryOf(projects, store),
+			review.id,
+			true,
+			{ before: Date.now() + 1 },
+		);
+		expect("error" in filed).toBe(false);
+		if ("error" in filed) throw new Error("no validation run filed");
+		// The details-only outcome reset the preserved stamp, and the batch
+		// carries the lead first.
+		const after = (await store.getTask(lead.id))!;
+		expect(after.validatedAt).toBeNull();
+		expect(after.details).not.toContain("still blocked");
+		expect(filed.reset).toEqual([lead.id]);
+		const run = (await store.getTask(filed.id))!;
+		expect(run.prompt).toContain(`#${lead.id}`);
+		// Drain the loop's async tails like the settle test above.
+		await loop.schedule();
+		await flushPromises();
 	});
 });
 

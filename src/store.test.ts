@@ -6952,14 +6952,15 @@ Validated by validation run #12 on 2026-11-23: still blocked — no retry contro
 		expect(grilled.stage).toBe("backlog");
 		expect(grilled.waitsValidation).toBe(false);
 		expect(grilled.validatedAt).toBe(900);
-		// Send-back 7's drift case: this lead's blocked outcome lives only in
-		// its details segment (the started-lead branch keeps no findings). The
-		// convergence leaves it decided backlog work — a reset can only act on
-		// recorded findings, so locking it here would strand it behind a
-		// Validate now that can never clear its validatedAt.
+		// Send-back 7's drift case, decided by the operator: this lead's blocked
+		// outcome lives only in its details segment (the started-lead branch
+		// keeps no findings), and resetValidatedLeads reads the details segment
+		// too — so the convergence moves it to the waiting form with its
+		// validatedAt preserved, and Validate now's scoped reset can still
+		// unlock it (the turn.test.ts regression proves the filing path).
 		const detailsOnly = (await store.getTask("detailsonly1"))!;
-		expect(detailsOnly.stage).toBe("backlog");
-		expect(detailsOnly.waitsValidation).toBe(false);
+		expect(detailsOnly.stage).toBe("todo");
+		expect(detailsOnly.waitsValidation).toBe(true);
 		expect(detailsOnly.validatedAt).toBe(955);
 		// The grill wiped the blocked lead's details too, but its recorded
 		// finding says blocked — undecided work that waits again, so a move to
@@ -7055,7 +7056,7 @@ Validated by validation run #12 on 2026-11-23: still blocked — no retry contro
 				);
 				for (const [resultIndex, outcome] of run.results.entries())
 					raw.exec(
-						`INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('${cardId}', 'Validation: #lead1 ${outcome}${resultIndex > 0 ? ` — repeat ${resultIndex}` : ""}', ${run.createdAt + resultIndex})`,
+						`INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('${cardId}', 'Validation: #lead1 ${outcome}${resultIndex > 0 ? `\nrepeat ${resultIndex}` : ""}', ${run.createdAt + resultIndex})`,
 					);
 			}
 			raw.close();

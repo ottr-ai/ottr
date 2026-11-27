@@ -2876,12 +2876,13 @@ export class ProjectStore {
 							{
 								id: string;
 								prompt: string;
+								details: string | null;
 								validated_at: number | null;
 								follow_up_of: string | null;
 							},
 							[]
 						>(
-							"SELECT id, prompt, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
+							"SELECT id, prompt, details, validated_at, follow_up_of FROM tasks WHERE stage = 'backlog' AND cancelled_at IS NULL AND prompt LIKE 'Needs validation%' AND prompt NOT LIKE '%The user answered the review%'",
 						)
 						.all();
 					const byReview = new Map<string, typeof legacy>();
@@ -2898,6 +2899,7 @@ export class ProjectStore {
 								legacyLeadWaits(
 									row.prompt,
 									row.validated_at,
+									row.details,
 									outcomes.get(row.id)?.outcome ?? null,
 								)
 							)

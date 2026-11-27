@@ -3573,8 +3573,6 @@ describe("OTTR-1252: a lead waiting for its review's validation never runs and n
 describe("OTTR-1252: the legacy-lead convergence decision reads the newest outcome", () => {
 	const BLOCKED =
 		"\nValidated by validation run #10 on 2026-11-21: still blocked — no retry control.";
-	const CONFIRMED =
-		"\nValidated by validation run #9 on 2026-11-20: confirmed.";
 	const DEPLOYMENT =
 		"\nValidated by validation run #11 on 2026-11-22: deployment — Which proxy terminates TLS?";
 	const CONFIRMED_WITH_EVIDENCE =
@@ -3603,30 +3601,40 @@ describe("OTTR-1252: the legacy-lead convergence decision reads the newest outco
 
 	test("legacyLeadWaits waits for undecided rows and keeps decided rows", () => {
 		const prompt = "Needs validation: suspicious retry loop";
+		const blockedDetails =
+			"Unverified lead.\nValidated by validation run #10 on 2026-11-21: still blocked — no retry control.";
+		const confirmedDetails =
+			"Unverified lead.\nValidated by validation run #9 on 2026-11-20: confirmed.";
 		// Undecided: never validated, a blocked finding, an unanswered
-		// deployment finding.
-		expect(legacyLeadWaits(prompt, null, null)).toBe(true);
-		expect(legacyLeadWaits(prompt, 950, "blocked")).toBe(true);
-		expect(legacyLeadWaits(prompt, 960, "deployment")).toBe(true);
-		// Decided: confirmed work, a refuted lead, and the operator's applies
-		// answer (its marker rides the prompt, set by the reply route).
-		expect(legacyLeadWaits(prompt, 900, "confirmed")).toBe(false);
+		// deployment finding, and a blocked details segment (the reset reads
+		// the segment too, so waiting stays unlockable — send-back 7).
+		expect(legacyLeadWaits(prompt, null, null, null)).toBe(true);
+		expect(legacyLeadWaits(prompt, 950, null, "blocked")).toBe(true);
+		expect(legacyLeadWaits(prompt, 960, null, "deployment")).toBe(true);
+		expect(legacyLeadWaits(prompt, 950, blockedDetails, null)).toBe(true);
+		// Decided: confirmed work (finding or details), a refuted lead, and
+		// the operator's applies answer (its marker rides the prompt, set by
+		// the reply route).
+		expect(legacyLeadWaits(prompt, 900, null, "confirmed")).toBe(false);
+		expect(legacyLeadWaits(prompt, 900, confirmedDetails, null)).toBe(false);
 		expect(
 			legacyLeadWaits(
 				`${prompt}\n\nThe user answered the review's question: Applies`,
 				900,
-				"blocked",
+				null,
+				null,
 			),
 		).toBe(false);
-		// A validatedAt with no finding at all is decided: the outcome was
-		// recorded through the started-lead branch, which keeps no findings,
-		// and a later grill wiped the segment — re-locking the row would
-		// strand work no route can unlock.
-		expect(legacyLeadWaits(prompt, 900, null)).toBe(false);
+		// A validatedAt with no readable outcome anywhere is decided: the
+		// outcome was recorded through the started-lead branch, which keeps no
+		// findings, and a later grill wiped the segment — re-locking the row
+		// would strand work no route can unlock.
+		expect(legacyLeadWaits(prompt, 900, null, null)).toBe(false);
 		// Not a lead: the question cards' prefix carries the hyphen.
 		expect(
 			legacyLeadWaits(
 				"Needs-validation lead questions from rev1: reply",
+				null,
 				null,
 				null,
 			),
