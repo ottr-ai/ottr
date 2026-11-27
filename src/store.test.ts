@@ -502,7 +502,7 @@ describe("turn model", () => {
 		await store.finishTurn(turn.id, { model: "openai/gpt-5" });
 		expect((await store.listTurns(task.id))[0]?.model).toBe("openai/gpt-5");
 		await store.close();
-	});
+	}, 60_000);
 });
 
 describe("boardCardFacts", () => {

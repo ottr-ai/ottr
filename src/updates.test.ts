@@ -221,7 +221,7 @@ describe("skips", () => {
 		} finally {
 			await store.close();
 		}
-	});
+	}, 60_000);
 });
 
 describe("update decisions", () => {

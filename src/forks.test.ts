@@ -2164,6 +2164,7 @@ describe("watcher", () => {
 		});
 	}
 
+	// Allow fixture setup to finish before Bun interrupts live Git commands.
 	for (const changed of [
 		"none",
 		"branch",
@@ -2288,7 +2289,7 @@ describe("watcher", () => {
 				(await store.listForkBranches(1)).find((row) => row.branchHash === bh)!
 					.head,
 			).toBe(changed === "branch" ? replacement : head);
-		});
+		}, 60_000);
 	}
 
 	for (const holdPrs of ["[]", "[5]"] as const) {

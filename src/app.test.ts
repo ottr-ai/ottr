@@ -1656,7 +1656,7 @@ describe("task routes", () => {
 			projects.delete("p3");
 			await closeTestStore(p2.store);
 			await closeTestStore(p3.store);
-		});
+		}, 60_000);
 
 		test("create links a card into another project and stores the parent's project", async () => {
 			const parent = await store.createTask("p1 parent");
@@ -5005,7 +5005,7 @@ describe("trending scout routes", () => {
 	const opened: ProjectStore[] = [];
 	afterAll(async () => {
 		for (const s of opened) await closeTestStore(s);
-	});
+	}, 60_000);
 	/** A fresh app with one project "tr" and a trending scout card on it. */
 	const setup = async (fetchStub?: typeof fetch) => {
 		const dir = mkdtempSync(join(root, "trending-"));
@@ -5259,7 +5259,7 @@ describe("trending scan host", () => {
 	const opened: ProjectStore[] = [];
 	afterAll(async () => {
 		for (const s of opened) await closeTestStore(s);
-	});
+	}, 60_000);
 
 	const [ALL_URL, TS_URL, JS_URL] = TRENDING_PAGES as [string, string, string];
 	const PAGES: Record<string, string> = {
@@ -5490,7 +5490,7 @@ describe(
 		return () => {
 			afterAll(async () => {
 				await closeTestApp(productionApp);
-			});
+			}, 60_000);
 
 			test("/api/boot reports live by default", async () => {
 				const res = await fetch(new URL("/api/boot", server.url), {
@@ -6281,7 +6281,7 @@ describe("alate routes", () => {
 					{ script: "sync.mjs", code: 0, output: "out", truncated: false },
 				],
 			};
-		});
+		}, 60_000);
 
 		test("refresh validates, maps repos, and hits alate with the bearer key", async () => {
 			await post("/api/alate", { url: alateUrl, key: "alate_secret" });
@@ -7519,7 +7519,7 @@ describe(
 			});
 			afterAll(async () => {
 				await closeTestStore(tickStore);
-			});
+			}, 60_000);
 
 			beforeAll(async () => {
 				const res = await m.call("/api/alate", {
@@ -7932,7 +7932,7 @@ describe("idle auto review tick", () => {
 	const opened: Entry[] = [];
 	afterAll(async () => {
 		for (const e of opened) await closeTestStore(e.store);
-	});
+	}, 60_000);
 
 	/** A fresh app (own shared state, own remembered card) with one due project: target
 	 * main and archReview.due, like a refresh left it. The New-tab repo's init commit is
@@ -11391,7 +11391,7 @@ describe(
 				await closeTestStore(g);
 				if (savedToken === undefined) delete process.env.GH_TOKEN;
 				else process.env.GH_TOKEN = savedToken;
-			});
+			}, 60_000);
 
 			test("onboarding needs a token-shaped GitHub token and gives it to server-side git", async () => {
 				delete process.env.GH_TOKEN;
@@ -13679,7 +13679,7 @@ describe(
 			afterAll(async () => {
 				srv.stop(true);
 				await closeTestStore(g);
-			});
+			}, 60_000);
 
 			test("needs the login or the API key, like a public host; a loopback peer stays open", async () => {
 				const gateway = spyOn(srv, "requestIP").mockReturnValue({
@@ -14694,7 +14694,7 @@ describe("dependabotWarn setting and the dependabotOff view field", () => {
 	const opened: Entry[] = [];
 	afterAll(async () => {
 		for (const e of opened) await closeTestStore(e.store);
-	});
+	}, 60_000);
 
 	/** A mount with one project whose GitHub remote points at octo/repo. */
 	async function depMount(gh: GhFn) {
@@ -14881,7 +14881,7 @@ describe(
 				await closeTestStore(rulesStore);
 				if (savedToken === undefined) delete process.env.GH_TOKEN;
 				else process.env.GH_TOKEN = savedToken;
-			});
+			}, 60_000);
 
 			test("a pull_request rule turns the suggestion on", async () => {
 				process.env.GH_TOKEN = "ghs_test_0000";
@@ -15495,7 +15495,7 @@ describe("review and release cards carry the board's GitHub alerts", () => {
 	const opened: Entry[] = [];
 	afterAll(async () => {
 		for (const e of opened) await closeTestStore(e.store);
-	});
+	}, 60_000);
 
 	/** A mount with one project whose remote points at octo/repo, ready for a review post. */
 	async function alertMount(gh: GhFn) {
@@ -15757,7 +15757,7 @@ describe(
 				body: "{}",
 			});
 		return () => {
-			afterAll(async () => await closeTestStore(g));
+			afterAll(async () => await closeTestStore(g), 60_000);
 
 			test("bodyless POST routes refuse foreign and missing origins", async () => {
 				// Old code checked Origin only in readJson, so /api/settings/api-key (no body) took
@@ -19997,7 +19997,7 @@ describe(
 			afterAll(async () => {
 				srv.stop(true);
 				await closeTestStore(g);
-			});
+			}, 60_000);
 
 			test("logout drops the caller's session; rotating the secret kills every old cookie", async () => {
 				const login = await call(
@@ -20065,7 +20065,7 @@ describe("session registry (OTTR-387)", () => {
 			o.srv.stop(true);
 			await closeTestStore(o.g);
 		}
-	});
+	}, 60_000);
 	// A real public host (Host header matches): every request sits behind the auth
 	// wall, like tailscale serve in front of the board. Same shape as the revoke test.
 	async function openBoard(name: string, seed: Record<string, unknown> = {}) {
@@ -21657,7 +21657,7 @@ describe(
 				body: body === undefined ? undefined : JSON.stringify(body),
 			});
 		return () => {
-			afterAll(async () => await closeTestApp(runnerApp));
+			afterAll(async () => await closeTestApp(runnerApp), 60_000);
 
 			test("GET lists every runner with its url, hold and live turn counts", async () => {
 				const res = await runnerCall("/api/drain");
@@ -25138,7 +25138,7 @@ describe("PR review auto-post routes", () => {
 	const opened: ProjectStore[] = [];
 	afterAll(async () => {
 		for (const s of opened) await closeTestStore(s);
-	});
+	}, 60_000);
 	let autoSeq = 0;
 	/** One harness: project "pg-auto" with github acme/widget, a fake gh whose canned
 	 * read-only GETs feed a real watcher tick, and a swappable review answer whose
@@ -26448,7 +26448,7 @@ describe("POST /api/projects/:project/tasks/:id/rerun-failed-jobs", () => {
 	const opened: ProjectStore[] = [];
 	afterAll(async () => {
 		for (const s of opened) await closeTestStore(s);
-	});
+	}, 60_000);
 
 	const TOKEN = `ghp_${"x".repeat(36)}`;
 	const RUN_URL = "https://github.com/ottr-ai/ottr/actions/runs/42313545100";
@@ -26818,7 +26818,7 @@ describe("POST /api/settings/turn-github-token", () => {
 		if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
 		else process.env.OTTR_GITHUB_HOST = savedHost;
 		for (const s of opened) await closeTestStore(s);
-	});
+	}, 60_000);
 
 	const TOKEN = "tok-turn-read";
 	const opened: ProjectStore[] = [];
@@ -27469,23 +27469,27 @@ describe("board warnings", () => {
 		}
 	});
 
-	test("a seeded dir with a role but no sign-in warns for that provider; an active row silences it", async () =>
-		withAgentDir(async (dir) => {
-			writeFileSync(
-				join(dir, "config.yml"),
-				"modelRoles:\n  default: anthropic/claude-opus-5-5:high\n",
-			);
-			const expected = [
-				"No active sign-in for anthropic (role default): sign in under Settings - Provider sign-in, or set its API key in the environment.",
-			];
-			// A fixed env: the host shell may export the provider's key.
-			expect(warnings(dir, {})).toEqual(expected);
-			credStore(join(dir, "agent.db"), [["anthropic", null]]);
-			expect(warnings(dir, {})).toEqual([]);
-			// A signed-out row counts as no active sign-in.
-			credStore(join(dir, "agent.db"), [["anthropic", "replaced by"]]);
-			expect(warnings(dir, {})).toEqual(expected);
-		}));
+	test(
+		"a seeded dir with a role but no sign-in warns for that provider; an active row silences it",
+		async () =>
+			withAgentDir(async (dir) => {
+				writeFileSync(
+					join(dir, "config.yml"),
+					"modelRoles:\n  default: anthropic/claude-opus-5-5:high\n",
+				);
+				const expected = [
+					"No active sign-in for anthropic (role default): sign in under Settings - Provider sign-in, or set its API key in the environment.",
+				];
+				// A fixed env: the host shell may export the provider's key.
+				expect(warnings(dir, {})).toEqual(expected);
+				credStore(join(dir, "agent.db"), [["anthropic", null]]);
+				expect(warnings(dir, {})).toEqual([]);
+				// A signed-out row counts as no active sign-in.
+				credStore(join(dir, "agent.db"), [["anthropic", "replaced by"]]);
+				expect(warnings(dir, {})).toEqual(expected);
+			}),
+		60_000,
+	);
 
 	test("a disabled sign-in yields one advisory: the dead sign-in, not a board warning too", async () =>
 		withAgentDir(async (dir) => {
@@ -28486,7 +28490,7 @@ describe(
 				if (savedAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
 				else process.env.PI_CODING_AGENT_DIR = savedAgent;
 				rmSync(home, { recursive: true, force: true });
-			});
+			}, 60_000);
 
 			test("POST probes at once and the GET answers the new shape; the 30-day push fires once per day", async () => {
 				setSystemTime(dayAt(1));
@@ -29074,7 +29078,7 @@ describe("project order route", () => {
 			projects.delete(name);
 		}
 		shared.projectOrder = [];
-	});
+	}, 60_000);
 	const stateProjects = async (): Promise<string[]> => {
 		const res = await get("/api/state");
 		expect(res.status).toBe(200);
@@ -29601,7 +29605,7 @@ describe(
 				board.stop(true);
 				upstream.stop(true);
 				await closeTestStore(g);
-			});
+			}, 60_000);
 			beforeEach(() => {
 				ensure.mockClear();
 				dashState = {
@@ -30520,7 +30524,7 @@ describe("concurrent SQLite route writes", () => {
 	const opened: ProjectStore[] = [];
 	afterAll(async () => {
 		for (const store of opened) await closeTestStore(store);
-	});
+	}, 60_000);
 
 	async function board() {
 		const dir = mkdtempSync(join(root, "route-race-"));

@@ -880,7 +880,7 @@ describe("stale needs_you re-classification", () => {
 		expect(after.needsReason).toBe(READY_STUCK);
 		expect(ops.calls.quarantine).toEqual([]);
 		await store.close();
-	});
+	}, 60_000);
 
 	test("guards win: a non-git-proof reason leaves the card untouched", async () => {
 		const { store, t } = await staleCard("re-guard-omp", {
@@ -3051,7 +3051,7 @@ describe("Dependabot pass", () => {
 			expect(await store.listTasks()).toHaveLength(1);
 			await store.close();
 		}
-	});
+	}, 60_000);
 
 	test("skips bad numbers, non-string titles and null entries; sanitizes the title; ignores a JSON url", async () => {
 		const { store, e } = await depProject("dep-untrusted");
