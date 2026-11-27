@@ -146,6 +146,9 @@ function seedRuleData(dir: string): string {
 		join(dir, "rule-ok.md"),
 		"---\nname: sync-gate-probe\ndescription: probe rule\n---\n\n# changed probe rule body\n",
 	);
+	// Both rules change on the branch, so both enter the diff-based hash set and
+	// the acceptance can pin each one's outcome against the deployed script.
+	writeFileSync(join(dir, "rule-bad.md"), "# still no frontmatter here\n");
 	sh("git add -A && git commit -qm card", dir);
 	return base;
 }
@@ -496,7 +499,7 @@ describe("real sync.mjs acceptance", () => {
 				),
 			);
 			expect(byPath.get("rule-bad.md")?.sourceSha256).toBe(
-				shaOf("# no frontmatter here\n"),
+				shaOf("# still no frontmatter here\n"),
 			);
 			// The deployed script rejects frontmatter-less files: nothing installs to
 			// the rule twin location for rule-bad.md.
