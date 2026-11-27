@@ -664,8 +664,8 @@ describe("worktree hardening against planted config (real omp)", () => {
 		() => {
 			// Decisive but slow: two real omp boots over a planted worktree. The second
 			// drops the hardening args, so the test notices if the flags ever stop doing
-			// anything. The bogus model makes both boots die at startup, right after
-			// discovery, so no provider is ever called.
+			// anything. The bogus model rejects after discovery, before a provider call.
+			// Wait for MCP connections to settle so that rejection cannot race the marker.
 			const dir = mkdtempSync(join(tmpdir(), "ottr-plant-"));
 			const home = mkdtempSync(join(tmpdir(), "ottr-plant-home-"));
 			try {
@@ -693,12 +693,16 @@ export default {};`,
 						},
 					}),
 				);
+				const startupConfig = join(home, "startup.yml");
+				writeFileSync(startupConfig, "mcp:\n  startupTimeoutMs: 0\n");
 				const args = [
 					...buildOmpArgs({
 						sessionDir: join(dir, "sessions"),
 						extensionPath: null,
 						resumeId: null,
 					}),
+					"--config",
+					startupConfig,
 					"--model",
 					"ottr-no-such-provider/no-such-model",
 				];
@@ -708,28 +712,37 @@ export default {};`,
 						cwd: dir,
 						env,
 						stdin: new Response("hi\n"),
-						timeout: 120_000,
+						timeout: 20_000,
 					});
+				const diagnostics = (
+					label: string,
+					result: Bun.SyncSubprocess<"pipe", "pipe">,
+				) =>
+					`${label}: exitCode=${result.exitCode}, signal=${result.signalCode}, timedOut=${result.exitedDueToTimeout}\nstdout:\n${result.stdout.toString()}\nstderr:\n${result.stderr.toString()}`;
 
 				const hardened = spawn(args);
-				expect(existsSync(extMarker)).toBe(false);
-				expect(existsSync(mcpMarker)).toBe(false);
-				// A null exitCode means the timeout killed the boot, not the model check.
-				expect(hardened.exitCode).not.toBe(null);
-				expect(hardened.exitCode).not.toBe(0);
+				const hardenedDetails = diagnostics("hardened", hardened);
+				expect(existsSync(extMarker), hardenedDetails).toBe(false);
+				expect(existsSync(mcpMarker), hardenedDetails).toBe(false);
+				expect(hardened.exitedDueToTimeout, hardenedDetails).not.toBe(true);
+				expect(hardened.exitCode, hardenedDetails).not.toBe(null);
+				expect(hardened.exitCode, hardenedDetails).not.toBe(0);
 
 				const control = spawn(
 					args.filter(
-						(a) =>
+						(a, index) =>
 							a !== "--no-extensions" &&
 							a !== "--no-lsp" &&
-							a !== "--config" &&
+							!(a === "--config" && args[index + 1] === NO_DISCOVERY_CONFIG) &&
 							a !== NO_DISCOVERY_CONFIG,
 					),
 				);
-				expect(existsSync(extMarker)).toBe(true);
-				expect(existsSync(mcpMarker)).toBe(true);
-				expect(control.exitCode).not.toBe(null);
+				const controlDetails = diagnostics("positive control", control);
+				expect(existsSync(extMarker), controlDetails).toBe(true);
+				expect(existsSync(mcpMarker), controlDetails).toBe(true);
+				expect(control.exitedDueToTimeout, controlDetails).not.toBe(true);
+				expect(control.exitCode, controlDetails).not.toBe(null);
+				expect(control.exitCode, controlDetails).not.toBe(0);
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 				rmSync(home, { recursive: true, force: true });
