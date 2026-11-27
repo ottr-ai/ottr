@@ -63,13 +63,27 @@ await seedDemo(root, false, stateDir);
 const db = new Database(join(root, PROJECT, ".tasks", "tasks.db"));
 const ids: Record<string, string | undefined> = {};
 let n = 901;
+// Fixture keys stay internal; the titles are what the shots render.
+const TITLES: Record<string, string> = {
+	targetDone: "Rate limit the public API endpoints",
+	targetPartial: "Extract the retry helper out of src/http.ts",
+	targetInfo: "Measure the queue depths for the record",
+	targetPending: "Split the config loader into modules",
+};
 for (const key of [
 	"targetDone",
 	"targetPartial",
 	"targetInfo",
 	"targetPending",
 ]) {
-	const seed = insertTaskRow(db, LUMEN, spec(key), n, now, `LUM-${n}`);
+	const seed = insertTaskRow(
+		db,
+		LUMEN,
+		spec(TITLES[key] ?? key),
+		n,
+		now,
+		`LUM-${n}`,
+	);
 	ids[key] = seed.id;
 	seedTaskEvents(db, seed);
 	n++;
@@ -145,13 +159,14 @@ db.query(
 ).run(JSON.stringify(n + 1));
 db.close();
 
-// Older-than-the-plants stamp: done cards land after it, so they stay unread.
+// Older-than-every-plant stamp: the cards' doneAt sits two days back, so the
+// stamp must predate it or the board counts them read and never pins them.
 const gdb = new Database(join(stateDir, ".tasks", "tracker.db"));
 gdb
 	.query(
 		"INSERT INTO kv (key, value) VALUES ('seen_done_since', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 	)
-	.run(JSON.stringify(now - 24 * HOUR));
+	.run(JSON.stringify(now - 30 * 24 * HOUR));
 gdb.close();
 
 const chromePath = findChrome("sweep-shot");
@@ -191,7 +206,8 @@ const chrome = Bun.spawn(
 		"--disable-dev-shm-usage",
 		"--hide-scrollbars",
 		`--window-size=${WIDTH},${HEIGHT}`,
-		...(typeof process.getuid === "function" && process.getuid() === 0
+		...(typeof process.getuid === "function" &&
+		(process.getuid() === 0 || process.env.OTTR_SHOT_NO_SANDBOX === "1")
 			? ["--no-sandbox"]
 			: []),
 		"about:blank",
@@ -322,8 +338,31 @@ async function capture(): Promise<void> {
 			result && typeof result === "object" && "value" in result
 				? result.value
 				: undefined;
-		if (value !== true)
-			fail("sweep-shot", `the ${view.name} view misses "${view.probe}"`);
+		if (value !== true) {
+			const text = await withTimeout(
+				client.send(
+					"Runtime.evaluate",
+					{
+						returnByValue: true,
+						expression:
+							"document.body.innerText.slice(0, 600).replace(/\\s+/g, ' ')",
+					},
+					sessionId,
+				),
+				10_000,
+				`the ${view.name} text probe`,
+			);
+			const seen =
+				text?.result &&
+				typeof text.result === "object" &&
+				"value" in text.result
+					? text.result.value
+					: "";
+			fail(
+				"sweep-shot",
+				`the ${view.name} view misses "${view.probe}" — page reads: ${String(seen)}`,
+			);
+		}
 		const shot = await withTimeout(
 			client.send("Page.captureScreenshot", { format: "png" }, sessionId),
 			15_000,

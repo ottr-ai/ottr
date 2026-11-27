@@ -12001,7 +12001,9 @@ function DrawerSweep(p: {
 						</ul>
 						{sweep.pending > 0 && (
 							<p className="sweep-pending" role="status">
-								{sweep.pending} more cards continue in the next sweep run.
+								{sweep.pending} more card
+								{sweep.pending === 1 ? "" : "s"} continue
+								{sweep.pending === 1 ? "s" : ""} in the next sweep run.
 							</p>
 						)}
 						{error !== null && (

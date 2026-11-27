@@ -167,7 +167,9 @@ extension (it loads standalone) and mirrors the prompt's contract section.
   preselected), verdict tag, evidence (pre-wrap), draft count. Stale rows: checkbox
   disabled, a `Stale` tag, never preselected. "Apply selected" busy button posts the
   checked rows to the apply route and refetches the detail and the state; disabled
-  while nothing is checked or a post is in flight.
+  while nothing is checked or a post is in flight. A `pending` count above 0 renders
+  one line, singular-aware ("1 more card continues in the next sweep run.", "N more
+  cards continue in the next sweep run.").
 - No change to research card pins, the drawer's per-card buttons, or the seen-mark
   rules (research-inbox.md decisions stay).
 

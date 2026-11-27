@@ -1698,6 +1698,15 @@ describe("Inbox sweep (OTTR-1259)", () => {
 		expect(withPending).toContain(
 			"2 more cards continue in the next sweep run.",
 		);
+		const onePending = renderToStaticMarkup(
+			<Drawer
+				{...drawerBase}
+				task={sweepCard(sweepView(sweepRows().slice(0, 1), 1))}
+			/>,
+		);
+		expect(onePending).toContain(
+			"1 more card continues in the next sweep run.",
+		);
 		const withoutPending = renderToStaticMarkup(
 			<Drawer
 				{...drawerBase}
