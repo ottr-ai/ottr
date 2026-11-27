@@ -3888,6 +3888,9 @@ export async function createApp(deps: AppDeps) {
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
 		signIns: activeSignInProviders,
+		// probeTransport stays unwired: the candidate probe must run inside the worker/VM
+		// isolation (OTTR-1287 security review), never on this server host. The watch
+		// files normal 7-day bump cards until the transport lands.
 	});
 
 	/**

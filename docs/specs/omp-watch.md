@@ -89,19 +89,23 @@ a release that adds model access files its bump card at once, at priority P1. Mo
 omp 19.1.1 (2026-11-23) added gpt-6.2-sol and gpt-6.2-astra for openai-codex, and the age
 gate would have held the board's access to them until 2026-11-30. The operator filed the
 bump card by hand (OTTR-1286). A static search of the package text finds no model ids, so
-the model set comes from running omp itself.
+the model set comes from running omp itself. On 2026-11-27 the user decided the probe may
+run only inside the worker/VM isolation (below): a same-UID run on the server host is not
+an acceptable boundary for unapproved code.
 
 ### The model set of one version
 
-- When a review ends with `pass`, the watcher runs that version's model list and stores
-  the set. The command is `bunx @oh-my-pi/pi-coding-agent@<version> models --json`: an
-  isolated install of that exact version. The reviewed version is unapproved code, so the
-  run gets its own sandbox, not the review's env: a throwaway HOME doubles as the working
-  directory, and the env is a whitelist that carries no identity, credential or board
-  configuration (no agent.db, no OAuth state, no SSH agent, no GitHub token). Only the
-  immutable package cache is shared across runs. `OMP_WATCH_GATES.modelsTimeoutMs`
-  (180 s) bounds the run. A failed review never runs it: a failed version can never be
-  the target.
+- The user decided on 2026-11-27 (OTTR-1287 security review): the candidate is unapproved
+  code, so it never executes on the server host. The probe runs only through
+  `deps.probeTransport`, inside the worker or VM isolation the board uses for untrusted
+  code (docs/WORKERS.md). The server wiring passes no transport yet: until the transport
+  lands, no candidate omp executes, the watch records no model sets, and it files normal
+  7-day bump cards only. `modelSet` returns null without one; a wired transport that
+  fails or returns unusable output only loses the fast track (below). `modelsTimeoutMs`
+  bounds one transport run.
+- When a review ends with `pass`, the watcher asks the transport for that version's model
+  list and stores the set. The transport runs `omp models --json` for that exact version
+  on the worker. A failed review never probes: a failed version can never be the target.
 - The output is untrusted data. `parseModelSet` accepts only a JSON object whose `models`
   value is an array. Each entry needs a provider id that matches `PROVIDER_ID`
   (`src/login.ts`) and a model id in the strict segment grammar: 1 to 3 non-empty
@@ -125,10 +129,11 @@ the model set comes from running omp itself.
 ### The fast track
 
 - The baseline is the live version's set: the model set of the pin. The watcher records
-  it with the same command and the same sandbox, under the current credential context,
-  once per pin. `backfillModelSets` fills the pin's set and the sets of passed releases
-  above the pin that lack one (a review that predates this change, or a first run that
-  failed). It runs at most `modelsPerTick` (5) model lists per tick.
+  it through the same transport, under the current credential context, once per pin.
+  `backfillModelSets` fills the pin's set and the sets of passed releases above the pin
+  that lack one (a review that predates the recording, or a first run that failed). It
+  runs at most `modelsPerTick` (5) probes per tick, and none at all while no transport
+  is wired.
 - In the bump target walk, a passed release is a candidate before the age rules when its
   set adds at least one id for a provider that the board has an active sign-in for
   (`signIns()` in `src/login.ts`; active rows only; an unreadable credential store counts
@@ -207,7 +212,9 @@ bun (`bun install -g` then `omp --version`). It holds no deploy key and pushes n
 - At most 5 reviews in one tick.
 - A cancelled bump card for X files no new card for X. A higher target files one.
 - A passed release younger than 7 days that adds a model id for a signed-in provider files
-  one P1 bump card at once (OTTR-1287). A second tick files no second card.
+  one P1 bump card at once (OTTR-1287). A second tick files no second card. With no
+  transport wired, the same release files no card: no probe runs, no set is stored, and
+  the aged release later files a normal unrated card (production stance today).
 - A passed release whose model set adds nothing for a signed-in provider keeps the 7-day wait.
 - A models list with junk output, or with more entries than the cap, files no card and logs
   a warning.

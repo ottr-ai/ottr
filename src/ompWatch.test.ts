@@ -113,37 +113,16 @@ function fakeNet() {
 	};
 }
 
-/** The model and the models list: one review reply per version (default PASS); each
- * `omp models --json` run answers from its version's map (default an empty catalog) and
- * records its version and env. */
+/** The model and the candidate probe: one review reply per version (default PASS); each
+ * probe of one version answers from its map (default an empty catalog) and records the
+ * version it ran for. */
 function fakeModel() {
 	const replies = new Map<string, string>();
 	const models = new Map<string, string>();
 	const modelsCodes = new Map<string, number>();
-	const modelsRequests: {
-		version: string;
-		env: Record<string, string | undefined>;
-		cwd: string | undefined;
-	}[] = [];
+	const modelsAskedFor: string[] = [];
 	const requests: { model: string; system: string; user: string }[] = [];
 	const spawn: SpawnFn = async (argv, o) => {
-		if (argv[0] === "bunx") {
-			expect(argv).toEqual(["bunx", argv[1]!, "models", "--json"]);
-			const m = /^@oh-my-pi\/pi-coding-agent@(\d+\.\d+\.\d+)$/.exec(
-				argv[1] ?? "",
-			);
-			expect(m).not.toBeNull();
-			const version = m![1]!;
-			modelsRequests.push({ version, env: o.env, cwd: o.cwd });
-			const code = modelsCodes.get(version);
-			if (code !== undefined)
-				return { code, stdout: "", stderr: "install failed" };
-			return {
-				code: 0,
-				stdout: models.get(version) ?? '{"models":[]}',
-				stderr: "",
-			};
-		}
 		expect(argv).toEqual(["omp", "auth-gateway", "stdio"]);
 		const req = JSON.parse(o.stdin) as {
 			body: { model: string; messages: { role: string; content: string }[] };
@@ -169,16 +148,32 @@ function fakeModel() {
 			stderr: "",
 		};
 	};
+	/** The fake worker/VM transport: same answers the probe tests assert against. */
+	const probeTransport = async (
+		version: string,
+		timeoutMs: number,
+	): Promise<{ code: number; stdout: string; stderr: string }> => {
+		expect(timeoutMs).toBe(OMP_WATCH_GATES.modelsTimeoutMs);
+		modelsAskedFor.push(version);
+		const code = modelsCodes.get(version);
+		if (code !== undefined)
+			return { code, stdout: "", stderr: "install failed" };
+		return {
+			code: 0,
+			stdout: models.get(version) ?? '{"models":[]}',
+			stderr: "",
+		};
+	};
 	return {
 		spawn,
+		probeTransport,
 		requests,
 		reply: (version: string, text: string) => replies.set(version, text),
 		reviewed: () => requests.map((r) => /^omp (\S+) /.exec(r.user)?.[1] ?? "?"),
 		modelsOut: (version: string, stdout: string) => models.set(version, stdout),
 		modelsExit: (version: string, code: number) =>
 			modelsCodes.set(version, code),
-		modelsAsked: () => modelsRequests.map((r) => r.version),
-		modelsRequests,
+		modelsAsked: () => modelsAskedFor,
 	};
 }
 
@@ -205,6 +200,8 @@ async function setup(
 		dockerfile?: string | null;
 		/** OTTR-1010: the hosted credit hold seam. */
 		creditHoldActive?: () => boolean;
+		/** False pins the production stance: no transport wired, the probe never runs. */
+		probe?: boolean;
 	} = {},
 ) {
 	const project = await newProject(o);
@@ -234,6 +231,8 @@ async function setup(
 		creditHoldActive: o.creditHoldActive,
 		apiBase: () => `${API}/`,
 		signIns: () => signedIn,
+		// The probe tests run through a fake worker/VM transport; production wires none.
+		...(o.probe === false ? {} : { probeTransport: model.probeTransport }),
 	});
 	const store = project.store;
 	return {
@@ -1013,21 +1012,7 @@ describe("createOmpWatcher", () => {
 				'{"provider":"baseten","id":"openai/gpt-oss-120b"}]}',
 		);
 		w.model.modelsOut(PIN, '{"models":[{"provider":"zai","id":"glm-5"}]}');
-		// The probe runs unapproved code: no live identity, credential or board config may
-		// reach it, and it works in a throwaway HOME, not the board's.
-		const realHome = process.env.HOME;
-		process.env.GH_TOKEN = "secret";
-		process.env.PI_CODING_AGENT_DIR = "/live/agent/dir";
-		process.env.SSH_AUTH_SOCK = "/live/ssh.sock";
-		try {
-			await w.watcher.tick();
-		} finally {
-			delete process.env.GH_TOKEN;
-			delete process.env.PI_CODING_AGENT_DIR;
-			delete process.env.SSH_AUTH_SOCK;
-			if (realHome === undefined) delete process.env.HOME;
-			else process.env.HOME = realHome;
-		}
+		await w.watcher.tick();
 		const cards = await w.cards();
 		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
 		expect(cards[0]!.priority).toBe("P1");
@@ -1039,30 +1024,38 @@ describe("createOmpWatcher", () => {
 		expect(cards[0]!.prompt).toContain("baseten/openai/gpt-oss-120b");
 		// glm-5 is not an added model: the pin already has it.
 		expect(cards[0]!.prompt).not.toContain("glm-5");
-		// One models run per version: the release at its review, the pin in the backfill.
+		// One probe per version: the release at its review, the pin in the backfill.
 		expect(w.model.modelsAsked()).toEqual(["18.16.0", PIN]);
-		for (const r of w.model.modelsRequests) {
-			// Nothing live reaches the probe: no tokens, no agent dir pointer, no SSH agent.
-			for (const key of [
-				"GH_TOKEN",
-				"GITHUB_TOKEN",
-				"PI_CODING_AGENT_DIR",
-				"SSH_AUTH_SOCK",
-			])
-				expect(r.env[key]).toBeUndefined();
-			// The throwaway HOME doubles as the working directory; only the package cache
-			// is shared across runs.
-			expect(r.cwd).toMatch(/ottr-omp-probe-/);
-			expect(r.cwd).toBe(r.env.HOME);
-			expect(r.env.HOME).not.toBe(realHome);
-			expect(r.env.BUN_INSTALL_CACHE_DIR).toMatch(/ottr-omp-models-cache/);
-			// A PATH survives: the probe needs bunx.
-			expect(typeof r.env.PATH).toBe("string");
-		}
 		expect(w.scheduled()).toBe(1);
 
 		await w.watcher.tick();
 		expect(await w.cards()).toHaveLength(1);
+	});
+
+	test("no transport wired: no probe runs, no fast track, normal 7-day cards", async () => {
+		// The production stance (OTTR-1287 security review): the candidate never executes
+		// on the server host, so no model set is recorded and the fast track never fires.
+		const w = await setup({ probe: false });
+		w.release("18.16.0", 1 * DAY);
+		w.signedIn(["zai"]);
+		// This catalog would add zai/glm-6.2 if a probe ran; none does.
+		w.model.modelsOut(
+			"18.16.0",
+			'{"models":[{"provider":"zai","id":"glm-6.2"}]}',
+		);
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.scheduled()).toBe(0);
+		expect(w.model.modelsAsked()).toEqual([]);
+		expect(w.state().modelSets).toEqual({});
+
+		// The normal path is untouched: the aged release files a normal, unrated card.
+		w.advance(7 * DAY);
+		await w.watcher.tick();
+		const cards = await w.cards();
+		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
+		expect(cards[0]!.priority).toBeNull();
+		expect(w.model.modelsAsked()).toEqual([]);
 	});
 
 	test("the same model set keeps the 7-day wait", async () => {

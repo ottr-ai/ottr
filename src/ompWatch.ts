@@ -2,15 +2,15 @@
  * The omp watch (docs/specs/omp-watch.md): an hourly tick reads the omp pin in a project's
  * Dockerfile.worker, lists the newer omp releases on npm, has a model review each release's
  * notes, files a fail card that holds the pin, and files a "Bump omp to X" card when a
- * reviewed release is old enough — or at once, at P1, when it adds model access for a
- * provider the board is signed in to (OTTR-1287).
+ * reviewed release is old enough — or, once the candidate probe runs inside the worker/VM
+ * isolation (deps.probeTransport), at once, at P1, when it adds model access for a provider
+ * the board is signed in to (OTTR-1287). Until that transport is wired, no candidate omp
+ * executes on the server and the watch files normal 7-day bump cards only.
  */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	clean,
-	defaultSpawn,
 	runGatewayWithFallbacks,
 	type SpawnFn,
 } from "./forkAnalysis.ts";
@@ -110,40 +110,6 @@ const isObj = (v: unknown): v is Record<string, unknown> =>
 
 const errText = (e: unknown): string =>
 	e instanceof Error ? e.message : String(e);
-
-/** The only inherited vars a candidate release sees in its probe: no identity, no
- * credentials, no board configuration (no agent.db pointer, no GitHub token, no SSH
- * agent). Proxy settings stay, so installs also work behind one. */
-const PROBE_ENV_KEYS = [
-	"PATH",
-	"LANG",
-	"LC_ALL",
-	"LC_CTYPE",
-	"TMPDIR",
-	"HTTP_PROXY",
-	"HTTPS_PROXY",
-	"NO_PROXY",
-	"http_proxy",
-	"https_proxy",
-	"no_proxy",
-] as const;
-
-/** The shared cache for probe installs: immutable package files of exact versions, never
- * execution state (that lives and dies in the probe's throwaway HOME). */
-const modelsCacheDir = (): string => join(tmpdir(), "ottr-omp-models-cache");
-
-/** The probe's env: the whitelist, a throwaway HOME, and the shared package cache. */
-function probeEnv(home: string): Record<string, string | undefined> {
-	const env: Record<string, string | undefined> = {
-		HOME: home,
-		BUN_INSTALL_CACHE_DIR: modelsCacheDir(),
-	};
-	for (const k of PROBE_ENV_KEYS) {
-		const v = process.env[k];
-		if (v !== undefined) env[k] = v;
-	}
-	return env;
-}
 
 /** The pinned omp version: the first `ARG OMP_VERSION=x.y.z` line, or null. */
 export function parsePin(dockerfile: string): string | null {
@@ -515,6 +481,18 @@ export function createOmpWatcher(deps: {
 	token?: () => string | undefined;
 	/** Hosted credit hold: true pauses the release review's model call until the top-up. */
 	creditHoldActive?: () => boolean;
+	/**
+	 * The candidate probe's transport: runs `omp models --json` for one exact version
+	 * inside the worker/VM isolation the board uses for untrusted code (docs/WORKERS.md),
+	 * and returns its exit code and stdout. The candidate is unapproved code, so it never
+	 * executes on the server host (OTTR-1287 security review): production passes no
+	 * transport yet, the probe stays off, and the watch files normal 7-day bump cards.
+	 * The follow-up card wires the worker/VM transport here. `timeoutMs` bounds the run.
+	 */
+	probeTransport?: (
+		version: string,
+		timeoutMs: number,
+	) => Promise<{ code: number; stdout: string; stderr: string }>;
 	/** Test seam only; production uses UPSTREAM_API_BASE. */
 	apiBase?: () => string;
 	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
@@ -527,7 +505,6 @@ export function createOmpWatcher(deps: {
 	signIns?: () => string[];
 }): { tick(): Promise<void> } {
 	const doFetch = withGithubRetry(deps.fetch ?? fetch);
-	const doSpawn = deps.spawn ?? defaultSpawn;
 	const now = deps.now ?? Date.now;
 
 	async function getJson(
@@ -569,38 +546,26 @@ export function createOmpWatcher(deps: {
 	}
 
 	/**
-	 * One version's model set (OTTR-1287): `omp models --json` from an isolated install of
-	 * that exact version. The reviewed version is unapproved code, so it runs in its own
-	 * sandbox, not the review's env: a throwaway HOME doubles as the working directory, and
-	 * the env is a whitelist that carries no identity, credential or board configuration
-	 * (no agent.db, no OAuth state, no SSH agent, no GitHub token). Only the immutable
-	 * package cache is shared across runs. Null (warned through `warn`) when the run fails
-	 * or the output is unusable: the version keeps the age gate. A failed run is a warning,
-	 * never a `lastError`: it cannot block or retry the review.
+	 * One version's model set (OTTR-1287): the parsed `omp models --json` output of that
+	 * exact version, read through `deps.probeTransport`. The candidate is unapproved code,
+	 * so it never executes on the server host (OTTR-1287 security review): with no
+	 * transport wired, this returns null and the watch keeps the normal 7-day bump cards.
+	 * Null (warned through `warn`) when the run fails or the output is unusable: the
+	 * version keeps the age gate. A failed run is a warning, never a `lastError`: it
+	 * cannot block or retry the review.
 	 */
 	async function modelSet(
 		version: string,
 		warn: (reason: string) => void,
 	): Promise<string[] | null> {
+		const transport = deps.probeTransport;
+		if (transport === undefined) return null;
 		let res: { code: number; stdout: string; stderr: string };
-		const home = mkdtempSync(join(tmpdir(), "ottr-omp-probe-"));
-		mkdirSync(modelsCacheDir(), { recursive: true });
 		try {
-			res = await doSpawn(
-				["bunx", `@oh-my-pi/pi-coding-agent@${version}`, "models", "--json"],
-				{
-					stdin: "",
-					cwd: home,
-					env: probeEnv(home),
-					timeoutMs: OMP_WATCH_GATES.modelsTimeoutMs,
-				},
-			);
+			res = await transport(version, OMP_WATCH_GATES.modelsTimeoutMs);
 		} catch (e) {
 			warn(`omp ${version}: models list not run: ${errText(e)}`);
 			return null;
-		} finally {
-			// The probe's own scratch: its agent dir, its downloads. Nothing live lives here.
-			rmSync(home, { recursive: true, force: true, maxRetries: 5 });
 		}
 		if (res.code !== 0) {
 			warn(
