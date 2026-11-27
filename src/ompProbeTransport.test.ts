@@ -1,9 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+	chmodSync,
+	cpSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -19,7 +22,7 @@ import {
 	probeSpawnEnv,
 	probeWrapperSource,
 } from "./ompProbeTransport.ts";
-import { OMP_PACKAGE_URL } from "./ompWatch.ts";
+import { OMP_PACKAGE_URL, OMP_WATCH_GATES, parseModelSet } from "./ompWatch.ts";
 import type { ProcSpawn } from "./sandboxRun.ts";
 
 // Per-test real-fs scratch; everything a test builds dies with its dir.
@@ -51,13 +54,61 @@ const PROJECT = "ottr";
 const TOKEN = "tok-redact-me-42";
 const TARBALL_URL = "https://registry.test/pkg/-/pkg-18.16.0.tgz";
 const VERSION = "18.16.0";
-// Arbitrary bytes: the fake spawn builds the tree, so the tar never unpacks
-// here — only its sha512 travels through the integrity check.
-const FAKE_TGZ = new TextEncoder().encode("fake candidate tarball bytes");
-const FAKE_DIGEST = new Bun.CryptoHasher("sha512")
-	.update(FAKE_TGZ)
-	.digest("base64");
+
+/** A real gzipped tar (package/package.json), because the wrapper's offline
+ * install in the guest extracts every payload tarball for real. Returns the
+ * bytes, their sha512 integrity header, and the tar path. */
+function makeTarball(
+	dir: string,
+	name: string,
+	version: string,
+): { bytes: Uint8Array<ArrayBuffer>; integrity: string; path: string } {
+	const src = join(dir, "src", `${name}-${version}`, "package");
+	mkdirSync(join(src, "dist"), { recursive: true });
+	writeFileSync(
+		join(src, "package.json"),
+		JSON.stringify({ name, version, bin: { omp: "dist/cli.js" } }),
+	);
+	writeFileSync(join(src, "dist", "cli.js"), "// candidate cli\n");
+	mkdirSync(join(dir, "tarballs"), { recursive: true });
+	const path = join(
+		dir,
+		"tarballs",
+		`${name.replace(/[^A-Za-z0-9._-]/g, "_")}-${version}.tgz`,
+	);
+	const packed = Bun.spawnSync(
+		[
+			"tar",
+			"-czf",
+			path,
+			"-C",
+			join(dir, "src", `${name}-${version}`),
+			"package",
+		],
+		{ stdout: "pipe", stderr: "pipe" },
+	);
+	if (packed.exitCode !== 0)
+		throw new Error(`tar fixture failed: ${packed.stderr.toString()}`);
+	const bytes = Uint8Array.from(readFileSync(path));
+	const integrity = `sha512-${new Bun.CryptoHasher("sha512").update(bytes).digest("base64")}`;
+	return { bytes, integrity, path };
+}
+
+const TMP0 = mkdtempSync(join(tmpdir(), "ottr-omp-probe-fx-"));
+const CAND_TGZ = makeTarball(TMP0, "@oh-my-pi/pi-coding-agent", VERSION);
+const FAKE_TGZ = CAND_TGZ.bytes;
+const FAKE_DIGEST = CAND_TGZ.integrity.slice("sha512-".length);
+// Distinct real bytes for the second locked version: the payload must carry
+// both, and the guest install extracts both.
+const SW5_TGZ = makeTarball(TMP0, "string-width", "5.1.2");
+const SW5_DIGEST = SW5_TGZ.integrity.slice("sha512-".length);
+const SW7_TGZ = makeTarball(TMP0, "string-width", "7.2.0");
+const SW7_DIGEST = SW7_TGZ.integrity.slice("sha512-".length);
+afterAll(() => {
+	rmSync(TMP0, { recursive: true, force: true });
+});
 const CATALOG_JSON = '{"models":[{"provider":"zai","id":"glm-6.2"}]}';
+const CATALOG_B64 = Buffer.from(CATALOG_JSON, "utf8").toString("base64");
 
 const packument = (integrity: string): unknown => ({
 	name: "@oh-my-pi/pi-coding-agent",
@@ -65,6 +116,26 @@ const packument = (integrity: string): unknown => ({
 		[VERSION]: {
 			version: VERSION,
 			dist: { tarball: TARBALL_URL, integrity },
+		},
+	},
+});
+const SW_REGISTRY = "https://registry.test/string-width";
+const depPackument = (): unknown => ({
+	name: "string-width",
+	versions: {
+		"7.2.0": {
+			version: "7.2.0",
+			dist: {
+				tarball: `${SW_REGISTRY}-7.2.0.tgz`,
+				integrity: `sha512-${SW7_DIGEST}`,
+			},
+		},
+		"8.6.0": {
+			version: "8.6.0",
+			dist: {
+				tarball: `${SW_REGISTRY}-8.6.0.tgz`,
+				integrity: `sha512-${SW5_DIGEST}`,
+			},
 		},
 	},
 });
@@ -78,7 +149,13 @@ const jobResponse = (job: unknown): Response =>
 			selfCheck: null,
 			missingControl: null,
 			job,
-			artifacts: [],
+			artifacts: [
+				{
+					name: "home/catalog.json",
+					size: CATALOG_B64.length,
+					bytes: CATALOG_B64,
+				},
+			],
 			limits: {},
 			bootMs: 12,
 			totalMs: 34,
@@ -94,7 +171,7 @@ const okJob = (): Record<string, unknown> => ({
 	exitCode: 0,
 	signal: null,
 	timedOut: false,
-	stdoutTail: CATALOG_JSON,
+	stdoutTail: "",
 	stderrTail: "",
 });
 
@@ -135,6 +212,10 @@ function makeHarness(opts: {
 	validateUrls: string[];
 	validateBodies: Record<string, unknown>[];
 	validateTarExisted: boolean[];
+	manifestDeps: {
+		deps: Record<string, string>;
+		refsExisted: boolean;
+	}[];
 	payloadProviders: string[][];
 	env: NodeJS.ProcessEnv;
 	boardDbPath: string;
@@ -181,9 +262,14 @@ function makeHarness(opts: {
 	const validateBodies: Record<string, unknown>[] = [];
 	const validateTarExisted: boolean[] = [];
 	const payloadProviders: string[][] = [];
+	const manifestDeps: {
+		deps: Record<string, string>;
+		refsExisted: boolean;
+	}[] = [];
 	const bin = opts.bin ?? { omp: "dist/cli.js" };
-	// A minimal lockfile fixture: the candidate plus one dep, both with
-	// checksums, exactly the shape the transport's payload builder reads.
+	// A minimal lockfile fixture: the candidate plus TWO locked versions of
+	// one package (a name-keyed manifest would drop one of them), all with
+	// checksums — exactly the shape the payload builder reads.
 	const LOCK_JSON = JSON.stringify({
 		lockfileVersion: 1,
 		packages: {
@@ -198,6 +284,12 @@ function makeHarness(opts: {
 				"",
 				{},
 				`sha512-${FAKE_DIGEST}`,
+			],
+			"string-width@8.6.0": [
+				"string-width@8.6.0",
+				"",
+				{},
+				`sha512-${SW5_DIGEST}`,
 			],
 		},
 	});
@@ -246,28 +338,42 @@ function makeHarness(opts: {
 		if (url === TARBALL_URL) return Promise.resolve(new Response(FAKE_TGZ));
 		if (url === `${new URL(OMP_PACKAGE_URL).origin}/string-width`)
 			return Promise.resolve(
-				new Response(
-					JSON.stringify({
-						versions: {
-							"7.2.0": {
-								dist: {
-									tarball:
-										"https://registry.test/string-width/-/string-width-7.2.0.tgz",
-									integrity: `sha512-${FAKE_DIGEST}`,
-								},
-							},
-						},
-					}),
-					{ status: 200 },
-				),
+				new Response(JSON.stringify(depPackument()), { status: 200 }),
 			);
-		if (url === "https://registry.test/string-width/-/string-width-7.2.0.tgz")
-			return Promise.resolve(new Response(FAKE_TGZ));
+		if (url === `${SW_REGISTRY}-7.2.0.tgz`)
+			return Promise.resolve(new Response(SW7_TGZ.bytes));
+		if (url === `${SW_REGISTRY}-8.6.0.tgz`)
+			return Promise.resolve(new Response(SW5_TGZ.bytes));
 		if (url.endsWith("/validate")) {
 			validateUrls.push(url);
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			validateBodies.push(body);
 			validateTarExisted.push(existsSync(String(body.targetTar)));
+			// The payload manifest, read at dispatch time: every locked
+			// version must be referenced from its own verified tarball —
+			// name-keyed manifests drop one of two locked versions, and
+			// refs that point outside pkg cannot resolve offline.
+			try {
+				const manifestPath = join(
+					body.targetTar as string,
+					"..",
+					"payload",
+					"pkg",
+					"package.json",
+				);
+				const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+					dependencies: Record<string, string>;
+				};
+				const refs = { ...manifest.dependencies };
+				// Every referenced tarball must exist at dispatch time, resolved
+				// relative to the manifest's own directory (inside pkg).
+				const refsExisted = Object.values(refs).every((ref) =>
+					existsSync(join(manifestPath, "..", ref.slice("file:".length))),
+				);
+				manifestDeps.push({ deps: refs, refsExisted });
+			} catch {
+				manifestDeps.push({ deps: {}, refsExisted: false });
+			}
 			// The payload store's providers, read at dispatch time: the copy
 			// the candidate will see must hold the board's rows, never the
 			// decoy's.
@@ -316,6 +422,7 @@ function makeHarness(opts: {
 		validateBodies,
 		validateTarExisted,
 		payloadProviders,
+		manifestDeps,
 		env,
 		boardDbPath,
 		decoyDbPath,
@@ -410,9 +517,9 @@ describe("ompProbeTransport", () => {
 		expect("collect" in body).toBe(false);
 		// Key type for a typeof-verified JSON body: the wire shape is the contract.
 		const job = body.job as Record<string, unknown>;
-		expect(Object.keys(job).every((k) => k === "argv" || k === "cwd")).toBe(
-			true,
-		);
+		expect(
+			Object.keys(job).every((k) => ["argv", "cwd", "collect"].includes(k)),
+		).toBe(true);
 		const argv = Array.isArray(job.argv) ? job.argv : [];
 		// The job runs the payload's trusted wrapper, which installs the
 		// payload offline inside the guest, stamps the redacted store into the
@@ -420,9 +527,10 @@ describe("ompProbeTransport", () => {
 		// allowlist (probeWrapperSource, unit-tested below).
 		expect(argv[0]).toBe("bun");
 		expect(argv[1]).toBe("/target/pkg/probe-wrapper.mjs");
-		expect(String(argv[2])).toContain(
-			"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
-		);
+		// argv[2] is the candidate's bin relative path; the wrapper composes
+		// the absolute cli path inside the /tmp scratch install tree.
+		expect(String(argv[2])).toBe("dist/cli.js");
+		expect(argv[3]).toBe("/target/pkg");
 		expect(job.cwd).toBe("/target");
 		// Flow order: read the candidate's manifest from the tarball, resolve
 		// the dependency graph metadata-only (no extract, no install on the
@@ -437,13 +545,29 @@ describe("ompProbeTransport", () => {
 		expect(h.spawns[2]![0]).toBe("tar");
 		expect(h.spawns[2]).toContain("-cf");
 		expect(h.spawns[2]).toContain("--hard-dereference");
-		expect(h.spawns[2]).toContain("registry");
+		expect(h.spawns[2]).toContain("pkg");
+		expect(h.spawns[2]).toContain("store");
 		// No install tree ever exists on the server: the payload ships
 		// integrity-pinned tarballs and the lockfile's file: map only.
 		expect(h.spawns.some((a) => a.includes("add"))).toBe(false);
 		// The redacted copy carries the board store's rows (the transport
 		// reads agentDir(), the same file signIns reads), never the decoy's.
 		expect(h.payloadProviders[0]).toEqual(["zai"]);
+		// Blockers 2+3: the payload manifest references every locked version
+		// (both string-width versions) through registry paths inside pkg, and
+		// every referenced tarball exists at that payload-relative path.
+		const snapshot = h.manifestDeps[0]!;
+		const depKeys = Object.keys(snapshot.deps).sort();
+		expect(depKeys).toEqual([
+			"@oh-my-pi/pi-coding-agent",
+			"string-width",
+			"string-width-8.6.0",
+		]);
+		for (const ref of Object.values(snapshot.deps)) {
+			expect(ref.startsWith("file:registry/")).toBe(true);
+		}
+		// Every referenced tarball existed at dispatch time (blocker 2).
+		expect(snapshot.refsExisted).toBe(true);
 		// The run dir (and everything under it) dies with the call.
 		expect(existsSync(h.runDir)).toBe(false);
 	}, 30_000);
@@ -506,7 +630,7 @@ describe("ompProbeTransport", () => {
 		});
 		await expect(exit1.transport(PROJECT, VERSION, 30_000)).resolves.toEqual({
 			code: 1,
-			stdout: "",
+			stdout: CATALOG_JSON,
 			stderr: "boom",
 		});
 	}, 30_000);
@@ -682,11 +806,12 @@ describe("ompProbeTransport", () => {
 		).toBe(1);
 	});
 
-	test("probeJobArgv: the wrapper runs the bundled cli", () => {
+	test("probeJobArgv: the wrapper gets the bin path and the payload dir", () => {
 		expect(probeJobArgv("dist/cli.js")).toEqual([
 			"bun",
 			"/target/pkg/probe-wrapper.mjs",
-			"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
+			"dist/cli.js",
+			"/target/pkg",
 		]);
 	});
 
@@ -742,7 +867,7 @@ describe("ompProbeTransport", () => {
 		expect(probe.exitCode).not.toBe(0);
 	});
 
-	test("the wrapper: the install runs offline, catalogs fit the guest tail", () => {
+	test("the wrapper: read-only target, offline install, complete catalog", () => {
 		const tmp = newTmp();
 		const wrapper = join(tmp, "probe-wrapper.mjs");
 		writeFileSync(wrapper, probeWrapperSource);
@@ -751,145 +876,268 @@ describe("ompProbeTransport", () => {
 		const storeDb = join(tmp, "store", "agent.db");
 		mkdirSync(dirname(storeDb), { recursive: true });
 		writeFileSync(storeDb, "store bytes");
-		// A stub candidate cli whose COMPACT catalog still exceeds the guest's
-		// 64 KiB stdout tail: 1000 entries with 64-character ids — the exact
-		// shape the parse's own entry cap allows.
-		const longId = "m".repeat(64);
-		const entries = Array.from({ length: 1000 }, (_, i) => ({
-			provider: "zai",
-			id: `${longId}-${i}`,
-			kind: "chat",
-			name: `Model ${i}`,
-		}));
-		const bigCatalog = JSON.stringify({ models: entries });
-		const stubCli = join(tmp, "stub-cli.mjs");
+
+		// The payload, in the transport's actual flat layout: the workspace
+		// root manifest aliases every locked version (both string-width
+		// versions) to its own verified registry tarball, and the trusted
+		// wrapper rides along. The candidate member's cli reads the stub
+		// dependency back through the installed tree, proving the offline
+		// install produced a working graph.
+		const pkgDir = join(tmp, "payload", "pkg");
+		const registryDir = join(pkgDir, "registry");
+		mkdirSync(registryDir, { recursive: true });
 		writeFileSync(
-			stubCli,
-			`process.stdout.write(${JSON.stringify(bigCatalog)});\n`,
+			join(pkgDir, "package.json"),
+			JSON.stringify({
+				name: "ottr-omp-probe",
+				private: true,
+				dependencies: {
+					"@oh-my-pi/pi-coding-agent":
+						"file:registry/_oh_my_pi_pi_coding_agent-18.16.0.tgz",
+					"stub-pkg": "file:registry/stub_pkg-1.0.0.tgz",
+					"string-width": "file:registry/string-width-7.2.0.tgz",
+					"string-width-8.6.0": "file:registry/string-width-8.6.0.tgz",
+				},
+			}),
 		);
+		writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
+		const longId = "m".repeat(64);
+		const candidateCli =
+			'const fs = require("node:fs");\n' +
+			'const stub = JSON.parse(fs.readFileSync("node_modules/stub-pkg/package.json", "utf8"));\n' +
+			'const envNames = Object.keys(process.env).sort().join(".");\n' +
+			'const records = [{ provider: envNames, id: "env" }, { provider: "stub", id: stub.version }];\n' +
+			`for (let i = 0; i < 998; i++) records.push({ provider: "zai", id: ${JSON.stringify(longId)} + "-" + i });\n` +
+			"process.stdout.write(JSON.stringify({ models: records }));\n";
+		const mkTar = (
+			out: string,
+			name: string,
+			version: string,
+			cliBody: string,
+		): void => {
+			const src = join(tmp, "src", `${name}-${version}`, "package");
+			mkdirSync(join(src, "dist"), { recursive: true });
+			writeFileSync(
+				join(src, "package.json"),
+				JSON.stringify({ name, version, bin: { omp: "dist/cli.js" } }),
+			);
+			writeFileSync(join(src, "dist", "cli.js"), cliBody);
+			const packed = Bun.spawnSync(
+				[
+					"tar",
+					"-czf",
+					out,
+					"-C",
+					join(tmp, "src", `${name}-${version}`),
+					"package",
+				],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			expect(packed.exitCode).toBe(0);
+		};
+		mkTar(
+			join(registryDir, "_oh_my_pi_pi_coding_agent-18.16.0.tgz"),
+			"@oh-my-pi/pi-coding-agent",
+			"18.16.0",
+			candidateCli,
+		);
+		mkTar(
+			join(registryDir, "stub_pkg-1.0.0.tgz"),
+			"stub-pkg",
+			"1.0.0",
+			"// stub\n",
+		);
+		mkTar(
+			join(registryDir, "string-width-7.2.0.tgz"),
+			"string-width",
+			"7.2.0",
+			"// sw7\n",
+		);
+		mkTar(
+			join(registryDir, "string-width-8.6.0.tgz"),
+			"string-width",
+			"8.6.0",
+			"// sw8\n",
+		);
+
+		// /target is a read-only mount (docker/ottr-vm-init): the fixture's
+		// payload dir is stripped to read-only for the run.
+		const targetPkg = join(tmp, "target", "pkg");
+		mkdirSync(dirname(targetPkg), { recursive: true });
+		cpSync(pkgDir, targetPkg, { recursive: true });
+		chmodSync(targetPkg, 0o555);
+
 		const env = {
 			PATH: process.env.PATH ?? "",
 			HOME: home,
 			LANG: "C.UTF-8",
 			OMP_PROBE_STORE: storeDb,
-			OMP_PROBE_SKIP_INSTALL: "1",
 		};
-		const run = Bun.spawnSync(["bun", wrapper, stubCli], {
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(run.exitCode).toBe(0);
-		// Blocker 2: the wrapper's OWN stdout — the thing the guest's
-		// TailBuffer cuts — must fit the 64 KiB tail with its head intact.
-		expect(run.stdout.length).toBeLessThanOrEqual(64 * 1024);
-		const catalog = JSON.parse(new TextDecoder().decode(run.stdout)) as {
-			models: { provider: string; id: string }[];
-		};
-		expect(catalog.models.length).toBeGreaterThan(0);
-		expect(catalog.models[0]!.id.startsWith(longId)).toBe(true);
-		// The head survived: the first entries are the first ids.
-		expect(catalog.models[0]!.id.endsWith("-0")).toBe(true);
-		// A candidate that prints no catalog exits non-zero with no stdout.
-		const junkCli = join(tmp, "junk-cli.mjs");
-		writeFileSync(junkCli, "process.stdout.write('not a catalog');\n");
-		const junk = Bun.spawnSync(["bun", wrapper, junkCli], {
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(junk.exitCode).not.toBe(0);
-		expect(junk.stdout.length).toBe(0);
-		// The candidate's env is the three-name allowlist: the wrapper spawns
-		// it with PATH, HOME and LANG only, whatever the job env carries. The
-		// stub carries the sorted env names in its provider field, so the
-		// observation rides a valid catalog through the wrapper's parse.
-		const envProbeCli = join(tmp, "env-probe.mjs");
-		writeFileSync(
-			envProbeCli,
-			'process.stdout.write(JSON.stringify({ models: [{ provider: Object.keys(process.env).sort().join("."), id: "env" }] }));\n',
+		// Only the scratch this run creates counts: earlier runs leave theirs.
+		const scratchBefore = new Set(readdirSync("/tmp"));
+		try {
+			const run = Bun.spawnSync(
+				["bun", join(targetPkg, "probe-wrapper.mjs"), "dist/cli.js", targetPkg],
+				{ env, stdout: "pipe", stderr: "pipe", cwd: tmp },
+			);
+			expect(run.exitCode).toBe(0);
+
+			// Blocker 1: the install happened in the /tmp scratch — the
+			// read-only target gained no node_modules.
+			// The wrapper scratch sits under the real /tmp, not the suite TMPDIR.
+			const scratchDirs = readdirSync("/tmp")
+				.filter((d) => d.startsWith("ottr-probe-") && !scratchBefore.has(d))
+				.map((d) => join("/tmp", d));
+			expect(scratchDirs.length).toBe(1);
+			expect(
+				scratchDirs.some((d) =>
+					existsSync(
+						join(d, "pkg", "node_modules", "@oh-my-pi", "pi-coding-agent"),
+					),
+				),
+			).toBe(true);
+			expect(existsSync(join(targetPkg, "node_modules"))).toBe(false);
+
+			// Blocker 3: both locked string-width versions materialized —
+			// one hoisted, one under its versioned alias directory.
+			const scratchPkgNm = scratchDirs.map((d) =>
+				join(d, "pkg", "node_modules"),
+			);
+			const swDirs: { dir: string; version: string }[] = [];
+			for (const nm of scratchPkgNm) {
+				for (const alias of ["string-width", "string-width-8.6.0"]) {
+					const manifest = join(nm, alias, "package.json");
+					if (existsSync(manifest)) {
+						const parsed = JSON.parse(readFileSync(manifest, "utf8")) as {
+							version: string;
+						};
+						swDirs.push({ dir: alias, version: parsed.version });
+					}
+				}
+			}
+			const versions = swDirs.map((d) => d.version).sort();
+			expect(versions).toEqual(["7.2.0", "8.6.0"]);
+
+			// Blocker 4: the promoted catalog holds the COMPLETE accepted set
+			// — the env record, the stub record, and all 998 entries with
+			// their 64-character ids — regardless of candidate output order.
+			const promoted = JSON.parse(
+				readFileSync(join(home, "catalog.json"), "utf8"),
+			) as { models: { provider: string; id: string }[] };
+			expect(promoted.models.length).toBe(1000);
+			expect(promoted.models[0]!.provider).toBe("HOME.LANG.PATH");
+			expect(promoted.models[1]!.provider).toBe("stub");
+			expect(promoted.models[1]!.id).toBe("1.0.0");
+			expect(promoted.models[2]!.id.endsWith("-0")).toBe(true);
+			expect(promoted.models.at(-1)!.id.endsWith("-997")).toBe(true);
+			// The sorted id set is order-independent (no prefix truncation).
+			const ids = promoted.models.map((m) => m.id).sort();
+			expect(ids[0]).toBe("1.0.0");
+			expect(ids.at(-1)).toBe("m".repeat(64) + "-997");
+
+			// The stdout copy stays a bounded diagnostic.
+			expect(run.stdout.length).toBeLessThanOrEqual(48 * 1024);
+			// The store was stamped into the job HOME.
+			expect(existsSync(join(home, ".omp", "agent", "agent.db"))).toBe(true);
+			// The env allowlist held: no secret name among the candidate's env.
+			expect(promoted.models[0]!.provider).not.toContain("SECRET");
+		} finally {
+			chmodSync(targetPkg, 0o755);
+		}
+	}, 60_000);
+
+	test("the wrapper: an over-cap catalog stays over the cap, never a truncated prefix", () => {
+		const tmp = newTmp();
+		const wrapper = join(tmp, "probe-wrapper.mjs");
+		writeFileSync(wrapper, probeWrapperSource);
+		const home = join(tmp, "home");
+		mkdirSync(home, { recursive: true });
+		const storeDb = join(tmp, "store", "agent.db");
+		mkdirSync(dirname(storeDb), { recursive: true });
+		writeFileSync(storeDb, "store bytes");
+		const pkgDir = join(tmp, "payload", "pkg");
+		const cliDir = join(
+			pkgDir,
+			"node_modules",
+			"@oh-my-pi",
+			"pi-coding-agent",
+			"dist",
 		);
-		const leaky = Bun.spawnSync(["bun", wrapper, envProbeCli], {
+		mkdirSync(cliDir, { recursive: true });
+		writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
+		const over = OMP_WATCH_GATES.modelsMaxEntries + 5;
+		const models = Array.from({ length: over }, (_, i) => ({
+			provider: "zai",
+			id: `m-${i}`,
+		}));
+		writeFileSync(
+			join(cliDir, "big-cli.js"),
+			`process.stdout.write(${JSON.stringify(JSON.stringify({ models }))});\n`,
+		);
+		const run = Bun.spawnSync(["bun", wrapper, "dist/big-cli.js", pkgDir], {
 			env: {
-				...env,
-				ZAI_API_KEY: "sk-secret",
-				OTTR_WORKER_TOKEN: TOKEN,
+				PATH: process.env.PATH ?? "",
+				HOME: home,
+				LANG: "C.UTF-8",
 				OMP_PROBE_STORE: storeDb,
+				OMP_PROBE_SKIP_INSTALL: "1",
 			},
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		expect(leaky.exitCode).toBe(0);
-		const leakyCatalog = JSON.parse(new TextDecoder().decode(leaky.stdout)) as {
-			models: { provider: string }[];
-		};
-		expect(leakyCatalog.models[0]!.provider).toBe("HOME.LANG.PATH");
+		expect(run.exitCode).toBe(0);
+		// The promoted catalog keeps the parse's over-cap verdict: a silently
+		// cut prefix would hide every model past the cap from the fast track.
+		const promoted = readFileSync(join(home, "catalog.json"), "utf8");
+		expect(parseModelSet(promoted, OMP_WATCH_GATES.modelsMaxEntries)).toEqual({
+			error: expect.stringContaining("models"),
+		});
 	});
 
-	test("the wrapper installs the payload offline inside the guest", () => {
+	test("the wrapper: junk candidate output exits non-zero with no catalog", () => {
 		const tmp = newTmp();
 		const wrapper = join(tmp, "probe-wrapper.mjs");
 		writeFileSync(wrapper, probeWrapperSource);
 		const home = join(tmp, "home");
 		mkdirSync(home, { recursive: true });
 		const pkgDir = join(tmp, "payload", "pkg");
-		mkdirSync(join(pkgDir, "registry"), { recursive: true });
-		// A real minimal dependency tarball, built here: the guest install
-		// runs offline from the payload's file: tarballs alone.
-		const stubSrc = join(tmp, "stub-src", "package");
-		mkdirSync(stubSrc, { recursive: true });
-		writeFileSync(
-			join(stubSrc, "package.json"),
-			JSON.stringify({ name: "stub-pkg", version: "1.0.0" }),
+		mkdirSync(pkgDir, { recursive: true });
+		writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
+		// The junk candidate cli rides the payload (the wrapper's scratch copy
+		// carries it), so the composed cli path exists without an install.
+		const cliDir = join(
+			pkgDir,
+			"node_modules",
+			"@oh-my-pi",
+			"pi-coding-agent",
+			"dist",
 		);
-		const stubTgz = join(pkgDir, "registry", "stub-pkg-1.0.0.tgz");
-		const tarPack = Bun.spawnSync(
-			["tar", "-czf", stubTgz, "-C", dirname(stubSrc), "package"],
-			{ stdout: "pipe", stderr: "pipe" },
-		);
-		expect(tarPack.exitCode).toBe(0);
-		writeFileSync(
-			join(pkgDir, "package.json"),
-			JSON.stringify({
-				name: "ottr-omp-probe",
-				private: true,
-				dependencies: { "stub-pkg": "file:registry/stub-pkg-1.0.0.tgz" },
-			}),
-		);
-		// The candidate cli: proves the tree it runs in is the one the guest
-		// install produced, by reading the installed dependency back.
-		const cliDir = join(pkgDir, "node_modules", "candidate", "dist");
 		mkdirSync(cliDir, { recursive: true });
 		writeFileSync(
-			join(cliDir, "cli.js"),
-			'const { readFileSync } = require("node:fs");\nconst manifest = JSON.parse(readFileSync("node_modules/stub-pkg/package.json", "utf8"));\nprocess.stdout.write(JSON.stringify({ models: [{ provider: manifest.name, id: manifest.version }] }));\n',
+			join(cliDir, "junk-cli.js"),
+			"process.stdout.write('not a catalog');\n",
 		);
-		const storeDb = join(tmp, "store", "agent.db");
-		mkdirSync(dirname(storeDb), { recursive: true });
-		writeFileSync(storeDb, "store bytes");
-		const run = Bun.spawnSync(
-			[process.execPath, wrapper, join(cliDir, "cli.js"), pkgDir],
-			{
-				env: {
-					PATH: process.env.PATH ?? "",
-					HOME: home,
-					LANG: "C.UTF-8",
-					OMP_PROBE_STORE: join(tmp, "store", "agent.db"),
-				},
-				stdout: "pipe",
-				stderr: "pipe",
-				cwd: pkgDir,
-			},
-		);
-		expect(run.exitCode).toBe(0);
-		// The offline install materialized the dependency in the guest tree.
-		expect(
-			existsSync(join(pkgDir, "node_modules", "stub-pkg", "package.json")),
-		).toBe(true);
-		const catalog = JSON.parse(new TextDecoder().decode(run.stdout)) as {
-			models: { provider: string; id: string }[];
+		// A real store file: the non-zero exit must come from the catalog
+		// check, not from a missing store copy.
+		mkdirSync(join(tmp, "store"), { recursive: true });
+		writeFileSync(join(tmp, "store", "agent.db"), "store bytes");
+		const env = {
+			PATH: process.env.PATH ?? "",
+			HOME: home,
+			LANG: "C.UTF-8",
+			OMP_PROBE_STORE: join(tmp, "store", "agent.db"),
+			OMP_PROBE_SKIP_INSTALL: "1",
 		};
-		expect(catalog.models).toEqual([{ provider: "stub-pkg", id: "1.0.0" }]);
+		const junk = Bun.spawnSync(["bun", wrapper, "dist/junk-cli.js", pkgDir], {
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(junk.exitCode).toBe(3);
+		expect(new TextDecoder().decode(junk.stderr)).toContain(
+			"the candidate output is not a models catalog",
+		);
+		expect(junk.stdout.length).toBe(0);
 	});
 
 	test("bin escape guard: a bin outside the package rejects the candidate", async () => {

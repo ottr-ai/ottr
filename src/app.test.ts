@@ -27978,7 +27978,7 @@ describe("omp watch probe wiring", () => {
 				id: string;
 				project: string;
 				targetTar: string;
-				job: { argv: string[]; cwd: string };
+				job: { argv: string[]; cwd: string; collect?: string[] };
 			};
 		}[] = [];
 		let served = 0;
@@ -27993,7 +27993,7 @@ describe("omp watch probe wiring", () => {
 					id: string;
 					project: string;
 					targetTar: string;
-					job: { argv: string[]; cwd: string };
+					job: { argv: string[]; cwd: string; collect?: string[] };
 				};
 				validateCalls.push({
 					url: req.url,
@@ -28018,7 +28018,15 @@ describe("omp watch probe wiring", () => {
 						stdoutTail: models,
 						stderrTail: "",
 					},
-					artifacts: [],
+					// The wrapper promotes the complete catalog as an artifact;
+					// the transport reads it, never the stdout tail.
+					artifacts: [
+						{
+							name: "home/catalog.json",
+							size: Buffer.byteLength(models),
+							bytes: Buffer.from(models, "utf8").toString("base64"),
+						},
+					],
 					limits: { ...VM_VALIDATE },
 					bootMs: null,
 					totalMs: 1,
@@ -28289,20 +28297,19 @@ describe("omp watch probe wiring", () => {
 				expect(body.targetTar.startsWith(dataTmp)).toBe(true);
 				// The tar exists at dispatch time; the runner reads it from this path.
 				expect(call.tarExisted).toBe(true);
-				expect(
-					Object.keys(body.job).every((k) => ["argv", "cwd"].includes(k)),
-				).toBe(true);
-				// The job runs the payload's trusted wrapper: it stamps the
-				// secret-free catalog copy into the job HOME, caps the
-				// candidate's stdout, and emits compact provider/id records so
-				// the whole catalog survives the guest's 64 KiB tail.
-				expect(body.job.argv[0]).toBe("bun");
-				expect(body.job.argv[1]).toBe("/target/pkg/probe-wrapper.mjs");
-				expect(body.job.argv[2]).toContain(
-					"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/",
-				);
-				expect(body.job.argv[2]).toContain("dist/cli.js");
-				expect(body.job.cwd).toBe("/target");
+				// The job runs the payload's trusted wrapper: it installs the
+				// payload offline inside the guest, stamps the secret-free store
+				// copy into the job HOME, and promotes the complete catalog.
+				expect(body.job).toEqual({
+					argv: [
+						"bun",
+						"/target/pkg/probe-wrapper.mjs",
+						"dist/cli.js",
+						"/target/pkg",
+					],
+					cwd: "/target",
+					collect: ["home/catalog.json"],
+				});
 				// The wire token rode the header only: never in the URL, never in
 				// any logged or thrown text.
 				expect(call.token).toBe(WIRE_TOKEN);

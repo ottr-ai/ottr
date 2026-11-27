@@ -221,23 +221,34 @@ function redactData(
 }
 
 /** The trusted guest-side wrapper (written into the payload as
- * probe-wrapper.mjs): installs the payload offline (every dependency is a
- * `file:` tarball the transport integrity-pinned — the guest has no network),
+ * probe-wrapper.mjs): copies the payload from the read-only /target mount
+ * into a writable /tmp scratch, installs it offline there (every dependency
+ * is a `file:` tarball the transport integrity-pinned; alias keys keep every
+ * locked version, the hoisted linker keeps the candidate's path stable),
  * stamps the redacted copy into the job HOME, spawns the candidate cli under
  * the three-name env allowlist, caps the candidate's stdout at 2 MiB, and
- * re-emits compact provider/id records under a byte budget that fits the
- * guest's 64 KiB stdout tail: catalogs beyond the budget lose their tail
- * entries (bounded, parseable) instead of failing the whole parse. The
+ * re-emits compact provider/id records — complete up to the parser's own
+ * entry cap — to a promoted artifact, so no entry is ever lost to the
+ * guest's 64 KiB stdout tail (the stdout copy is diagnostic only). The
  * candidate's own stderr passes through to the job's stderr. Exit codes: the
  * candidate's, or 3 when the output is not a models catalog.
  * `OMP_PROBE_STORE` and `OMP_PROBE_SKIP_INSTALL` override the stamped store
  * path and the offline install for tests; the guest job env never carries
  * either name. */
-export const probeWrapperSource = `import { copyFileSync, mkdirSync } from "node:fs";
-const cli = process.argv[2];
-const pkgDir = process.argv[3] ?? "/target/pkg";
-if (typeof cli !== "string" || cli === "") {
-	console.error("probe wrapper: no candidate cli path");
+export const probeWrapperSource = `import {
+	chmodSync,
+	copyFileSync,
+	cpSync,
+	mkdirSync,
+	mkdtempSync,
+	writeFileSync,
+} from "node:fs";
+// argv: <wrapper> <binRel> <targetPkgDir>. /target is a read-only mount, so
+// the payload is copied into a writable /tmp scratch and installed there.
+const binRel = process.argv[2];
+const targetPkg = process.argv[3] ?? "/target/pkg";
+if (typeof binRel !== "string" || binRel === "") {
+	console.error("probe wrapper: no candidate bin relative path");
 	process.exit(3);
 }
 const home = process.env.HOME ?? "";
@@ -245,16 +256,24 @@ if (home === "") {
 	console.error("probe wrapper: no HOME");
 	process.exit(3);
 }
+// Unique per run: a fresh VM's /tmp is fresh anyway, and tests can run the
+// wrapper many times on one machine.
+const scratch = mkdtempSync("/tmp/ottr-probe-");
+cpSync(targetPkg, scratch + "/pkg", { recursive: true });
+// The copy keeps the read-only source's modes: make the tree writable so the
+// install can create node_modules inside it.
+chmodSync(scratch + "/pkg", 0o755);
 if (process.env.OMP_PROBE_SKIP_INSTALL !== "1") {
 	const inst = Bun.spawnSync(
 		[
 			process.execPath,
 			"install",
+			"--linker=hoisted",
 			"--prefer-offline",
 			"--ignore-scripts",
 			"--production",
 			"--cwd",
-			pkgDir,
+			scratch + "/pkg",
 		],
 		{ stdout: "pipe", stderr: "inherit", stdin: "ignore" },
 	);
@@ -268,7 +287,9 @@ copyFileSync(
 	process.env.OMP_PROBE_STORE ?? "/target/store/agent.db",
 	home + "/.omp/agent/agent.db",
 );
+const cli = scratch + "/pkg/node_modules/@oh-my-pi/pi-coding-agent/" + binRel;
 const child = Bun.spawn([process.execPath, cli, "models", "--json"], {
+	cwd: scratch + "/pkg",
 	env: {
 		PATH: process.env.PATH,
 		HOME: process.env.HOME,
@@ -288,8 +309,6 @@ for (;;) {
 	if (size < CAP) chunks.push(value);
 	size += value.byteLength;
 	if (size >= CAP) {
-		// Bounded: stop storing and stop the candidate; whatever the parse
-		// makes of the partial text, the outcome is a non-fast-track run.
 		child.kill();
 		await reader.cancel().catch(() => {});
 		break;
@@ -306,22 +325,34 @@ try {
 		!Array.isArray(parsed.models)
 	)
 		throw new Error("no models array");
-	// The compact records carry only provider and id, and stop before the
-	// guest's 64 KiB stdout tail would discard their head.
-	const TAIL_BUDGET = 48 * 1024;
-	const models = [];
-	let used = 0;
-	for (const m of parsed.models) {
-		const record = {
+	// Compact provider/id records, complete up to the parser's own entry cap:
+	// the full list travels to the board as a promoted artifact (1 MiB cap,
+	// far above anything the parse accepts), so no entry is ever lost to the
+	// guest's 64 KiB stdout tail. The stdout copy is diagnostic only.
+	// One record past the parser's cap (OMP_WATCH_GATES.modelsMaxEntries) keeps
+	// an over-cap catalog over the cap, so the parse rejects it instead of
+	// accepting a truncated prefix.
+	const ENTRY_CAP = 1000;
+	const records = [];
+	for (const m of parsed.models.slice(0, ENTRY_CAP + 1)) {
+		records.push({
 			provider: typeof m === "object" && m !== null ? m.provider : undefined,
 			id: typeof m === "object" && m !== null ? m.id : undefined,
-		};
+		});
+	}
+	out = JSON.stringify({ models: records });
+	writeFileSync(home + "/catalog.json", out);
+	// The stdout copy is bounded: diagnostics only, never the catalog source.
+	const DIAG_BUDGET = 48 * 1024;
+	let used = 0;
+	const diag = [];
+	for (const record of records) {
 		const cost = JSON.stringify(record).length + 1;
-		if (used + cost > TAIL_BUDGET) break;
-		models.push(record);
+		if (used + cost > DIAG_BUDGET) break;
+		diag.push(record);
 		used += cost;
 	}
-	out = JSON.stringify({ models });
+	out = JSON.stringify({ models: diag });
 } catch (err) {
 	console.error(
 		"probe wrapper: the candidate output is not a models catalog:",
@@ -337,11 +368,7 @@ process.exit(code ?? 3);
  * bundled cli. `binRel` must pass binRelError (the caller resolved it
  * against the installed package dir already). */
 export function probeJobArgv(binRel: string): string[] {
-	return [
-		"bun",
-		"/target/pkg/probe-wrapper.mjs",
-		`/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/${binRel}`,
-	];
+	return ["bun", "/target/pkg/probe-wrapper.mjs", binRel, "/target/pkg"];
 }
 
 /** `omp-probe-<hex8>`: fits the ValidateRequest id rule and names the run dir. */
@@ -737,20 +764,37 @@ export function createOmpProbeTransport(
 			// 5. Ship every package as integrity-verified bytes: the guest's
 			// install runs offline from these exact files, so no dependency
 			// tree ever exists on the server.
-			const registryDir = join(runDir, "payload", "registry");
+			// 5+6. Ship every package as integrity-verified bytes: the guest's
+			// install runs offline from these exact files, so no dependency
+			// tree ever exists on the server. The manifest keys every locked
+			// version under its own (aliased) name — keying by package name
+			// alone would drop one of two locked versions of the same package,
+			// and bun installs each file: tarball under its alias directory,
+			// so both versions install side by side.
+			const pkgDir = join(runDir, "payload", "pkg");
+			const registryDir = join(pkgDir, "registry");
 			mkdirSync(registryDir, { recursive: true });
+			writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
 			const fileDeps: Record<string, string> = {};
+			const usedNames = new Set<string>();
 			for (const {
 				name,
 				version: depVersion,
 				integrity: lockIntegrity,
 			} of packages) {
 				const safe = name.replace(/[^A-Za-z0-9._-]/g, "_");
-				const relative = `registry/${safe}-${depVersion}.tgz`;
-				const target = join(runDir, "payload", relative);
+				// The first locked version of a package installs under its real
+				// name (the candidate's runtime path depends on it); second and
+				// later versions install under versioned alias directories,
+				// still from their own verified tarball.
+				let key = name;
+				if (usedNames.has(name))
+					key = `${safe}-${depVersion.replace(/[^A-Za-z0-9._-]/g, "_")}`;
+				usedNames.add(name);
+				const tgzPath = join(pkgDir, "registry", `${safe}-${depVersion}.tgz`);
 				if (name === PKG_NAME) {
 					// The candidate's bytes are already verified (step 2).
-					writeFileSync(target, candidateBytes);
+					writeFileSync(tgzPath, candidateBytes);
 				} else {
 					const dist = await packumentDistFor(
 						name,
@@ -765,16 +809,10 @@ export function createOmpProbeTransport(
 						fetchImpl,
 						controller.signal,
 					);
-					writeFileSync(target, bytes);
+					writeFileSync(tgzPath, bytes);
 				}
-				fileDeps[name] = `file:${relative}`;
+				fileDeps[key] = `file:registry/${safe}-${depVersion}.tgz`;
 			}
-
-			// 6. The guest job installs the payload offline (inside the VM) and
-			// runs the wrapper: stamps the store, caps and compacts the
-			// candidate's stdout.
-			const pkgDir = join(runDir, "payload", "pkg");
-			mkdirSync(pkgDir, { recursive: true });
 			writeFileSync(
 				join(pkgDir, "package.json"),
 				JSON.stringify({
@@ -783,7 +821,6 @@ export function createOmpProbeTransport(
 					dependencies: fileDeps,
 				}),
 			);
-			writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
 
 			// 5. Catalog context without secrets: the placeholder store drives the
 			// real CLI's provider list. The source is the board's own agent store
@@ -809,7 +846,6 @@ export function createOmpProbeTransport(
 				"--directory",
 				join(runDir, "payload"),
 				"pkg",
-				"registry",
 				"store",
 			]);
 			if (pack.code !== 0)
@@ -836,6 +872,7 @@ export function createOmpProbeTransport(
 					job: {
 						argv: probeJobArgv(binRel),
 						cwd: "/target",
+						collect: ["home/catalog.json"],
 					},
 				}),
 				signal: controller.signal,
@@ -860,9 +897,19 @@ export function createOmpProbeTransport(
 				throw new Error(
 					`omp models probe ended without an exit code (signal ${job.signal})`,
 				);
+			// The catalog travels as the promoted artifact: complete, never cut
+			// by the guest's 64 KiB stdout tail. The stdout tail is diagnostic.
+			const artifact = body.artifacts.find(
+				(a) => a.name === "home/catalog.json" && a.dropped === undefined,
+			);
+			if (artifact === undefined || artifact.bytes === "")
+				throw new Error(
+					"omp models probe: the guest promoted no catalog artifact",
+				);
+			const catalog = Buffer.from(artifact.bytes, "base64").toString("utf8");
 			return {
 				code: job.exitCode,
-				stdout: job.stdoutTail,
+				stdout: catalog,
 				stderr: job.stderrTail,
 			};
 		} catch (err) {

@@ -107,17 +107,22 @@ server host is not an acceptable boundary for unapproved code.
   of the tarball to stdout, resolves the dependency graph metadata-only (`bun install
   --lockfile-only` — bun writes the lockfile, never a node_modules tree), and ships
   every resolved package as an integrity-verified tarball beside a generated
-  `file:`-dependency manifest. The credential copy comes from the board's own agent
+  `file:`-dependency manifest. The manifest keys a second locked version of one
+  package by an alias (`<name>-<version>`), so every locked version installs. The
+  credential copy comes from the board's own agent
   store — `agentDir()`, the same file `signIns()` reads — and holds the signed-in
   providers with every data key shape and the identity keys, each value a placeholder,
   so the candidate lists the board's providers' catalogs without holding one secret or
   one piece of board identity data (verified against the real CLI). The guest does the
-  rest: it installs the payload offline (`bun install --prefer-offline --ignore-scripts
+  rest: it copies the read-only payload into a writable guest scratch, installs it
+  there offline (`bun install --linker=hoisted --prefer-offline --ignore-scripts
   --production`, dying with the VM), stamps the copy into the job HOME, and runs the
   candidate under the three-name env. The payload's trusted wrapper caps the
-  candidate's stdout at 2 MiB and re-emits compact provider/id records under a byte
-  budget that fits the guest's 64 KiB stdout tail: catalogs beyond the budget lose
-  their tail entries (bounded, parseable) instead of failing the whole parse.
+  candidate's stdout at 2 MiB and writes compact provider/id records to
+  `home/catalog.json`, which the guest promotes as an artifact. The transport parses
+  that artifact, never the 64 KiB stdout tail, so the complete catalog arrives. A
+  catalog with more entries than the parse accepts stays over the cap and is
+  rejected, never cut to an accepted prefix.
   `modelsTimeoutMs` arms before any preparation: past it the transport aborts, which
   kills the VM, the preparation runner kills its subprocesses, and every killed step
   surfaces as the one timeout error — the deadline stays armed through the response
