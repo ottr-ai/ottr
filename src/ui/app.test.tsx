@@ -3477,20 +3477,16 @@ describe("Drawer parent chip", () => {
 			state: "idle",
 			followUpOf: "P-9",
 		});
-		const realFetch = globalThis.fetch;
 		const fetches: string[] = [];
-		globalThis.fetch = (async (input: RequestInfo | URL) => {
-			const url = String(input);
+		const { restore } = stubFetch(async (url) => {
 			fetches.push(url);
 			return url.endsWith("/tasks/P-9")
 				? json({ ...parent, turns: [] })
 				: new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
+		});
+		const { container, root, unmount } = await mount(
+			<Drawer {...base} task={child} tasks={[]} />,
+		);
 		const link = (): Element | null =>
 			container.querySelector(
 				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-9"]',
@@ -3499,9 +3495,6 @@ describe("Drawer parent chip", () => {
 			fetches.filter((f) => f.endsWith("/tasks/P-9")).length;
 		try {
 			// Mount with the parent outside the frame: the row fetches and links.
-			await act(async () => {
-				root.render(<Drawer {...base} task={child} tasks={[]} />);
-			});
 			await act(async () => {});
 			await act(async () => {});
 			expect(link() !== null).toBe(true);
@@ -3524,11 +3517,8 @@ describe("Drawer parent chip", () => {
 			expect(link() !== null).toBe(true);
 			expect(parentFetchCount()).toBe(first + 1);
 		} finally {
-			await act(async () => {
-				root.unmount();
-			});
-			container.remove();
-			globalThis.fetch = realFetch;
+			await unmount();
+			restore();
 		}
 	});
 
