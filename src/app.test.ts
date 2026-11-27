@@ -14968,12 +14968,17 @@ describe("registration pins before refreshRemote (OTTR-1004)", () => {
 		const savedHost = process.env.OTTR_GITHUB_HOST;
 		makeFixture("reg-pin");
 		// A fixture pin is a file:// path, so no real GitHub host matches it. With the
-		// configured host set to the pin's tmpdir label, the pin is identity-bearing
-		// (https://tmp/<root>/fixture-repos/reg-pin), and registration must stamp that
-		// identity and run the branch-rules probe before it answers. The probe stops
-		// while the identity is null, so the old order — remote refresh first, pin after
-		// — leaves github null at registration, skips the probe, and fails these checks.
-		process.env.OTTR_GITHUB_HOST = "tmp";
+		// configured host set to the fixture dir's own name, the pin is identity-bearing
+		// (https://fixture-repos/reg-pin), and registration must stamp that identity and
+		// run the branch-rules probe before it answers. The probe stops while the
+		// identity is null, so the old order — remote refresh first, pin after — leaves
+		// github null at registration, skips the probe, and fails these checks. The
+		// label is the last segment the pin carries, so the host match consumes every
+		// segment the environment contributes: wherever the suite nests its scratch — a
+		// plain /tmp dir or a turn home whose path holds dot-leading layers — none of it
+		// reaches the identity, and the identity stays a constant across TMPDIRs.
+		const pinHost = fixtureRepos.split("/").at(-1)!;
+		process.env.OTTR_GITHUB_HOST = pinHost;
 		process.env.GH_TOKEN = "ghs_test_0000";
 		let probes = 0;
 		const regProjects = new Map<string, Entry>();
@@ -14996,13 +15001,11 @@ describe("registration pins before refreshRemote (OTTR-1004)", () => {
 			// would ever produce — and the probe ran inside registration.
 			const pin = (await e.store.getSettings()).originUrl ?? "";
 			expect(pin).toBe(`file://${fixtureRepos}/reg-pin`);
-			// The identity is the pin under the configured host, wherever the suite's
-			// tmpdir nests it and however it spells the host label: production cuts
-			// the pin at its first case-insensitive path segment named like the host
-			// (hostMatcher), not at a literal lowercase /tmp/ prefix.
-			const label = "/tmp/";
-			const at = pin.toLowerCase().indexOf(label);
-			const fromPin = `https://tmp/${pin.slice(at + label.length)}`;
+			// The identity is the pin under the configured host: the host match consumes
+			// the path through the segment the host names, wherever the suite nests its
+			// scratch.
+			const atHost = pin.indexOf(`/${pinHost}/`);
+			const fromPin = `https://${pinHost}/${pin.slice(atHost + pinHost.length + 2)}`;
 			expect(e.github).toBe(fromPin);
 			expect(e.protectedTarget).toBe(true);
 			expect(probes).toBe(1);
