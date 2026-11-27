@@ -9,6 +9,7 @@ import {
 } from "bun:test";
 import {
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -313,17 +314,15 @@ function seedOneOffExec(
 	rec.calls.push(line);
 	// The read exec carries its own rm suffix, so the cat branch matches first.
 	if (line.includes("-c cat ")) {
-		const clear = /-c cat (\S+?); rc=\$\?; rm -f (\S+) (\S+); exit \$rc/.exec(
-			line,
-		);
+		const clear = /-c cat (\S+?); rc=\$\?; rm -f ([^;]+); exit \$rc/.exec(line);
 		const plain = clear === null ? /-c cat (\S+?); exit \$rc/.exec(line) : null;
 		const path = (clear?.[1] ?? plain?.[1]) as string;
 		if (o.seedVolume !== undefined) {
 			const text = o.seedVolume.get(path);
 			if (clear !== null) {
-				const cleared = [clear[2], clear[3]].filter(
-					(p): p is string => p !== undefined,
-				);
+				const cleared = (clear[2] ?? "")
+					.split(" ")
+					.filter((p): p is string => p !== "");
 				for (const p of cleared) o.seedVolume.delete(p);
 			}
 			return text === undefined
@@ -333,7 +332,7 @@ function seedOneOffExec(
 		const scripted =
 			o.seedResultsFor !== undefined
 				? o.seedResultsFor(path)
-				: path.endsWith(".rules.json")
+				: path.endsWith(".external-rules.json")
 					? o.seedRulesResults
 					: o.seedResults;
 		if (scripted === undefined)
@@ -823,13 +822,13 @@ const RM_SEEDFAIL =
 const SEED_RESULTS_ENV = "-e ALATE_PROVISION_RESULTS=<results>";
 /** The success-path cleanup one-off (no read happened, exit 0). */
 const RESULTS_RM =
-	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c rm -f <results> <results>.rules.json";
-/** The main results read; its exec also removes both files after the cat. */
+	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c rm -f <results> <results>.rules.json <results>.external-rules.json";
+/** The main results read; its exec also removes all three files after the cat. */
 const RESULTS_READ =
-	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>; rc=$?; rm -f <results> <results>.rules.json; exit $rc";
-/** The rules sync's own results read (the entrypoint's flat rules sync wrote it). */
+	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>; rc=$?; rm -f <results> <results>.rules.json <results>.external-rules.json; exit $rc";
+/** The external rules sync's own results read (the entrypoint's flat rules sync wrote it). */
 const RESULTS_RULES_READ =
-	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>.rules.json; exit $rc";
+	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>.external-rules.json; exit $rc";
 const SEEDFAIL_WRITE = (record: {
 	since: number;
 	commit: string;
@@ -4648,11 +4647,13 @@ describe("board seed", () => {
 		);
 	}, 60_000);
 
-	test("the rules read precedes the clearing main read, so a real partial classifies", async () => {
+	test("the sync read precedes the clearing main read, so a real partial classifies", async () => {
 		const { main } = checkout();
 		const data = checkout();
-		// The volume models the real files: the main read's exec deletes both, so
-		// a main-first order would leave the rules read empty and fail the seed.
+		// The volume models the real files: the main read's exec deletes all three,
+		// so a main-first order would leave the external read empty and fail the
+		// seed. The external file is the proof the classifier reads; the nested
+		// rules file rides along, written by install-user itself.
 		const volume = new Map<string, string>([
 			[
 				"<results>",
@@ -4665,7 +4666,14 @@ describe("board seed", () => {
 				"<results>.rules.json",
 				JSON.stringify({
 					fatal: false,
-					items: [{ item: "a.md", status: "unchanged", rule: null }],
+					items: [{ item: "a.md", status: "installed", rule: null }],
+				}),
+			],
+			[
+				"<results>.external-rules.json",
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "a.md", status: "installed", rule: null }],
 				}),
 			],
 		]);
@@ -4675,7 +4683,8 @@ describe("board seed", () => {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(0);
-		// The partial verdict had its rules proof, and the cleanup emptied the volume.
+		// The partial verdict had its external proof, and the cleanup emptied the
+		// volume.
 		expect(f.seedPartialRecords).toHaveLength(1);
 		expect(volume.size).toBe(0);
 	}, 60_000);
@@ -4702,9 +4711,12 @@ describe("board seed", () => {
 		// whitespace-tolerant: writeProvisionResults pretty-prints the JSON.
 		expect(command).toContain('grep -q \'"fatal": *true\' "$$R"');
 		expect(command).not.toContain('"fatal":true');
-		// The flat sync writes its own results file, which the classification reads
-		// as the proof that the pipeline completed.
-		expect(command).toContain('ALATE_PROVISION_RESULTS="$$R.rules.json"');
+		// The flat sync writes its own results file — distinct from install-user's
+		// nested <results>.rules.json — which the classification reads as the proof
+		// that the pipeline completed.
+		expect(command).toContain(
+			'ALATE_PROVISION_RESULTS="$$R.external-rules.json"',
+		);
 		// Both exit codes fold into one non-zero exit.
 		expect(command).toContain("exit $$rc");
 		expect(command.match(/\|\| rc=\$\$s/g)?.length).toBe(2);
@@ -4749,6 +4761,158 @@ describe("board seed", () => {
 				`${JSON.stringify({ fatal: false, error: null, items: [] }, null, 2)}\n`,
 			);
 			expect(Bun.spawnSync(["grep", "-q", pattern, clean]).exitCode).toBe(1);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the compound seed command executes end to end", () => {
+		const compose = readFileSync(
+			join(import.meta.dir, "..", "docker-compose.yml"),
+			"utf8",
+		);
+		const block = compose.slice(
+			compose.indexOf("board-seed:"),
+			compose.indexOf("home-repair:"),
+		);
+		const raw = /^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
+		const command = raw.replaceAll("$$", "$");
+		const dir = mkdtempSync(join(tmpdir(), "ottr-1260-exec-"));
+		const bin = join(dir, "bin");
+		mkdirSync(bin, { recursive: true });
+		// A stub node dispatches on the script name; the scenarios script its
+		// behavior through env, so the real compound command runs end to end —
+		// layer flag, fatal skip, per-item sync, external result path, exit fold —
+		// without Docker.
+		writeFileSync(
+			join(bin, "node"),
+			[
+				"#!/bin/sh",
+				'script="$1"; shift',
+				'case "$script" in',
+				"  install-user.mjs)",
+				'    printf "%s\\n" "$*" > "$SEED_SANDBOX/install-args"',
+				'    if [ -n "${INSTALL_RESULTS:-}" ]; then printf "%s\\n" "$INSTALL_RESULTS" > "${ALATE_PROVISION_RESULTS:?}"; fi',
+				'    exit "${INSTALL_EXIT:-0}"',
+				"    ;;",
+				"  sync.mjs)",
+				'    printf "%s\\n" "$*" > "$SEED_SANDBOX/sync-args"',
+				'    if [ -n "${SYNC_RESULTS:-}" ]; then printf "%s\\n" "$SYNC_RESULTS" > "${ALATE_PROVISION_RESULTS:?}"; fi',
+				'    exit "${SYNC_EXIT:-0}"',
+				"    ;;",
+				"esac",
+				"exit 97",
+			].join("\n"),
+			{ mode: 0o755 },
+		);
+		const partial = JSON.stringify(
+			{
+				fatal: false,
+				error: null,
+				items: [
+					{
+						item: "user/omp/agent/skills/slow",
+						status: "rejected",
+						rule: "SC2",
+					},
+					{ item: "user/omp/plugins", status: "installed", rule: null },
+				],
+			},
+			null,
+			2,
+		);
+		const external = JSON.stringify(
+			{
+				fatal: false,
+				error: null,
+				items: [{ item: "a.md", status: "installed", rule: null }],
+			},
+			null,
+			2,
+		);
+		const run = (scenario: {
+			installExit: number;
+			installResults?: string;
+			syncExit?: number;
+			syncResults?: string;
+			withEnv?: boolean;
+		}) => {
+			const env: Record<string, string> = {
+				PATH: `${bin}:${process.env.PATH}`,
+				SEED_SANDBOX: dir,
+			};
+			if (scenario.withEnv !== false)
+				env.ALATE_PROVISION_RESULTS = join(dir, "results.json");
+			env.INSTALL_EXIT = String(scenario.installExit);
+			if (scenario.installResults !== undefined)
+				env.INSTALL_RESULTS = scenario.installResults;
+			if (scenario.syncExit !== undefined) {
+				env.SYNC_EXIT = String(scenario.syncExit);
+				env.SYNC_RESULTS = scenario.syncResults ?? "";
+			}
+			return Bun.spawnSync(["sh", "-c", command], { env, cwd: dir });
+		};
+		try {
+			// Fresh state per scenario: the stubs overwrite their arg files, but the
+			// sync-args marker and the external result file must not leak between runs.
+			const reset = () => {
+				for (const f of [
+					"install-args",
+					"sync-args",
+					"results.json.external-rules.json",
+				])
+					rmSync(join(dir, f), { force: true });
+			};
+			// Per-item failure: the sync runs and writes its own file; the exit folds
+			// to non-zero, which is the classification trigger.
+			reset();
+			const perItem = run({
+				installExit: 1,
+				installResults: partial,
+				syncExit: 0,
+				syncResults: external,
+			});
+			expect(perItem.exitCode).toBe(1);
+			// The layer flag reached install-user: the switch the outcome needs.
+			expect(readFileSync(join(dir, "install-args"), "utf8")).toContain(
+				"--layer",
+			);
+			expect(existsSync(join(dir, "sync-args"))).toBe(true);
+			expect(
+				readFileSync(join(dir, "results.json.external-rules.json"), "utf8"),
+			).toContain('"fatal": false');
+			// A fatal refusal skips the sync entirely: no args, no result file.
+			reset();
+			const fatal = run({
+				installExit: 1,
+				installResults: `${JSON.stringify({ fatal: true, error: "the run refused", items: [] }, null, 2)}\n`,
+				syncExit: 0,
+				syncResults: JSON.stringify({ fatal: false, items: [] }, null, 2),
+			});
+			expect(fatal.exitCode).toBe(1);
+			expect(existsSync(join(dir, "sync-args"))).toBe(false);
+			expect(existsSync(join(dir, "results.json.external-rules.json"))).toBe(
+				false,
+			);
+			// A clean run folds to zero and still runs the sync.
+			reset();
+			const clean = run({
+				installExit: 0,
+				installResults: `${JSON.stringify({ fatal: false, error: null, items: [] }, null, 2)}\n`,
+				syncExit: 0,
+				syncResults: JSON.stringify({ fatal: false, items: [] }, null, 2),
+			});
+			expect(clean.exitCode).toBe(0);
+			expect(existsSync(join(dir, "sync-args"))).toBe(true);
+			// Manual run without the results env: the old success-only sequence.
+			reset();
+			const manualOk = run({ installExit: 0, withEnv: false });
+			expect(manualOk.exitCode).toBe(0);
+			expect(existsSync(join(dir, "sync-args"))).toBe(true);
+			reset();
+			const manualFail = run({ installExit: 1, withEnv: false });
+			expect(manualFail.exitCode).toBe(1);
+			expect(existsSync(join(dir, "sync-args"))).toBe(false);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -5085,29 +5249,50 @@ describe("classifySeedResults", () => {
 		});
 	});
 
-	test("an installed write proves a flat run, so the layer never switched and the seed fails", () => {
+	test("an installed write on a user item proves a flat run and fails, but plugins and rule items stay legitimate", () => {
 		const flat = JSON.stringify({
 			fatal: false,
 			items: [
-				{ item: "user/a", status: "installed" },
+				{ item: "user/omp/agent/skills/demo", status: "installed" },
 				{ item: "user/b", status: "rejected", rule: "SC2" },
 			],
 		});
 		expect(classifySeedResults(1, flat, rulesOk)).toEqual({ kind: "failed" });
-		// Even a rules file alone cannot carry the partial verdict past flat proof.
+		// Layer mode installs plugins with bun install in both modes: legitimate.
 		expect(
 			classifySeedResults(
 				1,
 				JSON.stringify({
 					fatal: false,
-					items: [{ item: "user/a", status: "unchanged" }],
+					items: [
+						{ item: "user/omp/plugins", status: "installed", rule: null },
+						{ item: "user/b", status: "rejected", rule: "SC2" },
+					],
+				}),
+				rulesOk,
+			),
+		).toEqual({
+			kind: "partial",
+			leftOut: [{ name: "user/b", rule: "SC2" }],
+		});
+		// A bare rule name holds no user prefix: the first layer's nested sync and
+		// the external sync both label changes installed without --compare.
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "user/b", status: "rejected", rule: "SC2" }],
 				}),
 				JSON.stringify({
 					fatal: false,
-					items: [{ item: "b.md", status: "installed", rule: null }],
+					items: [{ item: "a.md", status: "installed", rule: null }],
 				}),
 			),
-		).toEqual({ kind: "failed" });
+		).toEqual({
+			kind: "partial",
+			leftOut: [{ name: "user/b", rule: "SC2" }],
+		});
 	});
 
 	test("a rejected item plus a no-origin item fails, and so does a lone one", () => {

@@ -1038,8 +1038,15 @@ const SEED_ITEM_STATUSES = [
 	"inconclusive",
 ];
 const SEED_LEFT_OUT_STATUSES = ["rejected", "inconclusive"];
-/** Statuses that prove the run was flat, so the layer never switched. */
+/** Statuses that prove the run was flat — but only on `user/`-prefixed items other
+ *  than the plugins item: layer mode legitimately reports `installed` for plugins
+ *  (install-user.mjs builds plugins with bun install in both modes) and for rule
+ *  items (the first layer's nested sync and the external sync run without
+ *  `--compare`, so every change labels `installed`). A flat run's snapshot items —
+ *  skills, config, mcp, the user layer's own files — are the sound proof. */
 const SEED_FLAT_PROOF_STATUSES = ["installed"];
+const SEED_FLAT_PROOF_KEY = /^user\//;
+const SEED_PLUGINS_ITEM = "user/omp/plugins";
 
 /** Per-run install-user results path: a fresh name every seed, so a run can never read
  *  the previous run's result — a clone failure before install-user writes leaves the
@@ -1082,9 +1089,16 @@ function seedItemVerdict(item: unknown): SeedItemVerdict {
 	const it = item as { item?: unknown; status?: unknown; rule?: unknown };
 	if (typeof it.status !== "string" || !SEED_ITEM_STATUSES.includes(it.status))
 		return { kind: "broken" };
-	// An installed write proves a flat run: the entrypoint seeds with --layer, so
-	// the switch is required and a flat result is an incomplete seed.
-	if (SEED_FLAT_PROOF_STATUSES.includes(it.status)) return { kind: "broken" };
+	// An installed write on a user item other than plugins proves a flat run: the
+	// entrypoint seeds with --layer, so the switch is required and a flat result is
+	// an incomplete seed. Plugin and rule items keep their legitimate installed.
+	if (
+		SEED_FLAT_PROOF_STATUSES.includes(it.status) &&
+		typeof it.item === "string" &&
+		SEED_FLAT_PROOF_KEY.test(it.item) &&
+		it.item !== SEED_PLUGINS_ITEM
+	)
+		return { kind: "broken" };
 	// no-origin is outside the card's partial scope: known, but never acceptable —
 	// lone or next to a rejected item.
 	if (it.status === "no-origin") return { kind: "broken" };
@@ -1158,7 +1172,7 @@ async function readSeedResults(
 		"board-seed",
 		"-c",
 		alsoClear
-			? `cat ${path}; rc=$?; rm -f ${path} ${path}.rules.json; exit $rc`
+			? `cat ${path}; rc=$?; rm -f ${path} ${path}.rules.json ${path}.external-rules.json; exit $rc`
 			: `cat ${path}; exit $rc`,
 	);
 	return r.code === 0 ? r.out : null;
@@ -1181,7 +1195,7 @@ async function seedResultsClear(
 		"sh",
 		"board-seed",
 		"-c",
-		`rm -f ${path} ${path}.rules.json`,
+		`rm -f ${path} ${path}.rules.json ${path}.external-rules.json`,
 	);
 	if (r.code !== 0) d.log("the seed results file cleanup failed");
 }
@@ -1265,17 +1279,19 @@ async function runSeed(
 	try {
 		const run = await d.docker("compose", ...compose, ...seed.args);
 		if (run.code !== 0) {
-			// The rules read must precede the main read: the main read's exec also
-			// removes both files, so a main-first order would always find no rules
-			// file and fail every real partial seed.
-			const rules = await readSeedResults(
+			// The reads order matters twice: the external sync's file must precede the
+			// main read (whose exec removes all three), and install-user's nested
+			// sync writes its own <results>.rules.json beside the external one —
+			// distinct files, so an external crash can never borrow the nested file
+			// as its proof.
+			const sync = await readSeedResults(
 				d,
 				compose,
-				`${seed.resultsPath}.rules.json`,
+				`${seed.resultsPath}.external-rules.json`,
 				false,
 			);
 			const results = await readSeedResults(d, compose, seed.resultsPath, true);
-			const verdict = classifySeedResults(run.code, results, rules);
+			const verdict = classifySeedResults(run.code, results, sync);
 			if (verdict.kind === "partial") {
 				// The layer switched with items left out: the amber notice, and the
 				// run counts as done for its commit.

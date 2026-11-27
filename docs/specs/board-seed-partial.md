@@ -30,9 +30,13 @@ results file, never the stdout text.
 Normal statuses: `unchanged`, `added`, `updated`. Left-out statuses: `rejected`,
 `inconclusive`. The card scopes the partial outcome to those two; a `no-origin` item
 fails the seed like any other unknown shape, so a missing origin keeps the red notice
-— a rejected item next to a `no-origin` one fails too. An `installed` item also fails
-the seed: layer mode labels every write `added`, `updated`, or `unchanged`, so
-`installed` proves a flat run, and a flat run never switched the layer.
+— a rejected item next to a `no-origin` one fails too. An `installed` item fails the
+seed only on a `user/`-prefixed item other than `user/omp/plugins`: layer mode labels
+every snapshot write `added`, `updated`, or `unchanged`, so an `installed` user item
+proves a flat run, and a flat run never switched the layer. `installed` on the
+plugins item is legitimate in both modes (bun install), and `installed` on rule items
+is legitimate because the first layer's nested sync and the external sync run without
+`--compare`, so every change labels `installed`.
 
 Exit 0 decides `ok` on its own. A results file that contradicts exit 0 is logged as a
 warning; the exit code stays authoritative, because an old Alate image writes no
@@ -87,15 +91,21 @@ installs the layer rules itself through a nested sync and switches the layer, bu
 flat mirror needs the second command, and with `&&` a per-item failure (exit 1,
 `fatal` `false`) skipped it. The entrypoint now runs the flat sync for every
 install-user run whose results file says `fatal: false`, points it at
-`<results>.rules.json` so its outcome is machine-readable, and folds both exit codes
-into one non-zero exit. The fatal guard is whitespace-tolerant
-(`'"fatal": *true'`), because writeProvisionResults pretty-prints the JSON. A fatal
-refusal still skips the sync (nothing was installed), and a run without the results
-env — a plain manual `docker compose run board-seed` — keeps the old success-only
-sequence. The classification accepts a partial outcome only when the rules file
-proves the sync ran; a missing or fatal rules file fails the seed. The reads order
-the rules file first: the main read's exec removes both files, so a main-first order
-would always find no rules file.
+`<results>.external-rules.json` so its outcome is machine-readable and distinct from
+install-user's nested `<results>.rules.json` — an external crash must not borrow the
+nested file as its proof — and folds both exit codes into one non-zero exit. The
+fatal guard is whitespace-tolerant (`'"fatal": *true'`), because
+writeProvisionResults pretty-prints the JSON. A fatal refusal still skips the sync
+(nothing was installed), and a run without the results env — a plain manual
+`docker compose run board-seed` — keeps the old success-only sequence. The
+classification accepts a partial outcome only when the external file proves the sync
+ran; a missing or fatal external file fails the seed. The reads order the external
+file first: the main read's exec removes all three files, so a main-first order
+would always find no external file. The compound command is itself under test: a
+stub `node` on PATH runs the real command string from the compose file across the
+fatal, per-item, success, and manual scenarios, asserting the layer flag in
+install-user's argv, which stages ran, the external file's content, and the folded
+exit codes.
 
 ## Records
 
