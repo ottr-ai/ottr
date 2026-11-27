@@ -119,22 +119,26 @@ function seedStaleWorktree(dir: string): string {
 	return base;
 }
 
-/** A committed card worktree whose branch changes three hostile-named
- *  projects/ files — non-ASCII, a trailing space, and a double quote — the
- *  name bytes the changed-set parser must carry intact. Returns the base sha. */
+/** A committed card worktree whose branch changes four hostile-named
+ *  projects/ files — non-ASCII, a double quote, an internal space, and a
+ *  name that ends in a real trailing space — the name bytes the changed-set
+ *  parser must carry intact: quoting corrupts the first two, and a trim()
+ *  after the split corrupts the last two. Returns the base sha. */
 function seedHostileNames(dir: string): string {
 	mkdirSync(join(dir, "projects/ottr"), { recursive: true });
 	writeFileSync(join(dir, "projects/ottr/文档.md"), "unicode base\n");
-	writeFileSync(join(dir, "projects/ottr/trailing .md"), "trailing base\n");
 	writeFileSync(join(dir, 'projects/ottr/we"ird.md'), "quoted base\n");
+	writeFileSync(join(dir, "projects/ottr/trailing .md"), "inner space base\n");
+	writeFileSync(join(dir, "projects/ottr/trailing.md "), "end space base\n");
 	sh("git init -q -b main", dir);
 	sh("git config user.email t@t && git config user.name t", dir);
 	sh("git add -A && git commit -qm base", dir);
 	const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
 	sh("git checkout -q -b ott/card", dir);
 	writeFileSync(join(dir, "projects/ottr/文档.md"), "unicode card\n");
-	writeFileSync(join(dir, "projects/ottr/trailing .md"), "trailing card\n");
 	writeFileSync(join(dir, 'projects/ottr/we"ird.md'), "quoted card\n");
+	writeFileSync(join(dir, "projects/ottr/trailing .md"), "inner space card\n");
+	writeFileSync(join(dir, "projects/ottr/trailing.md "), "end space card\n");
 	sh("git add -A && git commit -qm card", dir);
 	return base;
 }
@@ -722,8 +726,9 @@ describe("changed-file classification", () => {
 		// changed-set membership and wrongly turns the card's change into a skip.
 		mkdirSync(join(root, "ottr"), { recursive: true });
 		writeFileSync(join(root, "ottr", "文档.md"), "live unicode\n");
-		writeFileSync(join(root, "ottr", "trailing .md"), "live trailing\n");
 		writeFileSync(join(root, "ottr", 'we"ird.md'), "live quoted\n");
+		writeFileSync(join(root, "ottr", "trailing .md"), "live inner space\n");
+		writeFileSync(join(root, "ottr", "trailing.md "), "live end space\n");
 		const record = await runSyncGate(
 			targetFor({ root, worktree: wt, base, alateDir, home }),
 		);
@@ -733,8 +738,13 @@ describe("changed-file classification", () => {
 		const byPath = new Map(record.files.map((f) => [f.path, f]));
 		const expected: [string, string, string][] = [
 			["projects/ottr/文档.md", "unicode card\n", "live unicode\n"],
-			["projects/ottr/trailing .md", "trailing card\n", "live trailing\n"],
 			['projects/ottr/we"ird.md', "quoted card\n", "live quoted\n"],
+			[
+				"projects/ottr/trailing .md",
+				"inner space card\n",
+				"live inner space\n",
+			],
+			["projects/ottr/trailing.md ", "end space card\n", "live end space\n"],
 		];
 		for (const [path, source, twin] of expected) {
 			expect(byPath.get(path)?.sourceSha256).toBe(shaOf(source));
