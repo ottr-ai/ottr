@@ -17,7 +17,7 @@ import { dirname, join } from "node:path";
 import { aptListPath } from "./apt.ts";
 import { requirementsListPath } from "./python.ts";
 import { buildToolsPath, parseToolsJson, toolsListPath } from "./tools.ts";
-import { type GuestOptions, serveGuest } from "./vmGuest.ts";
+import { exec, type GuestOptions, serveGuest } from "./vmGuest.ts";
 import {
 	lineDropNotice,
 	MAX_STREAM_LINE_CHARS,
@@ -1141,4 +1141,19 @@ process.stdout.write('{"type":"after-flood"}\\n');`,
 			clearInterval(sampler);
 		}
 	}, 90_000);
+});
+
+describe("exec timeout", () => {
+	// exec runs unbounded unless the caller passes timeoutMs, and the /bake sync flush
+	// rides that option (SYNC_TIMEOUT_MS): a host writeback stall once blocked sync(1)
+	// for minutes and hung every POST /bake test (OTTR-1332). This pins the abort
+	// contract: a command that outlives its limit is killed and the error names it.
+	test("a command that outlives its timeout is killed and the error names the timeout", async () => {
+		const started = Date.now();
+		const r = await exec(["sleep", "5"], undefined, 100);
+		const elapsed = Date.now() - started;
+		expect(r.ok).toBe(false);
+		expect(r.err).toContain("100 ms timeout");
+		expect(elapsed).toBeLessThan(2_000);
+	});
 });

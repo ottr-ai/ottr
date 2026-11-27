@@ -208,10 +208,16 @@ interface ExecResult {
 	out: string;
 	/** stderr trimmed, or a synthetic line when the command said nothing. */
 	err: string;
+	/** True when timeoutMs fired: the child got the kill, but its exit was not awaited. */
+	timedOut: boolean;
 }
 
-/** Runs a guest tool (git, tar, sync) to its end; never throws. */
-async function exec(argv: string[], cwd?: string): Promise<ExecResult> {
+/** Runs a guest tool (git, tar, sync) to its end; never throws. Exported for tests. */
+export async function exec(
+	argv: string[],
+	cwd?: string,
+	timeoutMs?: number,
+): Promise<ExecResult> {
 	try {
 		const p = Bun.spawn(argv, {
 			cwd,
@@ -220,27 +226,60 @@ async function exec(argv: string[], cwd?: string): Promise<ExecResult> {
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		const [out, err, code] = await Promise.all([
+		const ended = Promise.all([
 			new Response(p.stdout).text(),
 			new Response(p.stderr).text(),
 			p.exited,
 		]);
+		if (timeoutMs === undefined) {
+			const [out, err, code] = await ended;
+			return {
+				ok: code === 0,
+				out,
+				err: err.trim() || `${argv.slice(0, 2).join(" ")} exited ${code}`,
+				timedOut: false,
+			};
+		}
+		const { promise: limit, resolve: fire } = Promise.withResolvers<null>();
+		const timer = setTimeout(() => {
+			// A stalled child (sync in D state during a host writeback stall) may never
+			// die on the kill, so the timeout result below returns without its exit.
+			p.kill();
+			fire(null);
+		}, timeoutMs);
+		const r = await Promise.race([ended, limit]);
+		clearTimeout(timer);
+		if (r === null)
+			return {
+				ok: false,
+				out: "",
+				err: `${argv.slice(0, 2).join(" ")} exceeded its ${timeoutMs} ms timeout and was killed`,
+				timedOut: true,
+			};
+		const [out, err, code] = r;
 		return {
 			ok: code === 0,
 			out,
 			err: err.trim() || `${argv.slice(0, 2).join(" ")} exited ${code}`,
+			timedOut: false,
 		};
 	} catch (err) {
 		return {
 			ok: false,
 			out: "",
 			err: err instanceof Error ? err.message : String(err),
+			timedOut: false,
 		};
 	}
 }
 
 const git = (cwd: string | undefined, args: string[]): Promise<ExecResult> =>
 	exec(["git", ...args], cwd);
+
+// At least 10 s: a loaded but healthy host can need seconds for the flush, so a shorter
+// limit would fail sync on a mere load spike. The ceiling bounds a stalled host instead:
+// OTTR-1215's writeback stall blocked sync(1) for minutes and hung every POST /bake test.
+const SYNC_TIMEOUT_MS = 10_000;
 
 /**
  * Routes each provider through the board's /llm proxy in `<agentDir>/models.yml`: the VM holds no
@@ -730,11 +769,18 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				// disk before it can read the line. syncfs of the layer's filesystem
 				// (`sync -f <home>`): the machine-wide sync(2) flushes every mounted
 				// filesystem on the host, and one mount whose daemon died (a FUSE
-				// mount, OTTR-1282) blocks it forever and so every bake.
-				await exec(["sync", "-f", opts.home ?? "/root"]);
-				push(
-					`${JSON.stringify({ [WORKER_DONE]: { exitCode, stderrTail } })}\n`,
+				// mount, OTTR-1282) blocks it forever and so every bake. The
+				// SYNC_TIMEOUT_MS floor keeps that failure mode bounded: a stalled
+				// host fails the bake with the timeout named, it no longer hangs it.
+				const flush = await exec(
+					["sync", "-f", opts.home ?? "/root"],
+					undefined,
+					SYNC_TIMEOUT_MS,
 				);
+				const done = flush.timedOut
+					? { exitCode: 1, stderrTail: flush.err }
+					: { exitCode, stderrTail };
+				push(`${JSON.stringify({ [WORKER_DONE]: done })}\n`);
 			},
 			() => {},
 		);
