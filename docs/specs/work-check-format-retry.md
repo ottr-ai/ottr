@@ -28,7 +28,10 @@ rule, so the board can feed it back and re-run the check without a human.
 2. **Retry with feedback.** After a format failure the board runs the check again at
    the same head, with the same inputs plus the board's validator message. At most two
    automatic retries run per check flow (so at most three attempts; format retries do
-   not extend a flow that ended in a non-format failure). Each retry writes one card
+   not extend a flow that ended in a non-format failure). The base bound stays two
+   attempts: the usage-limit fallback and the plain re-run gain no attempt, so a
+   provider-only flow runs exactly the two checks it ran before this card. Each retry
+   writes one card
    log line before it starts:
    `- work check format retry <n>/2: <validator message>`
    A retry never clears a blocker, never stamps a completed head, and never counts as

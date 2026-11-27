@@ -16335,6 +16335,80 @@ describe("work card check", () => {
 		expect(text).toContain("the check runs on anthropic/claude-check");
 	});
 
+	test("a second used-up fallback with another eligible provider adds no third check run", async () => {
+		const resetsAt = Date.now() + 3_600_000;
+		const anthropicLimited = runResult({
+			exitCode: 1,
+			model: "anthropic/claude-check",
+			providerError:
+				"Anthropic error event: The usage limit has been reached (code=usage_limit_reached)",
+		});
+		const { store, record, loop } = await workCheckCase(
+			{ sha: "sha1" },
+			[usageLimited, anthropicLimited],
+			{
+				modelRoles: () => ({
+					default: "anthropic/claude-opus-work",
+					adversary: "openai-codex/gpt-5.5",
+				}),
+				// Both fallbacks stay eligible in the quota report, so after the second
+				// limit the scan still finds a third provider. The base two-attempt bound
+				// must hold: only a format rejection extends the flow (OTTR-1265 review).
+				modelFallbacks: () => ({
+					adversary: ["anthropic/claude-check", "google/gemini-check"],
+				}),
+				quota: async () => ({
+					limits: [
+						{
+							provider: "openai-codex",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 100,
+							resetsAt,
+						},
+						{
+							provider: "anthropic",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 40,
+							resetsAt: resetsAt + 1_000,
+						},
+						{
+							provider: "google",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 40,
+							resetsAt: resetsAt + 2_000,
+						},
+					],
+					error: null,
+					at: Date.now(),
+				}),
+			},
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		// Work run + two check attempts: the third eligible provider never runs.
+		expect(record.runs).toHaveLength(3);
+		expect(record.runs[1]!.model).toBe("openai-codex/gpt-5.5");
+		expect(record.runs[2]!.model).toBe("anthropic/claude-check");
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.holdUntil).toBeNull();
+		expect(after.needsReason).toContain("The work check failed: ");
+		expect(after.needsReason).not.toContain("failed twice");
+		expect(after.needsReason).not.toContain("after 3 attempts");
+		expect(after.workCheckLog[0]!.outcome).toBe("error");
+		const text = await logText(store, task.id);
+		expect(text).toContain("the check runs on anthropic/claude-check");
+		expect(text).toContain("the check runs on google/gemini-check");
+		expect(text).not.toContain("work check format retry");
+	});
+
 	test("a fallback chain with no provider with quota still holds", async () => {
 		const resetsAt = Date.now() + 3_600_000;
 		const { store, record, loop } = await workCheckCase(

@@ -12057,11 +12057,10 @@ export function createTurnLoop(
 		let lastFormat: string | null = null;
 		let formatRetries = 0;
 		let attempts = 0;
-		for (
-			let attempt = 1;
-			attempt <= 1 + WORK_CHECK_MAX_FORMAT_RETRIES;
-			attempt++
-		) {
+		// The base two-attempt bound. Only a granted format retry extends it, so the
+		// usage-limit fallback and the plain re-run never gain an attempt.
+		let maxAttempts = 2;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			const ran = await awaitWorkCheckAttempt(
 				st,
 				feedback === null
@@ -12158,6 +12157,7 @@ export function createTurnLoop(
 			) {
 				formatRetries++;
 				feedback = out.formatError;
+				maxAttempts = 1 + WORK_CHECK_MAX_FORMAT_RETRIES;
 				await st.log(
 					`- work check format retry ${formatRetries}/${WORK_CHECK_MAX_FORMAT_RETRIES}: ${out.formatError}`,
 				);
