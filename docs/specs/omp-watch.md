@@ -124,7 +124,7 @@ server host is not an acceptable boundary for unapproved code.
   runs), stamps the copy into the job HOME, and runs the candidate under the
   three-name env. The wrapper caps the
   candidate's stdout at 2 MiB and writes compact provider/id records to
-  `home/catalog.json`, which the guest promotes as an artifact. The transport parses
+  `home/job/catalog.json` (the job HOME is `/home/job`), which the guest promotes as an artifact. The transport parses
   that artifact, never the 64 KiB stdout tail, so the complete catalog arrives. A
   catalog with more entries than the parse accepts stays over the cap and is
   rejected, never cut to an accepted prefix.

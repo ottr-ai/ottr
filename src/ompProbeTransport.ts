@@ -44,7 +44,14 @@ import { dirname, join } from "node:path";
 import { agentDir } from "./login.ts";
 import { OMP_PACKAGE_URL } from "./ompWatch.ts";
 import type { ProcSpawn } from "./sandboxRun.ts";
-import type { ValidateResponse } from "./vmValidateShared.ts";
+import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
+
+/**
+ * The collect name of the catalog the wrapper writes to `$HOME/catalog.json`.
+ * The guest promotes `home/...` from `/home/...`, and the job's HOME is
+ * VM_VALIDATE.envAllowlist.HOME (/home/job), so the name is `home/job/catalog.json`.
+ */
+export const CATALOG_ARTIFACT = `${VM_VALIDATE.envAllowlist.HOME.slice(1)}/catalog.json`;
 
 /** The exact pin shape the argv guard needs: strict x.y.z only, so the
  * version can never inject shell metacharacters into the job argv. */
@@ -943,7 +950,7 @@ export function createOmpProbeTransport(
 					job: {
 						argv: probeJobArgv(binRel),
 						cwd: "/target",
-						collect: ["home/catalog.json"],
+						collect: [CATALOG_ARTIFACT],
 					},
 				}),
 				signal: controller.signal,
@@ -971,7 +978,7 @@ export function createOmpProbeTransport(
 			// The catalog travels as the promoted artifact: complete, never cut
 			// by the guest's 64 KiB stdout tail. The stdout tail is diagnostic.
 			const artifact = body.artifacts.find(
-				(a) => a.name === "home/catalog.json" && a.dropped === undefined,
+				(a) => a.name === CATALOG_ARTIFACT && a.dropped === undefined,
 			);
 			if (artifact === undefined || artifact.bytes === "")
 				throw new Error(

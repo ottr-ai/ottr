@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
 	buildRedactedStore,
+	CATALOG_ARTIFACT,
 	createOmpProbeTransport,
 	lockEntryForPlatform,
 	payloadTarballName,
@@ -27,6 +28,7 @@ import {
 } from "./ompProbeTransport.ts";
 import { OMP_PACKAGE_URL, OMP_WATCH_GATES, parseModelSet } from "./ompWatch.ts";
 import type { ProcSpawn } from "./sandboxRun.ts";
+import { promoteArtifacts, realFs, type ValidateFs } from "./vmValidate.ts";
 import { VM_VALIDATE } from "./vmValidateShared.ts";
 
 // Per-test real-fs scratch; everything a test builds dies with its dir.
@@ -169,7 +171,7 @@ const jobResponse = (job: unknown): Response =>
 			job,
 			artifacts: [
 				{
-					name: "home/catalog.json",
+					name: CATALOG_ARTIFACT,
 					size: CATALOG_B64.length,
 					bytes: CATALOG_B64,
 				},
@@ -577,12 +579,27 @@ function lockedPayload(pkgs: LockedPkg[]) {
 	const targetPkg = join(tmp, "target", "pkg");
 	mkdirSync(dirname(targetPkg), { recursive: true });
 	cpSync(pkgDir, targetPkg, { recursive: true });
-	const home = join(tmp, "home");
+	// The guest's filesystem root: HOME sits at the guest's real HOME path
+	// below it, so the promotion walk reads the same collect name the
+	// transport sends.
+	const guestRoot = join(tmp, "guest");
+	const home = join(guestRoot, VM_VALIDATE.envAllowlist.HOME);
 	mkdirSync(home, { recursive: true });
 	const storeDb = join(tmp, "store", "agent.db");
 	mkdirSync(dirname(storeDb), { recursive: true });
 	writeFileSync(storeDb, "store bytes");
 	let scratch = "";
+	/** The catalog as the guest promotes it: the real promotion walk over the
+	 * transport's collect name, with the guest root under tmp. */
+	const promoted = (): string => {
+		const [artifact] = promoteArtifacts([CATALOG_ARTIFACT], {
+			fs: fsUnder(guestRoot),
+			collectFileBytes: VM_VALIDATE.collectFileBytes,
+			collectTotalBytes: VM_VALIDATE.collectTotalBytes,
+		});
+		expect(artifact?.dropped).toBeUndefined();
+		return Buffer.from(artifact!.bytes, "base64").toString("utf8");
+	};
 	return {
 		targetPkg,
 		home,
@@ -628,13 +645,20 @@ function lockedPayload(pkgs: LockedPkg[]) {
 			expect(scratch).not.toBe("");
 			return scratch;
 		},
-		catalogText: () => readFileSync(join(home, "catalog.json"), "utf8"),
+		catalogText: promoted,
 		catalog: () =>
-			(
-				JSON.parse(readFileSync(join(home, "catalog.json"), "utf8")) as {
-					models: { provider: string; id: string }[];
-				}
-			).models,
+			(JSON.parse(promoted()) as { models: { provider: string; id: string }[] })
+				.models,
+	};
+}
+
+/** The real no-follow fs with every absolute guest path rebased under root. */
+function fsUnder(root: string): ValidateFs {
+	const real = realFs();
+	return {
+		...real,
+		lstat: (path) => real.lstat(join(root, path)),
+		openRead: (path) => real.openRead(join(root, path)),
 	};
 }
 
@@ -1022,7 +1046,10 @@ describe("ompProbeTransport", () => {
 			PATH: process.env.PATH ?? "",
 		});
 		const started = Date.now();
-		const pending = spawn(["sleep", "30"]);
+		// A duration no other process uses: the leak check below must match
+		// only this child, never a sibling run's `sleep` on the host.
+		const duration = `30.${process.pid}`;
+		const pending = spawn(["sleep", duration]);
 		// Real clock, deliberately: the deadline must kill a real child
 		// process, and fake timers cannot advance a sleeping `sleep`.
 		setTimeout(() => controller.abort(), 150);
@@ -1031,7 +1058,11 @@ describe("ompProbeTransport", () => {
 		// by then, so the child is reaped when this resolves.
 		await expect(pending).rejects.toThrow("preparation killed at the deadline");
 		expect(Date.now() - started).toBeLessThan(10_000);
-		const probe = Bun.spawnSync(["pgrep", "-x", "sleep"]);
+		const probe = Bun.spawnSync([
+			"pgrep",
+			"-f",
+			`^sleep ${duration.replace(".", "\\.")}$`,
+		]);
 		expect(probe.exitCode).not.toBe(0);
 	});
 

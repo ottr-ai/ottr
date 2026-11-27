@@ -28022,7 +28022,7 @@ describe("omp watch probe wiring", () => {
 					// the transport reads it, never the stdout tail.
 					artifacts: [
 						{
-							name: "home/catalog.json",
+							name: "home/job/catalog.json",
 							size: Buffer.byteLength(models),
 							bytes: Buffer.from(models, "utf8").toString("base64"),
 						},
@@ -28308,7 +28308,7 @@ describe("omp watch probe wiring", () => {
 						"/target/pkg",
 					],
 					cwd: "/target",
-					collect: ["home/catalog.json"],
+					collect: ["home/job/catalog.json"],
 				});
 				// The wire token rode the header only: never in the URL, never in
 				// any logged or thrown text.

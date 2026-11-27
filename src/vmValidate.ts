@@ -652,9 +652,15 @@ export async function runSelfCheck(
  * racer outside the group cannot change a file between its stat and its read. Any
  * name that fails a promotion rule is dropped and named, never fatal.
  */
+/** The deps the promotion walk reads: the no-follow fs and the caps. */
+export type PromoteDeps = Pick<
+	ValidateDeps,
+	"fs" | "collectFileBytes" | "collectTotalBytes"
+>;
+
 export function promoteArtifacts(
 	collect: readonly string[],
-	deps: ValidateDeps = realDeps(),
+	deps: PromoteDeps = realDeps(),
 ): ValidateArtifact[] {
 	const artifacts: ValidateArtifact[] = [];
 	let total = 0;
@@ -669,7 +675,7 @@ export function promoteArtifacts(
 
 function promoteOne(
 	name: string,
-	deps: ValidateDeps,
+	deps: PromoteDeps,
 	total: number,
 ): ValidateArtifact {
 	const drop = (reason: string): ValidateArtifact => ({
