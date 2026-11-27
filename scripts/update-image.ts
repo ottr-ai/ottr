@@ -1065,8 +1065,14 @@ type SeedItemVerdict =
 	| { kind: "broken" };
 
 /** The results file's item array, or null when the text does not parse, `fatal` is
- *  not false, or the items are missing, empty, or not an array. */
-function seedItemsOf(resultsText: string | null): unknown[] | null {
+ *  not false, or the items are missing or not an array. `allowEmpty` admits an empty
+ *  items array: the external rules sync legitimately writes one when the data
+ *  repository carries no rules. The main file stays strict — an empty array there is
+ *  a broken write, not a real run. */
+function seedItemsOf(
+	resultsText: string | null,
+	allowEmpty = false,
+): unknown[] | null {
 	if (resultsText === null) return null;
 	let parsed: unknown;
 	try {
@@ -1077,7 +1083,8 @@ function seedItemsOf(resultsText: string | null): unknown[] | null {
 	if (typeof parsed !== "object" || parsed === null) return null;
 	const { fatal, items } = parsed as { fatal?: unknown; items?: unknown };
 	if (fatal !== false) return null;
-	if (!Array.isArray(items) || items.length === 0) return null;
+	if (!Array.isArray(items)) return null;
+	if (items.length === 0 && !allowEmpty) return null;
 	return items;
 }
 
@@ -1130,18 +1137,27 @@ export function classifySeedResults(
 	if (exitCode === 0) return { kind: "ok" };
 	const items = seedItemsOf(resultsText);
 	if (items === null) return { kind: "failed" };
-	const ruleItems = seedItemsOf(rulesText);
+	// The external file may legitimately hold no items: a data repository with no
+	// rules writes fatal false with an empty list.
+	const ruleItems = seedItemsOf(rulesText, true);
 	// No rules result is an incomplete pipeline: the compose entrypoint writes the
 	// rules file for every install-user run that was not a fatal refusal, so a
 	// missing file means the rules sync never ran (an old guard, a refusal it hid,
 	// or a crash) and the seed is not done.
 	if (ruleItems === null) return { kind: "failed" };
 	const leftOut: { name: string; rule: string }[] = [];
+	// The same rule can fail twice: install-user merges its nested sync's items
+	// into the main file, and the external sync reports the rule again. One
+	// left-out item per key, so the notice's count and Details tell the truth.
+	const seen = new Set<string>();
 	for (const item of [...items, ...ruleItems]) {
 		const verdict = seedItemVerdict(item);
 		if (verdict.kind === "broken") return { kind: "failed" };
-		if (verdict.kind === "leftOut")
+		if (verdict.kind === "leftOut") {
+			if (seen.has(verdict.name)) continue;
+			seen.add(verdict.name);
 			leftOut.push({ name: verdict.name, rule: verdict.rule });
+		}
 	}
 	if (leftOut.length === 0) return { kind: "failed" };
 	return { kind: "partial", leftOut };
@@ -1250,6 +1266,36 @@ export async function seedPartialRecord(
 		);
 }
 
+/** Records the partial seed's commit in the seed phase itself, before the deploy's
+ *  restart may defer: a busy runner or turns past the hold leave recordSeed unwritten,
+ *  and an unrecorded commit would make the next run seed the same commit again,
+ *  repeating the scans. The write is the same one recordSeed issues later; a failure
+ *  here is advisory — the later write, or the next run, repairs it. */
+async function seedCommitRecord(
+	d: Deps,
+	compose: string[],
+	wantedSha: string,
+): Promise<void> {
+	if (!/^[0-9a-f]{7,40}$/.test(wantedSha)) {
+		d.log("the partial seed commit is not a sha; the next run seeds again");
+		return;
+	}
+	const w = await d.docker(
+		"compose",
+		...compose,
+		"exec",
+		"-T",
+		"server",
+		"sh",
+		"-c",
+		`printf %s '${wantedSha}' > /etc/ottr/seed-commit`,
+	);
+	if (w.code !== 0)
+		d.log(
+			"the partial seed commit cannot be recorded; the next run seeds again",
+		);
+}
+
 /** Runs the board-seed service once, discovering ALATE_IMAGE for the child when needed. */
 async function runSeed(
 	d: Deps,
@@ -1294,7 +1340,10 @@ async function runSeed(
 			const verdict = classifySeedResults(run.code, results, sync);
 			if (verdict.kind === "partial") {
 				// The layer switched with items left out: the amber notice, and the
-				// run counts as done for its commit.
+				// run counts as done for its commit. The commit records here, not
+				// after the restart settles: a deferred restart (a busy runner,
+				// turns past the hold) must not turn the next run into a re-seed,
+				// because re-seeding repeats the SkillSpector scans.
 				const names = verdict.leftOut
 					.slice(0, 20)
 					.map((item) => item.name)
@@ -1311,6 +1360,7 @@ async function runSeed(
 					verdict.leftOut,
 					env,
 				);
+				await seedCommitRecord(d, compose, outcome.wantedSha);
 				return { ...outcome, seeded: true };
 			}
 			d.log(

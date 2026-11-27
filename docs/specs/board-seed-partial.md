@@ -36,7 +36,11 @@ every snapshot write `added`, `updated`, or `unchanged`, so an `installed` user 
 proves a flat run, and a flat run never switched the layer. `installed` on the
 plugins item is legitimate in both modes (bun install), and `installed` on rule items
 is legitimate because the first layer's nested sync and the external sync run without
-`--compare`, so every change labels `installed`.
+`--compare`, so every change labels `installed`. The external file may hold an empty
+items list — a data repository with no rules writes one — and it leaves the main
+file's verdict standing. The same rule failing in both files (install-user merges the
+nested sync's items into the main file, and the external sync reports the rule again)
+counts once.
 
 Exit 0 decides `ok` on its own. A results file that contradicts exit 0 is logged as a
 warning; the exit code stays authoritative, because an old Alate image writes no
@@ -112,10 +116,12 @@ exit codes.
 All records live next to the board home in the `board-config` volume. The seed is
 their only writer.
 
-`/etc/ottr/seed-commit` — unchanged format. A partial seed sets `seeded: true`, so the
-existing writers record it: `recordSeed` after the board took the deploy, and
-`seedOnlyUpdate` immediately. The next run's `readSeedRecord` comparison then skips
-the same commit.
+`/etc/ottr/seed-commit` — unchanged format. A partial seed sets `seeded: true` and
+records the commit in the seed phase itself: a deferred restart (a busy runner, turns
+past the hold) leaves `recordSeed` unwritten, and an unrecorded commit would make the
+next run seed the same commit again, repeating the scans. `recordSeed` rewrites the
+same value after the board took the deploy, and `seedOnlyUpdate` records immediately.
+The next run's `readSeedRecord` comparison then skips the same commit.
 
 `/etc/ottr/seed-partial` — new, written only for a partial outcome:
 

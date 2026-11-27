@@ -3816,6 +3816,57 @@ describe("rolling restart", () => {
 		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
 	}, 60_000);
 
+	test("a deferred restart still records a partial seed's commit in the seed phase", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [stl(0, 0, 0), stl(0, 0, 1)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+			seedCode: 1,
+			seedResults: JSON.stringify({
+				fatal: false,
+				items: [
+					{
+						item: "user/omp/agent/skills/slow",
+						status: "rejected",
+						rule: "SC2",
+					},
+					{
+						item: "user/omp/agent/skills/rest",
+						status: "unchanged",
+						rule: null,
+					},
+				],
+			}),
+			seedRulesResults: JSON.stringify({
+				fatal: false,
+				items: [{ item: "a.md", status: "unchanged", rule: null }],
+			}),
+		});
+		expect(
+			await updateImage(main, ["-f c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// The deferral stands: no restart, the wait report written.
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.seedWrites).toEqual([write, WAIT_WRITE(Date.UTC(2026, 9, 16))]);
+		// The commit recorded in the seed phase: the next run will not re-seed.
+		const next = fakes({ seedRecord: head });
+		expect(
+			await updateImage(main, ["-f c.yml"], next.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(next.seedRuns).toEqual([]);
+	}, 60_000);
+
 	test("a refused worker hold in the server step stops the run", async () => {
 		const { main } = checkout();
 		const data = checkout();
@@ -4554,7 +4605,9 @@ describe("board seed", () => {
 		expect(f.seedFailState.value).toBe("");
 		// The partial seed counts as done: the deploy settles and records the commit.
 		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
-		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
+		// The seed phase wrote the commit already; recordSeed rewrites it after the
+		// restart settles.
+		expect(f.seedWrites).toEqual([write, write, DEPLOYED(main)]);
 		const log = f.logs.join("\n");
 		expect(log).toContain(
 			`board seed partial at ${head.slice(0, 12)}: 3 items left out: user/agents/skills/ffmpeg-skill, user/agents/skills/shorts, user/omp/agent/skills/slow`,
@@ -5320,6 +5373,52 @@ describe("classifySeedResults", () => {
 				}),
 			),
 		).toEqual({ kind: "failed" });
+	});
+
+	test("an external file with no rules leaves the main verdict standing", () => {
+		// A data repository with no rules writes fatal false with an empty list.
+		const main = JSON.stringify({
+			fatal: false,
+			items: [{ item: "user/x", status: "rejected", rule: "SC2" }],
+		});
+		expect(
+			classifySeedResults(1, main, JSON.stringify({ fatal: false, items: [] })),
+		).toEqual({
+			kind: "partial",
+			leftOut: [{ name: "user/x", rule: "SC2" }],
+		});
+		// The main file keeps its strictness: an empty main list is a broken write.
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({ fatal: false, items: [] }),
+				JSON.stringify({ fatal: false, items: [] }),
+			),
+		).toEqual({ kind: "failed" });
+	});
+
+	test("a rule failing in both files counts once", () => {
+		// install-user merges the nested sync's items into the main file, and the
+		// external sync reports the same rule again: one left-out entry per key.
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [
+						{ item: "rule.md", status: "rejected", rule: "SC2" },
+						{ item: "user/a", status: "unchanged", rule: null },
+					],
+				}),
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "rule.md", status: "rejected", rule: "SC2" }],
+				}),
+			),
+		).toEqual({
+			kind: "partial",
+			leftOut: [{ name: "rule.md", rule: "SC2" }],
+		});
 	});
 
 	test("a lone no-origin item is failed: the card scopes partial to rejected and inconclusive", () => {
