@@ -63,8 +63,11 @@ classes, and the strict-JSON verdict format are unchanged.
   keeps its `bugClass`, so a still-open class across two consecutive blocking checks parks
   the diverging loop under the recorded repeated-class rule.
 - An omitted blocker is not fixed. Notes, malformed fixes, and demoted quotes do not resolve it.
-- An incomplete account uses the existing retry path. If both attempts fail, the card parks at
-  `needs_you`, outside the merge queue.
+- An incomplete account uses the retry path of `docs/specs/work-check-format-retry.md`
+  (OTTR-1265): a verdict the board's validators reject for its format re-runs with the
+  validator message as feedback, at most two automatic retries. If the attempts then
+  still end in a format rejection, the card parks at `needs_you`, outside the merge
+  queue; a provider-side failure keeps the two plain attempts and today's park.
 - An incomplete verdict changes no earlier blocker status, completed head, original report, or
   send-back count. Earlier completed statuses stay unchanged.
 - Repeated check errors must not evict the latest open blockers from the 20-run history.
@@ -93,9 +96,14 @@ classes, and the strict-JSON verdict format are unchanged.
 
 ## Error cases
 
-- The check run fails or returns no valid JSON twice: the card parks at `needs_you`; no head or
-  original-report stamp lands, so the next ready report runs a fresh check as first check.
-- A usage-limit hold parks the card until the provider resets (unchanged).
+- A provider-side check failure (a stopped run, a non-zero exit, an empty final
+  message) still parks the card at `needs_you` after two plain attempts; a usage-limit
+  hold parks the card until the provider resets (both unchanged).
+- A format-rejected verdict (no valid verdict JSON, or an accounting rejection) runs up
+  to two automatic retries with the board's validator message as feedback; when they
+  also end in a format rejection, the card parks at `needs_you` with a reason that
+  names the validator message and the attempt count
+  (`docs/specs/work-check-format-retry.md`).
 - No transcript file on disk: the check works from the report and the diff.
 - `workCheckHead` is null (checks ran but none completed): the run is treated as a first check
   with the full branch diff.

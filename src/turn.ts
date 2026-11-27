@@ -99,6 +99,7 @@ import {
 	validationRunPrompt,
 	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
+	workCheckFormatRetryFeedback,
 	workCheckPrompt,
 	workCheckSendBack,
 	workPrompt,
@@ -11993,8 +11994,15 @@ export function createTurnLoop(
 		);
 	}
 
-	/** Runs the second-model check on a work card that classify sent to merging (two attempts,
-	 * then the user decides: an unchecked card never merges; a usage limit reruns the check
+	/** Automatic format retries per check flow (OTTR-1265): after a board validator rejects
+	 * a verdict's format, the check re-runs at the same head with the validator message as
+	 * feedback, at most this many times. Format retries never count as send-backs and never
+	 * clear a blocker. */
+	const WORK_CHECK_MAX_FORMAT_RETRIES = 2;
+
+	/** Runs the second-model check on a work card that classify sent to merging (up to two
+	 * format-rejected retries beyond the first attempt, then the user decides: an unchecked
+	 * card never merges; a usage limit reruns the check
 	 * on the role's fallback provider when one has quota, else it holds until the reset).
 	 * At an unchanged head (a reply- or evidence-driven
 	 * re-check) the full diff stays, so the check can re-cite an earlier blocker's quote
@@ -12015,9 +12023,11 @@ export function createTurnLoop(
 		return await workCheckAttempts(st, cur, head, open, priorLog, roles, built);
 	}
 
-	/** The work check attempts (two, then the user decides: an unchecked card never merges;
-	 * a usage limit reruns the check on the role's fallback provider when one has quota,
-	 * else it holds until the reset). True: the turn stopped. */
+	/** The work check attempts: after a format failure (a board validator rejection) the
+	 * check re-runs with the validator message as feedback, at most
+	 * WORK_CHECK_MAX_FORMAT_RETRIES retries per flow; a provider failure still gets one
+	 * plain second attempt, and a usage limit reruns the check on the role's fallback
+	 * provider when one has quota, else it holds until the reset. True: the turn stopped. */
 	async function workCheckAttempts(
 		st: TurnSettle,
 		cur: Task,
@@ -12040,15 +12050,29 @@ export function createTurnLoop(
 		let checkModel = roles.checkModel;
 		let warn = roles.warn;
 		const tried = new Set<string>();
-		for (let attempt = 1; attempt <= 2; attempt++) {
+		// The last failure's board validator message: the retry input's feedback. Set only
+		// from workAttemptOutcome's formatError (board-generated strings), so provider,
+		// diff, transcript, and verdict text never reach a retry input (OTTR-1265).
+		let feedback: string | null = null;
+		let lastFormat: string | null = null;
+		let formatRetries = 0;
+		let attempts = 0;
+		for (
+			let attempt = 1;
+			attempt <= 1 + WORK_CHECK_MAX_FORMAT_RETRIES;
+			attempt++
+		) {
 			const ran = await awaitWorkCheckAttempt(
 				st,
-				built.input,
+				feedback === null
+					? built.input
+					: built.input + workCheckFormatRetryFeedback({ message: feedback }),
 				selector,
 				roles.checkRole,
 			);
 			if (ran === null) return true;
 			checkMs += ran.checkMs;
+			attempts = attempt;
 			const out = workAttemptOutcome(ran.result);
 			if (out.verdict !== null) {
 				const split = demoteUnquoted(
@@ -12080,9 +12104,11 @@ export function createTurnLoop(
 					return false;
 				}
 				out.failed = accountingError;
+				out.formatError = accountingError;
 			}
 			checkFailed = out.failed;
 			limitHit = out.limitHit;
+			lastFormat = out.formatError;
 			await st.log(`! work check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
 				const exhausted = providerOf(
@@ -12122,6 +12148,23 @@ export function createTurnLoop(
 				hold = rateLimitHold(wait);
 				break;
 			}
+			// A format failure buys a feedback retry while retries remain (OTTR-1265); the
+			// attempt bound caps the grants, so a logged retry always runs. A first failure
+			// of any kind still gets the plain second attempt as today.
+			if (
+				out.formatError !== null &&
+				formatRetries < WORK_CHECK_MAX_FORMAT_RETRIES &&
+				attempt <= WORK_CHECK_MAX_FORMAT_RETRIES
+			) {
+				formatRetries++;
+				feedback = out.formatError;
+				await st.log(
+					`- work check format retry ${formatRetries}/${WORK_CHECK_MAX_FORMAT_RETRIES}: ${out.formatError}`,
+				);
+				continue;
+			}
+			if (attempt < 2) continue;
+			break;
 		}
 		if (checkFailed !== null)
 			await parkFailedWorkCheck(
@@ -12135,6 +12178,9 @@ export function createTurnLoop(
 				checkFailed,
 				limitHit,
 				hold,
+				hold === null && lastFormat !== null
+					? { attempts, retries: formatRetries }
+					: null,
 			);
 		return false;
 	}
@@ -12408,7 +12454,9 @@ export function createTurnLoop(
 	}
 
 	/** A work check that failed twice (or hit a usage limit): park needs_you for a re-run, or
-	 * hold the card until the provider's reset. No head stamp: the next ready at this head
+	 * hold the card until the provider's reset. A final failure the board's validators
+	 * caused (format !== null) parks with the validator message and the attempt count
+	 * instead (OTTR-1265). No head stamp: the next ready at this head
 	 * must run the check again. */
 	async function parkFailedWorkCheck(
 		st: TurnSettle,
@@ -12421,6 +12469,7 @@ export function createTurnLoop(
 		checkFailed: string,
 		limitHit: boolean,
 		hold: UsageHold | null,
+		format: { attempts: number; retries: number } | null,
 	): Promise<void> {
 		const originalLog = st.log;
 		const lines: string[] = [];
@@ -12451,7 +12500,10 @@ export function createTurnLoop(
 						? {
 								stage: "in_progress" as const,
 								state: "needs_you" as const,
-								needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
+								needsReason:
+									format !== null
+										? `The work check failed after ${format.attempts} attempts: ${checkFailed}. The board re-ran it ${format.retries} times with its validator message, and every attempt was rejected for its format. Reply to re-run it, or cancel the card.`
+										: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
 								// The check ran past the limit: the probe count clears.
 								holdAttempts: 0,
 							}
@@ -12532,24 +12584,40 @@ export function createTurnLoop(
 		});
 	}
 
+	/** The board validator's message for a final message with no parseable verdict; the
+	 * failure text and the format-retry feedback for that rejection (OTTR-1265). */
+	const WORK_CHECK_FORMAT_PARSE_ERROR =
+		"the work check verdict was not valid JSON";
+
 	/** One work-check attempt's outcome: the parsed verdict on a valid one (null on an
-	 * invalid JSON verdict), else the failure reason and whether a usage limit caused it. */
+	 * invalid JSON verdict), else the failure reason and whether a usage limit caused it.
+	 * `formatError` holds the board validator's message on a format rejection — the run
+	 * completed and the verdict broke a board rule; provider-side failures leave it null,
+	 * so provider text never becomes retry feedback (OTTR-1265). */
 	function workAttemptOutcome(result: RunResult): {
 		verdict: WorkCheckVerdict | null;
 		failed: string;
 		limitHit: boolean;
+		formatError: string | null;
 	} {
 		const err = checkRunError(result);
 		if (err === null) {
 			const verdict = parseWorkCheck(result.finalText);
-			return {
-				verdict,
-				failed:
-					verdict === null ? "the work check verdict was not valid JSON" : "",
-				limitHit: false,
-			};
+			if (verdict === null)
+				return {
+					verdict: null,
+					failed: WORK_CHECK_FORMAT_PARSE_ERROR,
+					limitHit: false,
+					formatError: WORK_CHECK_FORMAT_PARSE_ERROR,
+				};
+			return { verdict, failed: "", limitHit: false, formatError: null };
 		}
-		return { verdict: null, failed: err, limitHit: hitUsageLimit(result) };
+		return {
+			verdict: null,
+			failed: err,
+			limitHit: hitUsageLimit(result),
+			formatError: null,
+		};
 	}
 
 	/** The done card: stamp the released version and remove the worktree. */
