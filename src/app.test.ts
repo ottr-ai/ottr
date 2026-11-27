@@ -1856,6 +1856,26 @@ describe("task routes", () => {
 			expect(childView.children).toEqual([]);
 		});
 
+		test("a cancelled child still serves as a ref", async () => {
+			const parent = await store.createTask("p1 parent of a cancelled child");
+			const child = await post("/api/projects/p1/tasks", {
+				prompt: "child cancelled after filing",
+				followUpOf: parent.id,
+			});
+			expect(child.status).toBe(200);
+			const childId = ((await child.json()) as { id: string }).id;
+			await store.updateTask(childId, { cancelledAt: Date.now() });
+			const res = await get(`/api/projects/p1/tasks/${parent.id}`);
+			expect(res.status).toBe(200);
+			const view = (await res.json()) as {
+				children?: { project: string; id: string }[];
+			};
+			// The scan reads only followUpOf: a settled child keeps its link.
+			expect(
+				view.children?.map((c) => ({ project: c.project, id: c.id })),
+			).toEqual([{ project: "p1", id: childId }]);
+		});
+
 		test("a board with a sick store drops only its own child refs", async () => {
 			const parent = await store.createTask("p1 parent, one sick board");
 			const cross = await post("/api/projects/p2/tasks", {

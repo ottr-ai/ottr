@@ -3616,6 +3616,55 @@ describe("Drawer parent chip", () => {
 		}
 	});
 
+	test("a done child the board's Done window dropped loads from the detail's ref", async () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const oldKid = cardFixture({
+			id: "K-9",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Old child",
+			followUpOf: "S-1",
+			createdAt: 500,
+		});
+		// No state rows: the Done window dropped the child, only the detail's
+		// ref still names it.
+		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
+			url.endsWith("/tasks/S-1")
+				? json({
+						...self,
+						turns: [],
+						prompt: "work",
+						summary: null,
+						details: null,
+						report: null,
+						diffFiles: null,
+						workCheckLog: [],
+						workCheckReport: null,
+						gate: null,
+						children: [{ project: "proj", id: "K-9", createdAt: 500 }],
+					})
+				: url.endsWith("/tasks/K-9")
+					? json({ ...oldKid, turns: [] })
+					: new Response("{}", { status: 404 }),
+		);
+		try {
+			await act(async () => {});
+			// The ref names this board: the fetch follows the child's own project,
+			// and the settled child renders as a real link, never as silence.
+			expect(fetches).toContain("/api/projects/proj/tasks/K-9");
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/K-9"]',
+			);
+			expect(link !== null).toBe(true);
+			expect(link?.textContent).toContain("K-9");
+			expect(link?.textContent).toContain("Old child");
+			expect(link?.textContent).toContain("done");
+			expect(container.querySelector(".lineage-gone")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
 	test("a child ref whose fetch 404s renders Card not found with its id", async () => {
 		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
 		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
