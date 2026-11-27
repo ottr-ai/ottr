@@ -23,9 +23,15 @@
  *   `signIns()` reads; identity keys redacted like every other value — so the
  *   real CLI lists the signed-in providers' catalogs without carrying real
  *   tokens or board identity data.
- * - Compact catalog: the wrapper caps the candidate's stdout at 2 MiB and
- *   re-emits compact provider/id records, so the whole list the parse accepts
- *   survives the guest's 64 KiB stdout tail (VM_VALIDATE.outputTailBytes).
+ * - Locked graph, never re-derived: the server resolves metadata only
+ *   (`bun install --lockfile-only`), ships bun's lockfile verbatim plus every
+ *   locked tarball integrity-verified, and the guest wrapper places each
+ *   tarball at the install path its lockfile key names. No manifest, alias
+ *   or resolver rebuilds the graph, so no version or dependency edge can be
+ *   lost between the resolution and the guest tree.
+ * - Catalog artifact: the wrapper writes the compact provider/id catalog to
+ *   a promoted artifact (1 MiB cap), so the guest's 64 KiB stdout tail
+ *   (VM_VALIDATE.outputTailBytes) never cuts the list the parse reads.
  *
  * A throw is a transport failure only: the caller warns and files normal
  * 7-day bump cards, never a lastError.
@@ -221,10 +227,10 @@ function redactData(
 }
 
 /** The trusted guest-side wrapper (written into the payload as
- * probe-wrapper.mjs): copies the payload from the read-only /target mount
- * into a writable /tmp scratch, installs it offline there (every dependency
- * is a `file:` tarball the transport integrity-pinned; alias keys keep every
- * locked version, the hoisted linker keeps the candidate's path stable),
+ * probe-wrapper.mjs): materializes the locked tree offline in a writable
+ * /tmp scratch (the /target mount is read-only) — each lockfile key is the
+ * install path bun's resolver chose, so every tarball the transport
+ * integrity-pinned lands exactly there, with no resolver run in the guest —
  * stamps the redacted copy into the job HOME, spawns the candidate cli under
  * the three-name env allowlist, caps the candidate's stdout at 2 MiB, and
  * re-emits compact provider/id records — complete up to the parser's own
@@ -232,19 +238,19 @@ function redactData(
  * guest's 64 KiB stdout tail (the stdout copy is diagnostic only). The
  * candidate's own stderr passes through to the job's stderr. Exit codes: the
  * candidate's, or 3 when the output is not a models catalog.
- * `OMP_PROBE_STORE` and `OMP_PROBE_SKIP_INSTALL` override the stamped store
- * path and the offline install for tests; the guest job env never carries
- * either name. */
+ * `OMP_PROBE_STORE` overrides the stamped store path for tests; the guest
+ * job env never carries that name. */
 export const probeWrapperSource = `import {
-	chmodSync,
 	copyFileSync,
-	cpSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
 	writeFileSync,
 } from "node:fs";
 // argv: <wrapper> <binRel> <targetPkgDir>. /target is a read-only mount, so
-// the payload is copied into a writable /tmp scratch and installed there.
+// the tree is materialized in a writable /tmp scratch.
 const binRel = process.argv[2];
 const targetPkg = process.argv[3] ?? "/target/pkg";
 if (typeof binRel !== "string" || binRel === "") {
@@ -259,28 +265,69 @@ if (home === "") {
 // Unique per run: a fresh VM's /tmp is fresh anyway, and tests can run the
 // wrapper many times on one machine.
 const scratch = mkdtempSync("/tmp/ottr-probe-");
-cpSync(targetPkg, scratch + "/pkg", { recursive: true });
-// The copy keeps the read-only source's modes: make the tree writable so the
-// install can create node_modules inside it.
-chmodSync(scratch + "/pkg", 0o755);
-if (process.env.OMP_PROBE_SKIP_INSTALL !== "1") {
-	const inst = Bun.spawnSync(
-		[
-			process.execPath,
-			"install",
-			"--linker=hoisted",
-			"--prefer-offline",
-			"--ignore-scripts",
-			"--production",
-			"--cwd",
-			scratch + "/pkg",
-		],
-		{ stdout: "pipe", stderr: "inherit", stdin: "ignore" },
-	);
-	if (inst.exitCode !== 0) {
-		console.error("probe wrapper: the offline install failed");
-		process.exit(inst.exitCode ?? 1);
+mkdirSync(scratch + "/pkg", { recursive: true });
+// One package name: optional scope, then a name that cannot be "." or "..".
+const NAME = /^(@[A-Za-z0-9][\\w.-]*\\/)?[A-Za-z0-9][\\w.-]*$/;
+// A bun lockfile key is the package's install path: "a", "@s/b", "a/c" (c in
+// a's node_modules), "@s/b/@t/d". Each segment must be a package name, so a
+// key can never leave the tree.
+function installPath(key) {
+	const segs = key.split("/");
+	const parts = [];
+	for (let i = 0; i < segs.length; ) {
+		const scoped = segs[i].startsWith("@");
+		const name = scoped ? segs[i] + "/" + segs[i + 1] : segs[i];
+		i += scoped ? 2 : 1;
+		if (!NAME.test(name)) throw new Error("lock key is not an install path: " + key);
+		parts.push("node_modules", name);
 	}
+	return parts;
+}
+// bun's own install rule: a package whose os/cpu list excludes this
+// platform is not installed ("!x" entries exclude x). The guest checks its
+// own platform; the server ships only tarballs for the platform it runs on.
+function forThisPlatform(meta) {
+	const ok = (list, value) => {
+		if (list === undefined) return true;
+		const all = Array.isArray(list) ? list : [list];
+		if (all.includes("!" + value)) return false;
+		const plain = all.filter((x) => !String(x).startsWith("!"));
+		return plain.length === 0 || plain.includes(value);
+	};
+	const m = meta !== null && typeof meta === "object" ? meta : {};
+	return ok(m.os, process.platform) && ok(m.cpu, process.arch);
+}
+try {
+	const lock = JSON.parse(
+		readFileSync(targetPkg + "/bun.lock", "utf8").replace(/,(\\s*[}\\]])/g, "$1"),
+	);
+	const keys = Object.keys(lock.packages ?? {}).map((key) => ({
+		key,
+		path: installPath(key),
+	}));
+	// Parents before the packages nested in their node_modules.
+	keys.sort((a, b) => a.path.length - b.path.length);
+	let n = 0;
+	for (const { key, path } of keys) {
+		const entry = lock.packages[key];
+		if (!Array.isArray(entry) || typeof entry[0] !== "string")
+			throw new Error("malformed lock entry: " + key);
+		if (!forThisPlatform(entry[2])) continue;
+		const tgz =
+			targetPkg + "/registry/" + encodeURIComponent(entry[0]) + ".tgz";
+		const stage = scratch + "/stage/" + n++;
+		mkdirSync(stage, { recursive: true });
+		await new Bun.Archive(readFileSync(tgz)).extract(stage);
+		const top = readdirSync(stage);
+		if (top.length !== 1)
+			throw new Error(entry[0] + " does not unpack to one directory");
+		const dest = scratch + "/pkg/" + path.join("/");
+		mkdirSync(dest.slice(0, dest.lastIndexOf("/")), { recursive: true });
+		renameSync(stage + "/" + top[0], dest);
+	}
+} catch (err) {
+	console.error("probe wrapper: the offline install failed:", String(err));
+	process.exit(1);
 }
 mkdirSync(home + "/.omp/agent", { recursive: true });
 copyFileSync(
@@ -391,6 +438,10 @@ function binRelError(binRel: string): string | null {
  * on. It is the registry the packument fetches already target. */
 export const OMP_REGISTRY_ORIGIN = new URL(OMP_PACKAGE_URL).origin;
 export const PKG_NAME = "@oh-my-pi/pi-coding-agent";
+/** One payload tarball's byte cap: 2.5x the largest measured one (the
+ * 18.19.0 linux-x64 native addon, 100 MiB); the guest's 1 GiB scratch
+ * (VM_VALIDATE.diskBytes) bounds the unpacked tree. */
+const TARBALL_MAX_BYTES = 256 * 1024 * 1024;
 
 /** The bin entry inside a package.json manifest (string, or {omp}) as a
  * relative path, or the exact reason it is unusable. */
@@ -479,6 +530,35 @@ export function probePrepSpawn(
 	};
 }
 
+/** The payload file name of one locked `name@version` tarball; the guest
+ * wrapper derives the same name from the lockfile entry (encodeURIComponent
+ * keeps scoped names flat and injective). */
+export function payloadTarballName(nameAtVersion: string): string {
+	return `${encodeURIComponent(nameAtVersion)}.tgz`;
+}
+
+/** bun's install rule for one lockfile entry's metadata: a package whose
+ * os/cpu list excludes the platform is not installed ("!x" excludes x). The
+ * guest wrapper applies the same rule to its own platform. */
+export function lockEntryForPlatform(
+	meta: unknown,
+	platform: string,
+	arch: string,
+): boolean {
+	const ok = (list: unknown, value: string): boolean => {
+		if (list === undefined) return true;
+		const all = (Array.isArray(list) ? list : [list]).map(String);
+		if (all.includes(`!${value}`)) return false;
+		const plain = all.filter((x) => !x.startsWith("!"));
+		return plain.length === 0 || plain.includes(value);
+	};
+	if (typeof meta !== "object" || meta === null) return true;
+	return (
+		ok("os" in meta ? meta.os : undefined, platform) &&
+		ok("cpu" in meta ? meta.cpu : undefined, arch)
+	);
+}
+
 /** The bun text lockfile's package entries, narrowed to what the payload
  * needs: exact name, exact version, and the checksum when the lockfile
  * carries one. A malformed entry is skipped, not guessed. */
@@ -486,12 +566,18 @@ function lockPackagesFrom(raw: string): {
 	name: string;
 	version: string;
 	integrity: string | null;
+	meta: unknown;
 }[] {
 	// The text lockfile is JSONC: trailing commas, no comments in practice.
 	const lock = JSON.parse(raw.replace(/,(\s*[}\]])/g, "$1")) as {
 		packages?: Record<string, unknown>;
 	};
-	const out: { name: string; version: string; integrity: string | null }[] = [];
+	const out: {
+		name: string;
+		version: string;
+		integrity: string | null;
+		meta: unknown;
+	}[] = [];
 	for (const entry of Object.values(lock.packages ?? {})) {
 		if (!Array.isArray(entry) || typeof entry[0] !== "string") continue;
 		const resolved = entry[0];
@@ -504,6 +590,7 @@ function lockPackagesFrom(raw: string): {
 			name,
 			version,
 			integrity: typeof entry[3] === "string" ? entry[3] : null,
+			meta: entry[2],
 		});
 	}
 	return out;
@@ -575,8 +662,9 @@ async function downloadVerified(
 			`omp models probe: the tarball fetch for ${label} failed: HTTP ${res.status}`,
 		);
 	const bytes = new Uint8Array(await res.arrayBuffer());
-	if (bytes.length > 64 * 1024 * 1024)
-		throw new Error(`omp models probe: the ${label} tarball is over 64 MiB`);
+	// Measured: the 18.19.0 linux-x64 native addon is a 100 MiB tarball.
+	if (bytes.length > TARBALL_MAX_BYTES)
+		throw new Error(`omp models probe: the ${label} tarball is over 256 MiB`);
 	const expected =
 		typeof integrity === "string" && integrity.startsWith("sha512-")
 			? integrity.slice("sha512-".length)
@@ -753,74 +841,57 @@ export function createOmpProbeTransport(
 				throw new Error(
 					`candidate dependency resolution failed (exit ${lock.code}): ${lock.stderr.trim().slice(-500)}`,
 				);
-			const packages = lockPackagesFrom(
-				readFileSync(join(resolveDir, "bun.lock"), "utf8"),
-			);
+			const lockText = readFileSync(join(resolveDir, "bun.lock"), "utf8");
+			const packages = lockPackagesFrom(lockText);
 			if (packages.length === 0)
 				throw new Error(
 					"omp models probe: the dependency lockfile carries no packages",
 				);
 
-			// 5. Ship every package as integrity-verified bytes: the guest's
-			// install runs offline from these exact files, so no dependency
-			// tree ever exists on the server.
-			// 5+6. Ship every package as integrity-verified bytes: the guest's
-			// install runs offline from these exact files, so no dependency
-			// tree ever exists on the server. The manifest keys every locked
-			// version under its own (aliased) name — keying by package name
-			// alone would drop one of two locked versions of the same package,
-			// and bun installs each file: tarball under its alias directory,
-			// so both versions install side by side.
+			// 5. Ship the locked graph as resolved: bun's lockfile verbatim (its
+			// keys are the install paths the guest wrapper materializes) and
+			// every locked name@version as integrity-verified tarball bytes.
+			// Nothing here rebuilds a manifest from the graph, so no version or
+			// dependency edge can be dropped between resolution and the guest.
 			const pkgDir = join(runDir, "payload", "pkg");
 			const registryDir = join(pkgDir, "registry");
 			mkdirSync(registryDir, { recursive: true });
 			writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
-			const fileDeps: Record<string, string> = {};
-			const usedNames = new Set<string>();
+			writeFileSync(join(pkgDir, "bun.lock"), lockText);
+			const shipped = new Set<string>();
 			for (const {
 				name,
 				version: depVersion,
 				integrity: lockIntegrity,
+				meta,
 			} of packages) {
-				const safe = name.replace(/[^A-Za-z0-9._-]/g, "_");
-				// The first locked version of a package installs under its real
-				// name (the candidate's runtime path depends on it); second and
-				// later versions install under versioned alias directories,
-				// still from their own verified tarball.
-				let key = name;
-				if (usedNames.has(name))
-					key = `${safe}-${depVersion.replace(/[^A-Za-z0-9._-]/g, "_")}`;
-				usedNames.add(name);
-				const tgzPath = join(pkgDir, "registry", `${safe}-${depVersion}.tgz`);
-				if (name === PKG_NAME) {
+				// Packages for another platform never install (bun's rule); the
+				// guest skips the same entries for its own platform.
+				if (!lockEntryForPlatform(meta, process.platform, process.arch))
+					continue;
+				const file = payloadTarballName(`${name}@${depVersion}`);
+				if (shipped.has(file)) continue;
+				shipped.add(file);
+				if (name === PKG_NAME && depVersion === version) {
 					// The candidate's bytes are already verified (step 2).
-					writeFileSync(tgzPath, candidateBytes);
-				} else {
-					const dist = await packumentDistFor(
-						name,
-						depVersion,
-						fetchImpl,
-						controller.signal,
-					);
-					const bytes = await downloadVerified(
-						dist.tarball,
-						dist.integrity ?? lockIntegrity,
-						`${name}@${depVersion}`,
-						fetchImpl,
-						controller.signal,
-					);
-					writeFileSync(tgzPath, bytes);
+					writeFileSync(join(registryDir, file), candidateBytes);
+					continue;
 				}
-				fileDeps[key] = `file:registry/${safe}-${depVersion}.tgz`;
+				const dist = await packumentDistFor(
+					name,
+					depVersion,
+					fetchImpl,
+					controller.signal,
+				);
+				const bytes = await downloadVerified(
+					dist.tarball,
+					dist.integrity ?? lockIntegrity,
+					`${name}@${depVersion}`,
+					fetchImpl,
+					controller.signal,
+				);
+				writeFileSync(join(registryDir, file), bytes);
 			}
-			writeFileSync(
-				join(pkgDir, "package.json"),
-				JSON.stringify({
-					name: "ottr-omp-probe",
-					private: true,
-					dependencies: fileDeps,
-				}),
-			);
 
 			// 5. Catalog context without secrets: the placeholder store drives the
 			// real CLI's provider list. The source is the board's own agent store

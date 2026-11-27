@@ -104,20 +104,25 @@ server host is not an acceptable boundary for unapproved code.
   The candidate is unapproved code, so its install tree never exists on the server
   either. The server's share is bytes and metadata only: it pins the candidate's npm
   tarball against the packument's integrity, reads the candidate's manifest member out
-  of the tarball to stdout, resolves the dependency graph metadata-only (`bun install
-  --lockfile-only` — bun writes the lockfile, never a node_modules tree), and ships
-  every resolved package as an integrity-verified tarball beside a generated
-  `file:`-dependency manifest. The manifest keys a second locked version of one
-  package by an alias (`<name>-<version>`), so every locked version installs. The
+  of the tarball to stdout, and resolves the dependency graph metadata-only (`bun
+  install --lockfile-only` — bun writes the lockfile, never a node_modules tree). It
+  ships that lockfile byte for byte, and beside it every locked `name@version` for the
+  server's platform as an integrity-verified tarball (bun's os/cpu rule skips packages
+  for other platforms). No step rebuilds a manifest or re-resolves the graph: a bun
+  lockfile key is the install path bun chose (`a`, `@s/b`, `a/c` for c nested under a),
+  so the guest tree is the lockfile, and every locked version and dependency edge
+  holds. One payload tarball may hold at most 256 MiB (the 18.19.0 linux-x64 native
+  addon is 100 MiB). The
   credential copy comes from the board's own agent
   store — `agentDir()`, the same file `signIns()` reads — and holds the signed-in
   providers with every data key shape and the identity keys, each value a placeholder,
   so the candidate lists the board's providers' catalogs without holding one secret or
   one piece of board identity data (verified against the real CLI). The guest does the
-  rest: it copies the read-only payload into a writable guest scratch, installs it
-  there offline (`bun install --linker=hoisted --prefer-offline --ignore-scripts
-  --production`, dying with the VM), stamps the copy into the job HOME, and runs the
-  candidate under the three-name env. The payload's trusted wrapper caps the
+  rest: the payload's trusted wrapper refuses a lockfile key that is not a package
+  path, unpacks each tarball for the guest's platform at its key's path in a writable
+  guest scratch (the payload mount is read-only; no resolver and no lifecycle script
+  runs), stamps the copy into the job HOME, and runs the candidate under the
+  three-name env. The wrapper caps the
   candidate's stdout at 2 MiB and writes compact provider/id records to
   `home/catalog.json`, which the guest promotes as an artifact. The transport parses
   that artifact, never the 64 KiB stdout tail, so the complete catalog arrives. A

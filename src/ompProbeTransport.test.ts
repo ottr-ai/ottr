@@ -12,11 +12,14 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
 	buildRedactedStore,
 	createOmpProbeTransport,
+	lockEntryForPlatform,
+	payloadTarballName,
 	probeJobArgv,
 	probePrepSpawn,
 	probeSpawnEnv,
@@ -24,6 +27,7 @@ import {
 } from "./ompProbeTransport.ts";
 import { OMP_PACKAGE_URL, OMP_WATCH_GATES, parseModelSet } from "./ompWatch.ts";
 import type { ProcSpawn } from "./sandboxRun.ts";
+import { VM_VALIDATE } from "./vmValidateShared.ts";
 
 // Per-test real-fs scratch; everything a test builds dies with its dir.
 const tmps: string[] = [];
@@ -34,19 +38,33 @@ const newTmp = (): string => {
 };
 // The transport reads the board store through agentDir(), which resolves
 // process.env.PI_CODING_AGENT_DIR directly (not through the env seam): each
-// harness pins it and registers the restore, and afterAll unwinds them.
-const envRestores: (() => void)[] = [];
-const pinProcessEnv = (name: string, value: string | undefined): void => {
-	const saved = process.env[name];
-	process.env[name] = value;
-	envRestores.push(() => {
-		if (saved === undefined) delete process.env[name];
-		else process.env[name] = saved;
-	});
-};
+// harness pins it. The pinner keeps each name's value from before its FIRST
+// pin, so restore always returns the original, however many pins ran.
+function envPinner(): {
+	pin: (name: string, value: string | undefined) => void;
+	restore: () => void;
+} {
+	const originals = new Map<string, string | undefined>();
+	return {
+		pin(name, value) {
+			if (!originals.has(name)) originals.set(name, process.env[name]);
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		},
+		restore() {
+			for (const [name, value] of originals) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			originals.clear();
+		},
+	};
+}
+const suiteEnv = envPinner();
+const pinProcessEnv = suiteEnv.pin;
 afterAll(() => {
+	suiteEnv.restore();
 	for (const dir of tmps) rmSync(dir, { recursive: true, force: true });
-	for (const restore of envRestores) restore();
 });
 
 const ID = "ompprobe-test-1";
@@ -212,10 +230,8 @@ function makeHarness(opts: {
 	validateUrls: string[];
 	validateBodies: Record<string, unknown>[];
 	validateTarExisted: boolean[];
-	manifestDeps: {
-		deps: Record<string, string>;
-		refsExisted: boolean;
-	}[];
+	payloads: { lock: string; pkgFiles: string[]; registry: string[] }[];
+	lockJson: string;
 	payloadProviders: string[][];
 	env: NodeJS.ProcessEnv;
 	boardDbPath: string;
@@ -262,37 +278,49 @@ function makeHarness(opts: {
 	const validateBodies: Record<string, unknown>[] = [];
 	const validateTarExisted: boolean[] = [];
 	const payloadProviders: string[][] = [];
-	const manifestDeps: {
-		deps: Record<string, string>;
-		refsExisted: boolean;
+	const payloads: {
+		lock: string;
+		pkgFiles: string[];
+		registry: string[];
 	}[] = [];
 	const bin = opts.bin ?? { omp: "dist/cli.js" };
-	// A minimal lockfile fixture: the candidate plus TWO locked versions of
-	// one package (a name-keyed manifest would drop one of them), all with
-	// checksums — exactly the shape the payload builder reads.
-	const LOCK_JSON = JSON.stringify({
-		lockfileVersion: 1,
-		packages: {
-			"@oh-my-pi/pi-coding-agent@18.16.0": [
-				"@oh-my-pi/pi-coding-agent@18.16.0",
-				"",
-				{},
-				`sha512-${FAKE_DIGEST}`,
-			],
-			"string-width@7.2.0": [
-				"string-width@7.2.0",
-				"",
-				{},
-				`sha512-${FAKE_DIGEST}`,
-			],
-			"string-width@8.6.0": [
-				"string-width@8.6.0",
-				"",
-				{},
-				`sha512-${SW5_DIGEST}`,
-			],
+	// A bun lockfile in its real shape: keys are install paths. Two locked
+	// string-width versions (one nested under the candidate) and one package
+	// for another platform, which never ships (bun never installs it).
+	const LOCK_JSON = `${JSON.stringify(
+		{
+			lockfileVersion: 1,
+			workspaces: {
+				"": {
+					name: "ottr-omp-probe",
+					dependencies: { "@oh-my-pi/pi-coding-agent": VERSION },
+				},
+			},
+			packages: {
+				"@oh-my-pi/pi-coding-agent": [
+					`@oh-my-pi/pi-coding-agent@${VERSION}`,
+					"",
+					{ dependencies: { "string-width": "^8.6.0" } },
+					`sha512-${FAKE_DIGEST}`,
+				],
+				"string-width": ["string-width@7.2.0", "", {}, `sha512-${SW7_DIGEST}`],
+				"@oh-my-pi/pi-coding-agent/string-width": [
+					"string-width@8.6.0",
+					"",
+					{},
+					`sha512-${SW5_DIGEST}`,
+				],
+				"native-other": [
+					"native-other@1.0.0",
+					"",
+					{ os: `!${process.platform}` },
+					"sha512-never-fetched",
+				],
+			},
 		},
-	});
+		null,
+		2,
+	)}\n`;
 	const spawnImpl: ProcSpawn = async (argv) => {
 		spawns.push([...argv]);
 		if (
@@ -349,31 +377,14 @@ function makeHarness(opts: {
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			validateBodies.push(body);
 			validateTarExisted.push(existsSync(String(body.targetTar)));
-			// The payload manifest, read at dispatch time: every locked
-			// version must be referenced from its own verified tarball —
-			// name-keyed manifests drop one of two locked versions, and
-			// refs that point outside pkg cannot resolve offline.
-			try {
-				const manifestPath = join(
-					body.targetTar as string,
-					"..",
-					"payload",
-					"pkg",
-					"package.json",
-				);
-				const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
-					dependencies: Record<string, string>;
-				};
-				const refs = { ...manifest.dependencies };
-				// Every referenced tarball must exist at dispatch time, resolved
-				// relative to the manifest's own directory (inside pkg).
-				const refsExisted = Object.values(refs).every((ref) =>
-					existsSync(join(manifestPath, "..", ref.slice("file:".length))),
-				);
-				manifestDeps.push({ deps: refs, refsExisted });
-			} catch {
-				manifestDeps.push({ deps: {}, refsExisted: false });
-			}
+			// The payload's pkg dir, read at dispatch time (the runDir dies
+			// with the call): the lockfile it ships and the tarballs beside it.
+			const payloadPkg = join(body.targetTar as string, "..", "payload", "pkg");
+			payloads.push({
+				lock: readFileSync(join(payloadPkg, "bun.lock"), "utf8"),
+				pkgFiles: readdirSync(payloadPkg).sort(),
+				registry: readdirSync(join(payloadPkg, "registry")).sort(),
+			});
 			// The payload store's providers, read at dispatch time: the copy
 			// the candidate will see must hold the board's rows, never the
 			// decoy's.
@@ -422,7 +433,8 @@ function makeHarness(opts: {
 		validateBodies,
 		validateTarExisted,
 		payloadProviders,
-		manifestDeps,
+		payloads,
+		lockJson: LOCK_JSON,
 		env,
 		boardDbPath,
 		decoyDbPath,
@@ -473,6 +485,157 @@ function makePinnedDb(
 	} finally {
 		db.close();
 	}
+}
+
+const CAND = "@oh-my-pi/pi-coding-agent";
+/** One locked package of a wrapper fixture: its lockfile key (install path),
+ * name, version and dependency ranges; `cli` makes it the candidate. */
+type LockedPkg = {
+	key: string;
+	name: string;
+	version: string;
+	deps?: Record<string, string>;
+	meta?: Record<string, unknown>;
+	cli?: string;
+	/** Ships no tarball (an entry the guest must skip). */
+	noTarball?: boolean;
+};
+/** The candidate cli of the edge tests: walks every dependency edge through
+ * the runtime's own require, from the candidate down, and reports each as a
+ * `parent>dep@version` record. */
+const EDGE_CLI = `const seen = [];
+const walk = (from, req) => {
+	const pj = req("./package.json");
+	for (const dep of Object.keys(pj.dependencies ?? {})) {
+		const depPj = req(dep + "/package.json");
+		seen.push({ provider: "edge", id: pj.name + ">" + dep + "@" + depPj.version });
+		walk(dep, require("node:module").createRequire(req.resolve(dep + "/package.json")));
+	}
+};
+walk(null, require("node:module").createRequire(require("node:path").join(__dirname, "..", "package.json")));
+process.stdout.write(JSON.stringify({ models: seen }));
+`;
+/** The install path segments a lockfile key names (test-side mirror). */
+function installSegments(key: string): string[] {
+	const segs = key.split("/");
+	const out: string[] = [];
+	for (let i = 0; i < segs.length; ) {
+		const scoped = segs[i]!.startsWith("@");
+		out.push("node_modules", scoped ? `${segs[i]}/${segs[i + 1]}` : segs[i]!);
+		i += scoped ? 2 : 1;
+	}
+	return out;
+}
+/** A payload in the transport's layout (bun.lock + registry/<name@version>
+ * tarballs + wrapper) under a read-only target dir, and a runner for the
+ * trusted wrapper with the guest's three-name env. */
+function lockedPayload(pkgs: LockedPkg[]) {
+	const tmp = newTmp();
+	const pkgDir = join(tmp, "payload", "pkg");
+	const registry = join(pkgDir, "registry");
+	mkdirSync(registry, { recursive: true });
+	writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
+	const packages: Record<string, unknown> = {};
+	for (const p of pkgs) {
+		packages[p.key] = [
+			`${p.name}@${p.version}`,
+			"",
+			{ ...(p.deps ? { dependencies: p.deps } : {}), ...p.meta },
+			"sha512-fixture",
+		];
+		if (p.noTarball) continue;
+		const src = join(tmp, "src", encodeURIComponent(p.key), "package");
+		mkdirSync(join(src, "dist"), { recursive: true });
+		writeFileSync(
+			join(src, "package.json"),
+			JSON.stringify({
+				name: p.name,
+				version: p.version,
+				dependencies: p.deps,
+				bin: { omp: "dist/cli.js" },
+			}),
+		);
+		writeFileSync(join(src, "dist", "cli.js"), p.cli ?? "// dependency\n");
+		const packed = Bun.spawnSync(
+			[
+				"tar",
+				"-czf",
+				join(registry, payloadTarballName(`${p.name}@${p.version}`)),
+				"-C",
+				dirname(src),
+				"package",
+			],
+			{ stdout: "pipe", stderr: "pipe" },
+		);
+		if (packed.exitCode !== 0) throw new Error(packed.stderr.toString());
+	}
+	writeFileSync(
+		join(pkgDir, "bun.lock"),
+		`${JSON.stringify({ lockfileVersion: 1, packages }, null, 2)}\n`,
+	);
+	// /target is a read-only mount in the guest (docker/ottr-vm-init).
+	const targetPkg = join(tmp, "target", "pkg");
+	mkdirSync(dirname(targetPkg), { recursive: true });
+	cpSync(pkgDir, targetPkg, { recursive: true });
+	const home = join(tmp, "home");
+	mkdirSync(home, { recursive: true });
+	const storeDb = join(tmp, "store", "agent.db");
+	mkdirSync(dirname(storeDb), { recursive: true });
+	writeFileSync(storeDb, "store bytes");
+	let scratch = "";
+	return {
+		targetPkg,
+		home,
+		run() {
+			const before = new Set(readdirSync("/tmp"));
+			chmodSync(targetPkg, 0o555);
+			chmodSync(join(targetPkg, "registry"), 0o555);
+			try {
+				return Bun.spawnSync(
+					[
+						"bun",
+						join(targetPkg, "probe-wrapper.mjs"),
+						"dist/cli.js",
+						targetPkg,
+					],
+					{
+						env: {
+							PATH: process.env.PATH ?? "",
+							HOME: home,
+							LANG: "C.UTF-8",
+							OMP_PROBE_STORE: storeDb,
+						},
+						stdout: "pipe",
+						stderr: "pipe",
+						cwd: tmp,
+					},
+				);
+			} finally {
+				chmodSync(targetPkg, 0o755);
+				chmodSync(join(targetPkg, "registry"), 0o755);
+				// The wrapper's scratch sits under the real /tmp (a fresh VM's
+				// /tmp in production); this run's is the one new entry.
+				const added = readdirSync("/tmp").filter(
+					(d) => d.startsWith("ottr-probe-") && !before.has(d),
+				);
+				if (added.length === 1) {
+					scratch = join("/tmp", added[0]!);
+					tmps.push(scratch);
+				}
+			}
+		},
+		scratch: () => {
+			expect(scratch).not.toBe("");
+			return scratch;
+		},
+		catalogText: () => readFileSync(join(home, "catalog.json"), "utf8"),
+		catalog: () =>
+			(
+				JSON.parse(readFileSync(join(home, "catalog.json"), "utf8")) as {
+					models: { provider: string; id: string }[];
+				}
+			).models,
+	};
 }
 
 describe("ompProbeTransport", () => {
@@ -553,21 +716,26 @@ describe("ompProbeTransport", () => {
 		// The redacted copy carries the board store's rows (the transport
 		// reads agentDir(), the same file signIns reads), never the decoy's.
 		expect(h.payloadProviders[0]).toEqual(["zai"]);
-		// Blockers 2+3: the payload manifest references every locked version
-		// (both string-width versions) through registry paths inside pkg, and
-		// every referenced tarball exists at that payload-relative path.
-		const snapshot = h.manifestDeps[0]!;
-		const depKeys = Object.keys(snapshot.deps).sort();
-		expect(depKeys).toEqual([
-			"@oh-my-pi/pi-coding-agent",
-			"string-width",
-			"string-width-8.6.0",
+		// The locked graph ships as resolved: bun's lockfile byte for byte, no
+		// manifest rebuilt from it, and one verified tarball per locked
+		// name@version for this platform — both string-width versions, never
+		// the other-platform package (its tarball is never even fetched).
+		const payload = h.payloads[0]!;
+		expect(payload.lock).toBe(h.lockJson);
+		expect(payload.pkgFiles).toEqual([
+			"bun.lock",
+			"probe-wrapper.mjs",
+			"registry",
 		]);
-		for (const ref of Object.values(snapshot.deps)) {
-			expect(ref.startsWith("file:registry/")).toBe(true);
-		}
-		// Every referenced tarball existed at dispatch time (blocker 2).
-		expect(snapshot.refsExisted).toBe(true);
+		expect(payload.registry).toEqual(
+			[
+				`@oh-my-pi/pi-coding-agent@${VERSION}`,
+				"string-width@7.2.0",
+				"string-width@8.6.0",
+			]
+				.map(payloadTarballName)
+				.sort(),
+		);
 		// The run dir (and everything under it) dies with the call.
 		expect(existsSync(h.runDir)).toBe(false);
 	}, 30_000);
@@ -867,278 +1035,237 @@ describe("ompProbeTransport", () => {
 		expect(probe.exitCode).not.toBe(0);
 	});
 
-	test("the wrapper: read-only target, offline install, complete catalog", () => {
-		const tmp = newTmp();
-		const wrapper = join(tmp, "probe-wrapper.mjs");
-		writeFileSync(wrapper, probeWrapperSource);
-		const home = join(tmp, "home");
-		mkdirSync(home, { recursive: true });
-		const storeDb = join(tmp, "store", "agent.db");
-		mkdirSync(dirname(storeDb), { recursive: true });
-		writeFileSync(storeDb, "store bytes");
+	test("envPinner: two pins of one name restore its original value", () => {
+		// Send-back 3 blocker 3: insertion-order restores left the name at the
+		// FIRST pin's value, so later tests read a deleted fixture store.
+		const name = "OTTR_PROBE_TEST_PIN";
+		process.env[name] = "original";
+		const pinner = envPinner();
+		pinner.pin(name, "first-fixture");
+		pinner.pin(name, "second-fixture");
+		pinner.restore();
+		expect(process.env[name]).toBe("original");
+		const unset = envPinner();
+		delete process.env[name];
+		unset.pin(name, "a");
+		unset.pin(name, "b");
+		unset.restore();
+		expect(name in process.env).toBe(false);
+	});
 
-		// The payload, in the transport's actual flat layout: the workspace
-		// root manifest aliases every locked version (both string-width
-		// versions) to its own verified registry tarball, and the trusted
-		// wrapper rides along. The candidate member's cli reads the stub
-		// dependency back through the installed tree, proving the offline
-		// install produced a working graph.
-		const pkgDir = join(tmp, "payload", "pkg");
-		const registryDir = join(pkgDir, "registry");
-		mkdirSync(registryDir, { recursive: true });
-		writeFileSync(
-			join(pkgDir, "package.json"),
-			JSON.stringify({
-				name: "ottr-omp-probe",
-				private: true,
-				dependencies: {
-					"@oh-my-pi/pi-coding-agent":
-						"file:registry/_oh_my_pi_pi_coding_agent-18.16.0.tgz",
-					"stub-pkg": "file:registry/stub_pkg-1.0.0.tgz",
-					"string-width": "file:registry/string-width-7.2.0.tgz",
-					"string-width-8.6.0": "file:registry/string-width-8.6.0.tgz",
-				},
-			}),
+	test("lockEntryForPlatform: bun's os/cpu install rule", () => {
+		expect(lockEntryForPlatform({}, "linux", "x64")).toBe(true);
+		expect(lockEntryForPlatform(undefined, "linux", "x64")).toBe(true);
+		expect(
+			lockEntryForPlatform({ os: "linux", cpu: "x64" }, "linux", "x64"),
+		).toBe(true);
+		expect(lockEntryForPlatform({ os: "darwin" }, "linux", "x64")).toBe(false);
+		expect(lockEntryForPlatform({ cpu: ["arm64"] }, "linux", "x64")).toBe(
+			false,
 		);
-		writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
-		const longId = "m".repeat(64);
-		const candidateCli =
-			'const fs = require("node:fs");\n' +
-			'const stub = JSON.parse(fs.readFileSync("node_modules/stub-pkg/package.json", "utf8"));\n' +
-			'const envNames = Object.keys(process.env).sort().join(".");\n' +
-			'const records = [{ provider: envNames, id: "env" }, { provider: "stub", id: stub.version }];\n' +
-			`for (let i = 0; i < 998; i++) records.push({ provider: "zai", id: ${JSON.stringify(longId)} + "-" + i });\n` +
-			"process.stdout.write(JSON.stringify({ models: records }));\n";
-		const mkTar = (
-			out: string,
-			name: string,
-			version: string,
-			cliBody: string,
-		): void => {
-			const src = join(tmp, "src", `${name}-${version}`, "package");
-			mkdirSync(join(src, "dist"), { recursive: true });
-			writeFileSync(
-				join(src, "package.json"),
-				JSON.stringify({ name, version, bin: { omp: "dist/cli.js" } }),
-			);
-			writeFileSync(join(src, "dist", "cli.js"), cliBody);
-			const packed = Bun.spawnSync(
-				[
-					"tar",
-					"-czf",
-					out,
-					"-C",
-					join(tmp, "src", `${name}-${version}`),
-					"package",
-				],
-				{ stdout: "pipe", stderr: "pipe" },
-			);
-			expect(packed.exitCode).toBe(0);
-		};
-		mkTar(
-			join(registryDir, "_oh_my_pi_pi_coding_agent-18.16.0.tgz"),
-			"@oh-my-pi/pi-coding-agent",
-			"18.16.0",
-			candidateCli,
+		expect(lockEntryForPlatform({ os: ["!win32"] }, "linux", "x64")).toBe(true);
+		expect(lockEntryForPlatform({ os: ["!linux"] }, "linux", "x64")).toBe(
+			false,
 		);
-		mkTar(
-			join(registryDir, "stub_pkg-1.0.0.tgz"),
-			"stub-pkg",
-			"1.0.0",
-			"// stub\n",
-		);
-		mkTar(
-			join(registryDir, "string-width-7.2.0.tgz"),
-			"string-width",
-			"7.2.0",
-			"// sw7\n",
-		);
-		mkTar(
-			join(registryDir, "string-width-8.6.0.tgz"),
-			"string-width",
-			"8.6.0",
-			"// sw8\n",
-		);
+	});
 
-		// /target is a read-only mount (docker/ottr-vm-init): the fixture's
-		// payload dir is stripped to read-only for the run.
-		const targetPkg = join(tmp, "target", "pkg");
-		mkdirSync(dirname(targetPkg), { recursive: true });
-		cpSync(pkgDir, targetPkg, { recursive: true });
-		chmodSync(targetPkg, 0o555);
+	test("the wrapper: a transitive range the root version cannot satisfy resolves from the nested lock key", () => {
+		// Send-back 3 blocker 2 (dependency-graph-loss): the root holds child@1
+		// and parent asks for child@^2. bun's lockfile nests child@2 under
+		// parent ("parent/child"); the guest tree must keep that edge.
+		const w = lockedPayload([
+			{
+				key: CAND,
+				name: CAND,
+				version: "18.16.0",
+				deps: { parent: "^1.0.0", child: "^1.0.0" },
+				cli: EDGE_CLI,
+			},
+			{
+				key: "parent",
+				name: "parent",
+				version: "1.0.0",
+				deps: { child: "^2.0.0" },
+			},
+			{ key: "child", name: "child", version: "1.0.0" },
+			{ key: "parent/child", name: "child", version: "2.0.0" },
+		]);
+		const run = w.run();
+		expect(run.exitCode).toBe(0);
+		const edges = w
+			.catalog()
+			.map((m) => m.id)
+			.sort();
+		expect(edges).toEqual([
+			"@oh-my-pi/pi-coding-agent>child@1.0.0",
+			"@oh-my-pi/pi-coding-agent>parent@1.0.0",
+			"parent>child@2.0.0",
+		]);
+	}, 60_000);
 
-		const env = {
-			PATH: process.env.PATH ?? "",
-			HOME: home,
-			LANG: "C.UTF-8",
-			OMP_PROBE_STORE: storeDb,
-		};
-		// Only the scratch this run creates counts: earlier runs leave theirs.
-		const scratchBefore = new Set(readdirSync("/tmp"));
-		try {
-			const run = Bun.spawnSync(
-				["bun", join(targetPkg, "probe-wrapper.mjs"), "dist/cli.js", targetPkg],
-				{ env, stdout: "pipe", stderr: "pipe", cwd: tmp },
-			);
-			expect(run.exitCode).toBe(0);
-
-			// Blocker 1: the install happened in the /tmp scratch — the
-			// read-only target gained no node_modules.
-			// The wrapper scratch sits under the real /tmp, not the suite TMPDIR.
-			const scratchDirs = readdirSync("/tmp")
-				.filter((d) => d.startsWith("ottr-probe-") && !scratchBefore.has(d))
-				.map((d) => join("/tmp", d));
-			expect(scratchDirs.length).toBe(1);
-			expect(
-				scratchDirs.some((d) =>
-					existsSync(
-						join(d, "pkg", "node_modules", "@oh-my-pi", "pi-coding-agent"),
-					),
-				),
-			).toBe(true);
-			expect(existsSync(join(targetPkg, "node_modules"))).toBe(false);
-
-			// Blocker 3: both locked string-width versions materialized —
-			// one hoisted, one under its versioned alias directory.
-			const scratchPkgNm = scratchDirs.map((d) =>
-				join(d, "pkg", "node_modules"),
-			);
-			const swDirs: { dir: string; version: string }[] = [];
-			for (const nm of scratchPkgNm) {
-				for (const alias of ["string-width", "string-width-8.6.0"]) {
-					const manifest = join(nm, alias, "package.json");
-					if (existsSync(manifest)) {
-						const parsed = JSON.parse(readFileSync(manifest, "utf8")) as {
-							version: string;
-						};
-						swDirs.push({ dir: alias, version: parsed.version });
-					}
-				}
+	test("the wrapper: every locked edge of every key shape resolves to a version its range accepts", () => {
+		// The class test: the guest tree IS the lockfile (key = install path),
+		// so for any locked graph every declared dependency resolves, through
+		// the runtime's own module resolution, to a version that satisfies
+		// its range. Key shapes: scoped root, scoped nested under scoped,
+		// plain nested under a nested scoped package, three versions of one
+		// name, and a package for another platform that must not install.
+		const pkgs: LockedPkg[] = [
+			{
+				key: CAND,
+				name: CAND,
+				version: "18.16.0",
+				deps: { "@s/a": "^1.0.0", "@t/b": "^1.0.0", c: "^3.0.0" },
+				cli: EDGE_CLI,
+			},
+			{
+				key: "@s/a",
+				name: "@s/a",
+				version: "1.0.0",
+				deps: { "@t/b": "^2.0.0", c: "^3.0.0" },
+			},
+			{ key: "@t/b", name: "@t/b", version: "1.0.0" },
+			{
+				key: "@s/a/@t/b",
+				name: "@t/b",
+				version: "2.0.0",
+				deps: { c: "^1.0.0" },
+			},
+			{ key: "@s/a/@t/b/c", name: "c", version: "1.0.0" },
+			{ key: "c", name: "c", version: "3.0.0" },
+			{
+				key: "other-platform",
+				name: "other-platform",
+				version: "1.0.0",
+				meta: { os: `!${process.platform}` },
+				noTarball: true,
+			},
+		];
+		const w = lockedPayload(pkgs);
+		const run = w.run();
+		expect(run.exitCode).toBe(0);
+		const tree = join(w.scratch(), "pkg");
+		let checked = 0;
+		for (const p of pkgs) {
+			const dir = join(tree, ...installSegments(p.key));
+			if (p.noTarball) {
+				expect(existsSync(dir)).toBe(false);
+				continue;
 			}
-			const versions = swDirs.map((d) => d.version).sort();
-			expect(versions).toEqual(["7.2.0", "8.6.0"]);
-
-			// Blocker 4: the promoted catalog holds the COMPLETE accepted set
-			// — the env record, the stub record, and all 998 entries with
-			// their 64-character ids — regardless of candidate output order.
-			const promoted = JSON.parse(
-				readFileSync(join(home, "catalog.json"), "utf8"),
-			) as { models: { provider: string; id: string }[] };
-			expect(promoted.models.length).toBe(1000);
-			expect(promoted.models[0]!.provider).toBe("HOME.LANG.PATH");
-			expect(promoted.models[1]!.provider).toBe("stub");
-			expect(promoted.models[1]!.id).toBe("1.0.0");
-			expect(promoted.models[2]!.id.endsWith("-0")).toBe(true);
-			expect(promoted.models.at(-1)!.id.endsWith("-997")).toBe(true);
-			// The sorted id set is order-independent (no prefix truncation).
-			const ids = promoted.models.map((m) => m.id).sort();
-			expect(ids[0]).toBe("1.0.0");
-			expect(ids.at(-1)).toBe("m".repeat(64) + "-997");
-
-			// The stdout copy stays a bounded diagnostic.
-			expect(run.stdout.length).toBeLessThanOrEqual(48 * 1024);
-			// The store was stamped into the job HOME.
-			expect(existsSync(join(home, ".omp", "agent", "agent.db"))).toBe(true);
-			// The env allowlist held: no secret name among the candidate's env.
-			expect(promoted.models[0]!.provider).not.toContain("SECRET");
-		} finally {
-			chmodSync(targetPkg, 0o755);
+			expect(
+				JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version,
+			).toBe(p.version);
+			const req = createRequire(join(dir, "package.json"));
+			for (const [dep, range] of Object.entries(p.deps ?? {})) {
+				const found = JSON.parse(
+					readFileSync(req.resolve(`${dep}/package.json`), "utf8"),
+				) as { version: string };
+				expect(Bun.semver.satisfies(found.version, range)).toBe(true);
+				checked++;
+			}
 		}
+		expect(checked).toBe(6);
+	}, 60_000);
+
+	test("the wrapper: a lock key outside the tree is refused before anything unpacks", () => {
+		const w = lockedPayload([
+			{ key: CAND, name: CAND, version: "18.16.0", cli: EDGE_CLI },
+			{ key: "../escape", name: "escape", version: "1.0.0" },
+		]);
+		const run = w.run();
+		expect(run.exitCode).toBe(1);
+		expect(new TextDecoder().decode(run.stderr)).toContain(
+			"not an install path",
+		);
+		expect(existsSync(join(w.scratch(), "escape"))).toBe(false);
+		expect(existsSync(join(w.scratch(), "pkg", "node_modules"))).toBe(false);
+	}, 60_000);
+
+	test("the wrapper: read-only target, guest-only tree, complete catalog artifact past the stdout tail", () => {
+		// The env probe, the stub dependency and 998 entries with 64-character
+		// ids: a catalog far over the guest's 64 KiB stdout tail must reach the
+		// promoted artifact whole.
+		// Every id is exactly 64 characters, the parser's segment limit.
+		const cli =
+			'const stub = require("stub-pkg/package.json");\n' +
+			'const envNames = Object.keys(process.env).sort().join("-").toLowerCase();\n' +
+			'const records = [{ provider: "env", id: envNames }, { provider: "stub", id: stub.version }];\n' +
+			'for (let i = 0; i < 998; i++) records.push({ provider: "zai", id: "m".repeat(60) + String(i).padStart(4, "0") });\n' +
+			"process.stdout.write(JSON.stringify({ models: records }));\n";
+		const w = lockedPayload([
+			{
+				key: CAND,
+				name: CAND,
+				version: "18.16.0",
+				deps: { "stub-pkg": "^1.0.0" },
+				cli,
+			},
+			{ key: "stub-pkg", name: "stub-pkg", version: "1.0.0" },
+		]);
+		const run = w.run();
+		expect(run.exitCode).toBe(0);
+		// The read-only target gained nothing; the tree exists in the scratch.
+		expect(existsSync(join(w.targetPkg, "node_modules"))).toBe(false);
+		expect(existsSync(join(w.scratch(), "pkg", "node_modules", CAND))).toBe(
+			true,
+		);
+		const promoted = w.catalogText();
+		expect(promoted.length).toBeGreaterThan(VM_VALIDATE.outputTailBytes);
+		const models = (
+			JSON.parse(promoted) as { models: { provider: string; id: string }[] }
+		).models;
+		expect(models.length).toBe(1000);
+		// The env allowlist held: the candidate saw exactly HOME, LANG, PATH.
+		expect(models[0]).toEqual({ provider: "env", id: "home-lang-path" });
+		expect(models[1]).toEqual({ provider: "stub", id: "1.0.0" });
+		expect(models.at(-1)!.id).toBe(`${"m".repeat(60)}0997`);
+		// The full artifact is what the watch parses: all 1000 entries accepted.
+		const parsed = parseModelSet(promoted, OMP_WATCH_GATES.modelsMaxEntries);
+		expect("pairs" in parsed && parsed.pairs.length).toBe(1000);
+		// The stdout copy stays a bounded diagnostic.
+		expect(run.stdout.length).toBeLessThanOrEqual(48 * 1024);
+		expect(existsSync(join(w.home, ".omp", "agent", "agent.db"))).toBe(true);
 	}, 60_000);
 
 	test("the wrapper: an over-cap catalog stays over the cap, never a truncated prefix", () => {
-		const tmp = newTmp();
-		const wrapper = join(tmp, "probe-wrapper.mjs");
-		writeFileSync(wrapper, probeWrapperSource);
-		const home = join(tmp, "home");
-		mkdirSync(home, { recursive: true });
-		const storeDb = join(tmp, "store", "agent.db");
-		mkdirSync(dirname(storeDb), { recursive: true });
-		writeFileSync(storeDb, "store bytes");
-		const pkgDir = join(tmp, "payload", "pkg");
-		const cliDir = join(
-			pkgDir,
-			"node_modules",
-			"@oh-my-pi",
-			"pi-coding-agent",
-			"dist",
-		);
-		mkdirSync(cliDir, { recursive: true });
-		writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
 		const over = OMP_WATCH_GATES.modelsMaxEntries + 5;
 		const models = Array.from({ length: over }, (_, i) => ({
 			provider: "zai",
 			id: `m-${i}`,
 		}));
-		writeFileSync(
-			join(cliDir, "big-cli.js"),
-			`process.stdout.write(${JSON.stringify(JSON.stringify({ models }))});\n`,
-		);
-		const run = Bun.spawnSync(["bun", wrapper, "dist/big-cli.js", pkgDir], {
-			env: {
-				PATH: process.env.PATH ?? "",
-				HOME: home,
-				LANG: "C.UTF-8",
-				OMP_PROBE_STORE: storeDb,
-				OMP_PROBE_SKIP_INSTALL: "1",
+		const w = lockedPayload([
+			{
+				key: CAND,
+				name: CAND,
+				version: "18.16.0",
+				cli: `process.stdout.write(${JSON.stringify(JSON.stringify({ models }))});\n`,
 			},
-			stdout: "pipe",
-			stderr: "pipe",
-		});
-		expect(run.exitCode).toBe(0);
-		// The promoted catalog keeps the parse's over-cap verdict: a silently
-		// cut prefix would hide every model past the cap from the fast track.
-		const promoted = readFileSync(join(home, "catalog.json"), "utf8");
-		expect(parseModelSet(promoted, OMP_WATCH_GATES.modelsMaxEntries)).toEqual({
+		]);
+		expect(w.run().exitCode).toBe(0);
+		expect(
+			parseModelSet(w.catalogText(), OMP_WATCH_GATES.modelsMaxEntries),
+		).toEqual({
 			error: expect.stringContaining("models"),
 		});
-	});
+	}, 60_000);
 
 	test("the wrapper: junk candidate output exits non-zero with no catalog", () => {
-		const tmp = newTmp();
-		const wrapper = join(tmp, "probe-wrapper.mjs");
-		writeFileSync(wrapper, probeWrapperSource);
-		const home = join(tmp, "home");
-		mkdirSync(home, { recursive: true });
-		const pkgDir = join(tmp, "payload", "pkg");
-		mkdirSync(pkgDir, { recursive: true });
-		writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
-		// The junk candidate cli rides the payload (the wrapper's scratch copy
-		// carries it), so the composed cli path exists without an install.
-		const cliDir = join(
-			pkgDir,
-			"node_modules",
-			"@oh-my-pi",
-			"pi-coding-agent",
-			"dist",
-		);
-		mkdirSync(cliDir, { recursive: true });
-		writeFileSync(
-			join(cliDir, "junk-cli.js"),
-			"process.stdout.write('not a catalog');\n",
-		);
-		// A real store file: the non-zero exit must come from the catalog
-		// check, not from a missing store copy.
-		mkdirSync(join(tmp, "store"), { recursive: true });
-		writeFileSync(join(tmp, "store", "agent.db"), "store bytes");
-		const env = {
-			PATH: process.env.PATH ?? "",
-			HOME: home,
-			LANG: "C.UTF-8",
-			OMP_PROBE_STORE: join(tmp, "store", "agent.db"),
-			OMP_PROBE_SKIP_INSTALL: "1",
-		};
-		const junk = Bun.spawnSync(["bun", wrapper, "dist/junk-cli.js", pkgDir], {
-			env,
-			stdout: "pipe",
-			stderr: "pipe",
-		});
+		const w = lockedPayload([
+			{
+				key: CAND,
+				name: CAND,
+				version: "18.16.0",
+				cli: "process.stdout.write('not a catalog');\n",
+			},
+		]);
+		const junk = w.run();
 		expect(junk.exitCode).toBe(3);
 		expect(new TextDecoder().decode(junk.stderr)).toContain(
 			"the candidate output is not a models catalog",
 		);
 		expect(junk.stdout.length).toBe(0);
-	});
+		expect(existsSync(join(w.home, "catalog.json"))).toBe(false);
+	}, 60_000);
 
 	test("bin escape guard: a bin outside the package rejects the candidate", async () => {
 		for (const bin of ["../outside.js", "/abs.js"]) {
