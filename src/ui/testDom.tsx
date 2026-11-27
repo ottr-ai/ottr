@@ -80,6 +80,9 @@ export const onChangeOf = (node: Element): ((e?: unknown) => void) =>
 export const onSubmitOf = (node: Element): ((e?: unknown) => void) =>
 	reactPropOf(node, "onSubmit");
 
+export const onKeyDownOf = (node: Element): ((e?: unknown) => void) =>
+	reactPropOf(node, "onKeyDown");
+
 export interface Mounted {
 	container: HTMLDivElement;
 	root: Root;

@@ -6,6 +6,7 @@ import type {
 	ReactNode,
 } from "react";
 import {
+	createContext,
 	Fragment,
 	isValidElement,
 	memo,
@@ -201,6 +202,14 @@ import {
 	seenToDrop,
 } from "./notify.ts";
 import { fmtNum } from "./numbers.ts";
+import {
+	type PendingCreate,
+	pendingBoard,
+	placeholderFlights,
+	placeholderTitle,
+	type Rect,
+	settledKeys,
+} from "./pending.ts";
 import {
 	autoMarkOnOpen,
 	canMarkUnread,
@@ -2842,6 +2851,143 @@ const DEEPEN_HELP = (
 	</>
 );
 
+/** What the New task dialog hands over on submit: the POST body plus what a failure restores. */
+type CreateArgs = {
+	text: string;
+	images: string[];
+	model: string;
+	files: File[];
+	from: Rect | null;
+};
+
+/** OTTR-1337: the creates in flight, for the boards' placeholders; `drop` removes one. */
+export const PendingContext = createContext<{
+	pending: PendingCreate[];
+	drop: (key: string) => void;
+}>({ pending: [], drop: () => {} });
+
+const MORPH_EASE = "cubic-bezier(0.2, 0.7, 0.3, 1)"; // --ease; WAAPI options don't resolve var()
+/** A failed send's error line; the draft stays in the dialog and its on-device cache. */
+const notAdded = (message: string): string =>
+	`Not added: ${message} The draft is kept on this device — try again once the server is back.`;
+
+/** Placeholders that already played their entrance: a board that remounts (a project
+ * switch and back) must not morph them out of the long-gone dialog again. */
+const enteredPlaceholders = new Set<string>();
+
+/** The placeholder of a task the server has not added yet: it morphs out of the New task
+ * dialog's rect into the todo lane, and plays a short exit when the POST fails. */
+function PendingCard({ p }: { p: PendingCreate }) {
+	const { drop } = useContext(PendingContext);
+	const ref = useRef<HTMLDivElement>(null);
+	const from = p.from;
+	useLayoutEffect(() => {
+		const el = ref.current;
+		if (el === null || typeof el.animate !== "function") return;
+		if (enteredPlaceholders.has(p.key)) return;
+		enteredPlaceholders.add(p.key);
+		// A long todo lane would hide the new card below its fold: bring it into view first.
+		if (typeof el.scrollIntoView === "function")
+			el.scrollIntoView({ block: "nearest" });
+		if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+			el.animate([{ opacity: "0" }, { opacity: "1" }], {
+				duration: 180,
+				easing: "ease-out",
+			});
+			return;
+		}
+		const r = el.getBoundingClientRect();
+		if (from === null || r.width === 0 || r.height === 0) return;
+		// The lane's scroll box clips a transform, so a fixed ghost on <body> flies instead
+		// and hands over to the hidden placeholder when it lands.
+		const ghost = el.cloneNode(true) as HTMLElement;
+		ghost.removeAttribute("data-pending-key");
+		ghost.setAttribute("aria-hidden", "true");
+		Object.assign(ghost.style, {
+			position: "fixed",
+			left: `${r.left}px`,
+			top: `${r.top}px`,
+			width: `${r.width}px`,
+			height: `${r.height}px`,
+			margin: "0",
+			boxSizing: "border-box",
+			zIndex: "50",
+			pointerEvents: "none",
+		});
+		document.body.appendChild(ghost);
+		el.style.opacity = "0";
+		ghost.animate(
+			[
+				{
+					transform: `translate(${from.left - r.left}px, ${from.top - r.top}px) scale(${from.width / r.width}, ${from.height / r.height})`,
+				},
+				{ transform: "none" },
+			],
+			{ duration: 340, easing: MORPH_EASE },
+		);
+		// The text fades in late, so the stretched start frame never shows warped words.
+		ghost
+			.querySelector<HTMLElement>(".card-open")
+			?.animate(
+				[{ opacity: "0" }, { opacity: "0", offset: 0.5 }, { opacity: "1" }],
+				{
+					duration: 340,
+					easing: "ease-out",
+				},
+			);
+		// A timer, never Animation.finished: the hand-over must happen even where it never settles.
+		const t = setTimeout(() => {
+			ghost.remove();
+			el.style.opacity = "";
+		}, 350);
+		return () => {
+			clearTimeout(t);
+			ghost.remove();
+			el.style.opacity = "";
+		};
+	}, [from, p.key]);
+	useEffect(() => {
+		if (!p.failed) return;
+		const el = ref.current;
+		if (el !== null && typeof el.animate === "function") {
+			const reduced = window.matchMedia(
+				"(prefers-reduced-motion: reduce)",
+			).matches;
+			el.animate(
+				reduced
+					? [{ opacity: "1" }, { opacity: "0" }]
+					: [
+							{ opacity: "1", transform: "scale(1)" },
+							{ opacity: "0", transform: "scale(0.96)" },
+						],
+				{ duration: 160, easing: "ease-in", fill: "forwards" },
+			);
+		}
+		// A timer, never Animation.finished: the drop must happen even where the animation never settles.
+		const t = setTimeout(() => drop(p.key), 170);
+		return () => clearTimeout(t);
+	}, [p.failed, p.key, drop]);
+	return (
+		<div
+			ref={ref}
+			className="card pending-card"
+			data-pending-key={p.key}
+			data-stage="todo"
+			aria-busy="true"
+		>
+			<div className="card-open">
+				{/* The real Card's row order: the head row (status where the key sits), then the
+				    title, so the server's card takes the same height when it replaces this one. */}
+				<span className="card-head">
+					{!p.failed && <span className="spinner" aria-hidden="true" />}
+					<span className="card-key">{p.failed ? "Not added" : "Adding…"}</span>
+				</span>
+				<span className="card-title">{placeholderTitle(p.text)}</span>
+			</div>
+		</div>
+	);
+}
+
 /** The shared compose dialog behind New task and Follow up: same hooks, draft reset and
     submit flow; callers pass the copy, the icon and a `send` that does the POST. */
 export function ComposeDialog({
@@ -2863,6 +3009,8 @@ export function ComposeDialog({
 	showModel,
 	/** One extra control above the prompt card (the follow-up's project picker). */
 	field,
+	restore,
+	onRestored,
 }: {
 	open: boolean;
 	onClose: () => void;
@@ -2878,11 +3026,14 @@ export function ComposeDialog({
 	hint: string;
 	icon: React.ComponentProps<typeof Icon>["name"];
 	submitLabel: string;
-	/** Does the POST; once it resolves the cached draft is cleared and the dialog closes. */
+	/** Does the POST; once it resolves the cached draft is cleared and the dialog closes.
+	 * `from` is the dialog's rect at submit, for a placeholder that morphs out of it. */
 	send: (args: {
 		text: string;
 		images: string[];
 		model: string;
+		files: File[];
+		from: Rect | null;
 	}) => Promise<void>;
 	/** Deepen the draft: POST /api/projects/:project/deepen. Absent on the backlog draft dialog. */
 	deepen?: (
@@ -2895,7 +3046,21 @@ export function ComposeDialog({
 	}>;
 	showModel?: boolean;
 	field?: ReactNode;
+	/** A failed optimistic send to put back on the next open: text, model, images and its error line. */
+	restore?: {
+		text: string;
+		model: string;
+		files: File[];
+		error: string;
+	} | null;
+	/** The restore is applied; the owner drops it. */
+	onRestored?: () => void;
 }) {
+	const formRef = useRef<HTMLFormElement>(null);
+	const restoreRef = useRef(restore);
+	restoreRef.current = restore;
+	const onRestoredRef = useRef(onRestored);
+	onRestoredRef.current = onRestored;
 	const [text, setText] = useState("");
 	const [model, setModel] = useState("");
 	const [modelQuery, setModelQuery] = useState("");
@@ -2937,6 +3102,18 @@ export function ComposeDialog({
 			setModel(saved.model);
 		}
 	}, [open, draftKey]);
+	// A failed optimistic send reopens with what was submitted. Runs after the cache load, so it
+	// wins; read through a ref, so a restore that lands while open waits for the next open.
+	useEffect(() => {
+		const r = restoreRef.current;
+		if (!open || r === undefined || r === null) return;
+		setText(r.text);
+		setModel(r.model);
+		saveComposeDraft(draftKey, { text: r.text, model: r.model });
+		images.addFiles(r.files);
+		setErr(notAdded(r.error));
+		onRestoredRef.current?.();
+	}, [open, draftKey, images.addFiles]);
 	// Keystrokes and model picks mirror into the cache.
 	const editText = (t: string): void => {
 		setText(t);
@@ -2978,10 +3155,21 @@ export function ComposeDialog({
 		sendState.start(() =>
 			act(
 				async () => {
+					const r = formRef.current?.closest("dialog")?.getBoundingClientRect();
 					await send({
 						text,
 						images: images.images.map((i) => i.data),
 						model,
+						files: images.images.map((i) => i.file),
+						from:
+							r === undefined
+								? null
+								: {
+										left: r.left,
+										top: r.top,
+										width: r.width,
+										height: r.height,
+									},
 					});
 					clearComposeDraft(draftKey);
 					setText("");
@@ -2989,10 +3177,7 @@ export function ComposeDialog({
 					images.clear();
 					onClose();
 				},
-				(message) =>
-					setErr(
-						`Not added: ${message} The draft is kept on this device — try again once the server is back.`,
-					),
+				(message) => setErr(notAdded(message)),
 			),
 		);
 	};
@@ -3000,6 +3185,7 @@ export function ComposeDialog({
 		<>
 			<Modal open={open} onClose={onClose} label={label} className="dialog">
 				<form
+					ref={formRef}
 					className="dialog-body"
 					onSubmit={(e) => {
 						e.preventDefault();
@@ -3120,11 +3306,18 @@ function NewTaskDialog({
 	open,
 	onClose,
 	act,
+	onCreate,
+	restore,
+	onRestored,
 }: {
 	project: ProjectView;
 	open: boolean;
 	onClose: () => void;
 	act: Act;
+	/** Starts the optimistic create; the dialog closes at once while the POST runs. */
+	onCreate: (args: CreateArgs) => void;
+	restore: React.ComponentProps<typeof ComposeDialog>["restore"];
+	onRestored: () => void;
 }) {
 	const label = projectLabel(project);
 	return (
@@ -3151,13 +3344,9 @@ function NewTaskDialog({
 					model: model || undefined,
 				})
 			}
-			send={async ({ text, images, model }) => {
-				await post(`/api/projects/${encodeURIComponent(project.name)}/tasks`, {
-					prompt: text,
-					images,
-					model: model || undefined,
-				});
-			}}
+			restore={restore}
+			onRestored={onRestored}
+			send={async (args) => onCreate(args)}
 		/>
 	);
 }
@@ -4616,7 +4805,7 @@ export function depHoldContexts(
 
 export function ProjectBoard({
 	project,
-	tasks,
+	tasks: boardTasks,
 	deltas,
 	open,
 	seenAnswers,
@@ -4662,6 +4851,18 @@ export function ProjectBoard({
 	navigate?: (path: string) => void;
 }) {
 	const hosted = useContext(HostedContext);
+	// OTTR-1337: a create in flight draws its placeholder in the todo lane, and a card a live
+	// frame carries before the POST answers stays held back, so the two never show at once.
+	const { pending } = useContext(PendingContext);
+	const { cards: pendingCards, held } = useMemo(
+		() => pendingBoard(pending, project.name, boardTasks),
+		[pending, project.name, boardTasks],
+	);
+	const tasks = useMemo(
+		() =>
+			held.size === 0 ? boardTasks : boardTasks.filter((t) => !held.has(t.id)),
+		[boardTasks, held],
+	);
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
 	// The project's cards at the last render: the re-release callback stays stable across
@@ -5222,6 +5423,7 @@ export function ProjectBoard({
 							<LaneCol
 								stage={c.key}
 								tasks={col}
+								pendingCards={c.key === "todo" ? pendingCards : undefined}
 								more={c.key === "done" ? doneHidden : 0}
 								// With a query applied "Show more" pages the server search instead
 								// of the older-pages fetch.
@@ -6694,9 +6896,12 @@ export function LaneCol({
 	onStarredToggle,
 	onRerelease,
 	tick,
+	pendingCards,
 }: {
 	stage: Stage;
 	tasks: TaskCard[];
+	/** Todo lane only: placeholders of creates the server has not answered yet (OTTR-1337). */
+	pendingCards?: PendingCreate[];
 	/** Todo lane only: idle backlog cards below the divider (started ones render in the lane's own list); the queue DnD never touches them. */
 	parked?: TaskCard[];
 	/** All parked (idle) backlog cards, ignoring the filter: the label count next to the Backlog label. */
@@ -6862,7 +7067,10 @@ export function LaneCol({
 		}
 		return m;
 	}, [dnd, busy, queuedIds, dragId, drop, clear]);
-	const hasTasks = tasks.length > 0 || (parked?.length ?? 0) > 0;
+	const hasTasks =
+		tasks.length > 0 ||
+		(parked?.length ?? 0) > 0 ||
+		(pendingCards?.length ?? 0) > 0;
 	const showBacklogRow = parked != null;
 	// "Show more" moves focus to the first card it reveals: the button may unmount on the last page,
 	// and focus must not fall to <body> (WCAG 2.4.3). The index counts the cards above the button.
@@ -7043,6 +7251,9 @@ export function LaneCol({
 				showMore={showMore}
 				card={card}
 			/>
+			{pendingCards?.map((p) => (
+				<PendingCard key={p.key} p={p} />
+			))}
 			{parked != null && (
 				<>
 					<hr className="lane-divider" />
@@ -16631,6 +16842,17 @@ function measureCards(): {
 		});
 		els.set(id, el);
 	}
+	// Placeholders join under their pending key, so the real card can fly from their spot.
+	for (const el of document.querySelectorAll<HTMLElement>(
+		".card[data-pending-key]",
+	)) {
+		const r = el.getBoundingClientRect();
+		next.set(el.dataset.pendingKey as string, {
+			stage: "todo",
+			left: r.left,
+			top: r.top,
+		});
+	}
 	return { next, els };
 }
 
@@ -18594,6 +18816,21 @@ export function App() {
 		history.replaceState(null, "", viewPath(view));
 	}, [view]);
 	const [composeFor, setComposeFor] = useState<string | null>(null);
+	const composeForRef = useRef(composeFor);
+	composeForRef.current = composeFor;
+	/** OTTR-1337: creates in flight; each draws a placeholder card until its real card renders. */
+	const [pendingCreates, setPendingCreates] = useState<PendingCreate[]>([]);
+	const pendingRef = useRef(pendingCreates);
+	pendingRef.current = pendingCreates;
+	const pendingSeq = useRef(0);
+	/** A failed create's input, put back into that project's New task dialog on its next open. */
+	const [composeRestore, setComposeRestore] = useState<{
+		project: string;
+		text: string;
+		model: string;
+		files: File[];
+		error: string;
+	} | null>(null);
 	const [draftFor, setDraftFor] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [offline, setOffline] = useState(false);
@@ -18872,13 +19109,15 @@ export function App() {
 	// picks up the fresh bundle instead of rendering old shapes against the new API. The drawer,
 	// modals and compose dialog count as busy (their textareas only exist inside them), so a
 	// half-typed reply is never lost; the effect reruns when busy state clears or on the next state push.
+	// A create in flight counts too: its failure reopens the dialog with the input.
 	useEffect(() => {
 		if (state === null) return;
 		const idle =
 			composeFor === null &&
 			draftFor === null &&
 			selectedId === null &&
-			!showAdd;
+			!showAdd &&
+			pendingCreates.length === 0;
 		const decision = decideReload(
 			seenVersion,
 			state.serverVersion,
@@ -18892,7 +19131,7 @@ export function App() {
 			seenVersion = state.serverVersion;
 			sessionStorage.setItem(SEEN_VERSION_KEY, state.serverVersion);
 		}
-	}, [state, composeFor, draftFor, selectedId, showAdd]);
+	}, [state, composeFor, draftFor, selectedId, showAdd, pendingCreates]);
 
 	/** Cards travel: when a task's stage changes, fly the card from its old column to its new one (FLIP). */
 	const cardPos = useRef(new Map<string, CardPos>());
@@ -18909,7 +19148,8 @@ export function App() {
 		// push, the clock tick's siblings); the entrance and flight animations all need one of
 		// the two. A path change remeasures, because another board's DOM sits where the last
 		// scan measured.
-		const sig = boardFlipSig(state.tasks);
+		// Placeholders count too: one appearing, answering or leaving moves cards.
+		const sig = `${boardFlipSig(state.tasks)}|${pendingCreates.map((p) => `${p.key}:${p.id ?? ""}`).join(" ")}`;
 		const path = location.pathname;
 		if (sig === flipKey.current.sig && path === flipKey.current.path) return;
 		flipKey.current = { sig, path };
@@ -18921,8 +19161,13 @@ export function App() {
 		const flights = stageFlights(prev, next);
 		// A fresh follow-up starts where its done parent sits, so it visibly grows out of that card.
 		applyOriginFlight(origin, flights, els, prev, next);
+		// The server's card takes the placeholder's place: no entrance, a flight only when it lands elsewhere.
+		for (const [id, f] of placeholderFlights(pendingRef.current, prev, next)) {
+			fresh.delete(id);
+			if (f.dx !== 0 || f.dy !== 0) flights.set(id, f);
+		}
 		animateBoardChanges(els, flights, fresh);
-	}, [state, view]);
+	}, [state, view, pendingCreates]);
 
 	const act = useCallback(
 		async (
@@ -18943,6 +19188,69 @@ export function App() {
 			}
 		},
 		[], // stable: setError and refreshState never change between renders
+	);
+
+	const stateRef = useRef(state);
+	stateRef.current = state;
+	// OTTR-1337: the dialog closes at once and a placeholder stands in while the POST runs.
+	const createTask = useCallback(
+		(project: string, args: CreateArgs): void => {
+			const key = `pending:${++pendingSeq.current}`;
+			const { text, images, model, files, from } = args;
+			const before = new Set((stateRef.current?.tasks ?? []).map((t) => t.id));
+			const mark = (patch: Partial<PendingCreate>): void =>
+				setPendingCreates((list) =>
+					list.map((p) => (p.key === key ? { ...p, ...patch } : p)),
+				);
+			setPendingCreates((list) => [
+				...list,
+				{
+					key,
+					project,
+					text,
+					model,
+					images,
+					files,
+					before,
+					id: null,
+					failed: false,
+					from,
+				},
+			]);
+			void act(
+				async () => {
+					const t = await post<TaskView>(
+						`/api/projects/${encodeURIComponent(project)}/tasks`,
+						{ prompt: text, images, model: model || undefined },
+					);
+					mark({ id: t.id });
+				},
+				(message) => {
+					// act shows the error toast; the dialog reopens with the input and its error line.
+					mark({ failed: true });
+					setComposeRestore({ project, text, model, files, error: message });
+					if (composeForRef.current === null) setComposeFor(project);
+				},
+			);
+		},
+		[act],
+	);
+	const dropPending = useCallback((key: string): void => {
+		setPendingCreates((list) => list.filter((p) => p.key !== key));
+	}, []);
+	// A create whose card the state carries is done: its placeholder drops.
+	useEffect(() => {
+		if (state === null || pendingCreates.length === 0) return;
+		const done = settledKeys(
+			pendingCreates,
+			new Set(state.tasks.map((t) => t.id)),
+		);
+		if (done.size > 0)
+			setPendingCreates((list) => list.filter((p) => !done.has(p.key)));
+	}, [state, pendingCreates]);
+	const pendingValue = useMemo(
+		() => ({ pending: pendingCreates, drop: dropPending }),
+		[pendingCreates, dropPending],
 	);
 
 	const selectedStateTask =
@@ -19357,332 +19665,342 @@ export function App() {
 
 	return (
 		<HostedContext.Provider value={hosted}>
-			<header className="bar">
-				<button
-					type="button"
-					className="icon areas-toggle"
-					popoverTarget="areas-pop"
-					title="Projects"
-					aria-label="Projects"
-				>
-					<Icon name="grid" />
-				</button>
-				<div
-					id="areas-pop"
-					popover="auto"
-					className="popover notif-pop areas-pop"
-				>
-					<RailRows
+			<PendingContext.Provider value={pendingValue}>
+				<header className="bar">
+					<button
+						type="button"
+						className="icon areas-toggle"
+						popoverTarget="areas-pop"
+						title="Projects"
+						aria-label="Projects"
+					>
+						<Icon name="grid" />
+					</button>
+					<div
+						id="areas-pop"
+						popover="auto"
+						className="popover notif-pop areas-pop"
+					>
+						<RailRows
+							projects={projects}
+							tasks={tasks}
+							seenAnswers={seenAnswers}
+							seenDoneSince={seenDoneSince}
+							project={project}
+							overviewCurrent={overviewCurrent}
+							systemCurrent={onSystem}
+							hosted={hosted}
+							version={bootVersion}
+							collapsed={false}
+							navigate={navigate}
+							onAdd={() => setShowAdd(true)}
+							onPick={() => document.getElementById("areas-pop")?.hidePopover()}
+						/>
+					</div>
+					<AppRailToggle
+						railCollapsed={railCollapsed}
+						toggleRail={toggleRail}
+					/>
+					<a className="brand" href="/" aria-label="Ottr home">
+						<img src={logo} alt="" />
+						<span>Ottr</span>
+					</a>
+					{state !== null && (
+						<SystemBar
+							tasks={tasks}
+							maxTotal={state.maxTotal}
+							slotsUsed={state.slotsUsed}
+							quota={state.quota}
+							serviceQuotas={state.serviceQuotas}
+							navigate={navigate}
+							hosted={hosted}
+						/>
+					)}
+					{checkProject !== null && (
+						<>
+							<button
+								type="button"
+								className="icon"
+								title={`Check the board with the check-ottr-board skill (dev tool)${boardNote === null ? "" : `. ${boardNote}`}`}
+								aria-label={
+									boardNote === null
+										? "Check the board"
+										: `Check the board. ${boardNote}`
+								}
+								onClick={async () =>
+									(await confirmDialog(
+										"Check the board? This creates a task that runs an agent over every open card. When a check card is still open, it opens that card instead.",
+										{ ok: "Create task" },
+									)) &&
+									void act(async () => {
+										const card = await post<{ id: string }>(
+											`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
+											{},
+										);
+										openTask(card.id);
+									})
+								}
+							>
+								<Icon name="activity" />
+							</button>
+							{boardNote !== null && <SkillGapMark note={boardNote} />}
+						</>
+					)}
+					<AppInboxBell
+						inbox={inbox}
+						inboxTitle={inboxTitle}
+						inboxName={inboxName}
+						loaded={state !== null}
+					/>
+					<AppInboxPanel
+						error={error}
+						critKey={critKey}
+						needTasks={needsShown}
+						askCards={askCards}
+						prActivity={prActivity}
+						prPosted={prPosted}
+						alarmCount={alarmCount}
+						updatesKey={updatesKey}
+						updateCount={updateCount}
+						isNew={isNew}
+						notice={notice}
+						noticeKey={noticeKey}
+						drainNotice={drainNotice}
+						drainKey={drainKey}
+						drainCommits={drainCommits}
+						behind={behind}
+						behindKey={behindKey}
+						behindCommits={behindCommits}
+						restartWait={restartWait}
+						restartWaitKey={restartWaitKey}
+						seedFailed={seedFailed}
+						seedFailKey={seedFailKey}
+						provisionError={
+							hosted ? null : (state?.alateProvisionError ?? null)
+						}
+						provisionErrKey={provisionErrKey}
+						state={state}
+						warnings={warnings}
+						orphanList={orphanList}
+						orphansError={orphansError}
+						orphansErrorKey={orphansErrorKey}
+						orphansKey={orphansKey}
+						keptCount={keptCount}
+						keptKey={keptKey}
+						alatePendingKey={alatePendingKey}
+						signinAdvisories={signinAdvisories}
 						projects={projects}
-						tasks={tasks}
-						seenAnswers={seenAnswers}
-						seenDoneSince={seenDoneSince}
-						project={project}
-						overviewCurrent={overviewCurrent}
-						systemCurrent={onSystem}
-						hosted={hosted}
-						version={bootVersion}
-						collapsed={false}
-						navigate={navigate}
-						onAdd={() => setShowAdd(true)}
-						onPick={() => document.getElementById("areas-pop")?.hidePopover()}
+						nowMs={nowMs}
+						openTask={openTask}
+						entries={entries}
+						inbox={inbox}
+						ackInbox={ackInbox}
+						setShowUpdates={setShowUpdates}
+						setError={setError}
+						setNotice={setNotice}
 					/>
-				</div>
-				<AppRailToggle railCollapsed={railCollapsed} toggleRail={toggleRail} />
-				<a className="brand" href="/" aria-label="Ottr home">
-					<img src={logo} alt="" />
-					<span>Ottr</span>
-				</a>
-				{state !== null && (
-					<SystemBar
-						tasks={tasks}
-						maxTotal={state.maxTotal}
-						slotsUsed={state.slotsUsed}
-						quota={state.quota}
-						serviceQuotas={state.serviceQuotas}
-						navigate={navigate}
-						hosted={hosted}
-					/>
-				)}
-				{checkProject !== null && (
-					<>
-						<button
-							type="button"
-							className="icon"
-							title={`Check the board with the check-ottr-board skill (dev tool)${boardNote === null ? "" : `. ${boardNote}`}`}
-							aria-label={
-								boardNote === null
-									? "Check the board"
-									: `Check the board. ${boardNote}`
-							}
-							onClick={async () =>
-								(await confirmDialog(
-									"Check the board? This creates a task that runs an agent over every open card. When a check card is still open, it opens that card instead.",
-									{ ok: "Create task" },
-								)) &&
-								void act(async () => {
-									const card = await post<{ id: string }>(
-										`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
-										{},
-									);
-									openTask(card.id);
-								})
-							}
-						>
-							<Icon name="activity" />
-						</button>
-						{boardNote !== null && <SkillGapMark note={boardNote} />}
-					</>
-				)}
-				<AppInboxBell
-					inbox={inbox}
-					inboxTitle={inboxTitle}
-					inboxName={inboxName}
-					loaded={state !== null}
-				/>
-				<AppInboxPanel
-					error={error}
-					critKey={critKey}
-					needTasks={needsShown}
-					askCards={askCards}
-					prActivity={prActivity}
-					prPosted={prPosted}
-					alarmCount={alarmCount}
-					updatesKey={updatesKey}
-					updateCount={updateCount}
-					isNew={isNew}
-					notice={notice}
-					noticeKey={noticeKey}
-					drainNotice={drainNotice}
-					drainKey={drainKey}
-					drainCommits={drainCommits}
-					behind={behind}
-					behindKey={behindKey}
-					behindCommits={behindCommits}
-					restartWait={restartWait}
-					restartWaitKey={restartWaitKey}
-					seedFailed={seedFailed}
-					seedFailKey={seedFailKey}
-					provisionError={hosted ? null : (state?.alateProvisionError ?? null)}
-					provisionErrKey={provisionErrKey}
-					state={state}
-					warnings={warnings}
-					orphanList={orphanList}
-					orphansError={orphansError}
-					orphansErrorKey={orphansErrorKey}
-					orphansKey={orphansKey}
-					keptCount={keptCount}
-					keptKey={keptKey}
-					alatePendingKey={alatePendingKey}
-					signinAdvisories={signinAdvisories}
-					projects={projects}
-					nowMs={nowMs}
-					openTask={openTask}
-					entries={entries}
-					inbox={inbox}
-					ackInbox={ackInbox}
-					setShowUpdates={setShowUpdates}
-					setError={setError}
-					setNotice={setNotice}
-				/>
-				{/* The payload carries credits only in hosted mode; a self-hosted board's
+					{/* The payload carries credits only in hosted mode; a self-hosted board's
 				    payload lacks the field, so nothing renders and its DOM stays
 				    byte-identical. The chip fetches nothing: the anchor navigates only
 				    on a click. */}
-				{state?.credits !== undefined && state.credits.balance !== null && (
-					<CreditsChip credits={state.credits} />
-				)}
-				{/* Desktop keeps theme in the bar; phones reach it through the account menu. */}
-				<button
-					type="button"
-					className="icon bar-theme"
-					popoverTarget="theme-pop"
-					title={themeName}
-					aria-label={themeName}
-				>
-					{/* The applied theme, also while "Match system" decides it. */}
-					<Icon name={THEME_META[applied].icon} />
-				</button>
-				<div
-					id="theme-pop"
-					popover="auto"
-					className="popover notif-pop theme-pop"
-				>
-					<h2>Theme</h2>
-					{THEME_ORDER.map((t) => (
-						<button
-							key={t}
-							type="button"
-							className="theme-choice"
-							aria-pressed={theme === t}
-							onClick={() => {
-								setTheme(t);
-								document.getElementById("theme-pop")?.hidePopover();
-							}}
-						>
-							<Icon name={THEME_META[t].icon} size={14} />
-							<span>
-								{t === "system"
-									? `${THEME_META[t].label} (${THEME_META[sysLight ? "light" : "dark"].label})`
-									: THEME_META[t].label}
-							</span>
-							{theme === t && <Icon name="check" size={14} />}
-						</button>
-					))}
-				</div>
-				{/* Phones have no rail: the bar's account chip opens the same account menu. */}
-				<button
-					type="button"
-					className="icon bar-user"
-					popoverTarget="user-menu"
-					title="Account"
-					aria-label={`Account menu, ${state?.user ?? "operator"}`}
-				>
-					<Icon name="user" />
-				</button>
-			</header>
-
-			<div
-				className="shell"
-				data-rail={railCollapsed ? "collapsed" : undefined}
-			>
-				{/* biome-ignore lint/a11y/useKeyWithClickEvents: a mouse shortcut only; the fold button in the footer is the keyboard path */}
-				<nav
-					className="areas rail"
-					aria-label="Projects"
-					data-collapsed={railCollapsed || undefined}
-					// A click on the rail's empty space (not on a row or the footer) folds it, like the fold button.
-					onClick={(e) => {
-						if (e.target === e.currentTarget) toggleRail();
-					}}
-				>
-					<RailRows
-						projects={projects}
-						tasks={tasks}
-						seenAnswers={seenAnswers}
-						seenDoneSince={seenDoneSince}
-						project={project}
-						overviewCurrent={overviewCurrent}
-						systemCurrent={onSystem}
-						hosted={hosted}
-						version={bootVersion}
-						collapsed={railCollapsed}
-						navigate={navigate}
-						onAdd={() => setShowAdd(true)}
+					{state?.credits !== undefined && state.credits.balance !== null && (
+						<CreditsChip credits={state.credits} />
+					)}
+					{/* Desktop keeps theme in the bar; phones reach it through the account menu. */}
+					<button
+						type="button"
+						className="icon bar-theme"
+						popoverTarget="theme-pop"
+						title={themeName}
+						aria-label={themeName}
 					>
-						{/* ponytail: placeholder account chip; swap in the user's avatar and name when
-				    		    Ottr gets user accounts. */}
-						<button
-							type="button"
-							className="rail-user"
-							popoverTarget="user-menu"
-							title={railCollapsed ? "Account" : undefined}
-							aria-label={`Account menu, ${state?.user ?? "operator"}`}
+						{/* The applied theme, also while "Match system" decides it. */}
+						<Icon name={THEME_META[applied].icon} />
+					</button>
+					<div
+						id="theme-pop"
+						popover="auto"
+						className="popover notif-pop theme-pop"
+					>
+						<h2>Theme</h2>
+						{THEME_ORDER.map((t) => (
+							<button
+								key={t}
+								type="button"
+								className="theme-choice"
+								aria-pressed={theme === t}
+								onClick={() => {
+									setTheme(t);
+									document.getElementById("theme-pop")?.hidePopover();
+								}}
+							>
+								<Icon name={THEME_META[t].icon} size={14} />
+								<span>
+									{t === "system"
+										? `${THEME_META[t].label} (${THEME_META[sysLight ? "light" : "dark"].label})`
+										: THEME_META[t].label}
+								</span>
+								{theme === t && <Icon name="check" size={14} />}
+							</button>
+						))}
+					</div>
+					{/* Phones have no rail: the bar's account chip opens the same account menu. */}
+					<button
+						type="button"
+						className="icon bar-user"
+						popoverTarget="user-menu"
+						title="Account"
+						aria-label={`Account menu, ${state?.user ?? "operator"}`}
+					>
+						<Icon name="user" />
+					</button>
+				</header>
+
+				<div
+					className="shell"
+					data-rail={railCollapsed ? "collapsed" : undefined}
+				>
+					{/* biome-ignore lint/a11y/useKeyWithClickEvents: a mouse shortcut only; the fold button in the footer is the keyboard path */}
+					<nav
+						className="areas rail"
+						aria-label="Projects"
+						data-collapsed={railCollapsed || undefined}
+						// A click on the rail's empty space (not on a row or the footer) folds it, like the fold button.
+						onClick={(e) => {
+							if (e.target === e.currentTarget) toggleRail();
+						}}
+					>
+						<RailRows
+							projects={projects}
+							tasks={tasks}
+							seenAnswers={seenAnswers}
+							seenDoneSince={seenDoneSince}
+							project={project}
+							overviewCurrent={overviewCurrent}
+							systemCurrent={onSystem}
+							hosted={hosted}
+							version={bootVersion}
+							collapsed={railCollapsed}
+							navigate={navigate}
+							onAdd={() => setShowAdd(true)}
 						>
-							<span className="user-chip" aria-hidden="true">
-								<Icon name="user" size={15} />
-							</span>
-							<span className="rail-label">{state?.user ?? "Operator"}</span>
-							<span className="rail-user-caret" aria-hidden="true">
-								<Icon name="chevron-right" size={12} />
-							</span>
-						</button>
-					</RailRows>
-				</nav>
-				<AppUserMenu
-					hosted={hosted}
-					state={state}
-					theme={theme}
-					setTheme={setTheme}
-					sysLight={sysLight}
-					navigate={navigate}
-					act={act}
-				/>
-
-				<main className="main">
-					<AppMainContent
-						state={state}
-						view={view}
+							{/* ponytail: placeholder account chip; swap in the user's avatar and name when
+				    		    Ottr gets user accounts. */}
+							<button
+								type="button"
+								className="rail-user"
+								popoverTarget="user-menu"
+								title={railCollapsed ? "Account" : undefined}
+								aria-label={`Account menu, ${state?.user ?? "operator"}`}
+							>
+								<span className="user-chip" aria-hidden="true">
+									<Icon name="user" size={15} />
+								</span>
+								<span className="rail-label">{state?.user ?? "Operator"}</span>
+								<span className="rail-user-caret" aria-hidden="true">
+									<Icon name="chevron-right" size={12} />
+								</span>
+							</button>
+						</RailRows>
+					</nav>
+					<AppUserMenu
 						hosted={hosted}
-						settingsRoute={settingsRoute}
-						onSystem={onSystem}
-						project={project}
-						projects={projects}
-						tasks={tasks}
-						seenAnswers={seenAnswers}
-						seenDoneSince={seenDoneSince}
-						deltas={deltas}
-						act={act}
-						openTask={openTask}
+						state={state}
+						theme={theme}
+						setTheme={setTheme}
+						sysLight={sysLight}
 						navigate={navigate}
-						setComposeFor={setComposeFor}
-						setDraftFor={setDraftFor}
-						setNotice={setNotice}
-						setShowAdd={setShowAdd}
-						draining={draining}
-						tick={clockTick}
-						prov={prov}
+						act={act}
 					/>
-				</main>
-			</div>
 
-			{projects.map((p) => (
-				<NewTaskDialog
-					key={p.name}
-					project={p}
-					open={composeFor === p.name}
-					onClose={() => setComposeFor(null)}
+					<main className="main">
+						<AppMainContent
+							state={state}
+							view={view}
+							hosted={hosted}
+							settingsRoute={settingsRoute}
+							onSystem={onSystem}
+							project={project}
+							projects={projects}
+							tasks={tasks}
+							seenAnswers={seenAnswers}
+							seenDoneSince={seenDoneSince}
+							deltas={deltas}
+							act={act}
+							openTask={openTask}
+							navigate={navigate}
+							setComposeFor={setComposeFor}
+							setDraftFor={setDraftFor}
+							setNotice={setNotice}
+							setShowAdd={setShowAdd}
+							draining={draining}
+							tick={clockTick}
+							prov={prov}
+						/>
+					</main>
+				</div>
+
+				{projects.map((p) => (
+					<NewTaskDialog
+						key={p.name}
+						project={p}
+						open={composeFor === p.name}
+						onClose={() => setComposeFor(null)}
+						act={act}
+						onCreate={(a) => createTask(p.name, a)}
+						restore={composeRestore?.project === p.name ? composeRestore : null}
+						onRestored={() => setComposeRestore(null)}
+					/>
+				))}
+
+				{projects.map((p) => (
+					<BacklogDialog
+						key={p.name}
+						project={p}
+						open={draftFor === p.name}
+						onClose={() => setDraftFor(null)}
+						act={act}
+					/>
+				))}
+
+				<AppDrawer
+					selected={selected}
+					selectedProject={selectedProject}
+					sheet={sheet}
+					pendingDrawer={pendingDrawer}
+					retryPending={retryPendingDrawer}
+					state={state}
+					projects={projects}
+					tasks={drawerContextTasks}
+					deltas={deltas}
+					draining={draining}
+					usedTotal={usedTotal}
+					seenAnswers={seenAnswers}
+					origin={origin}
 					act={act}
+					openTask={openTask}
+					markRead={markRead}
+					markUnread={markUnread}
+					closeDrawer={closeDrawer}
+					seenDoneSince={seenDoneSince}
 				/>
-			))}
 
-			{projects.map((p) => (
-				<BacklogDialog
-					key={p.name}
-					project={p}
-					open={draftFor === p.name}
-					onClose={() => setDraftFor(null)}
+				<AppOverlays
+					showAdd={showAdd}
+					showUpdates={showUpdates}
+					offline={offline}
+					connDiag={connDiag}
+					lastContact={lastContact}
+					retryAt={retryAt}
+					state={state}
+					tasks={tasks}
 					act={act}
+					openTask={openTask}
+					onNotice={setNotice}
+					setShowAdd={setShowAdd}
+					setShowUpdates={setShowUpdates}
 				/>
-			))}
-
-			<AppDrawer
-				selected={selected}
-				selectedProject={selectedProject}
-				sheet={sheet}
-				pendingDrawer={pendingDrawer}
-				retryPending={retryPendingDrawer}
-				state={state}
-				projects={projects}
-				tasks={drawerContextTasks}
-				deltas={deltas}
-				draining={draining}
-				usedTotal={usedTotal}
-				seenAnswers={seenAnswers}
-				origin={origin}
-				act={act}
-				openTask={openTask}
-				markRead={markRead}
-				markUnread={markUnread}
-				closeDrawer={closeDrawer}
-				seenDoneSince={seenDoneSince}
-			/>
-
-			<AppOverlays
-				showAdd={showAdd}
-				showUpdates={showUpdates}
-				offline={offline}
-				connDiag={connDiag}
-				lastContact={lastContact}
-				retryAt={retryAt}
-				state={state}
-				tasks={tasks}
-				act={act}
-				openTask={openTask}
-				onNotice={setNotice}
-				setShowAdd={setShowAdd}
-				setShowUpdates={setShowUpdates}
-			/>
+			</PendingContext.Provider>
 		</HostedContext.Provider>
 	);
 }

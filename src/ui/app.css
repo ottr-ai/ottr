@@ -3524,6 +3524,33 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .card.reorder-lock {
 	opacity: 0.55;
 }
+/* OTTR-1337: the optimistic placeholder of a task the server has not added yet. It is
+   not a card to act on: no hover, no pointer. Its content dims; the spinner beside
+   "Adding…" waits 400ms like a busy button, so a fast create never flashes one. */
+.card.pending-card {
+	pointer-events: none;
+	transform-origin: top left;
+	/* scrollIntoView leaves a gap under the card, not flush with the lane's edge. */
+	scroll-margin-bottom: 12px;
+}
+/* Dimmed by colour, not opacity: --dim holds 4.5:1 on --card, a faded layer would not. */
+.pending-card > .card-open,
+.pending-card .card-title {
+	color: var(--dim);
+}
+.pending-card .spinner {
+	width: 11px;
+	height: 11px;
+	opacity: 0;
+	animation:
+		spin 0.7s linear infinite,
+		wait-show 0s 0.4s forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+	.pending-card .spinner {
+		animation: wait-show 0s 0.4s forwards;
+	}
+}
 .card:hover {
 	background: var(--card-hover);
 	border-color: var(--line);

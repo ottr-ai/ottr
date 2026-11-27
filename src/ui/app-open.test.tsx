@@ -11,7 +11,9 @@ import type {
 	TaskCard,
 	TaskView,
 } from "../types.ts";
+import { clearComposeDraft } from "./notify.ts";
 import { refreshState } from "./socket.ts";
+import { onChangeOf, onKeyDownOf } from "./testDom.tsx";
 
 // Storage must exist before the import: app.tsx reads sessionStorage at module
 // load. The DOM globals register after the import instead — app.tsx auto-renders
@@ -2450,4 +2452,200 @@ test("an open older card stays open across frames and follows changes", async ()
 		setFetch(null);
 		setFrame(null);
 	}
+});
+
+// --- optimistic New task (OTTR-1337) -----------------------------------------
+// Submit closes the dialog at once and a placeholder holds the todo lane while the
+// POST runs; the server's card replaces it, and a failed POST reopens the dialog.
+
+const createUrl = "/api/projects/alpha/tasks";
+const newTaskText = "Ship the lane\nwith the details below";
+const newCard = card({
+	id: "AL-9",
+	title: "Ship the lane",
+	sessionTitle: "Ship the lane",
+	createdAt: 5,
+});
+const frameWithNewCard = (): StateResponse =>
+	({ ...state, tasks: [...state.tasks, newCard] }) as unknown as StateResponse;
+
+const newTaskDialog = (): Element | null =>
+	document.querySelector('dialog[aria-label="New task for Alpha"]');
+const newTaskOpen = (): boolean =>
+	newTaskDialog()?.hasAttribute("open") === true;
+const pendingCards = (): Element[] =>
+	Array.from(document.querySelectorAll(".pending-card"));
+const todoPendingCards = (): Element[] =>
+	Array.from(
+		document.querySelectorAll('section.stage[data-stage="todo"] .pending-card'),
+	);
+const cardCount = (id: string): number =>
+	document.querySelectorAll(`.card[data-task-id="${id}"]`).length;
+
+/**
+ * Serves the create POST from a deferred answer the test resolves, and passes every
+ * other request to the shared mock. setFetch sees only the URL, so this wraps
+ * host.fetch to read the method and body. Cleans the frame, the fetch and the
+ * on-device New task draft before and after, so test order does not matter.
+ */
+async function withCreatePost(
+	run: (post: {
+		answer: (res: Response) => void;
+		bodies: { prompt?: unknown }[];
+	}) => Promise<void>,
+): Promise<void> {
+	const previousFetch = host.fetch as typeof fetch;
+	const answer = Promise.withResolvers<Response>();
+	const bodies: { prompt?: unknown }[] = [];
+	clearComposeDraft("new:alpha");
+	host.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		if (String(input) === createUrl && init?.method === "POST") {
+			bodies.push(JSON.parse(String(init.body)) as { prompt?: unknown });
+			return answer.promise;
+		}
+		return previousFetch(input, init);
+	}) as typeof fetch;
+	try {
+		await run({ answer: answer.resolve, bodies });
+	} finally {
+		try {
+			await unmountApp();
+		} finally {
+			host.fetch = previousFetch;
+			setFrame(null);
+			setFetch(null);
+			clearComposeDraft("new:alpha");
+		}
+	}
+}
+
+/** Opens New task from the project header, types `text` and submits the form. */
+async function addTask(text: string): Promise<void> {
+	const open = document.querySelector<HTMLButtonElement>(
+		'button[title="New task (N)"]',
+	);
+	expect(open).not.toBeNull();
+	await click(open!);
+	await waitFor(newTaskOpen);
+	const box = newTaskDialog()?.querySelector("textarea");
+	expect(box).not.toBeNull();
+	await act(async () => {
+		onChangeOf(box!)({
+			target: { value: text },
+			currentTarget: { value: text },
+		});
+	});
+	// Enter submits, as the hint says. happy-dom's form element hides React's props
+	// from getOwnPropertyNames, so the textarea's key handler is the reachable path.
+	await act(async () => {
+		onKeyDownOf(box!)({
+			key: "Enter",
+			shiftKey: false,
+			altKey: false,
+			nativeEvent: { isComposing: false },
+			preventDefault: () => {},
+		});
+	});
+}
+
+/** The placeholder right after submit: one, in the todo lane, titled by the first line. */
+function expectPlaceholder(): void {
+	expect(pendingCards().length).toBe(1);
+	const placeholder = todoPendingCards()[0];
+	expect(placeholder).toBeDefined();
+	expect(placeholder!.textContent).toContain("Ship the lane");
+	expect(placeholder!.textContent).not.toContain("with the details below");
+	expect(placeholder!.textContent).toContain("Adding…");
+	expect(placeholder!.getAttribute("aria-busy")).toBe("true");
+	expect(placeholder!.hasAttribute("data-task-id")).toBe(false);
+}
+
+test("a new task closes its dialog at once and a placeholder holds the todo lane until the card lands", async () => {
+	await withCreatePost(async ({ answer, bodies }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		// No waitFor: the dialog closes and the placeholder shows in the submit's own render.
+		expect(newTaskOpen()).toBe(false);
+		expectPlaceholder();
+		expect(bodies.length).toBe(1);
+		expect(bodies[0]!.prompt).toBe(newTaskText);
+		expect(cardCount("AL-9")).toBe(0);
+
+		setFrame(frameWithNewCard());
+		answer(jsonResponse(newCard));
+		refreshState();
+		// Every sampled render shows the placeholder or the card, never both.
+		let overlap = false;
+		await waitFor(() => {
+			if (cardCount("AL-9") > 0 && pendingCards().length > 0) overlap = true;
+			return cardCount("AL-9") === 1 && pendingCards().length === 0;
+		});
+		expect(overlap).toBe(false);
+		expect(
+			document.querySelector(
+				'section.stage[data-stage="todo"] .card[data-task-id="AL-9"]',
+			),
+		).not.toBeNull();
+		expect(newTaskOpen()).toBe(false);
+	});
+});
+
+test("a frame that carries the new card before the POST answers keeps the placeholder, not a duplicate", async () => {
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		expectPlaceholder();
+
+		// The frame also renames AL-1, so the test can see that it rendered.
+		const revised = "Alpha work, revised";
+		const frame = frameWithNewCard();
+		setFrame({
+			...frame,
+			tasks: frame.tasks.map((t) =>
+				t.id === "AL-1" ? { ...t, title: revised, sessionTitle: revised } : t,
+			),
+		} as unknown as StateResponse);
+		refreshState();
+		await waitFor(() => document.body.textContent?.includes(revised) === true);
+		// The card stays held: only the placeholder shows until the POST names its id.
+		expect(cardCount("AL-9")).toBe(0);
+		expect(pendingCards().length).toBe(1);
+		expect(todoPendingCards().length).toBe(1);
+
+		answer(jsonResponse(newCard));
+		let overlap = false;
+		await waitFor(() => {
+			if (cardCount("AL-9") > 0 && pendingCards().length > 0) overlap = true;
+			return cardCount("AL-9") === 1 && pendingCards().length === 0;
+		});
+		expect(overlap).toBe(false);
+	});
+});
+
+test("a failed create drops the placeholder and reopens New task with the text and the error", async () => {
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		expect(newTaskOpen()).toBe(false);
+		expectPlaceholder();
+
+		answer(jsonResponse({ error: "boom" }, 500));
+		await waitFor(
+			() =>
+				pendingCards().length === 0 &&
+				newTaskOpen() &&
+				(newTaskDialog()?.querySelector('[role="alert"]')?.textContent ?? "")
+					.length > 0,
+		);
+		const box = newTaskDialog()?.querySelector("textarea");
+		expect(box).not.toBeNull();
+		expect(box!.value).toBe(newTaskText);
+		expect(
+			newTaskDialog()?.querySelector('[role="alert"]')?.textContent,
+		).toContain("Not added: boom");
+		// The board's usual error line names the failure too.
+		await waitFor(() => appErrorRow() !== null);
+		expect(appErrorRow()?.textContent).toContain("boom");
+		expect(cardCount("AL-9")).toBe(0);
+	});
 });
