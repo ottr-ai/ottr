@@ -10,16 +10,22 @@
  *   installed package and a store copy.
  * - Three-name env: the guest gives the job exactly PATH, HOME and LANG
  *   (VM_VALIDATE.envAllowlist), so no credential or identity env var can
- *   reach the candidate even by inheritance.
+ *   reach the candidate even by inheritance; the wrapper below spawns the
+ *   candidate with that same allowlist, and the server-side preparation
+ *   spawn runs on its own allowlist with --ignore-scripts, so no
+ *   candidate-controlled lifecycle hook ever executes off the guest, and the
+ *   hooks' inherited env is the allowlist, not the daemon's environment.
  * - Init-authored result drive: the guest's init writes the result JSON after
  *   the job exits, so the job cannot forge, truncate or suppress the outcome
  *   the runner hands back.
- * - Redacted store: the job's HOME gets a placeholder copy of the pinned
- *   agent store (same rows and key shapes, no secret values), so the real CLI
- *   lists the signed-in providers' catalogs without carrying real tokens.
- * - 64 KiB stdout tails (VM_VALIDATE.outputTailBytes) are the transport's
- *   real stdout bound: a models list is far smaller, so the tail bounds a
- *   runaway candidate's output, not a normal run.
+ * - Redacted store: the job's HOME gets a placeholder copy of the board's own
+ *   agent store — read from `agentDir()` (src/login.ts), the same file
+ *   `signIns()` reads; identity keys redacted like every other value — so the
+ *   real CLI lists the signed-in providers' catalogs without carrying real
+ *   tokens or board identity data.
+ * - Compact catalog: the wrapper caps the candidate's stdout at 2 MiB and
+ *   re-emits compact provider/id records, so the whole list the parse accepts
+ *   survives the guest's 64 KiB stdout tail (VM_VALIDATE.outputTailBytes).
  *
  * A throw is a transport failure only: the caller warns and files normal
  * 7-day bump cards, never a lastError.
@@ -29,7 +35,7 @@ import { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { childDatabaseEnv } from "./childEnv.ts";
+import { agentDir } from "./login.ts";
 import { OMP_PACKAGE_URL } from "./ompWatch.ts";
 import type { ProcSpawn } from "./sandboxRun.ts";
 import type { ValidateResponse } from "./vmValidateShared.ts";
@@ -153,13 +159,15 @@ export function buildRedactedStore(
 			if (row.disabled_cause !== null && row.disabled_cause !== undefined)
 				continue;
 			providers.add(row.provider);
+			// identity_key holds board identity data (emails, account and org
+			// ids): placeholder it like every other value. Null stays null.
 			out.run(
 				"INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
 				[
 					row.provider,
 					row.credential_type,
 					JSON.stringify(redactData(parseJson(row.data), "data", 0, expiresAt)),
-					row.identity_key ?? null,
+					row.identity_key === null ? null : REDACTED,
 					row.created_at ?? null,
 					row.updated_at ?? null,
 				],
@@ -212,15 +220,93 @@ function redactData(
 	}
 }
 
-/** The guest-side job command: stamps the redacted copy into the job HOME,
- * then execs the candidate's bundled cli (one process left for the kill).
- * `binRel` must be a relative posix path without ".." and without a leading
- * "/" (the caller resolved it against the installed package dir already). */
+/** The trusted guest-side wrapper (written into the payload as
+ * probe-wrapper.mjs): stamps the redacted copy into the job HOME, spawns the
+ * candidate cli under the three-name env allowlist, caps the candidate's
+ * stdout at 2 MiB, and re-emits compact provider/id records — the whole list
+ * the parse accepts survives the guest's 64 KiB stdout tail. The candidate's
+ * own stderr passes through to the job's stderr. Exit codes: the candidate's,
+ * or 3 when the output is not a models catalog. `OMP_PROBE_STORE` overrides
+ * the stamped store path for tests; the guest job env never carries that
+ * name, so production always reads /target/store/agent.db. */
+export const probeWrapperSource = `import { copyFileSync, mkdirSync } from "node:fs";
+const cli = process.argv[2];
+if (typeof cli !== "string" || cli === "") {
+	console.error("probe wrapper: no candidate cli path");
+	process.exit(3);
+}
+const home = process.env.HOME ?? "";
+if (home === "") {
+	console.error("probe wrapper: no HOME");
+	process.exit(3);
+}
+mkdirSync(home + "/.omp/agent", { recursive: true });
+copyFileSync(
+	process.env.OMP_PROBE_STORE ?? "/target/store/agent.db",
+	home + "/.omp/agent/agent.db",
+);
+const child = Bun.spawn([process.execPath, cli, "models", "--json"], {
+	env: {
+		PATH: process.env.PATH,
+		HOME: process.env.HOME,
+		LANG: process.env.LANG ?? "C.UTF-8",
+	},
+	stdin: "ignore",
+	stdout: "pipe",
+	stderr: "inherit",
+});
+const CAP = 2 * 1024 * 1024;
+const chunks = [];
+let size = 0;
+const reader = child.stdout.getReader();
+for (;;) {
+	const { done, value } = await reader.read();
+	if (done) break;
+	if (size < CAP) chunks.push(value);
+	size += value.byteLength;
+	if (size >= CAP) {
+		// Bounded: stop storing and stop the candidate; whatever the parse
+		// makes of the partial text, the outcome is a non-fast-track run.
+		child.kill();
+		await reader.cancel().catch(() => {});
+		break;
+	}
+}
+const code = await child.exited;
+const text = new TextDecoder().decode(Buffer.concat(chunks).subarray(0, CAP));
+let out;
+try {
+	const parsed = JSON.parse(text);
+	if (
+		typeof parsed !== "object" ||
+		parsed === null ||
+		!Array.isArray(parsed.models)
+	)
+		throw new Error("no models array");
+	const models = parsed.models.map((m) => ({
+		provider: typeof m === "object" && m !== null ? m.provider : undefined,
+		id: typeof m === "object" && m !== null ? m.id : undefined,
+	}));
+	out = JSON.stringify({ models });
+} catch (err) {
+	console.error(
+		"probe wrapper: the candidate output is not a models catalog:",
+		String(err),
+	);
+	process.exit(code === 0 || code === null ? 3 : code);
+}
+process.stdout.write(out);
+process.exit(code ?? 3);
+`;
+
+/** The guest-side job argv: the payload's wrapper runs the candidate's
+ * bundled cli. `binRel` must pass binRelError (the caller resolved it
+ * against the installed package dir already). */
 export function probeJobArgv(binRel: string): string[] {
 	return [
-		"/bin/sh",
-		"-c",
-		`mkdir -p "$HOME/.omp/agent" && cp /target/store/agent.db "$HOME/.omp/agent/agent.db" && exec bun /target/pkg/node_modules/@oh-my-pi/pi-coding-agent/${binRel} models --json`,
+		"bun",
+		"/target/pkg/probe-wrapper.mjs",
+		`/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/${binRel}`,
 	];
 }
 
@@ -281,30 +367,64 @@ function readBinRel(packageJsonPath: string): string {
 	return binRel;
 }
 
-/** sandboxRun's defaultSpawn shape, with the install env the candidate's own
- * postinstall scripts need: no puppeteer download, and bun's cache plus HOME
- * under the run dir, so the install writes nothing outside it. */
-const defaultSpawn =
-	(runDir: string): ProcSpawn =>
-	async (argv) => {
+/** The preparation spawn's env: an allowlist, never the daemon environment.
+ * The candidate's dependency tree is untrusted, so nothing it runs during
+ * preparation may see provider keys, configuration pointers or the worker
+ * token; the names below carry paths and build toggles only. PATH stays (the
+ * runner must find bun and tar); it carries no secret by itself. */
+export function probeSpawnEnv(
+	source: NodeJS.ProcessEnv,
+	runDir: string,
+): Record<string, string> {
+	const out: Record<string, string> = {
+		PUPPETEER_SKIP_DOWNLOAD: "1",
+		PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1",
+		BUN_INSTALL_CACHE_DIR: join(runDir, "bun-cache"),
+		HOME: join(runDir, "home"),
+		LANG: source.LANG ?? "C.UTF-8",
+	};
+	if (source.PATH !== undefined) out.PATH = source.PATH;
+	return out;
+}
+
+/** The default preparation runner: runs argv on the allowlist env and kills
+ * the child when `signal` aborts, so the transport's deadline bounds every
+ * preparation subprocess. */
+export function probePrepSpawn(
+	runDir: string,
+	signal: AbortSignal,
+	source: NodeJS.ProcessEnv,
+): ProcSpawn {
+	return async (argv) => {
+		mkdirSync(join(runDir, "home"), { recursive: true });
+		mkdirSync(join(runDir, "bun-cache"), { recursive: true });
 		const proc = Bun.spawn(argv, {
-			env: {
-				...childDatabaseEnv(),
-				PUPPETEER_SKIP_DOWNLOAD: "1",
-				PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1",
-				BUN_INSTALL_CACHE_DIR: join(runDir, "bun-cache"),
-				HOME: join(runDir, "home"),
-			},
+			env: probeSpawnEnv(source, runDir),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
 		});
-		const [stdout, stderr] = await Promise.all([
-			new Response(proc.stdout).arrayBuffer(),
-			new Response(proc.stderr).text(),
-		]);
-		return { code: await proc.exited, stdout: new Uint8Array(stdout), stderr };
+		const kill = (): void => {
+			if (proc.exitCode === null && proc.signalCode === null) proc.kill();
+		};
+		signal.addEventListener("abort", kill);
+		try {
+			const [stdout, stderr] = await Promise.all([
+				new Response(proc.stdout).arrayBuffer(),
+				new Response(proc.stderr).text(),
+			]);
+			const code = await proc.exited;
+			// A killed child reports the signal: fold it into a rejection so the
+			// caller's aborted branch maps the run to its timeout error.
+			if (signal.aborted)
+				throw new Error("omp models probe: preparation killed at the deadline");
+			return { code, stdout: new Uint8Array(stdout), stderr };
+		} finally {
+			signal.removeEventListener("abort", kill);
+			kill();
+		}
 	};
+}
 
 export function createOmpProbeTransport(
 	deps: {
@@ -337,25 +457,26 @@ export function createOmpProbeTransport(
 			throw new Error(
 				"OTTR_WORKER_TOKEN is not set; the runner rejects an unauthorized /validate call.",
 			);
-		const pinnedDb = (source.OTTR_PINNED_AGENT_DB ?? "").trim();
-		if (pinnedDb === "")
-			throw new Error(
-				"OTTR_PINNED_AGENT_DB is not set; the probe stamps the guest's HOME from it.",
-			);
 		if (!VERSION_RE.test(version))
 			throw new Error(`omp models probe: version is not x.y.z: ${version}`);
 
 		const id = (deps.idFactory ?? defaultId)();
 		const dataRoot = deps.dataRoot ?? source.OTTR_DATA_DIR ?? "/data";
 		const runDir = join(dataRoot, project, "omp-probe-jobs", id);
-		const spawn = deps.spawnImpl ?? defaultSpawn(runDir);
 		const fetchImpl = deps.fetchImpl ?? fetch;
 		mkdirSync(runDir, { recursive: true });
+		// The deadline arms before any work: downloads, extraction, install,
+		// packing, dispatch and the response body all share it, and the
+		// preparation runner kills its subprocess on expiry.
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(), timeoutMs);
+		const spawn =
+			deps.spawnImpl ?? probePrepSpawn(runDir, controller.signal, source);
 		try {
 			// 1. Which exact release? The packument names its tarball and integrity.
 			const packumentRes = await fetchImpl(OMP_PACKAGE_URL, {
 				headers: { accept: "application/json", "user-agent": "ottr" },
-				signal: AbortSignal.timeout(30_000),
+				signal: controller.signal,
 			});
 			if (!packumentRes.ok)
 				throw new Error(
@@ -410,7 +531,7 @@ export function createOmpProbeTransport(
 			// 2. The tarball itself, verified against the packument before any
 			// spawn touches it: a tampered mirror must never install.
 			const tgzRes = await fetchImpl(tarballUrl, {
-				signal: AbortSignal.timeout(60_000),
+				signal: controller.signal,
 			});
 			if (!tgzRes.ok)
 				throw new Error(
@@ -442,6 +563,11 @@ export function createOmpProbeTransport(
 			// tree, so the job runs `bun <cli>` with no network at job time.
 			const pkgDir = join(runDir, "payload", "pkg");
 			mkdirSync(pkgDir, { recursive: true });
+			// 4. Install from the verified tarball: the guest gets a bun install
+			// tree, so the job runs `bun <cli>` with no network at job time.
+			// --ignore-scripts: the candidate and its dependency tree are
+			// untrusted, so no lifecycle hook of theirs ever executes on the
+			// server, and the spawn's env is the probeSpawnEnv allowlist.
 			writeFileSync(
 				join(pkgDir, "package.json"),
 				JSON.stringify({
@@ -450,17 +576,33 @@ export function createOmpProbeTransport(
 					dependencies: { "@oh-my-pi/pi-coding-agent": version },
 				}),
 			);
-			const add = await spawn(["bun", "add", "--cwd", pkgDir, candidateTgz]);
+			const add = await spawn([
+				"bun",
+				"add",
+				"--ignore-scripts",
+				"--cwd",
+				pkgDir,
+				candidateTgz,
+			]);
 			if (add.code !== 0)
 				throw new Error(
 					`candidate install failed: ${add.stderr.trim().slice(-500)}`,
 				);
+			// The trusted wrapper: stamps the store, caps and compacts the
+			// candidate's stdout (probeJobArgv's bun entry runs it in the guest).
+			writeFileSync(join(pkgDir, "probe-wrapper.mjs"), probeWrapperSource);
 
 			// 5. Catalog context without secrets: the placeholder store drives the
-			// real CLI's provider list (missing pinned store degrades to empty).
+			// real CLI's provider list. The source is the board's own agent store
+			// — `agentDir()`, the same file `signIns()` reads (src/login.ts); a
+			// store that is missing or unreadable degrades to an empty copy, and
+			// the probe then lists no providers, like a board with no sign-ins.
 			const storeDir = join(runDir, "payload", "store");
 			mkdirSync(storeDir, { recursive: true });
-			buildRedactedStore(pinnedDb, join(storeDir, "agent.db"));
+			buildRedactedStore(
+				join(agentDir(), "agent.db"),
+				join(storeDir, "agent.db"),
+			);
 
 			// 6. Pack the payload: hard-dereference, because bun installs hard
 			// links from its cache and the runner's tar reader skips hard-link
@@ -485,37 +627,29 @@ export function createOmpProbeTransport(
 			const binRel = readBinRel(join(pkgDir, PKG_PACKAGE_DIR, "package.json"));
 
 			// 7. Dispatch through /validate; the request carries no lists and no
-			// taskId, so the job gets nothing but the payload it packs.
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), timeoutMs);
-			let res: Response;
-			try {
-				res = await fetchImpl(`${base}/validate`, {
-					method: "POST",
-					headers: {
-						// The token rides the wire only; it never enters the request
-						// body or any text this function returns.
-						"x-otwr-token": token,
-						"content-type": "application/json",
+			// taskId, so the job gets nothing but the payload it packs. The
+			// deadline stays armed through the response body: fetch can return
+			// headers while the body is still incomplete, and a stalled body
+			// must not hold the watch past modelsTimeoutMs.
+			const res = await fetchImpl(`${base}/validate`, {
+				method: "POST",
+				headers: {
+					// The token rides the wire only; it never enters the request
+					// body or any text this function returns.
+					"x-otwr-token": token,
+					"content-type": "application/json",
+				},
+				body: JSON.stringify({
+					id,
+					project,
+					targetTar,
+					job: {
+						argv: probeJobArgv(binRel),
+						cwd: "/target",
 					},
-					body: JSON.stringify({
-						id,
-						project,
-						targetTar,
-						job: {
-							argv: probeJobArgv(binRel),
-							cwd: "/target",
-						},
-					}),
-					signal: controller.signal,
-				});
-			} catch (err) {
-				if (controller.signal.aborted)
-					throw new Error(`omp models probe timed out after ${timeoutMs} ms`);
-				throw err;
-			} finally {
-				clearTimeout(timer);
-			}
+				}),
+				signal: controller.signal,
+			});
 			const bodyText = await res.text();
 			// Defense in depth: a misbehaving runner must not echo the wire token
 			// into the error text the watch stores as its exact blocker.
@@ -541,7 +675,14 @@ export function createOmpProbeTransport(
 				stdout: job.stdoutTail,
 				stderr: job.stderrTail,
 			};
+		} catch (err) {
+			// The deadline maps everything it killed to one timeout error: the
+			// caller warns with it, and no other failure can masquerade as it.
+			if (controller.signal.aborted)
+				throw new Error(`omp models probe timed out after ${timeoutMs} ms`);
+			throw err;
 		} finally {
+			clearTimeout(timer);
 			rmSync(runDir, { recursive: true, force: true });
 		}
 	};

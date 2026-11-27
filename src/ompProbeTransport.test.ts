@@ -10,11 +10,14 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
 	buildRedactedStore,
 	createOmpProbeTransport,
 	probeJobArgv,
+	probePrepSpawn,
+	probeSpawnEnv,
+	probeWrapperSource,
 } from "./ompProbeTransport.ts";
 import { OMP_PACKAGE_URL } from "./ompWatch.ts";
 import type { ProcSpawn } from "./sandboxRun.ts";
@@ -26,8 +29,21 @@ const newTmp = (): string => {
 	tmps.push(dir);
 	return dir;
 };
+// The transport reads the board store through agentDir(), which resolves
+// process.env.PI_CODING_AGENT_DIR directly (not through the env seam): each
+// harness pins it and registers the restore, and afterAll unwinds them.
+const envRestores: (() => void)[] = [];
+const pinProcessEnv = (name: string, value: string | undefined): void => {
+	const saved = process.env[name];
+	process.env[name] = value;
+	envRestores.push(() => {
+		if (saved === undefined) delete process.env[name];
+		else process.env[name] = saved;
+	});
+};
 afterAll(() => {
 	for (const dir of tmps) rmSync(dir, { recursive: true, force: true });
+	for (const restore of envRestores) restore();
 });
 
 const ID = "ompprobe-test-1";
@@ -85,7 +101,10 @@ const okJob = (): Record<string, unknown> => ({
 const okSpawn = () => ({ code: 0, stdout: new Uint8Array(), stderr: "" });
 
 /** One harness per test: real fs, fixed id, controlled env, fake npm registry
- * and fake /validate. Every spawn is recorded and answered by shape. */
+ * and fake /validate. Every spawn is recorded and answered by shape. The
+ * board store lives at PI_CODING_AGENT_DIR (the transport reads it through
+ * `agentDir()`); a decoy store rides the old OTTR_PINNED_AGENT_DB name, so an
+ * implementation that reads the wrong source fails the payload assertions. */
 function makeHarness(opts: {
 	/** Overrides or blanks env names (undefined blanks). */
 	envOverride?: Record<string, string | undefined>;
@@ -93,8 +112,12 @@ function makeHarness(opts: {
 	bin?: unknown;
 	/** Packument integrity override (default: the real digest of FAKE_TGZ). */
 	integrity?: string;
-	/** Overrides the pinned-store path the env names. */
-	pinnedDbPath?: string;
+	/** Overrides the board-store path the pinned PI_CODING_AGENT_DIR names. */
+	boardDbPath?: string;
+	/** False skips building the board fixture at boardDbPath: the pinned
+	 * PI_CODING_AGENT_DIR then names a directory with no agent.db, and the
+	 * redacted copy must degrade to empty. */
+	buildBoardStore?: boolean;
 	/** Answers POST /validate; default: 200 with a successful job. */
 	respondValidate?: (
 		url: string,
@@ -112,22 +135,52 @@ function makeHarness(opts: {
 	validateUrls: string[];
 	validateBodies: Record<string, unknown>[];
 	validateTarExisted: boolean[];
+	payloadProviders: string[][];
 	env: NodeJS.ProcessEnv;
-	pinnedDbPath: string;
+	boardDbPath: string;
+	decoyDbPath: string;
 } {
 	const tmp = newTmp();
 	const dataRoot = join(tmp, "data");
-	const pinnedDbPath = opts.pinnedDbPath ?? join(tmp, "pinned", "agent.db");
+	const boardDbPath = opts.boardDbPath ?? join(tmp, "board-store", "agent.db");
+	const decoyDbPath = join(tmp, "decoy-store", "agent.db");
+	// The board store: one zai row with an identity_key (blocker 3's leak
+	// witness) and a secret-shaped key. The decoy under the old env name
+	// carries a different provider: reading it instead of the board store
+	// fails the payload assertions below. Skipped when the test wants a
+	// missing store at the pinned path.
+	if (opts.buildBoardStore !== false)
+		makePinnedDb(boardDbPath, [
+			{
+				provider: "zai",
+				credential_type: "api_key",
+				data: { key: "SECRET-KEY-VALUE", source: "user" },
+				identity_key: "user@example.com",
+			},
+		]);
+	makePinnedDb(decoyDbPath, [
+		{
+			provider: "llama.cpp",
+			credential_type: "api_key",
+			data: { key: "DECOY-KEY-VALUE", source: "decoy" },
+		},
+	]);
 	const env: NodeJS.ProcessEnv = {
 		OTTR_VM_RUNNER_URL: "http://runner.test/",
 		OTTR_WORKER_TOKEN: TOKEN,
-		OTTR_PINNED_AGENT_DB: pinnedDbPath,
+		// The old, wrong store source: the transport must ignore it.
+		OTTR_PINNED_AGENT_DB: decoyDbPath,
 		...opts.envOverride,
 	};
+	pinProcessEnv(
+		"PI_CODING_AGENT_DIR",
+		opts.boardDbPath ? join(boardDbPath, "..") : join(tmp, "board-store"),
+	);
 	const spawns: string[][] = [];
 	const validateUrls: string[] = [];
 	const validateBodies: Record<string, unknown>[] = [];
 	const validateTarExisted: boolean[] = [];
+	const payloadProviders: string[][] = [];
 	const bin = opts.bin ?? { omp: "dist/cli.js" };
 	const spawnImpl: ProcSpawn = async (argv) => {
 		spawns.push([...argv]);
@@ -145,7 +198,8 @@ function makeHarness(opts: {
 			return okSpawn();
 		}
 		if (argv[0] === "bun" && argv[1] === "add") {
-			const pkgDir = argv[3]!;
+			// bun add --ignore-scripts --cwd <pkgDir> <candidate.tgz>
+			const pkgDir = argv[4]!;
 			const installed = join(
 				pkgDir,
 				"node_modules",
@@ -194,6 +248,31 @@ function makeHarness(opts: {
 			const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
 			validateBodies.push(body);
 			validateTarExisted.push(existsSync(String(body.targetTar)));
+			// The payload store's providers, read at dispatch time: the copy
+			// the candidate will see must hold the board's rows, never the
+			// decoy's.
+			const storeDb = join(
+				body.targetTar as string,
+				"..",
+				"payload",
+				"store",
+				"agent.db",
+			);
+			const providers: string[] = [];
+			try {
+				const db = new Database(resolve(storeDb), { readonly: true });
+				try {
+					for (const row of db
+						.query("SELECT provider FROM auth_credentials")
+						.all() as { provider: string }[])
+						providers.push(row.provider);
+				} finally {
+					db.close();
+				}
+			} catch {
+				// A missing store records as empty.
+			}
+			payloadProviders.push(providers.sort());
 			return Promise.resolve(
 				opts.respondValidate
 					? opts.respondValidate(url, validateBodies.at(-1), init?.signal)
@@ -216,8 +295,10 @@ function makeHarness(opts: {
 		validateUrls,
 		validateBodies,
 		validateTarExisted,
+		payloadProviders,
 		env,
-		pinnedDbPath,
+		boardDbPath,
+		decoyDbPath,
 	};
 }
 
@@ -229,6 +310,7 @@ function makePinnedDb(
 		provider: string;
 		credential_type: string;
 		data: unknown;
+		identity_key?: string;
 		disabled_cause?: string;
 	}[],
 	version = 8,
@@ -252,11 +334,12 @@ function makePinnedDb(
 		db.run("INSERT INTO auth_change_revision (id, revision) VALUES (1, 1)");
 		for (const row of rows)
 			db.run(
-				"INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause) VALUES (?, ?, ?, ?)",
+				"INSERT INTO auth_credentials (provider, credential_type, data, identity_key, disabled_cause) VALUES (?, ?, ?, ?, ?)",
 				[
 					row.provider,
 					row.credential_type,
 					JSON.stringify(row.data),
+					row.identity_key ?? null,
 					row.disabled_cause ?? null,
 				],
 			);
@@ -268,11 +351,7 @@ function makePinnedDb(
 describe("ompProbeTransport", () => {
 	test("config: a missing env name or a non-x.y.z version throws before any effect", async () => {
 		const { transport, env, spawns } = makeHarness({});
-		for (const name of [
-			"OTTR_VM_RUNNER_URL",
-			"OTTR_WORKER_TOKEN",
-			"OTTR_PINNED_AGENT_DB",
-		]) {
+		for (const name of ["OTTR_VM_RUNNER_URL", "OTTR_WORKER_TOKEN"]) {
 			const broken = makeHarness({
 				envOverride: { [name]: undefined },
 			});
@@ -289,7 +368,7 @@ describe("ompProbeTransport", () => {
 		// Every config throw ran before the first spawn and left no run dir.
 		expect(spawns).toEqual([]);
 		expect(env.OTTR_VM_RUNNER_URL).toBe("http://runner.test/");
-	});
+	}, 30_000);
 
 	test("happy path: pack, dispatch /validate, map the job outcome", async () => {
 		const h = makeHarness({});
@@ -315,25 +394,32 @@ describe("ompProbeTransport", () => {
 			true,
 		);
 		const argv = Array.isArray(job.argv) ? job.argv : [];
-		expect(argv[0]).toBe("/bin/sh");
-		const cmd = String(argv[2]);
-		expect(cmd).toContain("cp /target/store/agent.db");
-		expect(cmd).toContain("models --json");
-		expect(cmd).toContain(
+		// The job runs the payload's trusted wrapper, which stamps the redacted
+		// store into the job HOME and spawns the candidate under the three-name
+		// env allowlist (probeWrapperSource, unit-tested below).
+		expect(argv[0]).toBe("bun");
+		expect(argv[1]).toBe("/target/pkg/probe-wrapper.mjs");
+		expect(String(argv[2])).toContain(
 			"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
 		);
 		expect(job.cwd).toBe("/target");
-		// Flow order: extract the verified tarball, bun add from it, pack the payload.
+		// Flow order: extract the verified tarball, bun add from it (with
+		// --ignore-scripts: no candidate-controlled lifecycle hook ever runs
+		// on the server), pack the payload.
 		expect(h.spawns.length).toBe(3);
 		expect(h.spawns[0]![0]).toBe("tar");
 		expect(h.spawns[0]).toContain("-xzf");
 		expect(h.spawns[0]).toContain(join(h.runDir, "candidate.tgz"));
 		expect(h.spawns[1]![0]).toBe("bun");
+		expect(h.spawns[1]).toContain("--ignore-scripts");
 		expect(h.spawns[1]).toContain("--cwd");
 		expect(h.spawns[1]!.at(-1)).toBe(join(h.runDir, "candidate.tgz"));
 		expect(h.spawns[2]![0]).toBe("tar");
 		expect(h.spawns[2]).toContain("-cf");
 		expect(h.spawns[2]).toContain("--hard-dereference");
+		// The redacted copy carries the board store's rows (the transport
+		// reads agentDir(), the same file signIns reads), never the decoy's.
+		expect(h.payloadProviders[0]).toEqual(["zai"]);
 		// The run dir (and everything under it) dies with the call.
 		expect(existsSync(h.runDir)).toBe(false);
 	});
@@ -399,7 +485,7 @@ describe("ompProbeTransport", () => {
 			stdout: "",
 			stderr: "boom",
 		});
-	});
+	}, 30_000);
 
 	test("deadline: the transport's abort becomes the timeout error", async () => {
 		const h = makeHarness({
@@ -418,21 +504,18 @@ describe("ompProbeTransport", () => {
 		);
 	});
 
-	test("missing pinned db: the flow completes with an empty store", async () => {
-		let storeExistedDuringCall = false;
+	test("missing board store: the flow completes with an empty copy", async () => {
 		const h = makeHarness({
-			pinnedDbPath: join(newTmp(), "missing", "agent.db"),
-			respondValidate: (_url, _body) => {
-				storeExistedDuringCall = existsSync(
-					join(h.runDir, "payload", "store", "agent.db"),
-				);
-				return jobResponse(okJob());
-			},
+			// agentDir() points at a directory with no agent.db: the copy
+			// degrades to an empty store, and the flow still dispatches.
+			boardDbPath: join(newTmp(), "missing", "agent.db"),
+			buildBoardStore: false,
 		});
 		const res = await h.transport(PROJECT, VERSION, 30_000);
 		expect(res.code).toBe(0);
-		expect(storeExistedDuringCall).toBe(true);
-	});
+		expect(h.validateTarExisted[0]).toBe(true);
+		expect(h.payloadProviders[0]).toEqual([]);
+	}, 30_000);
 
 	test("buildRedactedStore: key shapes survive, values do not", () => {
 		const tmp = newTmp();
@@ -444,6 +527,7 @@ describe("ompProbeTransport", () => {
 					provider: "zai",
 					credential_type: "api_key",
 					data: { key: "SECRET-VALUE", source: "user" },
+					identity_key: "user@example.com",
 				},
 				{
 					provider: "openai-codex",
@@ -469,12 +553,14 @@ describe("ompProbeTransport", () => {
 		const { providers } = buildRedactedStore(pinned, out, () => fixedNow);
 		expect(existsSync(out)).toBe(true);
 		expect(providers).toEqual(["openai-codex", "zai"]);
-		// No secret value survives anywhere in the out file's raw bytes.
+		// No secret value survives anywhere in the out file's raw bytes — and
+		// neither does board identity data: identity_key carried an email.
 		const raw = new TextDecoder("latin1").decode(readFileSync(out));
 		expect(raw.includes("SECRET-VALUE")).toBe(false);
 		expect(raw.includes("SECRET-A")).toBe(false);
 		expect(raw.includes("SECRET-R")).toBe(false);
 		expect(raw.includes("SECRET-G")).toBe(false);
+		expect(raw.includes("user@example.com")).toBe(false);
 		// Read the rows back and check shapes.
 		const outDb = new Database(out, { readonly: true });
 		let outRows: unknown[] = [];
@@ -482,7 +568,9 @@ describe("ompProbeTransport", () => {
 		let revisionRows: unknown[] = [];
 		try {
 			outRows = outDb
-				.query("SELECT provider, data FROM auth_credentials ORDER BY provider")
+				.query(
+					"SELECT provider, data, identity_key FROM auth_credentials ORDER BY provider",
+				)
 				.all();
 			schemaRows = outDb.query("SELECT version FROM auth_schema_version").all();
 			revisionRows = outDb
@@ -503,6 +591,14 @@ describe("ompProbeTransport", () => {
 			key: "ottr-probe-redacted",
 			source: "ottr-probe-redacted",
 		});
+		// The identity_key row: placeholder, never the board's identity data.
+		let zaiIdentityKey: unknown;
+		for (const row of outRows) {
+			if (typeof row !== "object" || row === null) continue;
+			const r = row as Record<string, unknown>; // key type for a typeof-verified object row
+			if (r.provider === "zai") zaiIdentityKey = r.identity_key;
+		}
+		expect(zaiIdentityKey).toBe("ottr-probe-redacted");
 		const oauth = JSON.parse(String(byProvider.get("openai-codex"))) as {
 			access: string;
 			refresh: string;
@@ -534,12 +630,144 @@ describe("ompProbeTransport", () => {
 		).toBe(1);
 	});
 
-	test("probeJobArgv: the exact sh command for the bundled cli", () => {
+	test("probeJobArgv: the wrapper runs the bundled cli", () => {
 		expect(probeJobArgv("dist/cli.js")).toEqual([
-			"/bin/sh",
-			"-c",
-			'mkdir -p "$HOME/.omp/agent" && cp /target/store/agent.db "$HOME/.omp/agent/agent.db" && exec bun /target/pkg/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js models --json',
+			"bun",
+			"/target/pkg/probe-wrapper.mjs",
+			"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js",
 		]);
+	});
+
+	test("probeSpawnEnv: an allowlist, never the daemon environment", () => {
+		const out = probeSpawnEnv(
+			{
+				PATH: "/usr/local/bun/bin:/usr/bin:/bin",
+				LANG: "C.UTF-8",
+				// Names the candidate's dependency tree must never see:
+				ZAI_API_KEY: "sk-secret",
+				OTTR_WORKER_TOKEN: TOKEN,
+				PI_CODING_AGENT_DIR: "/board/agent",
+				OTTR_DATABASE_URL: "postgres://…",
+				HINDSIGHT_API_TOKEN: "h-secret",
+				HTTP_PROXY: "http://proxy:8080",
+			},
+			"/run/dir",
+		);
+		// The allowlist: build toggles, run-dir paths, locale and PATH only.
+		expect(out).toEqual({
+			PUPPETEER_SKIP_DOWNLOAD: "1",
+			PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "1",
+			BUN_INSTALL_CACHE_DIR: "/run/dir/bun-cache",
+			HOME: "/run/dir/home",
+			LANG: "C.UTF-8",
+			PATH: "/usr/local/bun/bin:/usr/bin:/bin",
+		});
+		// Proxy variables are credentials-adjacent configuration: dropped.
+		expect("HTTP_PROXY" in out).toBe(false);
+		// A missing LANG degrades to the guest default.
+		const minimal = probeSpawnEnv({}, "/run/dir2");
+		expect(minimal.LANG).toBe("C.UTF-8");
+		expect("PATH" in minimal).toBe(false);
+	});
+
+	test("probePrepSpawn: the deadline kills a stalled preparation subprocess", async () => {
+		const runDir = newTmp();
+		const controller = new AbortController();
+		const spawn = probePrepSpawn(runDir, controller.signal, {
+			PATH: process.env.PATH ?? "",
+		});
+		const started = Date.now();
+		const pending = spawn(["sleep", "30"]);
+		// Real clock, deliberately: the deadline must kill a real child
+		// process, and fake timers cannot advance a sleeping `sleep`.
+		setTimeout(() => controller.abort(), 150);
+		// The kill lands well inside sleep's 30 s budget: the runner rejects
+		// instead of waiting the child out, and it has awaited proc.exited
+		// by then, so the child is reaped when this resolves.
+		await expect(pending).rejects.toThrow("preparation killed at the deadline");
+		expect(Date.now() - started).toBeLessThan(10_000);
+		const probe = Bun.spawnSync(["pgrep", "-x", "sleep"]);
+		expect(probe.exitCode).not.toBe(0);
+	});
+
+	test("the wrapper: a 70 KiB catalog survives complete, junk does not", async () => {
+		const tmp = newTmp();
+		const wrapper = join(tmp, "probe-wrapper.mjs");
+		writeFileSync(wrapper, probeWrapperSource);
+		const home = join(tmp, "home");
+		mkdirSync(home, { recursive: true });
+		const storeDb = join(tmp, "store", "agent.db");
+		mkdirSync(dirname(storeDb), { recursive: true });
+		writeFileSync(storeDb, "store bytes");
+		// A stub candidate cli whose catalog is bigger than the guest's
+		// 64 KiB stdout tail: 1400 entries, ~80 KiB on the wire.
+		const entries = Array.from({ length: 1400 }, (_, i) => ({
+			provider: "zai",
+			id: `model-${i}`,
+			kind: "chat",
+			name: `Model ${i}`,
+		}));
+		const bigCatalog = JSON.stringify({ models: entries });
+		const stubCli = join(tmp, "stub-cli.mjs");
+		writeFileSync(
+			stubCli,
+			`process.stdout.write(${JSON.stringify(bigCatalog)});\n`,
+		);
+		const env = {
+			PATH: process.env.PATH ?? "",
+			HOME: home,
+			LANG: "C.UTF-8",
+			OMP_PROBE_STORE: storeDb,
+		};
+		const run = Bun.spawnSync(["bun", wrapper, stubCli], {
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(run.exitCode).toBe(0);
+		const catalog = JSON.parse(new TextDecoder().decode(run.stdout)) as {
+			models: { provider: string; id: string }[];
+		};
+		// Complete: the head of the list did not fall off a tail buffer.
+		expect(catalog.models.length).toBe(1400);
+		expect(catalog.models[0]!.id).toBe("model-0");
+		expect(catalog.models.at(-1)!.id).toBe("model-1399");
+		// The store was stamped into the job HOME.
+		expect(existsSync(join(home, ".omp", "agent", "agent.db"))).toBe(true);
+		// A candidate that prints no catalog exits non-zero with no stdout.
+		const junkCli = join(tmp, "junk-cli.mjs");
+		writeFileSync(junkCli, "process.stdout.write('not a catalog');\n");
+		const junk = Bun.spawnSync(["bun", wrapper, junkCli], {
+			env,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(junk.exitCode).not.toBe(0);
+		expect(junk.stdout.length).toBe(0);
+		// The candidate's env is the three-name allowlist: the wrapper spawns
+		// it with PATH, HOME and LANG only, whatever the job env carries. The
+		// stub carries the sorted env names in its provider field, so the
+		// observation rides a valid catalog through the wrapper's parse.
+		const envProbeCli = join(tmp, "env-probe.mjs");
+		writeFileSync(
+			envProbeCli,
+			'process.stdout.write(JSON.stringify({ models: [{ provider: Object.keys(process.env).sort().join("."), id: "env" }] }));\n',
+		);
+		const leaky = Bun.spawnSync(["bun", wrapper, envProbeCli], {
+			env: {
+				...env,
+				ZAI_API_KEY: "sk-secret",
+				OTTR_WORKER_TOKEN: TOKEN,
+				OMP_PROBE_STORE: storeDb,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(leaky.exitCode).toBe(0);
+		const leakyCatalog = JSON.parse(new TextDecoder().decode(leaky.stdout)) as {
+			models: { provider: string }[];
+		};
+		expect(leakyCatalog.models[0]!.provider).toBe("HOME.LANG.PATH");
 	});
 
 	test("bin escape guard: a bin outside the package rejects the candidate", async () => {

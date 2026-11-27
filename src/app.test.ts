@@ -28191,7 +28191,6 @@ describe("omp watch probe wiring", () => {
 		};
 		setEnv("OTTR_DATA_DIR", dataTmp);
 		setEnv("OTTR_WORKER_TOKEN", WIRE_TOKEN);
-		setEnv("OTTR_PINNED_AGENT_DB", join(agentTmp, "agent.db"));
 		setEnv("PI_CODING_AGENT_DIR", agentTmp);
 
 		// Console capture: the watch's warnings ride deps.log, and the no-runner
@@ -28291,23 +28290,26 @@ describe("omp watch probe wiring", () => {
 				expect(
 					Object.keys(body.job).every((k) => ["argv", "cwd"].includes(k)),
 				).toBe(true);
-				expect(body.job.argv[0]).toBe("/bin/sh");
-				// The job script stamps the secret-free catalog copy into its HOME
-				// and runs the candidate cli's models list from the payload.
-				expect(body.job.argv[2]).toContain("cp /target/store/agent.db");
-				expect(body.job.argv[2]).toContain("models --json");
+				// The job runs the payload's trusted wrapper: it stamps the
+				// secret-free catalog copy into the job HOME, caps the
+				// candidate's stdout, and emits compact provider/id records so
+				// the whole catalog survives the guest's 64 KiB tail.
+				expect(body.job.argv[0]).toBe("bun");
+				expect(body.job.argv[1]).toBe("/target/pkg/probe-wrapper.mjs");
 				expect(body.job.argv[2]).toContain(
 					"/target/pkg/node_modules/@oh-my-pi/pi-coding-agent/",
 				);
+				expect(body.job.argv[2]).toContain("dist/cli.js");
 				expect(body.job.cwd).toBe("/target");
 				// The wire token rode the header only: never in the URL, never in
 				// any logged or thrown text.
 				expect(call.token).toBe(WIRE_TOKEN);
 				expect(call.url.includes(WIRE_TOKEN)).toBe(false);
 			}
-			expect(spawnCalls.some((a) => a[0] === "bun" && a.includes("add"))).toBe(
-				true,
-			);
+			const addCall = spawnCalls.find((a) => a[0] === "bun" && a.includes("add"));
+			expect(addCall).toBeDefined();
+			// No candidate-controlled lifecycle hook ever runs on the server.
+			expect(addCall!.includes("--ignore-scripts")).toBe(true);
 			expect(spawnCalls.some((a) => a[0] === "tar" && a.includes("-xzf"))).toBe(
 				true,
 			);
