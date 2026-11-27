@@ -3508,6 +3508,40 @@ describe("against real repos", () => {
 		expect(githubUrlFromPin("git@ghe.example.com:o/r.git")).toBeNull();
 	});
 
+	test("the leftmost case-insensitive host boundary wins in a pin path", () => {
+		// tmpdir-host-collision class: an ancestor of the fixture dir whose name
+		// differs only by case must not move the match site. The parser takes the
+		// leftmost boundary, so the identity rides after that ancestor — the same
+		// segment an oracle reusing this parser selects.
+		for (const ancestor of [
+			"Fixture-Repos",
+			"FIXTURE-REPOS",
+			"fixture-repos",
+			"fiXtUre-RePos",
+		]) {
+			expect(
+				githubUrlFromPin(
+					`file:///srv/${ancestor}/app/fixture-repos/reg-pin`,
+					"fixture-repos",
+				),
+			).toBe("https://fixture-repos/app/fixture-repos/reg-pin");
+		}
+		// A longer name that merely contains the label is no boundary; only the
+		// real segment matches.
+		expect(
+			githubUrlFromPin(
+				"file:///srv/xfixture-repos/fixture-repos/reg-pin",
+				"fixture-repos",
+			),
+		).toBe("https://fixture-repos/reg-pin");
+		expect(
+			githubUrlFromPin(
+				"file:///srv/.fixture-repos-x/fixture-repos/reg-pin",
+				"fixture-repos",
+			),
+		).toBe("https://fixture-repos/reg-pin");
+	});
+
 	test("remoteUrl returns the https origin on any host, null for local paths", async () => {
 		// The fixture's origin is a local path: no host, no icon source.
 		expect(await remoteUrl(main)).toBeNull();
