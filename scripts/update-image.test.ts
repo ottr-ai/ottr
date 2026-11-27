@@ -140,6 +140,11 @@ interface FakeOptions {
 	/** Records the per-run results paths raw instead of normalizing them to
 	 *  `<results>`, so the stale-result sequence can tell two runs apart. */
 	rawSeedPaths?: boolean;
+	/** A simulated volume for the per-run results files: path → text. The reads and
+	 *  rms mutate it, so a test can prove the exec order — the main read's exec
+	 *  deletes both files, and the rules read must precede it. Keys are the paths as
+	 *  the exec line names them (normalized tests use `<results>`). */
+	seedVolume?: Map<string, string>;
 	/** The seed-partial record the volume already holds ("" = none; a write replaces it). */
 	seedPartialRecord?: string;
 	/** Exit code of the seed-partial record write (the board-seed printf exec). */
@@ -306,9 +311,25 @@ function seedOneOffExec(
 	rec: FakeRecord,
 ): ExecResult {
 	rec.calls.push(line);
-	if (line.includes("-c rm -f ")) return { code: 0, out: "" };
+	// The read exec carries its own rm suffix, so the cat branch matches first.
 	if (line.includes("-c cat ")) {
-		const path = /-c cat (\S+?); (?:rc=\$\?; )?/.exec(line)?.[1] ?? "";
+		const clear = /-c cat (\S+?); rc=\$\?; rm -f (\S+) (\S+); exit \$rc/.exec(
+			line,
+		);
+		const plain = clear === null ? /-c cat (\S+?); exit \$rc/.exec(line) : null;
+		const path = (clear?.[1] ?? plain?.[1]) as string;
+		if (o.seedVolume !== undefined) {
+			const text = o.seedVolume.get(path);
+			if (clear !== null) {
+				const cleared = [clear[2], clear[3]].filter(
+					(p): p is string => p !== undefined,
+				);
+				for (const p of cleared) o.seedVolume.delete(p);
+			}
+			return text === undefined
+				? { code: 1, out: `cat: can't open ${path}: No such file\n` }
+				: { code: 0, out: text };
+		}
 		const scripted =
 			o.seedResultsFor !== undefined
 				? o.seedResultsFor(path)
@@ -321,6 +342,13 @@ function seedOneOffExec(
 				out: `cat: can't open ${path}: No such file\n`,
 			};
 		return { code: 0, out: scripted };
+	}
+	// The rm-only exec: the success-path cleanup (exit 0 never reads).
+	if (line.includes("-c rm -f ")) {
+		const paths = line.split("-c rm -f ")[1]?.split(";")[0]?.trim() ?? "";
+		if (o.seedVolume)
+			for (const p of paths.split(" ").filter(Boolean)) o.seedVolume.delete(p);
+		return { code: 0, out: "" };
 	}
 	rec.seedPartialRecords.push(line);
 	const code = o.seedPartialWriteCode ?? 0;
@@ -4445,7 +4473,7 @@ describe("board seed", () => {
 			fatal: false,
 			error: null,
 			items: [
-				{ item: "user/omp/agent/skills/demo", status: "installed", rule: null },
+				{ item: "user/omp/agent/skills/demo", status: "updated", rule: null },
 				{
 					item: "user/omp/agent/skills/ghost-editor",
 					status: "unchanged",
@@ -4571,21 +4599,42 @@ describe("board seed", () => {
 			)?.[1] ?? "";
 		expect(stalePath).toMatch(/^\/etc\/ottr\/seed-results-\d+-\d+\.json$/);
 		// Run 2 at a new commit: install-user crashes before it writes (a clone
-		// failure), so the read for run 2's own path finds no file. The stale file
-		// from run 1 must not answer for run 2's outcome.
+		// failure), so the read for run 2's own path finds no file. The stale
+		// answers are a VALID partial pair from run 1's path: if the two runs
+		// shared one path, run 2 would classify partial and record the commit,
+		// and the assertions below would fail. Isolation is what the test proves.
+		const staleMain = JSON.stringify({
+			fatal: false,
+			items: [{ item: "user/old", status: "rejected", rule: "old" }],
+		});
+		const staleRules = JSON.stringify({
+			fatal: false,
+			items: [{ item: "a.md", status: "unchanged", rule: null }],
+		});
 		const data2 = checkout();
 		const head2 = must(data2.main, "rev-parse", "HEAD");
 		const second = fakes({
 			...SEED_BASE,
 			seedCode: 1,
 			rawSeedPaths: true,
-			seedResultsFor: (path) => (path === stalePath ? "stale" : undefined),
+			seedResultsFor: (path) =>
+				path === stalePath
+					? staleMain
+					: path === `${stalePath}.rules.json`
+						? staleRules
+						: undefined,
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], second.deps, {
 				ALATE_DATA: data2.main,
 			}),
 		).toBe(1);
+		// Run 2 never read run 1's paths: every board-seed cat named run 2's own files.
+		const reads = second.calls.filter((l) =>
+			l.includes("--entrypoint sh board-seed -c cat "),
+		);
+		expect(reads.length).toBe(2);
+		expect(reads.every((l) => !l.includes(stalePath))).toBe(true);
 		// The stale file stayed stale: the red path, no commit record, no record write.
 		expect(second.seedFailRecords).toHaveLength(1);
 		expect(seedFailRecordOf(second)).toEqual({
@@ -4599,6 +4648,38 @@ describe("board seed", () => {
 		);
 	}, 60_000);
 
+	test("the rules read precedes the clearing main read, so a real partial classifies", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// The volume models the real files: the main read's exec deletes both, so
+		// a main-first order would leave the rules read empty and fail the seed.
+		const volume = new Map<string, string>([
+			[
+				"<results>",
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "user/x", status: "rejected", rule: "r" }],
+				}),
+			],
+			[
+				"<results>.rules.json",
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "a.md", status: "unchanged", rule: null }],
+				}),
+			],
+		]);
+		const f = fakes({ ...SEED_BASE, seedCode: 1, seedVolume: volume });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// The partial verdict had its rules proof, and the cleanup emptied the volume.
+		expect(f.seedPartialRecords).toHaveLength(1);
+		expect(volume.size).toBe(0);
+	}, 60_000);
+
 	test("the compose seed entrypoint runs the rules sync for every non-fatal install-user outcome", () => {
 		const compose = readFileSync(
 			join(import.meta.dir, "..", "docker-compose.yml"),
@@ -4610,10 +4691,17 @@ describe("board seed", () => {
 		);
 		const command =
 			/^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
+		// The seed runs in layer mode: without --layer (or ALATE_LAYER=1) install-user
+		// does a flat install, and the partial outcome's required switch never happens.
+		expect(command).toContain(
+			"node install-user.mjs --home /etc/ottr/home --layer --force",
+		);
 		// The flat rules sync no longer rides install-user's exit alone: it runs
 		// whenever install-user's results file says fatal false, so a partial seed's
-		// commit is never recorded with the rules half missing.
-		expect(command).toContain('grep -q \'"fatal":true\' "$$R"');
+		// commit is never recorded with the rules half missing. The guard is
+		// whitespace-tolerant: writeProvisionResults pretty-prints the JSON.
+		expect(command).toContain('grep -q \'"fatal": *true\' "$$R"');
+		expect(command).not.toContain('"fatal":true');
 		// The flat sync writes its own results file, which the classification reads
 		// as the proof that the pipeline completed.
 		expect(command).toContain('ALATE_PROVISION_RESULTS="$$R.rules.json"');
@@ -4624,6 +4712,46 @@ describe("board seed", () => {
 		// and without the results env the old success-only sequence holds.
 		expect((command.match(/node sync\.mjs/g) ?? []).length).toBe(2);
 		expect(command).toContain('elif [ "$$rc" -eq 0 ]');
+	});
+
+	test("the entrypoint's fatal guard reads Alate's pretty-printed results file", () => {
+		const compose = readFileSync(
+			join(import.meta.dir, "..", "docker-compose.yml"),
+			"utf8",
+		);
+		const block = compose.slice(
+			compose.indexOf("board-seed:"),
+			compose.indexOf("home-repair:"),
+		);
+		const command =
+			/^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
+		const pattern = /grep -q '([^']+)' "\$\$R"/.exec(command)?.[1] ?? "";
+		const dir = mkdtempSync(join(tmpdir(), "ottr-1260-guard-"));
+		try {
+			// Alate's own serialization: JSON.stringify(payload, null, 2) plus a newline.
+			const refusal = join(dir, "refused.json");
+			writeFileSync(
+				refusal,
+				`${JSON.stringify({ fatal: true, error: "the run refused", items: [] }, null, 2)}\n`,
+			);
+			expect(Bun.spawnSync(["grep", "-q", pattern, refusal]).exitCode).toBe(0);
+			// The compact spelling stays caught too.
+			const compact = join(dir, "compact.json");
+			writeFileSync(
+				compact,
+				JSON.stringify({ fatal: true, error: "the run refused", items: [] }),
+			);
+			expect(Bun.spawnSync(["grep", "-q", pattern, compact]).exitCode).toBe(0);
+			// A clean run (fatal false) must not trip the guard.
+			const clean = join(dir, "clean.json");
+			writeFileSync(
+				clean,
+				`${JSON.stringify({ fatal: false, error: null, items: [] }, null, 2)}\n`,
+			);
+			expect(Bun.spawnSync(["grep", "-q", pattern, clean]).exitCode).toBe(1);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	/** Runs a failing seed with the scripted results file and asserts today's red path. */
@@ -4937,9 +5065,8 @@ describe("classifySeedResults", () => {
 				JSON.stringify({
 					fatal: false,
 					items: [
-						{ item: "user/a", status: "installed" },
+						{ item: "user/a", status: "updated" },
 						{ item: "user/b", status: "rejected", rule: "bad rule" },
-						{ item: "user/c", status: "no-origin", rule: null },
 						{ item: "user/d", status: "inconclusive", rule: "" },
 					],
 				}),
@@ -4952,11 +5079,62 @@ describe("classifySeedResults", () => {
 			kind: "partial",
 			leftOut: [
 				{ name: "user/b", rule: "bad rule" },
-				// no-origin is outside the card's partial scope: it fails the run below.
 				{ name: "user/d", rule: "inconclusive" },
 				{ name: "e.md", rule: "inconclusive" },
 			],
 		});
+	});
+
+	test("an installed write proves a flat run, so the layer never switched and the seed fails", () => {
+		const flat = JSON.stringify({
+			fatal: false,
+			items: [
+				{ item: "user/a", status: "installed" },
+				{ item: "user/b", status: "rejected", rule: "SC2" },
+			],
+		});
+		expect(classifySeedResults(1, flat, rulesOk)).toEqual({ kind: "failed" });
+		// Even a rules file alone cannot carry the partial verdict past flat proof.
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "user/a", status: "unchanged" }],
+				}),
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "b.md", status: "installed", rule: null }],
+				}),
+			),
+		).toEqual({ kind: "failed" });
+	});
+
+	test("a rejected item plus a no-origin item fails, and so does a lone one", () => {
+		const withNoOrigin = JSON.stringify({
+			fatal: false,
+			items: [
+				{ item: "user/a", status: "rejected", rule: "SC2" },
+				{ item: "user/b", status: "no-origin", rule: null },
+			],
+		});
+		expect(classifySeedResults(1, withNoOrigin, rulesOk)).toEqual({
+			kind: "failed",
+		});
+		// The same failure from the rules file's own items.
+		expect(
+			classifySeedResults(
+				1,
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "user/a", status: "rejected", rule: "SC2" }],
+				}),
+				JSON.stringify({
+					fatal: false,
+					items: [{ item: "b.md", status: "no-origin", rule: null }],
+				}),
+			),
+		).toEqual({ kind: "failed" });
 	});
 
 	test("a lone no-origin item is failed: the card scopes partial to rejected and inconclusive", () => {

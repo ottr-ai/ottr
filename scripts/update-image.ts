@@ -1023,10 +1023,11 @@ type SeedVerdict =
 	| { kind: "partial"; leftOut: { name: string; rule: string }[] }
 	| { kind: "failed" };
 
-/** install-user's known item statuses: the four normal ones and the two the scan gate
- *  leaves out while the layer still switches. A `no-origin` item is not one of them:
- *  the card scopes the partial outcome to rejected or inconclusive, so a lone
- *  `no-origin` failure fails the seed like any other unknown shape. */
+/** install-user's known item statuses. `installed` is a known status too, but it
+ *  proves a FLAT run (layer mode labels every write added, updated, or unchanged),
+ *  so the verdict fails on it: the card's partial outcome requires the layer to have
+ *  switched. `no-origin` is not known at all: it is outside the card's partial scope,
+ *  so any no-origin item — lone or next to a rejected one — fails the seed. */
 const SEED_ITEM_STATUSES = [
 	"installed",
 	"unchanged",
@@ -1037,6 +1038,8 @@ const SEED_ITEM_STATUSES = [
 	"inconclusive",
 ];
 const SEED_LEFT_OUT_STATUSES = ["rejected", "inconclusive"];
+/** Statuses that prove the run was flat, so the layer never switched. */
+const SEED_FLAT_PROOF_STATUSES = ["installed"];
 
 /** Per-run install-user results path: a fresh name every seed, so a run can never read
  *  the previous run's result — a clone failure before install-user writes leaves the
@@ -1079,6 +1082,12 @@ function seedItemVerdict(item: unknown): SeedItemVerdict {
 	const it = item as { item?: unknown; status?: unknown; rule?: unknown };
 	if (typeof it.status !== "string" || !SEED_ITEM_STATUSES.includes(it.status))
 		return { kind: "broken" };
+	// An installed write proves a flat run: the entrypoint seeds with --layer, so
+	// the switch is required and a flat result is an incomplete seed.
+	if (SEED_FLAT_PROOF_STATUSES.includes(it.status)) return { kind: "broken" };
+	// no-origin is outside the card's partial scope: known, but never acceptable —
+	// lone or next to a rejected item.
+	if (it.status === "no-origin") return { kind: "broken" };
 	if (!SEED_LEFT_OUT_STATUSES.includes(it.status)) return { kind: "kept" };
 	if (typeof it.item !== "string") return { kind: "broken" };
 	return {
@@ -1256,13 +1265,16 @@ async function runSeed(
 	try {
 		const run = await d.docker("compose", ...compose, ...seed.args);
 		if (run.code !== 0) {
-			const results = await readSeedResults(d, compose, seed.resultsPath, true);
+			// The rules read must precede the main read: the main read's exec also
+			// removes both files, so a main-first order would always find no rules
+			// file and fail every real partial seed.
 			const rules = await readSeedResults(
 				d,
 				compose,
 				`${seed.resultsPath}.rules.json`,
 				false,
 			);
+			const results = await readSeedResults(d, compose, seed.resultsPath, true);
 			const verdict = classifySeedResults(run.code, results, rules);
 			if (verdict.kind === "partial") {
 				// The layer switched with items left out: the amber notice, and the

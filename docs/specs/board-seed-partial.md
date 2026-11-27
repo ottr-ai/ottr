@@ -27,10 +27,12 @@ results file, never the stdout text.
   is left out. Today's failure path: write `seed-failed`, leave `seed-commit` and
   `seed-partial` untouched, `failed: true`, run exits 1.
 
-Normal statuses: `installed`, `unchanged`, `added`, `updated`. Left-out statuses:
-`rejected`, `inconclusive`. The card scopes the partial outcome to those two; a
-`no-origin` item fails the seed like any other unknown shape, so a missing origin
-keeps the red notice.
+Normal statuses: `unchanged`, `added`, `updated`. Left-out statuses: `rejected`,
+`inconclusive`. The card scopes the partial outcome to those two; a `no-origin` item
+fails the seed like any other unknown shape, so a missing origin keeps the red notice
+— a rejected item next to a `no-origin` one fails too. An `installed` item also fails
+the seed: layer mode labels every write `added`, `updated`, or `unchanged`, so
+`installed` proves a flat run, and a flat run never switched the layer.
 
 Exit 0 decides `ok` on its own. A results file that contradicts exit 0 is logged as a
 warning; the exit code stays authoritative, because an old Alate image writes no
@@ -77,17 +79,23 @@ Already implemented in Alate (`specs/provision-item-by-item.md` in the alate rep
 ## The complete seed pipeline
 
 The board-seed entrypoint is a compound command:
-`install-user.mjs --home /etc/ottr/home` then `sync.mjs /etc/ottr/home/.omp/agent/rules`
-(the flat rules mirror). install-user's layer mode installs the layer rules itself
-through a nested sync and switches the layer, but the flat mirror needs the second
-command, and with `&&` a per-item failure (exit 1, `fatal` `false`) skipped it. The
-entrypoint now runs the flat sync for every install-user run whose results file says
-`fatal: false`, points it at `<results>.rules.json` so its outcome is machine-readable,
-and folds both exit codes into one non-zero exit. A fatal refusal still skips the sync
-(nothing was installed), and a run without the results env — a plain manual
-`docker compose run board-seed` — keeps the old success-only sequence. The
-classification accepts a partial outcome only when the rules file proves the sync ran;
-a missing or fatal rules file fails the seed.
+`install-user.mjs --home /etc/ottr/home --layer`, then
+`sync.mjs /etc/ottr/home/.omp/agent/rules` (the flat rules mirror). The `--layer` flag
+is required: without it (or `ALATE_LAYER=1`) install-user runs a flat install, and the
+partial outcome's required layer switch never happens. install-user's layer mode
+installs the layer rules itself through a nested sync and switches the layer, but the
+flat mirror needs the second command, and with `&&` a per-item failure (exit 1,
+`fatal` `false`) skipped it. The entrypoint now runs the flat sync for every
+install-user run whose results file says `fatal: false`, points it at
+`<results>.rules.json` so its outcome is machine-readable, and folds both exit codes
+into one non-zero exit. The fatal guard is whitespace-tolerant
+(`'"fatal": *true'`), because writeProvisionResults pretty-prints the JSON. A fatal
+refusal still skips the sync (nothing was installed), and a run without the results
+env — a plain manual `docker compose run board-seed` — keeps the old success-only
+sequence. The classification accepts a partial outcome only when the rules file
+proves the sync ran; a missing or fatal rules file fails the seed. The reads order
+the rules file first: the main read's exec removes both files, so a main-first order
+would always find no rules file.
 
 ## Records
 

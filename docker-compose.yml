@@ -546,12 +546,15 @@ services:
       - sh
       - -c
       # install-user's exit alone no longer gates the rules sync: a per-item failure
-      # (exit 1, results file fatal:false) still runs the flat rules sync with its own
+      # (exit 1, results file fatal false) still runs the flat rules sync with its own
       # <results>.rules.json file, so the seed the update script classifies is complete.
-      # A fatal refusal skips the sync (nothing was installed), and without the results
-      # env (a plain manual run) the old success-only sequence holds. The exit folds
-      # both scripts: non-zero when either failed.
-      - node install-user.mjs --home /etc/ottr/home --force "$$@"; rc=$$?; R="$${ALATE_PROVISION_RESULTS:-}"; if [ -n "$$R" ] && [ -f "$$R" ] && ! grep -q '"fatal":true' "$$R"; then ALATE_PROVISION_RESULTS="$$R.rules.json" node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; elif [ "$$rc" -eq 0 ]; then node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; fi; exit $$rc
+      # --layer makes the run layer mode (the switch the partial outcome needs); the
+      # update script's classifier fails on flat proof. The fatal guard is
+      # whitespace-tolerant: writeProvisionResults pretty-prints the JSON. A fatal
+      # refusal skips the sync (nothing was installed), and without the results env
+      # (a plain manual run) the old success-only sequence holds. The exit folds both
+      # scripts: non-zero when either failed.
+      - node install-user.mjs --home /etc/ottr/home --layer --force "$$@"; rc=$$?; R="$${ALATE_PROVISION_RESULTS:-}"; if [ -n "$$R" ] && [ -f "$$R" ] && ! grep -q '"fatal": *true' "$$R"; then ALATE_PROVISION_RESULTS="$$R.rules.json" node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; elif [ "$$rc" -eq 0 ]; then node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; fi; exit $$rc
       - board-seed
 
   # Repair for the empty agent.db folder: a wrong OTTR_AGENT_DB host path makes rootful
