@@ -1359,6 +1359,9 @@ export interface SweepRowView {
 	proposed: "clear" | "implement";
 	/** True when the target changed after the sweep read it (a new child, a reply, a cancel). */
 	stale: boolean;
+	/** True when this row's action already applied (the run's durable applied
+	 * marker exists): the checkbox renders done and nothing re-applies. */
+	applied: boolean;
 	/** The target card's live row fields. */
 	stage: Stage;
 	state: RunState;

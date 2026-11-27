@@ -297,6 +297,25 @@ describe("relatedByTokens and relatedLines", () => {
 		expect(hit.map((h) => h.id)).toEqual(["CLIP-64"]);
 	});
 
+	test("a card whose id matches joins even when its text names no handle", async () => {
+		// The prompt is pinned away from the id on purpose: row() defaults the
+		// prompt to the id, which would mask a matcher that only reads text.
+		const hit = await relatedByTokens(
+			[
+				row({
+					id: "CLIP-64",
+					title: "the pairing fix",
+					prompt: "no handle here",
+				}),
+			],
+			[],
+			["CLIP-64"],
+			"target",
+			async () => null,
+		);
+		expect(hit.map((h) => h.id)).toEqual(["CLIP-64"]);
+	});
+
 	test("an id prefix boundary never matches a longer id", async () => {
 		const hit = await relatedByTokens(
 			[row({ id: "CLIP-64", title: "the pairing fix" })],

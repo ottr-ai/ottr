@@ -950,6 +950,11 @@ const loop = createTurnLoop(projects, {
 	// OTTR-876: the read-only GitHub token a turn may hold (docs/specs/turn-read-token.md);
 	// late-bound like pushAuthKind above — app exists below the loop.
 	turnReadToken: () => app.turnReadToken(),
+	// OTTR-1259: the board's seen keys and baseline; the inbox sweep's filing
+	// reads them per start so its candidates are exactly the unread Inbox
+	// (late-bound like turnReadToken — app exists below the loop).
+	seenIds: () => app.seenIds(),
+	seenSince: async () => await app.seenSince(),
 	// OTTR-882: the release identity (the configured GitHub app's contents-write token, else
 	// the GH_TOKEN user token with a warning); late-bound like turnReadToken above.
 	releaseIdentity: (owner, repo) => app.releaseIdentity(owner, repo),

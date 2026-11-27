@@ -8520,6 +8520,17 @@ button.log-mode[aria-pressed="true"] {
 	border: 1px solid var(--alarm-line);
 	border-radius: 3px;
 }
+.sweep-applied-tag {
+	flex: none;
+	padding: 0 5px;
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 16px;
+	color: var(--accent);
+	background: var(--accent-bg);
+	border-color: var(--accent-line);
+	border-radius: 3px;
+}
 .sweep-row.stale .sweep-title,
 .sweep-row.stale .sweep-action,
 .sweep-row.stale .sweep-evidence,

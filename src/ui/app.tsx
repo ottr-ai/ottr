@@ -10575,7 +10575,9 @@ function CardIdLinks({
 	onOpenTask: (id: string, project?: string) => void;
 }) {
 	const parts: ReactNode[] = [];
-	const re = /\b[A-Z]{1,4}-\d+\b/g;
+	// The board's own handle shape (TASK_ID_RE): a prefix of up to eight
+	// characters, so an eight-letter project's ids link like four-letter ones.
+	const re = /\b[A-Z0-9]{1,8}-\d+\b/g;
 	let last = 0;
 	for (const m of text.matchAll(re)) {
 		if (m.index > last) parts.push(text.slice(last, m.index));
@@ -11931,34 +11933,89 @@ function DrawerPrSec(p: {
 /** Drawer Sweep section (OTTR-1259): the sweep run card's one table — one row per
  * swept card, its verdict, its evidence and its proposed action; the operator
  * checks rows and applies. The section rides the drawer detail (task.sweep). */
+/** The sweep row's evidence with the cited ids as links: a board card id opens
+ * its card when the board lists it (CardIdLinks' rule), and a commit hash
+ * links to the project's GitHub commit when the project has one. */
+function SweepEvidence(p: {
+	evidence: string;
+	selfProject: string;
+	tasks: TaskCard[];
+	github: string | null;
+	onOpenTask: (id: string) => void;
+}) {
+	const parts: ReactNode[] = [];
+	const re = /\b[0-9a-f]{7,40}\b/g;
+	let last = 0;
+	const cardLinks = (text: string, key: string): ReactNode => (
+		<CardIdLinks
+			text={text}
+			selfProject={p.selfProject}
+			tasks={p.tasks}
+			onOpenTask={p.onOpenTask}
+			key={key}
+		/>
+	);
+	for (const m of p.evidence.matchAll(re)) {
+		if (m.index > last)
+			parts.push(cardLinks(p.evidence.slice(last, m.index), `t${m.index}`));
+		const sha = m[0];
+		parts.push(
+			p.github ? (
+				<a
+					key={`c${m.index}`}
+					className="reason-card-link"
+					href={`${p.github}/commit/${sha}`}
+					target="_blank"
+					rel="noreferrer"
+				>
+					{sha}
+				</a>
+			) : (
+				sha
+			),
+		);
+		last = m.index + sha.length;
+	}
+	parts.push(cardLinks(p.evidence.slice(last), `t${p.evidence.length}`));
+	return <>{parts}</>;
+}
+
 function DrawerSweep(p: {
 	task: TaskView;
 	act: Act;
 	setDetail: React.Dispatch<React.SetStateAction<TaskView | null>>;
+	tasks: TaskCard[];
+	project: ProjectView;
+	onOpenTask: (id: string) => void;
 }) {
 	const { task, act, setDetail } = p;
 	const sweep = task.sweep;
 	// Checked rows, keyed by the target card id. Stale rows never join: their
 	// checkbox is disabled, so an apply cannot carry them either. Applied rows
-	// (this drawer session's own applies, plus rows the server answers
-	// "already applied" for) drop out of every reset, so a refresh never
-	// re-selects work that filed.
+	// (the run's durable applied marker, which the server ships on every row)
+	// render as done and drop out of every reset, so a reload never re-selects
+	// work that filed.
 	const [checked, setChecked] = useState<ReadonlySet<string>>(
 		() =>
-			new Set((sweep?.rows ?? []).filter((r) => !r.stale).map((r) => r.card)),
+			new Set(
+				(sweep?.rows ?? [])
+					.filter((r) => !r.stale && !r.applied)
+					.map((r) => r.card),
+			),
 	);
 	const applied = useRef(new Set<string>());
 	const [error, setError] = useState<string | null>(null);
 	// An apply refetches the detail (and the state refresh re-renders the drawer):
-	// the fresh rows reset the checks to their defaults minus the applied ones,
-	// like PrReviewSection's draft reset. Render-phase guard on the rows identity.
+	// the fresh rows reset the checks to their defaults minus the applied ones —
+	// the server's applied flags first, this session's own applies second — like
+	// PrReviewSection's draft reset. Render-phase guard on the rows identity.
 	const lastRows = useRef(sweep?.rows);
 	if (sweep !== undefined && sweep.rows !== lastRows.current) {
 		lastRows.current = sweep.rows;
 		setChecked(
 			new Set(
 				sweep.rows
-					.filter((r) => !r.stale && !applied.current.has(r.card))
+					.filter((r) => !r.stale && !r.applied && !applied.current.has(r.card))
 					.map((r) => r.card),
 			),
 		);
@@ -11974,15 +12031,19 @@ function DrawerSweep(p: {
 							{sweep.rows.map((row) => (
 								<li
 									key={row.card}
-									className={row.stale ? "sweep-row stale" : "sweep-row"}
+									className={
+										row.stale || row.applied ? "sweep-row stale" : "sweep-row"
+									}
 								>
 									<label className="sweep-row-head">
 										<input
 											type="checkbox"
 											name={`sweep-row-${row.card}`}
 											aria-label={`${sweepVerdictLabel(row)}: ${row.title}`}
-											checked={!row.stale && checked.has(row.card)}
-											disabled={row.stale}
+											checked={
+												!row.stale && !row.applied && checked.has(row.card)
+											}
+											disabled={row.stale || row.applied}
 											onChange={() => {
 												const next = new Set(checked);
 												if (next.has(row.card)) next.delete(row.card);
@@ -11994,13 +12055,24 @@ function DrawerSweep(p: {
 											{sweepVerdictLabel(row)}
 										</span>
 										<span className="sweep-title">{row.title}</span>
+										{row.applied && (
+											<span className="sweep-applied-tag">Applied</span>
+										)}
 										{row.stale && (
 											<span className="sweep-stale-tag">Stale</span>
 										)}
 									</label>
 									<p className="sweep-action">{sweepRowAction(row)}</p>
-									<pre className="sweep-evidence">{row.evidence}</pre>
-									{row.drafts.length > 0 && (
+									<pre className="sweep-evidence">
+										<SweepEvidence
+											evidence={row.evidence}
+											selfProject={task.project}
+											tasks={p.tasks}
+											github={p.project.github}
+											onOpenTask={p.onOpenTask}
+										/>
+									</pre>
+									{row.drafts.length > 0 && !row.applied && (
 										<p className="sweep-drafts">
 											{row.drafts.length} draft
 											{row.drafts.length === 1 ? "" : "s"} to file on apply.
@@ -16315,7 +16387,14 @@ export function Drawer({
 						act={act}
 						setDetail={setDetail}
 					/>
-					<DrawerSweep task={task} act={act} setDetail={setDetail} />
+					<DrawerSweep
+						task={task}
+						act={act}
+						setDetail={setDetail}
+						tasks={tasks}
+						project={project}
+						onOpenTask={onOpenTask}
+					/>
 					<DrawerWorkCheck task={task} catalog={catalog} />
 					<DrawerMergeModal
 						mergeOpen={mergeOpen}

@@ -195,7 +195,9 @@ export async function relatedByTokens(
 	const hit: ListedTask[] = [];
 	for (const t of others) {
 		if (hit.length === 10) break;
-		if (names(t)) {
+		// The card's own id is an evidence source too: a report naming CLIP-64
+		// cites that card even when its text carries no handle.
+		if (idTokens.includes(t.id) || names(t)) {
 			hit.push(t);
 			continue;
 		}

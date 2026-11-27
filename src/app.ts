@@ -2194,17 +2194,29 @@ const settingParsers: FieldParser[] = [
  * with applyInboxSweepRows for the sequence test). */
 export type SweepApplyRow = { card: string; action: "clear" | "implement" };
 
+/** The durable applied marker of one apply row: a review finding on the run
+ * card with this prompt (appendReviewFinding's conflict rule makes the write
+ * idempotent). Prompt-based "did it file" checks die when the operator edits
+ * the proposal; the marker survives, and neither the settle nor the chain
+ * parses it (their readers want the exact `Sweep: ` first line). */
+export const SWEEP_APPLIED_PREFIX = "Sweep applied: ";
+
+export const sweepAppliedMarker = (row: SweepApplyRow): string =>
+	`${SWEEP_APPLIED_PREFIX}#${row.card} ${row.action}`;
+
 /** The inbox sweep apply's core (OTTR-1259; the POST route delegates): per row,
  * the run card must carry a parsed verdict for the card, else `skipped: "no
  * verdict"`; a stale row never applies (`skipped: "stale"`), whatever the body
  * asks — the stamp is the run's immutable filing time (`createdAt`), because
  * the evidence was gathered at filing and a settle later advances `updatedAt`.
- * `clear` hands the card's completion key to `markSeen`; `implement` files each
- * recorded draft as a held proposal card — a draft that already filed for this
- * run (followUpOf the run, same prompt) skips, so a repeated apply creates no
- * duplicate cards — then hands the completion key over. An implement row with
- * no drafts only marks seen. The caller owns the mark semantics (the route
- * runs the shared /api/seen path). */
+ * A row whose applied marker already exists answers `skipped: "already
+ * applied"` — the marker is the durable record, so proposal edits and repeated
+ * or concurrent applies never re-create cards. `clear` hands the card's
+ * completion key to `markSeen`; `implement` files each distinct recorded draft
+ * as a held proposal card, then hands the completion key over. An implement
+ * row with no drafts only marks seen. The whole run is one store transaction,
+ * so concurrent applies serialize: the second reads the first's markers. The
+ * caller owns the mark semantics (the route runs the shared /api/seen path). */
 export async function applyInboxSweepRows(o: {
 	store: ProjectStore;
 	run: Task;
@@ -2215,58 +2227,28 @@ export async function applyInboxSweepRows(o: {
 	results: { card: string; applied: boolean; skipped?: string }[];
 }> {
 	const { store, run } = o;
-	const applicable = run.cancelledAt === null && run.stage === "done";
-	const verdicts = new Map<string, SweepRecord>();
-	if (applicable)
-		for (const finding of await store.listReviewFindings(run.id)) {
-			const parsed = sweepResult(finding.prompt);
-			if (parsed !== null && !verdicts.has(parsed.cardId))
-				verdicts.set(parsed.cardId, parsed);
-		}
-	const tasks = await store.listTasks();
-	// The evidence was read at filing time; the run's own createdAt stamps it.
-	const stamp = run.createdAt;
-	const existing = new Set(
-		tasks
-			.filter((t) => t.followUpOf === run.id)
-			.map((t) => `${t.followUpOf}\u0000${t.prompt}`),
-	);
-	const results: { card: string; applied: boolean; skipped?: string }[] = [];
-	const markSeen: string[] = [];
-	for (const row of o.rows) {
-		const verdict = verdicts.get(row.card);
-		if (verdict === undefined) {
-			results.push({ card: row.card, applied: false, skipped: "no verdict" });
-			continue;
-		}
-		const target = tasks.find((t) => t.id === row.card);
-		if (
-			target === undefined ||
-			sweepRowStale(target, collectDescendants(tasks, row.card), stamp)
-		) {
-			results.push({ card: row.card, applied: false, skipped: "stale" });
-			continue;
-		}
-		if (row.action === "implement") {
-			const fresh = verdict.drafts.filter(
-				(draft) => !existing.has(`${run.id}\u0000${draft}`),
-			);
-			for (const draft of fresh) {
-				const proposal = await store.createTask(draft);
-				// In-request dedupe too: two rows carrying the same draft file it once.
-				existing.add(`${run.id}\u0000${draft}`);
-				await store.updateTask(proposal.id, {
-					followUpOf: run.id,
-					promptAuthor: "board",
-					stage: "backlog",
-					state: "needs_you",
-					queuedAt: null,
-					needsReason: sweepProposedReason({ id: run.id }),
-				});
-				await o.log(`- filed proposal ${proposal.id} for #${row.card}`);
+	return await store.transaction(async () => {
+		const applicable = run.cancelledAt === null && run.stage === "done";
+		const verdicts = new Map<string, SweepRecord>();
+		const appliedMarkers = new Set<string>();
+		if (applicable)
+			for (const finding of await store.listReviewFindings(run.id)) {
+				const parsed = sweepResult(finding.prompt);
+				if (parsed !== null && !verdicts.has(parsed.cardId))
+					verdicts.set(parsed.cardId, parsed);
+				appliedMarkers.add(finding.prompt);
 			}
-			if (verdict.drafts.length > 0 && fresh.length === 0) {
-				// Every draft filed on an earlier apply: the row applied already.
+		const tasks = await store.listTasks();
+		// The evidence was read at filing time; the run's own createdAt stamps it.
+		const stamp = run.createdAt;
+		const results: {
+			card: string;
+			applied: boolean;
+			skipped?: string;
+		}[] = [];
+		const markSeen: string[] = [];
+		for (const row of o.rows) {
+			if (appliedMarkers.has(sweepAppliedMarker(row))) {
 				results.push({
 					card: row.card,
 					applied: false,
@@ -2274,16 +2256,56 @@ export async function applyInboxSweepRows(o: {
 				});
 				continue;
 			}
+			const verdict = verdicts.get(row.card);
+			if (verdict === undefined) {
+				results.push({
+					card: row.card,
+					applied: false,
+					skipped: "no verdict",
+				});
+				continue;
+			}
+			const target = tasks.find((t) => t.id === row.card);
+			if (
+				target === undefined ||
+				sweepRowStale(target, collectDescendants(tasks, row.card), stamp)
+			) {
+				results.push({ card: row.card, applied: false, skipped: "stale" });
+				continue;
+			}
+			if (row.action === "implement") {
+				// Distinct drafts only: one verdict may repeat a draft, and one
+				// repetition must not file twice.
+				const drafts = [...new Set(verdict.drafts)];
+				for (const draft of drafts) {
+					const proposal = await store.createTask(draft);
+					await store.updateTask(proposal.id, {
+						followUpOf: run.id,
+						promptAuthor: "board",
+						stage: "backlog",
+						state: "needs_you",
+						queuedAt: null,
+						needsReason: sweepProposedReason({ id: run.id }),
+					});
+					await o.log(`- filed proposal ${proposal.id} for #${row.card}`);
+				}
+			}
+			await store.appendReviewFinding(run.id, {
+				prompt: sweepAppliedMarker(row),
+				model: null,
+				rank: null,
+				security: null,
+			});
+			// `clear` marks seen; `implement` marks seen after the drafts filed. The
+			// completion key matches the Inbox's own mark (OTTR-566), so the pin
+			// clears; the caller's write keeps the shared decay rules.
+			if (target.doneAt !== null)
+				markSeen.push(doneReadKey({ id: target.id, doneAt: target.doneAt }));
+			results.push({ card: row.card, applied: true });
 		}
-		// `clear` marks seen; `implement` marks seen after the drafts filed. The
-		// completion key matches the Inbox's own mark (OTTR-566), so the pin
-		// clears; the caller's write keeps the shared decay rules.
-		if (target.doneAt !== null)
-			markSeen.push(doneReadKey({ id: target.id, doneAt: target.doneAt }));
-		results.push({ card: row.card, applied: true });
-	}
-	await o.markSeen(markSeen);
-	return { results };
+		await o.markSeen(markSeen);
+		return { results };
+	});
 }
 
 /** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
@@ -7198,52 +7220,43 @@ export async function createApp(deps: AppDeps) {
 		return null;
 	}
 
-	/** A sweep run's parsed verdicts: the card's stored findings parsed with
-	 * `sweepResult`, first result per card id winning (the settle's rule).
-	 * `applicable` is the spec's live-and-done gate — a cancelled or unfinished
-	 * sweep's records apply nowhere. */
-	async function sweepVerdicts(
-		store: ProjectStore,
-		runId: string,
-		applicable: boolean,
-	): Promise<Map<string, SweepRecord>> {
-		const verdicts = new Map<string, SweepRecord>();
-		if (!applicable) return verdicts;
-		for (const finding of await store.listReviewFindings(runId)) {
-			const parsed = sweepResult(finding.prompt);
-			if (parsed !== null && !verdicts.has(parsed.cardId))
-				verdicts.set(parsed.cardId, parsed);
-		}
-		return verdicts;
-	}
-
 	/** The sweep section a kind "sweep" card's drawer shows (OTTR-1259): one row
 	 * per recorded verdict, stale computed live against the run's immutable
-	 * filing stamp (createdAt — the evidence was read then), plus the pinned
-	 * cards no live sweep covers (the chain's remainder). */
+	 * filing stamp (createdAt — the evidence was read then), each row carrying
+	 * its applied marker (the durable "this row already applied" record), plus
+	 * the pinned cards no live sweep covers (the chain's remainder). */
 	async function sweepView(e: Entry, run: Task): Promise<SweepView> {
 		const tasks = await e.store.listTasks();
-		const verdicts = await sweepVerdicts(
-			e.store,
-			run.id,
-			run.cancelledAt === null,
-		);
+		const verdicts = new Map<string, SweepRecord>();
+		const applied = new Set<string>();
+		if (run.cancelledAt === null)
+			for (const finding of await e.store.listReviewFindings(run.id)) {
+				const parsed = sweepResult(finding.prompt);
+				if (parsed !== null && !verdicts.has(parsed.cardId))
+					verdicts.set(parsed.cardId, parsed);
+				else if (finding.prompt.startsWith(SWEEP_APPLIED_PREFIX))
+					applied.add(finding.prompt);
+			}
 		const stamp = run.createdAt;
 		const rows = (
 			await Promise.all(
 				[...verdicts.values()].map(async (v) => {
 					const target = tasks.find((t) => t.id === v.cardId);
 					if (target === undefined) return null;
+					const action =
+						v.verdict === "done" || v.verdict === "info"
+							? ("clear" as const)
+							: ("implement" as const);
 					return {
 						card: v.cardId,
 						title: await e.store.frozenTitle(target),
 						verdict: v.verdict,
 						evidence: v.evidence,
 						drafts: v.drafts,
-						proposed:
-							v.verdict === "done" || v.verdict === "info"
-								? ("clear" as const)
-								: ("implement" as const),
+						proposed: action,
+						applied: applied.has(
+							sweepAppliedMarker({ card: v.cardId, action }),
+						),
 						stale: sweepRowStale(
 							target,
 							collectDescendants(tasks, v.cardId),
@@ -13444,9 +13457,6 @@ export async function createApp(deps: AppDeps) {
 		return json(await taskView(e, t));
 	}
 
-	/** One apply row the request body parsed into. */
-	type SweepApplyRow = { card: string; action: "clear" | "implement" };
-
 	/** Parses the apply body's rows; a Response is the 400. */
 	function parseSweepApplyRows(rows: unknown): SweepApplyRow[] | Response {
 		if (!Array.isArray(rows) || rows.length === 0 || rows.length > 200)
@@ -18005,8 +18015,8 @@ export async function createApp(deps: AppDeps) {
 		// OTTR-876: the read-only GitHub token a turn may hold, or null — the served rule
 		// (docs/specs/turn-read-token.md); the turn loop asks it at every turn start.
 		turnReadToken,
-		// OTTR-1259: the board's sorted seen ids; the turn loop reads them per inbox
-		// sweep filing (candidates skip already-read cards).
+		// OTTR-1259: the board's seen keys and baseline; the turn loop reads them
+		// per inbox sweep filing (candidates skip already-read cards).
 		seenIds: loadSeen,
 		seenSince: () => seenDoneSince,
 		// OTTR-882: the release identity (the configured GitHub app's contents-write token,

@@ -14169,6 +14169,126 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		).toHaveLength(1);
 	});
 
+	test("the app surface carries the seen keys and baseline the loop wiring reads", async () => {
+		// The production loop's ops delegate to these two accessors; before the
+		// wiring existed they were undefined and every filing read an empty seen.
+		const card = await pinnedResearch(
+			"surface seen card",
+			"# R\n## Recommended steps\n- x",
+		);
+		const key = doneReadKey({ id: card.id, doneAt: card.doneAt! });
+		expect((await post("/api/seen", { ids: [key] })).status).toBe(200);
+		const keys = await app.seenIds();
+		expect(keys).toContain(key);
+		expect(typeof (await app.seenSince())).toBe("number");
+		// The card stays seen: an unread reset here would put it back into the
+		// Inbox group and shift the drawer test's pending count below.
+	});
+
+	test("two concurrent applies file the draft once", async () => {
+		const target = await pinnedResearch(
+			"concurrent apply card",
+			"# R\n## Recommended steps\n- one open step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> partial\nopen step\n${SWEEP_DRAFT_SEP}\nConcurrent draft prompt`,
+			},
+		]);
+		const rows = [{ card: target.id, action: "implement" as const }];
+		const both = await Promise.all([
+			post(`/api/projects/p3/inbox/sweep/apply`, { run: run.id, rows }),
+			post(`/api/projects/p3/inbox/sweep/apply`, { run: run.id, rows }),
+		]);
+		for (const r of both) expect(r.status).toBe(200);
+		const outcomes = (await Promise.all(both.map((r) => r.json()))) as {
+			results: { card: string; applied: boolean; skipped?: string }[];
+		}[];
+		// Exactly one request applies; the other reads its marker.
+		expect(outcomes.map((o) => o.results[0]?.applied).sort()).toEqual([
+			false,
+			true,
+		]);
+		expect(
+			outcomes
+				.map((o) => o.results[0]?.skipped)
+				.sort()
+				.filter(Boolean),
+		).toEqual(["already applied"]);
+		expect(
+			(await store3.listTasks()).filter((t) => t.followUpOf === run.id),
+		).toHaveLength(1);
+	});
+
+	test("an edited proposal still counts its row applied", async () => {
+		const target = await pinnedResearch(
+			"edited proposal card",
+			"# R\n## Recommended steps\n- one open step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> partial\nopen step\n${SWEEP_DRAFT_SEP}\nOriginal draft prompt`,
+			},
+		]);
+		const rows = [{ card: target.id, action: "implement" as const }];
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: run.id,
+					rows,
+				})
+			).status,
+		).toBe(200);
+		// The supported edit: the operator changes the proposal's prompt. The
+		// applied record must not depend on that prompt.
+		const proposal = (await store3.listTasks()).find(
+			(t) => t.followUpOf === run.id,
+		)!;
+		await store3.updateTask(proposal.id, {
+			prompt: "Edited by the operator before accepting",
+		});
+		const second = await post(`/api/projects/p3/inbox/sweep/apply`, {
+			run: run.id,
+			rows,
+		});
+		const b = (await second.json()) as {
+			results: { card: string; applied: boolean; skipped?: string }[];
+		};
+		expect(b.results).toEqual([
+			{ card: target.id, applied: false, skipped: "already applied" },
+		]);
+		expect(
+			(await store3.listTasks()).filter((t) => t.followUpOf === run.id),
+		).toHaveLength(1);
+	});
+
+	test("a verdict repeating a draft files it once", async () => {
+		const target = await pinnedResearch(
+			"duplicate draft card",
+			"# R\n## Recommended steps\n- one open step",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> none\nthe same step twice\n${SWEEP_DRAFT_SEP}\nThe same draft prompt\n${SWEEP_DRAFT_SEP}\nThe same draft prompt`,
+			},
+		]);
+		expect(
+			(
+				await post(`/api/projects/p3/inbox/sweep/apply`, {
+					run: run.id,
+					rows: [{ card: target.id, action: "implement" }],
+				})
+			).status,
+		).toBe(200);
+		const proposals = (await store3.listTasks()).filter(
+			(t) => t.followUpOf === run.id,
+		);
+		expect(proposals).toHaveLength(1);
+	});
+
 	test("a stale row, a no-verdict row and a cancelled run apply nothing", async () => {
 		const fresh = await pinnedResearch(
 			"stale target card",
@@ -14290,6 +14410,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 					title: string;
 					verdict: string;
 					evidence: string;
+					applied: boolean;
 					proposed: string;
 					stale: boolean;
 					drafts: string[];
@@ -14306,6 +14427,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 				title: a.title,
 				verdict: "done",
 				evidence: "card #x did it",
+				applied: false,
 				proposed: "clear",
 				stale: false,
 				drafts: [],
@@ -14318,6 +14440,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 				title: b.title,
 				verdict: "none",
 				evidence: "everything open",
+				applied: false,
 				proposed: "implement",
 				stale: true,
 				drafts: ["draft one"],
@@ -14330,6 +14453,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 				title: info.title,
 				verdict: "info",
 				evidence: "info only",
+				applied: false,
 				proposed: "clear",
 				stale: false,
 				drafts: [],

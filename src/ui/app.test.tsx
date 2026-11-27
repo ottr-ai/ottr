@@ -1564,6 +1564,7 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			title: "Fix the login bug",
 			verdict: "done",
 			evidence: "The fix landed in card w7; git log names 1a2b3c4.",
+			applied: false,
 			drafts: [],
 			proposed: "clear",
 			stale: false,
@@ -1576,6 +1577,7 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			title: "Research the queue rewrite",
 			verdict: "partial",
 			evidence: "Step 2 has no child card.",
+			applied: false,
 			drafts: ["Rewrite the queue page"],
 			proposed: "implement",
 			stale: false,
@@ -1588,6 +1590,7 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			title: "Research the stale plan",
 			verdict: "none",
 			evidence: "No step is done.",
+			applied: false,
 			drafts: ["Draft the first step"],
 			proposed: "implement",
 			stale: true,
@@ -1727,6 +1730,62 @@ describe("Inbox sweep (OTTR-1259)", () => {
 			<Drawer {...drawerBase} task={cardFixture({ ...drawerFields })} />,
 		);
 		expect(html).not.toContain("Sweep results");
+	});
+
+	test("an applied row renders its tag, a done checkbox, and leaves Apply disabled", () => {
+		// Blocker 6: the applied state rides the server's row (survives reloads
+		// and navigation), not a component ref.
+		const rows = sweepRows().map((r) => ({ ...r, applied: r.card === "r1" }));
+		const html = renderToStaticMarkup(
+			<Drawer {...drawerBase} task={sweepCard(sweepView(rows))} />,
+		);
+		// The applied row's tag and its done, disabled checkbox.
+		expect(html).toContain("Applied");
+		const applied = rowInput(html, "r1");
+		expect(applied.disabled).toBe(true);
+		expect(applied.checked).toBe(false);
+		// The other rows stay preselected, but the applied one never joins them.
+		expect(rowInput(html, "r2").checked).toBe(true);
+		// Apply stays enabled while a non-applied row is checked.
+		expect(applyButton(html).disabled).toBe(false);
+		// All-applied: nothing to send, Apply renders disabled.
+		const allApplied = renderToStaticMarkup(
+			<Drawer
+				{...drawerBase}
+				task={sweepCard(
+					sweepView(sweepRows().map((r) => ({ ...r, applied: true }))),
+				)}
+			/>,
+		);
+		expect(applyButton(allApplied).disabled).toBe(true);
+	});
+
+	test("evidence renders card ids and commit hashes as links", () => {
+		// Blocker 7: the operator can open the cited evidence. The card id links
+		// only when the board lists the card; the commit links to the project's
+		// GitHub commit when the project has one.
+		const base = {
+			...drawerBase,
+			project: { ...drawerProject, github: "https://github.com/ottr/ottr" },
+			tasks: [cardFixture({ id: "OTHER-1", title: "the pairing fix" })],
+		};
+		const rows = [
+			{
+				...sweepRows()[0]!,
+				evidence: "Commit 1a2b3c4 landed it; see OTHER-1 and 5f5e5d5c.",
+			},
+		];
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={sweepCard(sweepView(rows))} />,
+		);
+		expect(
+			html.includes('href="https://github.com/ottr/ottr/commit/1a2b3c4"'),
+		).toBe(true);
+		expect(
+			html.includes('href="https://github.com/ottr/ottr/commit/5f5e5d5c"'),
+		).toBe(true);
+		// The card id links through the task path (its drawer opens from there).
+		expect(html).toContain("/projects/proj/tasks/OTHER-1");
 	});
 
 	// happy-dom's dispatched clicks never reach React's event plugin: call the

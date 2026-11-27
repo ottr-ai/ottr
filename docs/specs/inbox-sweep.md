@@ -106,6 +106,7 @@ interface SweepRowView {
   drafts: string[];
   proposed: "clear" | "implement";
   stale: boolean;
+  applied: boolean;        // the row's durable applied marker exists
   stage: Stage;
   state: RunState;
   cancelled: boolean;
@@ -134,9 +135,13 @@ an answer, finish or cancellation landing on an existing one alike.
   proposal card — backlog stage, `needs_you`, `promptAuthor: "board"`,
   `needsReason: sweepProposedReason(run card)` (`"Inbox sweep proposal from #<run>."
   + the action sentence`) — then marks the target seen. A draft that already
-  filed for this run (a card linked to the run with the same prompt) skips, and
-  a row whose drafts all filed answers `skipped: "already applied"` — a
-  repeated apply creates no duplicate cards. Marks use the completion key
+  filed for this run skips (identical draft text files once), and a row whose
+  durable applied marker exists answers `skipped: "already applied"` — the
+  marker is a review finding on the run card (`Sweep applied: #<card>
+  <action>`, idempotent by the findings table's conflict rule), so repeated
+  and concurrent applies create no duplicate cards and the record survives
+  proposal edits; the whole apply runs in one store transaction, so concurrent
+  requests serialize. Marks use the completion key
   (`<id>@<doneAt>`), the Inbox's own mark. An implement row with no drafts only
   marks seen. Response: `{ results: Array<{ card, applied, skipped? }> }`.
 
@@ -175,11 +180,15 @@ extension (it loads standalone) and mirrors the prompt's contract section.
 - Sweep card drawer: a "Sweep results" section lists one row per verdict — checkbox
   (name `sweep-row-<cardId>`, label `<verdict label>: <title>`, the proposed action
   preselected), verdict tag, evidence (pre-wrap), draft count. Stale rows: checkbox
-  disabled, a `Stale` tag, never preselected. "Apply selected" busy button posts the
+  disabled, a `Stale` tag, never preselected. Applied rows: an `Applied` tag, a done
+  disabled checkbox, never preselected — the state rides the server's row, so a reload
+  or navigation cannot re-select applied work. "Apply selected" busy button posts the
   checked rows to the apply route and refetches the detail and the state; disabled
   while nothing is checked or a post is in flight. A `pending` count above 0 renders
   one line, singular-aware ("1 more card continues in the next sweep run.", "N more
-  cards continue in the next sweep run.").
+  cards continue in the next sweep run."). The evidence renders the cited ids as
+  links: a board card id opens its card when the board lists it, and a commit hash
+  links to the project's GitHub commit when the project has one.
 - No change to research card pins, the drawer's per-card buttons, or the seen-mark
   rules (research-inbox.md decisions stay).
 
