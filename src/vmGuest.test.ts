@@ -1147,13 +1147,29 @@ describe("exec timeout", () => {
 	// exec runs unbounded unless the caller passes timeoutMs, and the /bake sync flush
 	// rides that option (SYNC_TIMEOUT_MS): a host writeback stall once blocked sync(1)
 	// for minutes and hung every POST /bake test (OTTR-1332). This pins the abort
-	// contract: a command that outlives its limit is killed and the error names it.
+	// contract: a command that outlives its limit is killed, the error names the
+	// timeout, and the child really terminates — a lost kill lets sh create the
+	// marker after its sleep, so the final assertion fails.
 	test("a command that outlives its timeout is killed and the error names the timeout", async () => {
+		const markerDir = fresh("exec-timeout");
+		mkdirSync(markerDir, { recursive: true });
+		const marker = join(markerDir, "done");
 		const started = Date.now();
-		const r = await exec(["sleep", "5"], undefined, 100);
+		const r = await exec(
+			["sh", "-c", `sleep 1; touch ${JSON.stringify(marker)}`],
+			undefined,
+			100,
+		);
 		const elapsed = Date.now() - started;
 		expect(r.ok).toBe(false);
 		expect(r.err).toContain("100 ms timeout");
 		expect(elapsed).toBeLessThan(2_000);
+		// Termination proof: the thing under test is real platform time — an OS child's
+		// lifetime after SIGTERM — so fake timers cannot drive it, and the marker's
+		// absence is provable only once the child's 1 s sleep would have ended. Poll,
+		// so a surviving sh fails fast instead of at a cap.
+		const deadline = Date.now() + 2_500;
+		while (Date.now() < deadline && !existsSync(marker)) await Bun.sleep(50);
+		expect(existsSync(marker)).toBe(false);
 	});
 });
