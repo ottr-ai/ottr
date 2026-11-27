@@ -4949,7 +4949,7 @@ describe("Waiting lead drawer actions", () => {
 		}) as unknown as TaskCard;
 	/** Mounts the drawer for the lead; the detail route serves the same card
 	 * back loaded (OTTR-965), everything else 404s. */
-	const mountLead = async (card: TaskCard) => {
+	const mountLead = async (card: TaskCard, boardTasks: TaskCard[] = []) => {
 		const { restore } = stubFetch(async (url) => {
 			const u = String(url);
 			if (u.endsWith(`/api/projects/proj/tasks/${card.id}`)) {
@@ -4961,7 +4961,7 @@ describe("Waiting lead drawer actions", () => {
 			return new Response("{}", { status: 404 });
 		});
 		const { container, unmount } = await mount(
-			<Drawer {...base} task={card} />,
+			<Drawer {...base} task={card} tasks={boardTasks} />,
 		);
 		await act(async () => {});
 		return {
@@ -4972,6 +4972,19 @@ describe("Waiting lead drawer actions", () => {
 			},
 		};
 	};
+
+	/** A board row for one open validation run: the live state the drawer's
+	 * Validate now gating reads (OTTR-1252 send-back 8). */
+	const validationRunCard = (id: string, stage: "todo" | "done") =>
+		cardFixture({
+			id,
+			title: "validation run",
+			sessionTitle: "validation run",
+			stage,
+			state: stage === "done" ? "idle" : "queued",
+			kind: "validation",
+			followUpOf: "R-7",
+		}) as unknown as TaskCard;
 
 	test("the actions row holds exactly Cancel task and Validate now with the hint", async () => {
 		const { container, close } = await mountLead(leadCard());
@@ -5022,10 +5035,12 @@ describe("Waiting lead drawer actions", () => {
 		}
 	});
 
-	test("with a validation run open, Validate now names it and stays disabled", async () => {
-		const { container, close } = await mountLead(
-			leadCard({ openValidationRun: "V-3" }),
-		);
+	test("with a validation run open on the board, Validate now names it and stays disabled", async () => {
+		// The gating reads the LIVE board rows (send-back 8): the detail carries
+		// no open-run field, so a stale cached detail cannot hold the button.
+		const { container, close } = await mountLead(leadCard(), [
+			validationRunCard("V-3", "todo"),
+		]);
 		try {
 			const validate = [
 				...container.querySelectorAll<HTMLButtonElement>(
@@ -5038,6 +5053,47 @@ describe("Waiting lead drawer actions", () => {
 			expect(validate?.disabled).toBe(true);
 		} finally {
 			await close();
+		}
+	});
+
+	test("another run's completion re-enables Validate now; a new run disables it (send-back 8)", async () => {
+		// Happy-dom scenario for the live read: the same lead and detail, only
+		// the board row changes. Before the fix the drawer read the cached
+		// detail, so neither update moved the button.
+		const open = await mountLead(leadCard(), [
+			validationRunCard("V-3", "todo"),
+		]);
+		const disabled = (container: Element): boolean | null => {
+			const validate = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].find((b) => b.textContent?.trim() === "Validate now");
+			return validate?.disabled ?? null;
+		};
+		try {
+			expect(disabled(open.container)).toBe(true);
+			await open.close();
+			// The run settled done: the same drawer state re-enables the button.
+			const done = await mountLead(leadCard(), [
+				validationRunCard("V-3", "done"),
+			]);
+			try {
+				expect(disabled(done.container)).toBe(false);
+			} finally {
+				await done.close();
+			}
+			// A new run appears: the same state disables it again.
+			const again = await mountLead(leadCard(), [
+				validationRunCard("V-9", "todo"),
+			]);
+			try {
+				expect(disabled(again.container)).toBe(true);
+			} finally {
+				await again.close();
+			}
+		} finally {
+			// close() already ran for `open`.
 		}
 	});
 
@@ -5067,6 +5123,57 @@ describe("Waiting lead drawer actions", () => {
 			expect(container.textContent).toContain(
 				"Last result: deployment — Which proxy terminates TLS? — 2026-11-22",
 			);
+		} finally {
+			await close();
+		}
+	});
+
+	test("a recorded deployment finding hides Validate now on a wiped-details lead", async () => {
+		// A migrated sandbox-tagged lead: a later grill replaced its details, so
+		// the details carry no outcome segment, but the recorded finding says
+		// deployment (it rides the view). The question card must decide it —
+		// no Validate now.
+		const { container, close } = await mountLead(
+			leadCard({
+				details: "Grilled definition of ready",
+				recordedValidationOutcome: "deployment",
+			}),
+		);
+		try {
+			const names = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].map((b) => b.textContent?.trim());
+			expect(names).toEqual(["Cancel task"]);
+			expect(container.textContent).toContain(
+				"asks this lead's deployment question; your answer decides the lead.",
+			);
+			expect(container.textContent).not.toContain("Validate now");
+		} finally {
+			await close();
+		}
+	});
+
+	test("a recorded blocked finding shows the last result even with wiped details", async () => {
+		// The migration fixture's shape: the details text went, but the
+		// recorded finding says blocked — the drawer still shows the outcome
+		// and the result date (acceptance item 5).
+		const { container, close } = await mountLead(
+			leadCard({
+				details: "Grilled definition of ready",
+				recordedValidationOutcome: "blocked",
+			}),
+		);
+		try {
+			expect(container.textContent).toContain("Last result: blocked");
+			const validate = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			].find((b) => b.textContent?.trim() === "Validate now");
+			expect(validate).not.toBeNull();
+			expect(validate?.disabled ?? false).toBe(false);
 		} finally {
 			await close();
 		}

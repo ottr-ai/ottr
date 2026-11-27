@@ -13648,6 +13648,50 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		}
 	});
 
+	test("a recorded deployment finding refuses Validate now after a grill wiped the details", async () => {
+		// The migrated legacy shape: the lead's details text went (a grill
+		// replaced it), so the details carry no outcome segment, but the lead's
+		// own review's recorded finding says deployment. The filing guard must
+		// read the recorded outcome — before the fix it filed (or answered no
+		// batchable leads) for a lead only its question card can decide.
+		const { review, lead } = await doneReviewWithWaitingLead();
+		const valcard = await store.createTask(
+			"older validation run",
+			null,
+			"validation",
+		);
+		await store.updateTask(valcard.id, {
+			followUpOf: review.id,
+			stage: "done",
+			state: "idle",
+		});
+		await store.updateTask(lead.id, { details: "Grilled definition of ready" });
+		await store.appendReviewFinding(valcard.id, {
+			prompt: `Validation: #${lead.id} deployment`,
+			model: null,
+			rank: null,
+			security: null,
+		});
+		let filed = 0;
+		validateLeadsImpl = async () => {
+			filed++;
+			return { id: "nope", reset: [] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				"this lead's blocker is a deployment fact: the review's question card answers it, not a validation run",
+			);
+			expect(filed).toBe(0);
+		} finally {
+			validateLeadsImpl = null;
+			await store.updateTask(valcard.id, { cancelledAt: Date.now() });
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
 	test("a waiting lead with an open validation card answers 409 with its id", async () => {
 		const { review, lead } = await doneReviewWithWaitingLead();
 		const run = await store.createTask(

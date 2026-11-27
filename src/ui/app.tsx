@@ -15368,7 +15368,13 @@ export function Drawer({
 		const details = detail?.details ?? "";
 		const marker = "\nValidated by ";
 		const start = details.lastIndexOf(marker);
-		if (start < 0) return fallback;
+		if (start < 0)
+			// OTTR-1252 send-back 8: a grill can replace the details text, so the
+			// newest result may live only in the recorded finding that the view
+			// carries — never drop the outcome.
+			return detail?.recordedValidationOutcome
+				? `${detail.recordedValidationOutcome} — ${fallback}`
+				: fallback;
 		let end = details.indexOf(marker, start + 1);
 		if (end < 0) end = details.length;
 		const seg = details.slice(start + 1, end);
@@ -15385,16 +15391,28 @@ export function Drawer({
 		return date === "" ? short : `${short} — ${date}`;
 	})();
 	// OTTR-1252: a deployment decision never takes a run — the blocker line may
-	// ride the prompt, or a recorded deployment outcome may have overruled a
+	// ride the prompt, a recorded deployment outcome may have overruled a
 	// sandbox blocker line (the settle keeps the prompt, sets validatedAt and
-	// asks the question card). Either way the button would promise an action
-	// the route refuses (409). The list row carries no prompt (OTTR-965), so
-	// both reads prefer the fetched detail.
+	// asks the question card), and that recorded outcome rides the view (the
+	// lead's own review's newest finding), surviving a grill's details wipe.
+	// Any of the three means the button would promise an action the route
+	// refuses (409). The list row carries no prompt (OTTR-965), so the reads
+	// prefer the fetched detail.
 	const deploymentLead =
 		task.waitsValidation === true &&
 		!cancelled &&
 		(leadBlocker(detail?.prompt ?? "").kind === "deployment" ||
-			leadValidationOutcome(detail?.details ?? null) === "deployment");
+			leadValidationOutcome(detail?.details ?? null) === "deployment" ||
+			detail?.recordedValidationOutcome === "deployment");
+	// OTTR-1252 send-back 8: the open validation run's id reads the LIVE board
+	// rows (the socket refreshes them), not the cached detail — another run's
+	// completion must re-enable Validate now and another run's creation must
+	// disable it, and neither touches this card's row.
+	const openValidationRunId =
+		tasks.find(
+			(t) =>
+				t.kind === "validation" && t.cancelledAt === null && t.stage !== "done",
+		)?.id ?? null;
 	useEffect(() => {
 		setRefileError(null);
 	}, [rerunTaskId]);
@@ -16253,7 +16271,7 @@ export function Drawer({
 						cancelInPanel={proposal && task.state === "needs_you"}
 						runBackToTodo={runBackToTodo}
 						backToTodoError={backToTodoError}
-						openValidationRun={detail?.openValidationRun ?? null}
+						openValidationRun={openValidationRunId}
 						deploymentLead={deploymentLead}
 						lastValidation={lastValidation}
 						onOpenTask={onOpenTask}

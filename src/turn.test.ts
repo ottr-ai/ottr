@@ -32191,15 +32191,17 @@ describe("stored review findings", () => {
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, done_at)
 			VALUES
-				('R', 'own review', 'review of the case', 'done', 'idle', 'review', 10, 10, NULL, 15),
-				('V', 'validation run', 'Batch validation of 1 lead(s) of review.', 'done', 'idle', 'validation', 20, 25, 'R', 26)`);
+				('R', 'own review', 'review of the case', 'done', 'idle', 'review', 10, 10, NULL, 15)`);
 		raw.exec(`INSERT INTO tasks
 			(id, title, prompt, stage, state, kind, created_at, updated_at, follow_up_of, cancelled_at, validated_at, details)
 			VALUES
-				('L', 'lead card', 'Needs validation: details-only legacy lead\nBlocker: sandbox run: control', 'backlog', 'idle', 'work', 100, 120, 'R', NULL, 900, 'Grilled definition of ready')`);
-		raw.exec(
-			"INSERT INTO review_findings (card_id, prompt, created_at) VALUES ('V', 'Validation: #L blocked', 30)",
-		);
+				('L', 'lead card', 'Needs validation: details-only legacy lead\nBlocker: sandbox run: control', 'backlog', 'idle', 'work', 100, 120, 'R', NULL, 900,
+					'Unverified lead from review R.
+Validated by validation run #old on 2026-11-20: still blocked — no retry control.')`);
+		// No review_findings rows: the blocked outcome lives ONLY in the details
+		// segment (the started-lead branch's record). The findings-only outcome
+		// read at a8cd138d left this lead in startable backlog; the details
+		// fallback converges it into the waiting form.
 		raw.close();
 
 		// The real migration: ProjectStore.open runs the convergence pass on

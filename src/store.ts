@@ -29,6 +29,7 @@ import {
 	CONVERGE_LEAD_WAIT_SQL,
 	initializeProjectSchema,
 	projectSchemaName,
+	selectValidationOutcomeRows,
 } from "./postgresSchema.ts";
 import { derivedTaskPrefix } from "./prefix.ts";
 import {
@@ -5651,6 +5652,13 @@ export class ProjectStore {
 				})),
 			};
 		});
+	}
+
+	/** The validation results for the shared outcome selector (OTTR-1252),
+	 * read through the canonical query on this store's own driver: the route's
+	 * filing guard and the card view's recorded-outcome field both read it. */
+	validationOutcomeRows() {
+		return selectValidationOutcomeRows(this.db);
 	}
 
 	/** Stores one arrived review finding; returns true when it was new (not a duplicate of a

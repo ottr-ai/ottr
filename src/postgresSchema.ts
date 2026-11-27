@@ -368,9 +368,12 @@ WHERE f.prompt LIKE 'Validation: #%'`;
 
 /** The database surface selectValidationOutcomeRows needs: both the SQLite
  * driver's Database and the PostgreSQL driver's Database satisfy it. */
+/** The database surface selectValidationOutcomeRows needs: both drivers'
+ * query methods satisfy it (rows are cast to the aliased shape once, here). */
 type OutcomeRowsDb = {
-	query<T>(sql: string): { all(): Promise<T[]> };
+	query(sql: string): { all(): Promise<unknown[]> };
 };
+
 type ValidationOutcomeRowDb = {
 	prompt: string;
 	finding_order: number;
@@ -387,7 +390,7 @@ export async function selectValidationOutcomeRows(
 	db: OutcomeRowsDb,
 ): Promise<ValidationOutcomeRow[]> {
 	const rows = (await db
-		.query<ValidationOutcomeRowDb>(VALIDATION_OUTCOME_ROWS_SQL)
+		.query(VALIDATION_OUTCOME_ROWS_SQL)
 		.all()) as ValidationOutcomeRowDb[];
 	return rows.map((row) => ({
 		prompt: row.prompt,

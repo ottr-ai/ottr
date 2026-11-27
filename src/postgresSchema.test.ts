@@ -369,7 +369,13 @@ describe("PostgreSQL migration surface", () => {
 			caseLeads.push({ id: leadId, waits: outcomeCase.waits });
 			for (const run of outcomeCase.runs) {
 				const cardId = `${leadId}-run-${run.foreign ? "F" : "R"}-${run.createdAt}`;
-				run.results.forEach((outcome, order) => {
+				// The conflicting results are inserted REVERSED (the later result
+				// first, its finding_order still the larger one): an adapter that
+				// ignores finding_order and reads insertion order picks the wrong
+				// result for every duplicate case.
+				const reversed = [...run.results].reverse();
+				reversed.forEach((outcome, reverseIndex) => {
+					const order = run.results.length - 1 - reverseIndex;
 					caseRows.push({
 						prompt: `Validation: #${leadId} ${outcome}${order > 0 ? `\nrepeat ${order}` : ""}`,
 						finding_order: (index + 1) * 10 + order,
