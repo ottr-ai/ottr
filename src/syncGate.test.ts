@@ -23,6 +23,7 @@ import {
 	GATE_OUTPUT_CAP,
 	runSyncGate,
 	runSyncGateQueued,
+	STALE_SOURCE_SKIP_REASON,
 	SYNC_GATE_LOG_CAP,
 	syncGateFilesError,
 	workspaceRootFor,
@@ -96,12 +97,36 @@ function seedWorktree(dir: string): string {
 	return base;
 }
 
+/** A committed card worktree whose branch changes only a user file: every
+ *  projects/ file and the root rule at HEAD still carry their base bytes, so
+ *  their installed twins can drift without the branch noticing. Returns the
+ *  base sha. */
+function seedStaleWorktree(dir: string): string {
+	mkdirSync(join(dir, "projects/ottr"), { recursive: true });
+	mkdirSync(join(dir, "user/.omp/agent"), { recursive: true });
+	writeFileSync(join(dir, "projects/ottr/AGENTS.md"), "base agents\n");
+	writeFileSync(join(dir, "projects/ottr/NOTES.md"), "base notes\n");
+	writeFileSync(join(dir, "guard.md"), "base rule\n");
+	writeFileSync(join(dir, "user/.omp/agent/config.yml"), "base user\n");
+	writeFileSync(join(dir, ".gitignore"), "scratch-*\n");
+	sh("git init -q -b main", dir);
+	sh("git config user.email t@t && git config user.name t", dir);
+	sh("git add -A && git commit -qm base", dir);
+	const base = execSync("git rev-parse HEAD", { cwd: dir }).toString().trim();
+	sh("git checkout -q -b ott/card", dir);
+	writeFileSync(join(dir, "user/.omp/agent/config.yml"), "card user\n");
+	sh("git add -A && git commit -qm card", dir);
+	return base;
+}
+
 /** The mechanics probe: a transparent stand-in for runner-mechanics tests only.
  *  It enforces the argv contract (exit 2 without --data, so a launcher that
- *  drops the flag fails every mechanics test), echoes its argv, and prints the
- *  sha256 of one data file it was handed — it installs nothing, so no test can
- *  mistake its behavior for the real sync's. Sync-behavior acceptance runs
- *  against the real script via useRealSync below. */
+ *  drops the flag fails every mechanics test), echoes its argv and a fixed set
+ *  of child env keys (the gate's pins, its allowlist, and the credential names
+ *  the server env carries), and prints the sha256 of one data file it was
+ *  handed — it installs nothing, so no test can mistake its behavior for the
+ *  real sync's. Sync-behavior acceptance runs against the real script via
+ *  useRealSync below. */
 function seedProbe(dir: string): void {
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(
@@ -111,6 +136,10 @@ function seedProbe(dir: string): void {
 			`import { readFileSync } from "node:fs";`,
 			`import { join, relative, resolve } from "node:path";`,
 			`console.log("argv " + JSON.stringify(process.argv));`,
+			`const keys = ["ALATE_HOME", "HOME", "PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALATE_API_KEY", "GH_TOKEN", "OTTR_WORKER_TOKEN"];`,
+			`const seen = {};`,
+			`for (const key of keys) if (process.env[key] !== undefined) seen[key] = process.env[key];`,
+			`console.log("env " + JSON.stringify(seen));`,
 			`const flag = process.argv.indexOf("--data");`,
 			`const data = flag === -1 ? null : process.argv[flag + 1];`,
 			`if (data === undefined || data === null) { console.error("probe: no --data path"); process.exit(2); }`,
@@ -493,6 +522,153 @@ describe("runSyncGate", () => {
 		expect(record.truncated).toBe(true);
 		expect(record.output.length).toBe(GATE_OUTPUT_CAP);
 		expect(record.output).not.toContain("tail");
+	});
+});
+
+describe("gate child env pinning", () => {
+	test("the child's env takes ALATE_HOME and HOME from the gate target; server-env secrets never reach it", async () => {
+		const root = freshDir("envpin");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		seedWorktree(wt);
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedProbe(alateDir);
+		// The production server env carries credentials (OTTR-1305's leak class):
+		// plant sentinels so an allowlist regression that leaks process.env into
+		// the child cannot pass silently. Restored in every path.
+		const planted: Record<string, string> = {
+			ALATE_API_KEY: "PLANTED-ALATE-KEY",
+			GH_TOKEN: "PLANTED-GH-TOKEN",
+			OTTR_WORKER_TOKEN: "PLANTED-WORKER-TOKEN",
+		};
+		const saved: Record<string, string | undefined> = {};
+		for (const [key, value] of Object.entries(planted)) {
+			saved[key] = process.env[key];
+			process.env[key] = value;
+		}
+		try {
+			const record = await runSyncGate(
+				targetFor({ root, worktree: wt, alateDir, home }),
+			);
+			expect(record.code).toBe(0);
+			const envLine = record.output
+				.split("\n")
+				.find((l) => l.startsWith("env "));
+			expect(envLine).toBeDefined();
+			const child = JSON.parse(envLine!.slice("env ".length)) as Record<
+				string,
+				string
+			>;
+			// The pin: both install-target roots come from the gate target's own
+			// dirs. A gateEnv that passes process.env.HOME through again fails the
+			// HOME equality with the server's real home.
+			expect(child.ALATE_HOME).toBe(alateDir);
+			expect(child.HOME).toBe(home);
+			expect(child.PATH).toBe(process.env.PATH);
+			// Nothing beyond the documented allowlist rides: no planted secret key
+			// and no planted value anywhere in the recorded output.
+			expect(child.ALATE_API_KEY).toBeUndefined();
+			expect(child.GH_TOKEN).toBeUndefined();
+			expect(child.OTTR_WORKER_TOKEN).toBeUndefined();
+			expect(record.output).not.toContain("PLANTED-");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+});
+
+describe("stale-source skip (OTTR-1305)", () => {
+	test("an unchanged projects path whose twin differs is skipped: the child never sees the branch's bytes", async () => {
+		const root = freshDir("stale");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		const base = seedStaleWorktree(wt);
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedProbe(alateDir);
+		// The live twins: AGENTS.md gained fresher content after the fork, NOTES.md
+		// matches the branch bytes, the root rule drifted (outside the guard's
+		// scope), and the branch-changed user file drifted too.
+		mkdirSync(join(root, "ottr"), { recursive: true });
+		writeFileSync(join(root, "ottr", "AGENTS.md"), "fresh live agents\n");
+		writeFileSync(join(root, "ottr", "NOTES.md"), "base notes\n");
+		mkdirSync(join(home, ".omp/agent/rules"), { recursive: true });
+		writeFileSync(join(home, ".omp/agent/rules/guard.md"), "fresh rule\n");
+		writeFileSync(join(home, ".omp/agent/config.yml"), "stale user\n");
+		const record = await runSyncGate(
+			targetFor({
+				root,
+				worktree: wt,
+				base,
+				alateDir,
+				home,
+				extraFiles: ["guard.md", "projects/ottr/NOTES.md"],
+			}),
+		);
+		expect(record.code).toBe(0);
+		// Exactly the unchanged, drifted projects path is declined.
+		expect(record.skipped).toEqual([
+			{ path: "projects/ottr/AGENTS.md", reason: STALE_SOURCE_SKIP_REASON },
+		]);
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		// The skipped path keeps its pre-run hashes: the record still shows the
+		// stale bytes the gate refused to install.
+		expect(byPath.get("projects/ottr/AGENTS.md")?.sourceSha256).toBe(
+			shaOf("base agents\n"),
+		);
+		expect(byPath.get("projects/ottr/AGENTS.md")?.installedSha256).toBe(
+			shaOf("fresh live agents\n"),
+		);
+		expect(byPath.get("projects/ottr/AGENTS.md")?.match).toBe(false);
+		// The identical twin is not skipped; the out-of-scope root rule keeps the
+		// plain behavior (hashed, never skipped).
+		expect(byPath.get("projects/ottr/NOTES.md")?.match).toBe(true);
+		expect(byPath.get("guard.md")?.match).toBe(false);
+		// Nothing was installed for the skipped path: the twin keeps its bytes.
+		expect(readFileSync(join(root, "ottr", "AGENTS.md"), "utf8")).toBe(
+			"fresh live agents\n",
+		);
+		// And the child never saw the stale bytes: the probe hashed the snapshot's
+		// AGENTS.md after the gate restored the twin's bytes there.
+		const shaLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("probe sha256 "));
+		expect(shaLine?.endsWith(shaOf("fresh live agents\n"))).toBe(true);
+	});
+
+	test("a path the card changed installs normally even when its twin differs", async () => {
+		const root = freshDir("proceed");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		const base = seedWorktree(wt);
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedProbe(alateDir);
+		mkdirSync(join(root, "ottr"), { recursive: true });
+		writeFileSync(join(root, "ottr", "AGENTS.md"), "fresh live agents\n");
+		const record = await runSyncGate(
+			targetFor({ root, worktree: wt, base, alateDir, home }),
+		);
+		expect(record.code).toBe(0);
+		// No skip: the branch changed the path, so its bytes are the evidence the
+		// gate exists to install.
+		expect(record.skipped).toBeUndefined();
+		const byPath = new Map(record.files.map((f) => [f.path, f]));
+		expect(byPath.get("projects/ottr/AGENTS.md")?.sourceSha256).toBe(
+			shaOf("card agents\n"),
+		);
+		expect(byPath.get("projects/ottr/AGENTS.md")?.installedSha256).toBe(
+			shaOf("fresh live agents\n"),
+		);
+		// The child received the branch's bytes, not the twin's.
+		const shaLine = record.output
+			.split("\n")
+			.find((l) => l.startsWith("probe sha256 "));
+		expect(shaLine?.endsWith(shaOf("card agents\n"))).toBe(true);
 	});
 });
 

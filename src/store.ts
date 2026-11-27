@@ -74,6 +74,7 @@ import type {
 	Stage,
 	SyncGateFileHash,
 	SyncGateRun,
+	SyncGateSkip,
 	Task,
 	TaskKind,
 	TrendingVerdict,
@@ -1028,6 +1029,21 @@ function parseSyncGateRun(r: unknown): SyncGateRun | null {
 		output: typeof e.output === "string" ? e.output : "",
 		truncated: e.truncated === true,
 		files,
+		...(Array.isArray(e.skipped)
+			? {
+					skipped: e.skipped.flatMap((s): SyncGateSkip[] => {
+						if (typeof s !== "object" || s === null) return [];
+						const k = s as Record<string, unknown>;
+						if (typeof k.path !== "string") return [];
+						return [
+							{
+								path: k.path,
+								reason: typeof k.reason === "string" ? k.reason : "",
+							},
+						];
+					}),
+				}
+			: {}),
 		durationMs: typeof e.durationMs === "number" ? e.durationMs : 0,
 		error: typeof e.error === "string" ? e.error : undefined,
 	};

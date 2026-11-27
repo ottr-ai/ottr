@@ -73,19 +73,52 @@ to the calling run's own card and project.
      reach, and the gate runs `node <alate checkout>/sync.mjs --data .`
      with cwd at that snapshot. The command is the documented one; the
      data it reads is the archive, so worktree disk tricks cannot change
-     what sync installs. Env `ALATE_HOME=<alate checkout>`, the pinned
-     `HOME`, git config and proxy vars from the server, nothing else. 10
-     minute timeout; stdout+stderr captured in one bounded output field
-     with a `truncated` flag. The snapshot dir is removed after the run.
-  8. The record
-     `{at, head, code, output, truncated, files, durationMs, error?}`
-     appends to the task's `syncGateLog` (new tracked store column, same
-     parse/serialize and keep-last-20 cap as `workCheckLog`) and the
-     stored record is the response body. Gate-level refusals (the
-     clean-tree guard, a missing sync.mjs, an unresolvable head, a spawn
-     failure) append an error record with `code: null`, so every run
-     attempt is tracked data; route-level auth and eligibility refusals
-     answer 403/400/404/409 before any record exists.
+     what sync installs. Env pinning: the child env takes `ALATE_HOME`
+     and `HOME` only from the gate target. It also gets `PATH` and the
+     documented pass-through list (`GIT_CONFIG_GLOBAL`,
+     `GIT_CONFIG_SYSTEM`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`).
+     Nothing else from the server env rides. A probe test pins this
+     contract and asserts that server-env secrets (`ALATE_API_KEY`,
+     `GH_TOKEN`, `OTTR_WORKER_TOKEN`) never reach the child. The first
+     gate version passed the server's real `HOME` through the allowlist,
+     and a later fix pinned both variables to the target. The test keeps
+     that fix from a silent revert: a leaked `process.env.HOME` fails the
+     equality with the target's home, and a gate child would then resolve
+     install targets from the server's real home. 10 minute timeout;
+     stdout+stderr captured in one bounded output field with a
+     `truncated` flag. The snapshot dir is removed after the run.
+- The record
+  `{at, head, code, output, truncated, files, durationMs, error?}`
+  appends to the task's `syncGateLog` (new tracked store column, same
+  parse/serialize and keep-last-20 cap as `workCheckLog`) and the
+  stored record is the response body. Gate-level refusals (the
+  clean-tree guard, a missing sync.mjs, an unresolvable head, a spawn
+  failure) append an error record with `code: null`, so every run
+  attempt is tracked data; route-level auth and eligibility refusals
+  answer 403/400/404/409 before any record exists.
+- Stale-source skip (OTTR-1305). Before the child runs, the gate walks
+  the snapshot's `projects/<p>/<rest>` files. The guard checks three
+  facts for each path: the installed twin exists, its bytes differ from
+  the snapshot source, and the branch's diff (fork point to HEAD) does
+  not include the path. When all three hold, the gate declines the
+  install for that path: the branch forked before the file gained its
+  current content, so its bytes are stale against the fresher live
+  checkout. The record gains a `skipped` entry
+  `{path, reason: "stale source: unchanged in branch, twin differs"}`,
+  and the skipped path keeps its `files` entry with the pre-run hashes
+  (`match: false`), so the record shows the stale bytes the gate
+  refused. The gate then replaces the snapshot bytes at that path with
+  the twin's own bytes, so the child cannot install anything stale; at
+  worst it rewrites the twin's bytes. A path the card changed installs
+  normally — that is the acceptance evidence the gate exists for. A
+  twin that is missing or byte-equal never skips. `user/` paths and
+  root rules keep the plain behavior. A run without a known fork point
+  treats every unchanged drifted `projects/` path as stale, because the
+  changed set is empty and the gate refuses to overwrite live bytes it
+  cannot vouch for.
+- Operator side (the OTTR-1305 incident). Validation runs use a fixture
+  `ALATE_HOME` with isolated install targets. Never run `--data .` from
+  a card worktree against the real alate checkout.
 - The gate never cleans up, repairs or resets anything. The only
   live-state writes are sync.mjs's own install — the same mutation the
   operator's run makes, now executed by the board. Every other step

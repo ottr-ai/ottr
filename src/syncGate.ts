@@ -8,10 +8,10 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import type { SyncGateFileHash, SyncGateRun } from "./types.ts";
+import type { SyncGateFileHash, SyncGateRun, SyncGateSkip } from "./types.ts";
 import { GIT_CONFIG_PINS, NO_EXT_DIFF } from "./worktree.ts";
 
 /** The only project whose cards may run the gate: the data repo the sync installs. */
@@ -28,6 +28,12 @@ export const SYNC_GATE_LOG_CAP = 20;
 
 /** Cap on the caller-requested extra hash set (sandbox_run's collect cap). */
 export const SYNC_GATE_FILES_CAP = 16;
+
+/** The skip reason when the gate declines to install stale bytes (OTTR-1305):
+ *  the branch never changed the path and the installed twin carries fresher
+ *  bytes than the branch's snapshot. */
+export const STALE_SOURCE_SKIP_REASON =
+	"stale source: unchanged in branch, twin differs";
 
 /** The gate target the route composes from its own deps: no path or name is
  *  hardcoded, so tests point every member at temp fixtures. */
@@ -362,6 +368,22 @@ async function changedFiles(target: SyncGateTarget): Promise<string[]> {
 		.filter((l) => l !== "");
 }
 
+/** Every projects/ file the snapshot carries: the staleness guard's candidate
+ *  set, independent of the branch's changed files. */
+async function snapshotProjectPaths(snapshot: string): Promise<string[]> {
+	const out: string[] = [];
+	const walk = async (rel: string): Promise<void> => {
+		const entries = await readdir(join(snapshot, rel), { withFileTypes: true });
+		for (const entry of entries) {
+			const child = rel === "" ? entry.name : `${rel}/${entry.name}`;
+			if (entry.isDirectory()) await walk(child);
+			else if (entry.isFile() && child.startsWith("projects/")) out.push(child);
+		}
+	};
+	await walk("");
+	return out;
+}
+
 /** One gate step: guards, an immutable HEAD snapshot, the sync.mjs run inside it,
  *  the per-file hashes against the installed twins, and the tracked record.
  *  Refusals record too, so every attempt is store data. */
@@ -428,6 +450,36 @@ export async function runSyncGate(
 		target.home,
 	);
 	try {
+		// The branch's changed set before the child runs: the staleness guard
+		// needs it, and the post-run hash set reuses it.
+		const changed = new Set(await changedFiles(target));
+		// The staleness guard (OTTR-1305): a branch forked before a mapped
+		// projects/ file gained its current content carries stale bytes at HEAD,
+		// and sync would install them over the fresher installed twin. For each
+		// unchanged path whose snapshot bytes differ from its twin, the gate
+		// replaces the snapshot bytes with the twin's own bytes, so the child
+		// cannot install anything stale at that path — at worst it rewrites the
+		// twin's own bytes. user/ files and root rules keep the plain behavior.
+		const skipped: SyncGateSkip[] = [];
+		const skipFiles: SyncGateFileHash[] = [];
+		for (const path of await snapshotProjectPaths(snapshot)) {
+			if (changed.has(path)) continue;
+			const twin = installedTwin(path, target.workspaceRoot, target.home);
+			if (twin === null) continue;
+			const [sourceSha256, installedSha256] = await Promise.all([
+				sha256File(join(snapshot, path)),
+				sha256File(twin),
+			]);
+			if (
+				sourceSha256 === null ||
+				installedSha256 === null ||
+				sourceSha256 === installedSha256
+			)
+				continue;
+			skipped.push({ path, reason: STALE_SOURCE_SKIP_REASON });
+			skipFiles.push({ path, sourceSha256, installedSha256, match: false });
+			await copyFile(twin, join(snapshot, path));
+		}
 		// The child runs `--data .` at the snapshot: the documented command, pointed
 		// at immutable archive bytes instead of the worktree's disk.
 		const result = await runChild(
@@ -436,18 +488,25 @@ export async function runSyncGate(
 			gateEnv(target.alateDir, target.home),
 		);
 		const paths = new Set<string>();
-		for (const path of await changedFiles(target)) {
+		for (const path of changed) {
 			if (installedTwin(path, target.workspaceRoot, target.home) !== null)
 				paths.add(path);
 		}
 		for (const path of target.extraFiles ?? []) paths.add(path.trim());
-		const files = await fileHashes(target, snapshot, [...paths]);
+		// A skipped path's files entry is already recorded with the pre-run hashes
+		// (the stale source against the twin), so the child run must not re-hash it.
+		for (const skip of skipped) paths.delete(skip.path);
+		const files = [
+			...skipFiles,
+			...(await fileHashes(target, snapshot, [...paths])),
+		];
 		return record({
 			head,
 			code: result.code,
 			output: result.output,
 			truncated: result.truncated,
 			files,
+			...(skipped.length > 0 ? { skipped } : {}),
 			...(result.spawnError !== undefined ? { error: result.spawnError } : {}),
 		});
 	} finally {

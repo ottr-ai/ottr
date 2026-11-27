@@ -854,6 +854,17 @@ export interface SyncGateFileHash {
 	match: boolean;
 }
 
+/** One install the sync gate declined (OTTR-1305): the branch never changed the
+ *  mapped `projects/` path, but its snapshot bytes differ from the installed
+ *  twin, so installing them would overwrite the fresher live bytes with stale
+ *  ones from an older fork point. */
+export interface SyncGateSkip {
+	/** The data-repo-relative path the gate declined to install. */
+	path: string;
+	/** Why the gate skipped it, for example the stale-source reason. */
+	reason: string;
+}
+
 /** One run of the agent-data sync gate the board executed for a work card
  *  (docs/specs/agent-data-sync-gate.md). Board-written tracked data: the record
  *  lands in the store before the turn sees it, so a report can cite it without
@@ -874,6 +885,10 @@ export interface SyncGateRun {
 	truncated: boolean;
 	/** Per-file hash comparison for the card's changed `projects/` files. */
 	files: SyncGateFileHash[];
+	/** The installs the gate declined before the child ran; absent when nothing
+	 *  was skipped. A skipped path still carries its files entry, hashed before
+	 *  the decline, so the record shows the stale bytes the gate refused. */
+	skipped?: SyncGateSkip[];
 	/** Wall-clock duration of the whole gate step (guards, run, hashing). */
 	durationMs: number;
 	/** The refusal reason when the gate never ran or failed to start. */
