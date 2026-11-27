@@ -10996,9 +10996,7 @@ function DrawerLineage(p: {
 									{railRows.map((e) => {
 										if (e.kind === "ref") {
 											const f =
-												lineageFetches[
-													`${e.ref.project}/${e.ref.id}`
-												] ?? null;
+												lineageFetches[`${e.ref.project}/${e.ref.id}`] ?? null;
 											return (
 												<Fragment key={`${e.ref.project}/${e.ref.id}`}>
 													{fetchRow(
