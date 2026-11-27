@@ -152,13 +152,25 @@ test("settledKeys names only creates whose id the state carries", () => {
 			create({ key: "answered", id: "AL-10" }),
 			create({ key: "failed", id: null, failed: true }),
 		],
-		new Set(["AL-1", "AL-9"]),
+		[task("AL-1"), task("AL-9")],
 	);
 	expect(keys).toEqual(new Set(["landed"]));
 });
 
 test("settledKeys is empty for an empty state", () => {
-	expect(settledKeys([create({ id: "AL-9" })], new Set())).toEqual(new Set());
+	expect(settledKeys([create({ id: "AL-9" })], [])).toEqual(new Set());
+});
+
+// Two projects can derive one prefix (alpha and alphabet both ALPH): an id alone is not
+// a card's identity, so neither pairing nor settlement may match another project's card.
+test("pairCreates and settledKeys never match the same id in another project", () => {
+	const p = create({ key: "a", project: "alpha", id: "ALPH-9" });
+	const foreign = [task("ALPH-1"), task("ALPH-9", "alphabet")];
+	expect(pairCreates([p], foreign)).toEqual(new Map());
+	expect(settledKeys([p], foreign)).toEqual(new Set());
+	const landed = [...foreign, task("ALPH-9", "alpha")];
+	expect(pairCreates([p], landed)).toEqual(new Map([["a", "ALPH-9"]]));
+	expect(settledKeys([p], landed)).toEqual(new Set(["a"]));
 });
 
 // --- placeholderFlights -----------------------------------------------------

@@ -19345,10 +19345,7 @@ export function App() {
 	// A create whose card the state carries is done: its placeholder drops.
 	useEffect(() => {
 		if (state === null || pendingCreates.length === 0) return;
-		const done = settledKeys(
-			pendingCreates,
-			new Set(state.tasks.map((t) => t.id)),
-		);
+		const done = settledKeys(pendingCreates, state.tasks);
 		if (done.size === 0) return;
 		setPendingCreates((list) => list.filter((p) => !done.has(p.key)));
 	}, [state, pendingCreates]);

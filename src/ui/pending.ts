@@ -39,20 +39,25 @@ export function placeholderTitle(text: string, max = 140): string {
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+/** One card's identity: ids are unique per project only (two projects can derive one
+ * prefix, e.g. alpha and alphabet both ALPH), so every match keys on both. */
+const cardKey = (project: string, id: string): string => `${project}\n${id}`;
+
 /**
  * Pairs each create with its real card, keyed by the create's client key. A placeholder
  * pairs only through its own request: once the POST answered with an id and the state
- * carries that card. No other card (another tab's, one with the same first line) ever
+ * carries that id in the create's own project. No other card (another tab's, one with the same first line) ever
  * stands in for it, so an unanswered create keeps its placeholder.
  */
 export function pairCreates(
 	pending: readonly PendingCreate[],
-	tasks: readonly { id: string }[],
+	tasks: readonly { id: string; project: string }[],
 ): Map<string, string> {
-	const ids = new Set(tasks.map((t) => t.id));
+	const cards = new Set(tasks.map((t) => cardKey(t.project, t.id)));
 	const pairs = new Map<string, string>();
 	for (const p of pending)
-		if (p.id !== null && ids.has(p.id)) pairs.set(p.key, p.id);
+		if (p.id !== null && cards.has(cardKey(p.project, p.id)))
+			pairs.set(p.key, p.id);
 	return pairs;
 }
 
@@ -66,15 +71,13 @@ export function projectPlaceholders(
 	return pending.filter((p) => p.project === project && !pairs.has(p.key));
 }
 
-/** Keys of the creates whose card the state now carries: they are done and drop. */
+/** Keys of the creates whose card the state now carries in their own project: they are
+ * done and drop. */
 export function settledKeys(
 	pending: readonly PendingCreate[],
-	taskIds: ReadonlySet<string>,
+	tasks: readonly { id: string; project: string }[],
 ): Set<string> {
-	const keys = new Set<string>();
-	for (const p of pending)
-		if (p.id !== null && taskIds.has(p.id)) keys.add(p.key);
-	return keys;
+	return new Set(pairCreates(pending, tasks).keys());
 }
 
 /**

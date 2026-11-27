@@ -3113,3 +3113,48 @@ test("a create that fails while the board is not mounted still drops its placeho
 		expect(leaked).toBe(false);
 	});
 });
+
+test("an answered create keeps its placeholder while only another project carries the same id", async () => {
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		expectPlaceholder();
+
+		// Two projects can derive one prefix (alpha and alphabet both ALPH): the answer
+		// names XX-9, and beta's frame carries a card with that same id first.
+		const beta = card({
+			id: "XX-9",
+			title: "Beta work",
+			sessionTitle: "Beta work",
+			project: "beta",
+			createdAt: 5,
+		});
+		const alpha = card({
+			id: "XX-9",
+			title: "Ship the lane",
+			sessionTitle: "Ship the lane",
+			createdAt: 6,
+		});
+		setFrame(frameWith(beta));
+		refreshState();
+		await act(async () => {
+			answer(jsonResponse(alpha));
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 0);
+			await promise;
+		});
+		// Neither the board's pairing nor App's settlement takes beta's card for alpha's.
+		await holdsFor(() => todoPendingCards().length === 1);
+		expect(todoPendingCards().length).toBe(1);
+
+		setFrame(frameWith(beta, alpha));
+		refreshState();
+		await waitFor(
+			() =>
+				pendingCards().length === 0 &&
+				document.querySelector(
+					'section.stage[data-stage="todo"] .card[data-task-id="XX-9"]',
+				) !== null,
+		);
+	});
+});
