@@ -829,6 +829,23 @@ const RESULTS_READ =
 /** The external rules sync's own results read (the entrypoint's flat rules sync wrote it). */
 const RESULTS_RULES_READ =
 	"compose -f c.yml run --rm --no-deps --entrypoint sh board-seed -c cat <results>.external-rules.json; exit $rc";
+/** The board-seed entrypoint's compound command as the compose file holds it: the
+ *  single-quoted YAML scalar stripped (outer quotes off, '' back to '), compose's
+ *  $$ escaping left in place for the text assertions. */
+function entrypointRaw(): string {
+	const compose = readFileSync(
+		join(import.meta.dir, "..", "docker-compose.yml"),
+		"utf8",
+	);
+	const block = compose.slice(
+		compose.indexOf("board-seed:"),
+		compose.indexOf("home-repair:"),
+	);
+	const line = /^\s+- ('?node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
+	return line.startsWith("'") && line.endsWith("'")
+		? line.slice(1, -1).replaceAll("''", "'")
+		: line;
+}
 const SEEDFAIL_WRITE = (record: {
 	since: number;
 	commit: string;
@@ -4743,16 +4760,7 @@ describe("board seed", () => {
 	}, 60_000);
 
 	test("the compose seed entrypoint runs the rules sync for every non-fatal install-user outcome", () => {
-		const compose = readFileSync(
-			join(import.meta.dir, "..", "docker-compose.yml"),
-			"utf8",
-		);
-		const block = compose.slice(
-			compose.indexOf("board-seed:"),
-			compose.indexOf("home-repair:"),
-		);
-		const command =
-			/^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
+		const command = entrypointRaw();
 		// The seed runs in layer mode: without --layer (or ALATE_LAYER=1) install-user
 		// does a flat install, and the partial outcome's required switch never happens.
 		expect(command).toContain(
@@ -4780,17 +4788,8 @@ describe("board seed", () => {
 	});
 
 	test("the entrypoint's fatal guard reads Alate's pretty-printed results file", () => {
-		const compose = readFileSync(
-			join(import.meta.dir, "..", "docker-compose.yml"),
-			"utf8",
-		);
-		const block = compose.slice(
-			compose.indexOf("board-seed:"),
-			compose.indexOf("home-repair:"),
-		);
-		const command =
-			/^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
-		const pattern = /grep -q '([^']+)' "\$\$R"/.exec(command)?.[1] ?? "";
+		const command = entrypointRaw().replaceAll("$$", "$");
+		const pattern = /grep -q '([^']+)' "\$R"/.exec(command)?.[1] ?? "";
 		const dir = mkdtempSync(join(tmpdir(), "ottr-1260-guard-"));
 		try {
 			// Alate's own serialization: JSON.stringify(payload, null, 2) plus a newline.
@@ -4820,16 +4819,9 @@ describe("board seed", () => {
 	});
 
 	test("the compound seed command executes end to end", () => {
-		const compose = readFileSync(
-			join(import.meta.dir, "..", "docker-compose.yml"),
-			"utf8",
-		);
-		const block = compose.slice(
-			compose.indexOf("board-seed:"),
-			compose.indexOf("home-repair:"),
-		);
-		const raw = /^\s+- (node install-user\.mjs .+)$/m.exec(block)?.[1] ?? "";
-		const command = raw.replaceAll("$$", "$");
+		// Un-double compose's dollars too, so the stub sees the shell command
+		// exactly as the entry script runs it.
+		const command = entrypointRaw().replaceAll("$$", "$");
 		const dir = mkdtempSync(join(tmpdir(), "ottr-1260-exec-"));
 		const bin = join(dir, "bin");
 		mkdirSync(bin, { recursive: true });

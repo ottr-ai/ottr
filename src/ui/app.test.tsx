@@ -16118,6 +16118,7 @@ describe("AppInboxBell badge", () => {
 			0,
 			null,
 			state.seedFailed ?? null,
+			null,
 			false,
 			[],
 			null,

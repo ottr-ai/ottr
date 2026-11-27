@@ -556,8 +556,9 @@ services:
       # scripts: non-zero when either failed. The external sync's result file is its
       # own: install-user's nested sync already writes <results>.rules.json, and a
       # classifier that could not tell the two apart would accept the nested file as
-      # the external sync's proof after an external crash.
-      - node install-user.mjs --home /etc/ottr/home --layer --force "$$@"; rc=$$?; R="$${ALATE_PROVISION_RESULTS:-}"; if [ -n "$$R" ] && [ -f "$$R" ] && ! grep -q '"fatal": *true' "$$R"; then ALATE_PROVISION_RESULTS="$$R.external-rules.json" node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; elif [ "$$rc" -eq 0 ]; then node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; fi; exit $$rc
+      # the external sync's proof after an external crash. The scalar is single-
+      # quoted: the guard's ": *" would parse as a YAML alias in a plain scalar.
+      - 'node install-user.mjs --home /etc/ottr/home --layer --force "$$@"; rc=$$?; R="$${ALATE_PROVISION_RESULTS:-}"; if [ -n "$$R" ] && [ -f "$$R" ] && ! grep -q ''"fatal": *true'' "$$R"; then ALATE_PROVISION_RESULTS="$$R.external-rules.json" node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; elif [ "$$rc" -eq 0 ]; then node sync.mjs /etc/ottr/home/.omp/agent/rules "$$@"; s=$$?; [ "$$s" -eq 0 ] || rc=$$s; fi; exit $$rc'
       - board-seed
 
   # Repair for the empty agent.db folder: a wrong OTTR_AGENT_DB host path makes rootful
