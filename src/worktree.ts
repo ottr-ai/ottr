@@ -174,7 +174,38 @@ const NETWORK_GIT: Record<string, true> = {
  * the child git a submodule diff, fetch or push starts, and a submodule's config is
  * worker-writable too: so the board never recurses into submodules either.
  */
-const NO_EXT_DIFF = ["--no-ext-diff", "--no-textconv", "--submodule=short"];
+export const NO_EXT_DIFF = [
+	"--no-ext-diff",
+	"--no-textconv",
+	"--submodule=short",
+];
+/** The R5-1 command-line config pins every board-side git spawn rides: a work
+ *  turn can write the repo's .git/config or a planted .gitconfig, and these
+ *  outrank both (fsmonitor commands, hooks, signing programs, cookie jars,
+ *  gc/maintenance that follows symlinks, dubious-ownership refusals). Shared by
+ *  the board's own git() and every server-side git spawn outside it. */
+export const GIT_CONFIG_PINS: readonly string[] = [
+	"-c",
+	"core.fsmonitor=false",
+	"-c",
+	"core.hooksPath=/dev/null",
+	"-c",
+	"commit.gpgSign=false",
+	"-c",
+	"tag.gpgSign=false",
+	"-c",
+	"gpg.program=false",
+	"-c",
+	"gpg.x509.program=false",
+	"-c",
+	"gpg.ssh.program=false",
+	"-c",
+	"gc.auto=0",
+	"-c",
+	"maintenance.auto=false",
+	"-c",
+	"safe.directory=*",
+];
 const UPLOAD_PACK = [
 	"--upload-pack=git-upload-pack",
 	"--no-recurse-submodules",
@@ -415,34 +446,15 @@ export async function git(
 			// PINNED_ARGS covers the diff and pack keys -c cannot clear. Filter drivers need
 			// sealedGit. Residual: network subcommands still read credential.helper and
 			// core.sshCommand from planted config (docs/WORKERS.md).
-			"-c",
-			"core.fsmonitor=false",
-			"-c",
-			"core.hooksPath=/dev/null",
-			"-c",
-			"commit.gpgSign=false",
-			"-c",
-			"tag.gpgSign=false",
-			"-c",
-			"gpg.program=false",
-			"-c",
-			"gpg.x509.program=false",
-			"-c",
-			"gpg.ssh.program=false",
+			...GIT_CONFIG_PINS,
 			// Auto gc/maintenance prunes stale worktree admin entries, and git follows a symlinked
 			// entry when it deletes one (guardAdminEntries): the board's git never runs either.
-			"-c",
-			"gc.auto=0",
-			"-c",
-			"maintenance.auto=false",
 			// OTTR-1176: main checkouts are turn-uid-owned (OTTR-994 chowns them for a
 			// run) and an image roll recreated the server while the ownership was mid
 			// change, so a branch read died with "detected dubious ownership" before the
 			// new boot seeded the board gitconfig. Command-line config is protected
 			// config for safe.directory, so the trust rides every spawn and survives a
 			// missing, empty or stale GIT_CONFIG_GLOBAL file.
-			"-c",
-			"safe.directory=*",
 			// libcurl rewrites http.cookieFile as a Netscape cookie jar after a successful
 			// network fetch: a planted cookieFile + saveCookies would replace any file the
 			// board git can write (the server-only databases included) with a cookie jar.

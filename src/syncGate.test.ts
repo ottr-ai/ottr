@@ -385,6 +385,45 @@ describe("runSyncGate", () => {
 		expect(record.error).toContain("no sync.mjs");
 	});
 
+	test("the gate's git never runs a planted core.fsmonitor command (R5-1)", async () => {
+		const root = freshDir("fsmonitor");
+		const wt = join(root, "wt");
+		mkdirSync(wt, { recursive: true });
+		seedWorktree(wt);
+		const alateDir = join(root, "alate");
+		const home = join(root, "home");
+		seedProbe(alateDir);
+		// The turn uid owns the worktree's .git/config: plant a live fsmonitor
+		// command the way worktree.test.ts's control proves plain git executes it.
+		// The script and its marker live outside the worktree, so the clean-tree
+		// guard sees a committed tree and the denial under test is the pins'.
+		const script = join(root, "fsmonitor.sh");
+		writeFileSync(
+			script,
+			"#!/bin/sh\ntouch " +
+				JSON.stringify(join(root, "planted.fsmonitor")) +
+				"\n",
+		);
+		chmodSync(script, 0o755);
+		sh("git config core.fsmonitor " + JSON.stringify(script), wt);
+		const marker = join(root, "planted.fsmonitor");
+		// Control: the plant is live — plain git status runs the command.
+		execSync("git status --porcelain", {
+			cwd: wt,
+			stdio: "ignore",
+			env: fixtureGitEnv(),
+		});
+		expect(existsSync(marker)).toBe(true);
+		rmSync(marker);
+		// The gate's pinned spawn overrides the config: the planted command cannot
+		// run under the board's rights, and the gate still works.
+		const record = await runSyncGate(
+			targetFor({ root, worktree: wt, base: null, alateDir, home }),
+		);
+		expect(record.code).toBe(0);
+		expect(existsSync(marker)).toBe(false);
+	});
+
 	test("a dirty worktree records the refusal with the status lines", async () => {
 		const root = freshDir("guard");
 		const wt = join(root, "wt");

@@ -12,6 +12,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import type { SyncGateFileHash, SyncGateRun } from "./types.ts";
+import { GIT_CONFIG_PINS, NO_EXT_DIFF } from "./worktree.ts";
 
 /** The only project whose cards may run the gate: the data repo the sync installs. */
 export const SYNC_GATE_PROJECT = "agent-data";
@@ -152,7 +153,10 @@ function gitOut(
 	home: string,
 ): Promise<string | null> {
 	const { promise, resolve } = Promise.withResolvers<string | null>();
-	const child = spawn("git", args, {
+	// The R5-1 pins ride every spawn: the worktree's .git/config is turn-writable,
+	// and an unpinned `git status` here would execute a planted fsmonitor command
+	// as the server uid (the board's own git pins the same list, src/worktree.ts).
+	const child = spawn("git", [...GIT_CONFIG_PINS, ...args], {
 		cwd,
 		env: gateEnv(alateDir, home),
 		stdio: ["ignore", "pipe", "pipe"],
@@ -205,7 +209,7 @@ async function extractSnapshot(
 ): Promise<string> {
 	const dir = await mkdtemp(join(tmpdir(), "ottr-syncgate-snap-"));
 	await new Promise<void>((resolve, reject) => {
-		const archive = spawn("git", ["archive", head], {
+		const archive = spawn("git", [...GIT_CONFIG_PINS, "archive", head], {
 			cwd: worktree,
 			env: gateEnv(alateDir, home),
 			stdio: ["ignore", "pipe", "pipe"],
@@ -347,7 +351,7 @@ async function changedFiles(target: SyncGateTarget): Promise<string[]> {
 	if (target.base === null) return [];
 	const out = await gitOut(
 		target.worktree,
-		["diff", "--name-only", `${target.base}...HEAD`],
+		["diff", ...NO_EXT_DIFF, "--name-only", `${target.base}...HEAD`],
 		target.alateDir,
 		target.home,
 	);
