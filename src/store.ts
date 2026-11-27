@@ -29,7 +29,7 @@ import {
 	CONVERGE_LEAD_WAIT_SQL,
 	initializeProjectSchema,
 	projectSchemaName,
-	selectValidationOutcomeRows,
+	selectAppliedValidationOutcomeRows,
 } from "./postgresSchema.ts";
 import { derivedTaskPrefix } from "./prefix.ts";
 import {
@@ -2833,45 +2833,7 @@ export class ProjectStore {
 						"validated_at",
 					].every((c) => cols.includes(c))
 				) {
-					// The newest recorded outcome per lead id, from review_findings:
-					// the authoritative record that survives a later grill's details
-					// wipe. validationOutcomes is the ONE selector the settle and
-					// resetValidatedLeads also read: it keeps only the lead's own
-					// review's runs (a foreign review's result never decides the
-					// lead), sorts runs newest first, and takes the first result
-					// per lead inside a run. The legacy rows group by their own
-					// review, so each group selects against its review. The
-					// findings table predates validated_at, which this block
-					// already requires, so it exists in every database that
-					// reaches this pass.
-					const findingRows = await db
-						.query<
-							{
-								prompt: string;
-								finding_order: number;
-								card_id: string;
-								created_at: number | null;
-								kind: string;
-								follow_up_of: string | null;
-							},
-							[]
-						>(
-							`SELECT f.prompt AS prompt, f.id AS finding_order, f.card_id AS card_id,
-									c.created_at AS created_at, c.kind AS kind,
-									c.follow_up_of AS follow_up_of
-								FROM review_findings f
-								JOIN tasks c ON c.id = f.card_id
-								WHERE f.prompt LIKE 'Validation: #%'`,
-						)
-						.all();
-					const outcomeRows = findingRows.map((row) => ({
-						prompt: row.prompt,
-						order: Number(row.finding_order),
-						cardId: row.card_id,
-						cardCreatedAt: row.created_at,
-						cardKind: row.kind,
-						cardFollowUpOf: row.follow_up_of,
-					}));
+					const outcomeRows = await selectAppliedValidationOutcomeRows(db);
 					const legacy = await db
 						.query<
 							{
@@ -5654,11 +5616,15 @@ export class ProjectStore {
 		});
 	}
 
-	/** The validation results for the shared outcome selector (OTTR-1252),
-	 * read through the canonical query on this store's own driver: the route's
-	 * filing guard and the card view's recorded-outcome field both read it. */
-	validationOutcomeRows() {
-		return selectValidationOutcomeRows(this.db);
+	/** Reads only completed-run outcomes, after preceding transactions settle.
+	 * Settlement consumes candidate findings through its separate input path. */
+	appliedValidationOutcomes(reviewId: string) {
+		return this.queue.run(async () =>
+			validationOutcomes(
+				reviewId,
+				await selectAppliedValidationOutcomeRows(this.db),
+			),
+		);
 	}
 
 	/** Stores one arrived review finding; returns true when it was new (not a duplicate of a

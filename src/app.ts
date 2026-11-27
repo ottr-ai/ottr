@@ -364,7 +364,6 @@ import {
 	reviewFindings,
 	silentSince,
 	validatableReview,
-	validationOutcomes,
 	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_CANCEL,
 	WORK_CHECK_ASK_DIVERGE,
@@ -7104,18 +7103,11 @@ export async function createApp(deps: AppDeps) {
 							c.followUpOfProject === null,
 					);
 		const proposal = await e.store.trendingVerdictByProposal(t.id);
-		// OTTR-1252: a waiting lead's recorded outcome (its own review's newest
-		// validation finding) rides the view, so the drawer can classify
-		// deployment decisions and show the last result even when a grill
-		// replaced the details text. The same read as the route's filing guard
-		// (selectValidationOutcomeRows + validationOutcomes), one listTasks and
-		// one findings read only for waiting leads.
-		const recordedValidationOutcome =
+		// Candidate findings do not decide drawer actions before settlement.
+		const appliedValidationOutcome =
 			t.waitsValidation === true && t.followUpOf !== null
-				? (validationOutcomes(
-						t.followUpOf,
-						await e.store.validationOutcomeRows(),
-					).get(t.id)?.outcome ?? null)
+				? ((await e.store.appliedValidationOutcomes(t.followUpOf)).get(t.id)
+						?.outcome ?? null)
 				: null;
 		return {
 			...task,
@@ -7124,7 +7116,7 @@ export async function createApp(deps: AppDeps) {
 				({ prompt: _prompt, ...turn }) => turn,
 			),
 			sessionTitle: await e.store.frozenTitle(t),
-			...(t.waitsValidation === true ? { recordedValidationOutcome } : {}),
+			...(t.waitsValidation === true ? { appliedValidationOutcome } : {}),
 			...(proposal?.verdict === "filed" ? { trendingRepo: proposal.repo } : {}),
 			...(pr !== null && e.github !== null
 				? {
@@ -13088,22 +13080,15 @@ export async function createApp(deps: AppDeps) {
 		if (isLead(task) && task.waitsValidation === true) {
 			if (task.followUpOf === null)
 				return json({ error: "the lead does not name a review" }, 409);
-			// A deployment decision never enters a batch (pendingSandboxLead reads
-			// the blocker line, and a recorded deployment outcome set validatedAt):
-			// its review's question card decides it, so a run for this lead cannot
-			// exist and the filing would only take siblings. The blocker line rides
-			// the prompt; a recorded outcome rides the details, or — when a later
-			// grill replaced the details text — the review's recorded findings.
-			// All three are read before filing.
-			const recordedOutcome =
-				validationOutcomes(
-					task.followUpOf,
-					await e.store.validationOutcomeRows(),
-				).get(task.id)?.outcome ?? null;
+			// A deployment result requires the review's question flow. Only
+			// completed-run outcomes count, not findings from a cancelled run.
+			const appliedOutcome =
+				(await e.store.appliedValidationOutcomes(task.followUpOf)).get(task.id)
+					?.outcome ?? null;
 			if (
 				leadBlocker(task.prompt).kind === "deployment" ||
 				leadValidationOutcome(task.details) === "deployment" ||
-				recordedOutcome === "deployment"
+				appliedOutcome === "deployment"
 			)
 				return json(
 					{

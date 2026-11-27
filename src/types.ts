@@ -1328,12 +1328,10 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	 * first. This card's Work steps show their turns; each finding stays a card of its own.
 	 * Absent without findings. */
 	findings?: FindingView[];
-	/** OTTR-1252: set only on a waiting lead's card view — the outcome of the
-	 * lead's own review's newest validation finding ("blocked", "confirmed",
-	 * "refuted" or "deployment"), read through the shared outcome selector.
-	 * Survives a grill's details wipe, so the drawer can classify deployment
-	 * decisions and show the last result when the details text went. */
-	recordedValidationOutcome?:
+	/** The lead's result from its review's newest completed validation run.
+	 * The store excludes cancelled and unfinished runs before selection.
+	 * This result survives a later replacement of the details text. */
+	appliedValidationOutcome?:
 		| "confirmed"
 		| "refuted"
 		| "blocked"

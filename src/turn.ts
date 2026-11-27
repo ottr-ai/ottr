@@ -170,7 +170,6 @@ import {
 	reviewFindings,
 	selectFindings,
 	UNCHECKED_FINDINGS_HOLD,
-	type ValidationOutcomeRow,
 	validatableReview,
 	validationOutcomes,
 	WORK_CHECK_ASK_BLOCK,
@@ -10064,26 +10063,8 @@ export function createTurnLoop(
 		lead?: string,
 	): Promise<string[]> {
 		const tasks = await store.listTasks();
-		// OTTR-1252: the newest outcome per lead comes through the one shared
-		// outcome selector — this review's validation runs newest first, the
-		// first result per lead inside a run — so the reset can never disagree
-		// with the settle or the convergence about what the lead's outcome is.
-		const rows: ValidationOutcomeRow[] = [];
-		for (const card of tasks) {
-			if (card.kind !== "validation") continue;
-			const findings = await store.listReviewFindings(card.id);
-			findings.forEach((finding, order) => {
-				rows.push({
-					prompt: finding.prompt,
-					order,
-					cardId: card.id,
-					cardCreatedAt: card.createdAt,
-					cardKind: card.kind,
-					cardFollowUpOf: card.followUpOf,
-				});
-			});
-		}
-		const newest = validationOutcomes(reviewId, rows);
+		// Use the same completed-run boundary as the route and migration.
+		const newest = await store.appliedValidationOutcomes(reviewId);
 		const reset: string[] = [];
 		for (const t of tasks) {
 			if (lead !== undefined && t.id !== lead) continue;

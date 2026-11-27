@@ -7631,6 +7631,70 @@ describe("prompt author column", () => {
 });
 
 describe("async store serial operations", () => {
+	test("validation outcome reads exclude a yielded transaction that rolls back", async () => {
+		const store = await open(join(root, "validation-outcome-rollback"));
+		const card = await store.createTask("validation run", null, "validation");
+		await store.updateTask(card.id, {
+			followUpOf: "R",
+			stage: "done",
+			state: "idle",
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const failure = new Error("rollback validation finding");
+		const transaction = store
+			.transaction(async () => {
+				await store.appendReviewFinding(card.id, {
+					prompt: "Validation: #L deployment",
+					model: null,
+					rank: null,
+					security: null,
+				});
+				entered.resolve();
+				await release.promise;
+				throw failure;
+			})
+			.catch((error: unknown) => error);
+		await entered.promise;
+		const read = store.appliedValidationOutcomes("R");
+		release.resolve();
+		expect(await transaction).toBe(failure);
+		expect((await read).size).toBe(0);
+		expect((await store.appliedValidationOutcomes("R")).size).toBe(0);
+	});
+
+	test("persisted outcomes cross the completed-run boundary only", async () => {
+		const store = await open(join(root, "validation-outcome-lifecycle"));
+		const card = await store.createTask("validation run", null, "validation");
+		await store.updateTask(card.id, { followUpOf: "R" });
+		await store.appendReviewFinding(card.id, {
+			prompt: "Validation: #L deployment",
+			model: null,
+			rank: null,
+			security: null,
+		});
+		// The same recorded finding stays a candidate throughout these states.
+		for (const patch of [
+			{ stage: "todo", state: "queued" },
+			{ stage: "in_progress", state: "running" },
+			{ stage: "in_progress", state: "needs_you" },
+			{ stage: "in_progress", state: "idle", cancelledAt: Date.now() },
+		] as const) {
+			await store.updateTask(card.id, patch);
+			expect((await store.appliedValidationOutcomes("R")).size).toBe(0);
+		}
+		await store.updateTask(card.id, {
+			cancelledAt: null,
+			stage: "done",
+			state: "idle",
+		});
+		expect((await store.appliedValidationOutcomes("R")).get("L")).toEqual({
+			outcome: "deployment",
+			evidence: "",
+			cardId: card.id,
+		});
+	});
+
 	for (const fail of [false, true]) {
 		test(`a yielded file transaction isolates unrelated work and ${fail ? "rolls back" : "commits"} nested work`, async () => {
 			const dir = join(root, `async-file-transaction-${fail}`);

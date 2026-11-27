@@ -15372,8 +15372,8 @@ export function Drawer({
 			// OTTR-1252 send-back 8: a grill can replace the details text, so the
 			// newest result may live only in the recorded finding that the view
 			// carries — never drop the outcome.
-			return detail?.recordedValidationOutcome
-				? `${detail.recordedValidationOutcome} — ${fallback}`
+			return detail?.appliedValidationOutcome
+				? `${detail.appliedValidationOutcome} — ${fallback}`
 				: fallback;
 		let end = details.indexOf(marker, start + 1);
 		if (end < 0) end = details.length;
@@ -15403,7 +15403,7 @@ export function Drawer({
 		!cancelled &&
 		(leadBlocker(detail?.prompt ?? "").kind === "deployment" ||
 			leadValidationOutcome(detail?.details ?? null) === "deployment" ||
-			detail?.recordedValidationOutcome === "deployment");
+			detail?.appliedValidationOutcome === "deployment");
 	// OTTR-1252 send-back 8: the open validation run's id reads the LIVE board
 	// rows (the socket refreshes them), not the cached detail — another run's
 	// completion must re-enable Validate now and another run's creation must

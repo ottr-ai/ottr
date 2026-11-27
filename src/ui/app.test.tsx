@@ -4960,12 +4960,17 @@ describe("Waiting lead drawer actions", () => {
 			}
 			return new Response("{}", { status: 404 });
 		});
-		const { container, unmount } = await mount(
+		const { container, root, unmount } = await mount(
 			<Drawer {...base} task={card} tasks={boardTasks} />,
 		);
 		await act(async () => {});
 		return {
 			container,
+			updateTasks: async (tasks: TaskCard[]) => {
+				await act(async () => {
+					root.render(<Drawer {...base} task={card} tasks={tasks} />);
+				});
+			},
 			close: async () => {
 				await unmount();
 				restore();
@@ -5056,44 +5061,71 @@ describe("Waiting lead drawer actions", () => {
 		}
 	});
 
-	test("another run's completion re-enables Validate now; a new run disables it (send-back 8)", async () => {
-		// Happy-dom scenario for the live read: the same lead and detail, only
-		// the board row changes. Before the fix the drawer read the cached
-		// detail, so neither update moved the button.
-		const open = await mountLead(leadCard(), [
+	test("one mounted drawer updates Validate now when runs finish and appear", async () => {
+		const { container, updateTasks, close } = await mountLead(leadCard(), [
 			validationRunCard("V-3", "todo"),
 		]);
-		const disabled = (container: Element): boolean | null => {
-			const validate = [
+		const validate = () =>
+			[
 				...container.querySelectorAll<HTMLButtonElement>(
 					".drawer-actions button",
 				),
-			].find((b) => b.textContent?.trim() === "Validate now");
-			return validate?.disabled ?? null;
-		};
+			].find((button) => button.textContent?.trim() === "Validate now");
 		try {
-			expect(disabled(open.container)).toBe(true);
-			await open.close();
-			// The run settled done: the same drawer state re-enables the button.
-			const done = await mountLead(leadCard(), [
+			expect(validate()?.disabled).toBe(true);
+			expect(validate()?.title).toBe(
+				"Validation run #V-3 is open in this project",
+			);
+			await updateTasks([validationRunCard("V-3", "done")]);
+			expect(validate()?.disabled).toBe(false);
+			expect(validate()?.title).toBe(
+				"Files this review's batch validation run with this lead first",
+			);
+			await updateTasks([
 				validationRunCard("V-3", "done"),
-			]);
-			try {
-				expect(disabled(done.container)).toBe(false);
-			} finally {
-				await done.close();
-			}
-			// A new run appears: the same state disables it again.
-			const again = await mountLead(leadCard(), [
 				validationRunCard("V-9", "todo"),
 			]);
-			try {
-				expect(disabled(again.container)).toBe(true);
-			} finally {
-				await again.close();
-			}
+			expect(validate()?.disabled).toBe(true);
+			expect(validate()?.title).toBe(
+				"Validation run #V-9 is open in this project",
+			);
 		} finally {
-			// close() already ran for `open`.
+			await close();
+		}
+	});
+
+	test("an unapplied deployment finding keeps Validate now and the validation hint", async () => {
+		const cancelledRun = {
+			...validationRunCard("V-3", "todo"),
+			cancelledAt: 100,
+		};
+		const { container, close } = await mountLead(
+			leadCard({
+				validatedAt: null,
+				details: null,
+				appliedValidationOutcome: null,
+			}),
+			[cancelledRun],
+		);
+		try {
+			const buttons = [
+				...container.querySelectorAll<HTMLButtonElement>(
+					".drawer-actions button",
+				),
+			];
+			expect(buttons.map((button) => button.textContent?.trim())).toEqual([
+				"Cancel task",
+				"Validate now",
+			]);
+			expect(buttons[1]?.disabled).toBe(false);
+			expect(container.textContent).toContain(
+				"Validate now starts it at once.",
+			);
+			expect(container.textContent).not.toContain(
+				"asks this lead's deployment question",
+			);
+		} finally {
+			await close();
 		}
 	});
 
@@ -5136,7 +5168,7 @@ describe("Waiting lead drawer actions", () => {
 		const { container, close } = await mountLead(
 			leadCard({
 				details: "Grilled definition of ready",
-				recordedValidationOutcome: "deployment",
+				appliedValidationOutcome: "deployment",
 			}),
 		);
 		try {
@@ -5162,7 +5194,7 @@ describe("Waiting lead drawer actions", () => {
 		const { container, close } = await mountLead(
 			leadCard({
 				details: "Grilled definition of ready",
-				recordedValidationOutcome: "blocked",
+				appliedValidationOutcome: "blocked",
 			}),
 		);
 		try {

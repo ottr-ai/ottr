@@ -299,18 +299,9 @@ export const projectMigrations: readonly PostgresMigration[] = [
 		await db.exec(
 			"ALTER TABLE tasks ADD COLUMN waits_validation bigint NOT NULL DEFAULT 0",
 		);
-		// The newest recorded outcome per lead id, from review_findings: the
-		// authoritative record that survives a later grill's details wipe.
-		// selectValidationOutcomeRows is the canonical read (one SQL, one row
-		// shape, shared with the SQLite convergence), and validationOutcomes
-		// the ONE selector the settle and resetValidatedLeads also read: it
-		// keeps only the lead's own review's runs (a foreign review's result
-		// never decides the lead), sorts runs newest first, and takes the
-		// first result per lead inside a run. The legacy rows group by their
-		// own review, so each group selects against its review. The findings
-		// table ships in step one, so every schema that reaches this step
-		// has it.
-		const outcomeRows = await selectValidationOutcomeRows(db);
+		// Completed runs supply persistent results after a later details edit.
+		// The shared query and selector preserve lifecycle, review, and result order.
+		const outcomeRows = await selectAppliedValidationOutcomeRows(db);
 		const legacy = await db
 			.query<
 				{
@@ -354,22 +345,18 @@ export const projectMigrations: readonly PostgresMigration[] = [
 export const CONVERGE_LEAD_WAIT_SQL =
 	"UPDATE tasks SET stage = 'todo', state = 'queued', waits_validation = 1, queued_at = updated_at WHERE id = ?";
 
-/** The ONE query that reads validation results for the shared outcome
- * selector: the column aliases are production shape, defined here once so no
- * reader or fixture can drift (the `finding_order` alias exists because
- * `order` is a reserved word). Both engines run it verbatim; rows arrive
- * unordered and validationOutcomes sorts them itself. */
-export const VALIDATION_OUTCOME_ROWS_SQL = `SELECT f.prompt AS prompt, f.id AS finding_order,
+/** Candidate findings become persisted outcomes only after a non-cancelled run
+ * reaches done. Settlement reads candidates separately before this boundary.
+ * Both migrations and the queued store read use this query. */
+export const APPLIED_VALIDATION_OUTCOME_ROWS_SQL = `SELECT f.prompt AS prompt, f.id AS finding_order,
 	f.card_id AS card_id, c.created_at AS created_at, c.kind AS kind,
 	c.follow_up_of AS follow_up_of
 FROM review_findings f
 JOIN tasks c ON c.id = f.card_id
-WHERE f.prompt LIKE 'Validation: #%'`;
+WHERE f.prompt LIKE 'Validation: #%'
+	AND c.kind = 'validation' AND c.stage = 'done' AND c.cancelled_at IS NULL`;
 
-/** The database surface selectValidationOutcomeRows needs: both the SQLite
- * driver's Database and the PostgreSQL driver's Database satisfy it. */
-/** The database surface selectValidationOutcomeRows needs: both drivers'
- * query methods satisfy it (rows are cast to the aliased shape once, here). */
+/** The query surface that both database drivers implement. */
 type OutcomeRowsDb = {
 	query(sql: string): { all(): Promise<unknown[]> };
 };
@@ -383,14 +370,13 @@ type ValidationOutcomeRowDb = {
 	follow_up_of: string | null;
 };
 
-/** Reads the validation results through the canonical SQL and maps them into
- * the shared selector's row shape. Both the SQLite convergence and the
- * PostgreSQL step call this, so their outcome source cannot drift. */
-export async function selectValidationOutcomeRows(
+/** Reads completed-run outcomes for the shared selector. Runtime callers must
+ * use ProjectStore.appliedValidationOutcomes to preserve transaction isolation. */
+export async function selectAppliedValidationOutcomeRows(
 	db: OutcomeRowsDb,
 ): Promise<ValidationOutcomeRow[]> {
 	const rows = (await db
-		.query(VALIDATION_OUTCOME_ROWS_SQL)
+		.query(APPLIED_VALIDATION_OUTCOME_ROWS_SQL)
 		.all()) as ValidationOutcomeRowDb[];
 	return rows.map((row) => ({
 		prompt: row.prompt,

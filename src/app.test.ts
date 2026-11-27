@@ -13692,6 +13692,67 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		}
 	});
 
+	const cancelledDeployment = async () => {
+		const { review, lead } = await doneReviewWithWaitingLead();
+		const run = await store.createTask("validation run", null, "validation");
+		await store.updateTask(run.id, {
+			followUpOf: review.id,
+			stage: "in_progress",
+			state: "running",
+		});
+		await store.appendReviewFinding(run.id, {
+			prompt: `Validation: #${lead.id} deployment\nWhich proxy terminates TLS?`,
+			model: null,
+			rank: null,
+			security: null,
+		});
+		await store.updateTask(run.id, { cancelledAt: Date.now(), state: "idle" });
+		return { review, lead, run };
+	};
+
+	test("a cancelled run's deployment finding does not refuse a lead retry", async () => {
+		const { review, lead } = await cancelledDeployment();
+		let filed: string | undefined;
+		validateLeadsImpl = async (e, reviewId) => {
+			const card = await e.store.createTask(
+				"retry validation",
+				null,
+				"validation",
+			);
+			await e.store.updateTask(card.id, { followUpOf: reviewId });
+			filed = card.id;
+			return { id: card.id, reset: [] };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${lead.id}/validate`, {});
+			expect(res.status).toBe(200);
+			const body = await res.json();
+			expect(body.id).toBe(filed);
+			expect(body.kind).toBe("validation");
+			expect((await store.getTask(lead.id))?.validatedAt).toBeNull();
+		} finally {
+			validateLeadsImpl = null;
+			if (filed !== undefined)
+				await store.updateTask(filed, { cancelledAt: Date.now() });
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
+	test("a cancelled run's deployment finding is absent from the lead view", async () => {
+		const { review, lead } = await cancelledDeployment();
+		try {
+			const res = await get(`/api/projects/p1/tasks/${lead.id}`);
+			expect(res.status).toBe(200);
+			const body = await res.json();
+			expect(body.appliedValidationOutcome).toBeNull();
+			expect(body.validatedAt).toBeNull();
+		} finally {
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(lead.id, { cancelledAt: Date.now() });
+		}
+	});
+
 	test("a waiting lead with an open validation card answers 409 with its id", async () => {
 		const { review, lead } = await doneReviewWithWaitingLead();
 		const run = await store.createTask(

@@ -29,16 +29,18 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    then converges per row, idempotent on every open:
 
    ```sql
-   -- VALIDATION_OUTCOME_ROWS_SQL (postgresSchema.ts), run by
-   -- selectValidationOutcomeRows for both engines:
+   -- APPLIED_VALIDATION_OUTCOME_ROWS_SQL (postgresSchema.ts), run by
+   -- selectAppliedValidationOutcomeRows for both engines:
    SELECT f.prompt AS prompt, f.id AS finding_order, f.card_id AS card_id,
      c.created_at AS created_at, c.kind AS kind,
      c.follow_up_of AS follow_up_of
    FROM review_findings f
    JOIN tasks c ON c.id = f.card_id
-   WHERE f.prompt LIKE 'Validation: #%';
+   WHERE f.prompt LIKE 'Validation: #%'
+     AND c.kind = 'validation' AND c.stage = 'done'
+     AND c.cancelled_at IS NULL;
    -- per legacy row, grouped by its review:
-   SELECT id, prompt, validated_at, follow_up_of FROM tasks
+   SELECT id, prompt, details, validated_at, follow_up_of FROM tasks
    WHERE stage = 'backlog' AND cancelled_at IS NULL
      AND prompt LIKE 'Needs validation%'
      AND prompt NOT LIKE '%The user answered the review%';
@@ -46,27 +48,14 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
    --   waits_validation = 1, queued_at = updated_at WHERE id = ?
    ```
 
-   Only undecided leads converge (`legacyLeadWaits`, src/scheduler.ts): the
-   deciding outcome is the lead's newest review_findings record, read through
-   ONE shared selector (`validationOutcomes`) that the settle,
-   resetValidatedLeads, the SQLite convergence and the PostgreSQL step all
-   call — only results of the lead's own review count, runs newest first,
-   and the first result per lead inside a run — so no reader can drift: a
-   confirmed result is normal work the operator may park, a refuted lead
-   stays cancelled, and the operator's applies answer rides its own marker
-   in the prompt, while a never-validated lead, a still-blocked result, or
-   an unanswered deployment result waits. Details segments are deliberately
-   not an outcome source: a reset can only act on recorded findings, so
-   waiting on a details-only outcome would lock work behind a Validate now
-   that can never unlock it. When neither a finding nor a segment could
-   have decided the row, a validatedAt means an outcome was recorded
-   through a path that kept no findings (the started-lead details-only
-   branch, later wiped by a grill's details replacement), and the row stays
-   decided — re-locking it would strand work that batching (validatedAt
-   null) and the reset can never unlock. The per-row decision runs in
-   TypeScript because "newest run, first result" needs newest-wins reading
-   that no LIKE can do. (`Needs-validation lead questions...` does not
-   match the pattern: the hyphen.)
+   `legacyLeadWaits` decides which leads wait. A confirmed or refuted result keeps
+   its decision. The operator's applies answer also keeps its decision.
+   A never-validated, blocked, or unanswered deployment lead waits.
+   A details segment supplies the legacy result when no applied finding exists.
+   The scoped reset reads the same legacy result, so Validate now can clear a blocked stamp.
+   When `validatedAt` exists without a readable result, the row keeps its decision.
+   The per-row decision uses TypeScript, not SQL `LIKE`, to preserve the result order.
+   `Needs-validation lead questions...` does not match the lead prefix because it contains a hyphen.
 3. PostgreSQL: the column lives only in a numbered step, never in
    `projectStepOne` — the steps run on fresh databases too, so a stepOne
    column plus the step's ALTER fails with duplicate_column (the
@@ -77,6 +66,31 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
 4. No new enum value: the stage and state CHECK lists stay untouched, so no
    table rebuild happens.
 5. The shared fresh-SQLite vs fresh-PostgreSQL schema comparison test stays green.
+
+## Outcome authority
+
+The bug class is premature outcome authority. Raw findings can exist before transaction commit or validation settlement.
+Raw findings must not decide retries, drawer actions, resets, or migration results.
+
+- `onRecorded` stores candidate findings. It does not apply a result to a lead.
+- Settlement consumes its own candidate findings through `validationOutcomes`.
+- Persisted readers use `selectAppliedValidationOutcomeRows`.
+  Its single query admits only non-cancelled validation cards in `done`.
+- `ProjectStore.appliedValidationOutcomes(reviewId)` owns the runtime read.
+  It uses `this.queue.run` around the query and selection.
+  Unrelated reads wait for transaction commit or rollback.
+- The route, `taskView`, and reset use this store method.
+  SQLite convergence and the PostgreSQL step use the same query before the store admits callers.
+- Selection still uses the lead's review, newest run first, and first result per lead within a run.
+- The API field `appliedValidationOutcome` contains only this applied result.
+  Details retain the legacy result fallback.
+- The drawer derives the open run from current board rows on each render.
+  Its test changes rows through one React root without another detail fetch.
+
+Assumptions: settlement marks a successful validation card `done`.
+Cancelled, stopped, queued, running, and needs-you cards supply no applied findings.
+No schema change or validation prompt change is necessary.
+
 
 ## Turn loop (src/turn.ts)
 
@@ -133,8 +147,8 @@ meaning; the marker is the scheduler's hold for both null and set `validatedAt`.
 - The lead answer flow: "applies" clears `waitsValidation` and queues the lead
   (todo/queued/queuedAt, answer appended to the prompt); "does not apply"
   cancels it. The old backlog+idle shape keeps working where it still exists.
-- `taskView` adds optional `openValidationRun?: string | null`: the id of the
-  project's one open validation card, set only for a waiting lead's detail view.
+- `taskView` adds optional `appliedValidationOutcome` from the serialized store lookup.
+  A cancelled or unfinished run cannot supply this value.
 
 ## UI (src/ui/app.tsx)
 
@@ -142,8 +156,7 @@ For a waiting lead the drawer renders:
 
 - a sandbox-blocker lead: exactly two actions, "Cancel task" (existing) and
   "Validate now" (new, posts the lead validate route). "Validate now" is
-  disabled with the open run's card id in its title while `openValidationRun`
-  is set;
+  disabled with the open run's card id in its title while the current board rows contain an open validation run;
 - a deployment decision (blocker line `deployment fact`, or a recorded
   deployment outcome overruling a sandbox blocker line): only "Cancel task".
   No run can take the lead, so there is no Validate now button;
@@ -151,8 +164,8 @@ For a waiting lead the drawer renders:
   reads "The review #<id> starts this lead's validation run by itself.
   Validate now starts it at once."; a deployment-fact lead reads "The review
   #<id> asks this lead's deployment question; your answer decides the lead.";
-  plus the last validation result and date when `validatedAt` is set (the
-  newest "Validated by " segment of the fetched details);
+  plus the last validation result and date when `validatedAt` exists.
+  An applied finding supplies the result when the details lack a result segment;
 - no Move-to-backlog/park button, no Merge anyway, no prompt edit, no reply or
   steer composer, no Start. Gated on `task.waitsValidation`.
 
@@ -191,6 +204,11 @@ waiting lead instead of "queued with no hold found".
    prompt later loses the tag stays exempt (sequence test through the real
    store write and mergeHold).
 7. The board report shows the waiting lead as "waits for validation".
+8. An unrelated outcome read waits for a yielded transaction and observes no result after rollback.
+9. A cancelled run's deployment finding does not prevent a lead retry or classify the drawer as deployment.
+10. A lifecycle test checks queued, running, needs-you, cancelled, and done validation cards through the real store.
+11. One mounted drawer enables Validate now when a run finishes, then disables it when a new run appears.
+
 
 ## Non-goals
 
