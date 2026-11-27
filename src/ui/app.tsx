@@ -2861,13 +2861,15 @@ type CreateArgs = {
 	from: Rect | null;
 };
 
-/** OTTR-1337: the creates in flight, for the boards' placeholders; `drop` removes one.
+/** OTTR-1337: the creates in flight, for the boards' placeholders.
  * `taken`: ids of creates that settled and dropped, so pairCreates never pairs them again. */
 export const PendingContext = createContext<{
 	pending: PendingCreate[];
 	taken: ReadonlySet<string>;
-	drop: (key: string) => void;
-}>({ pending: [], taken: new Set(), drop: () => {} });
+}>({ pending: [], taken: new Set() });
+
+/** How long a failed placeholder's exit plays before App drops the create. */
+const PENDING_EXIT_MS = 170;
 
 const MORPH_EASE = "cubic-bezier(0.2, 0.7, 0.3, 1)"; // --ease; WAAPI options don't resolve var()
 /** A failed send's error line; the draft stays in the dialog and its on-device cache. */
@@ -2879,13 +2881,12 @@ const notAdded = (message: string): string =>
 const enteredPlaceholders = new Set<string>();
 
 /** The motion of a placeholder (the todo lane's card, the Overview's Todo chip): it morphs
- * out of the New task dialog's rect into its spot, and plays a short exit, then drops, when
- * the POST fails. */
+ * out of the New task dialog's rect into its spot, and plays a short exit when the POST
+ * fails. App drops the failed create on its own timer, mounted placeholder or not. */
 function usePendingMotion(
 	ref: React.RefObject<HTMLElement | null>,
 	p: PendingCreate,
 ): void {
-	const { drop } = useContext(PendingContext);
 	const from = p.from;
 	useLayoutEffect(() => {
 		const el = ref.current;
@@ -2965,13 +2966,10 @@ function usePendingMotion(
 							{ opacity: "1", transform: "scale(1)" },
 							{ opacity: "0", transform: "scale(0.96)" },
 						],
-				{ duration: 160, easing: "ease-in", fill: "forwards" },
+				{ duration: PENDING_EXIT_MS - 10, easing: "ease-in", fill: "forwards" },
 			);
 		}
-		// A timer, never Animation.finished: the drop must happen even where the animation never settles.
-		const t = setTimeout(() => drop(p.key), 170);
-		return () => clearTimeout(t);
-	}, [p.failed, p.key, drop, ref]);
+	}, [p.failed, ref]);
 }
 
 /** The placeholder of a task the server has not added yet, in the todo lane. */
@@ -4963,6 +4961,22 @@ export function ProjectBoard({
 	const reviewNote = skillGapNote(userLayer ?? null, "review");
 	// Mobile stage tabs: which column the single-column tier shows; the desktop grid ignores it.
 	const [stage, setStage] = useState<Stage>("todo");
+	// The phone tier shows one lane: a new placeholder flips the tabs to Todo, so it is never
+	// drawn in a hidden lane. Set during render (React's previous-render pattern), so the
+	// placeholder's morph measures the visible lane in the same commit. Keys seen at mount
+	// (a board switched back to) do not flip it.
+	const [seenPending, setSeenPending] = useState(
+		() => new Set(pendingCards.map((p) => p.key)),
+	);
+	const freshPending = pendingCards.filter(
+		(p) => !p.failed && !seenPending.has(p.key),
+	);
+	if (freshPending.length > 0) {
+		setSeenPending(
+			new Set([...seenPending, ...freshPending.map((p) => p.key)]),
+		);
+		if (stage !== "todo") setStage("todo");
+	}
 	const stageTab = useRef<HTMLButtonElement>(null);
 	useEffect(() => {
 		// Center alignment stays stable while tap feedback shrinks the button.
@@ -19318,6 +19332,13 @@ export function App() {
 				(message) => {
 					// act shows the error toast; the input queues for this project's New task dialog.
 					mark({ failed: true });
+					// App owns the drop: a placeholder that is not mounted (Settings, another
+					// project) has no timer of its own, and the entry must still go.
+					setTimeout(
+						() =>
+							setPendingCreates((list) => list.filter((p) => p.key !== key)),
+						PENDING_EXIT_MS,
+					);
 					setComposeRestores((queue) => [
 						...queue,
 						{ key, project, text, model, files, error: message },
@@ -19334,9 +19355,6 @@ export function App() {
 		},
 		[act],
 	);
-	const dropPending = useCallback((key: string): void => {
-		setPendingCreates((list) => list.filter((p) => p.key !== key));
-	}, []);
 	const dropRestore = useCallback((key: string): void => {
 		setComposeRestores((queue) => queue.filter((r) => r.key !== key));
 	}, []);
@@ -19360,9 +19378,8 @@ export function App() {
 		() => ({
 			pending: pendingCreates,
 			taken: takenRef.current,
-			drop: dropPending,
 		}),
-		[pendingCreates, dropPending],
+		[pendingCreates],
 	);
 
 	const selectedStateTask =

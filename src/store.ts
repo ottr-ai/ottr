@@ -9,7 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { leadCardTitle, retitleBareLeadTitles } from "./auditLeads.ts";
+import { retitleBareLeadTitles } from "./auditLeads.ts";
 import { mkdirBelow, writeBelow } from "./confine.ts";
 import {
 	closeLocked,
@@ -53,6 +53,7 @@ import {
 } from "./session.ts";
 import { type SQLiteDatabase, sqliteNumber } from "./sqliteDriver.ts";
 import { StoreQueue } from "./storeQueue.ts";
+import { deriveTitle } from "./title.ts";
 import { assignTopics } from "./topics.ts";
 import type {
 	AskQuestion,
@@ -1421,28 +1422,6 @@ export function discoverProjects(
 		}
 	}
 	return [...byName.values()].sort();
-}
-
-/**
- * First non-empty trimmed line of the prompt, max 80 chars — the task's title. Skips section
- * labels (Markdown headings with a single word, e.g. "# Goal") and strips leading `#` marks,
- * so a heading like "# Set up agent rules" becomes the bare text. Overlong lines cut at a
- * word boundary (shortTitle), never mid-word. A lead filed with the review prompt's bare tag
- * line ("Needs validation" alone on line 1, OTTR-1164) titles from its claim instead, so
- * leads stay tellable apart on the board. No code matches on the title text (card kind
- * is a trusted, server-set field, never derived from prompt text), so this is safe to change.
- */
-function deriveTitle(prompt: string): string {
-	// OTTR-1164: "Needs validation: <subject>" beats the bare tag as the title.
-	const lead = leadCardTitle(prompt);
-	if (lead !== null) return lead;
-	const lines = prompt.split("\n").map((line) => line.trim());
-	const isSectionLabel = (line: string) => /^#{1,6}\s+\S+$/.test(line);
-	const line =
-		lines.find((line) => line.length > 0 && !isSectionLabel(line)) ??
-		lines.find((line) => line.length > 0) ??
-		"";
-	return shortTitle(line.replace(/^#+\s*/, ""), 80);
 }
 
 /**

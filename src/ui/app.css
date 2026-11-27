@@ -9143,6 +9143,10 @@ button.log-mode[aria-pressed="true"] {
 	.project-actions .primary {
 		display: none;
 	}
+	/* The scroll that brings a new placeholder into view clears the fixed FAB. */
+	.card.pending-card {
+		scroll-margin-bottom: calc(88px + env(safe-area-inset-bottom, 0px));
+	}
 	.fab {
 		display: inline-flex;
 		position: fixed;

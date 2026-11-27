@@ -2,6 +2,8 @@
 // placeholder card holds the todo lane until the server's card arrives. Pure helpers,
 // so the board wiring in app.tsx stays thin and the rules stay unit-tested.
 
+import { deriveTitle } from "../title.ts";
+
 /** A viewport rect: the dialog the placeholder morphs out of. */
 export interface Rect {
 	left: number;
@@ -46,15 +48,20 @@ export function placeholderTitle(text: string, max = 140): string {
  * The pairing never hides a real card: it only decides which placeholders still draw.
  * - An answered create pairs with its own id, once the state carries that card.
  * - An unanswered create can meet its card first: a live frame can carry the card before
- *   the POST answers. It then pairs, in submit order, with the oldest card of its project
- *   that is new since its submit and that no other create or settled create claims. A
- *   wrong guess (another tab's card) only hides this placeholder early; the POST answer
- *   corrects it.
+ *   the POST answers. It then pairs only with a card that matches its own request: same
+ *   project, new since its submit, unclaimed, and titled as the server titles this prompt
+ *   (deriveTitle over the trimmed text). Among several matches the oldest wins, in submit
+ *   order. An unrelated arrival never matches, so the placeholder stays until its answer.
  * `taken`: ids of creates that already settled and dropped; they never pair again.
  */
 export function pairCreates(
 	pending: readonly PendingCreate[],
-	tasks: readonly { id: string; project: string; createdAt: number }[],
+	tasks: readonly {
+		id: string;
+		project: string;
+		title: string;
+		createdAt: number;
+	}[],
 	taken: ReadonlySet<string>,
 ): Map<string, string> {
 	const ids = new Set(tasks.map((t) => t.id));
@@ -68,9 +75,13 @@ export function pairCreates(
 	const oldest = [...tasks].sort((a, b) => a.createdAt - b.createdAt);
 	for (const p of pending) {
 		if (p.id !== null || p.failed) continue;
+		const title = deriveTitle(p.text.trim());
 		const hit = oldest.find(
 			(t) =>
-				t.project === p.project && !p.before.has(t.id) && !claimed.has(t.id),
+				t.project === p.project &&
+				t.title === title &&
+				!p.before.has(t.id) &&
+				!claimed.has(t.id),
 		);
 		if (hit === undefined) continue;
 		claimed.add(hit.id);

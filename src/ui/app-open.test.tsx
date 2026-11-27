@@ -13,7 +13,7 @@ import type {
 } from "../types.ts";
 import { clearComposeDraft, loadComposeDraft } from "./notify.ts";
 import { refreshState } from "./socket.ts";
-import { onChangeOf, onKeyDownOf } from "./testDom.tsx";
+import { onChangeOf, onClickOf, onKeyDownOf } from "./testDom.tsx";
 
 // Storage must exist before the import: app.tsx reads sessionStorage at module
 // load. The DOM globals register after the import instead — app.tsx auto-renders
@@ -2655,8 +2655,9 @@ test("a frame that carries the new card before the POST answers shows the card i
 		await addTask(newTaskText);
 		expectPlaceholder();
 
-		// No real card is held back: the frame's new card of this project stands in for the
-		// placeholder before the POST names its id. Never both, never a duplicate.
+		// No real card is held back: the frame's new card of this project, titled as the
+		// server titles this prompt ("Ship the lane"), stands in for the placeholder before
+		// the POST names its id. Never both, never a duplicate.
 		setFrame(frameWithNewCard());
 		refreshState();
 		let overlap = false;
@@ -2713,42 +2714,55 @@ const waitingLine = (): string | null => {
 const oneWaiting =
 	"1 earlier task was not added. Send or clear this draft, then open New task again to get it back.";
 
-test("a card from another tab shows at once while a local create runs", async () => {
+test("a card from another tab shows at once while a local create runs, and the placeholder holds the lane", async () => {
 	await withCreatePost(async ({ answer }) => {
 		await mountAt("/projects/alpha");
 		await addTask(newTaskText);
 		expectPlaceholder();
 
-		// Another tab adds AL-7 while this tab's POST runs. The placeholder may take it for
-		// its own card, but the card itself always renders.
+		// Another tab adds AL-7 while this tab's POST runs. Its title is not this prompt's,
+		// so the placeholder never takes it for its own card: from the moment AL-7 renders,
+		// both stand on the board in every sampled render until AL-9 lands.
 		const foreign = card({
 			id: "AL-7",
 			title: "Another tab's task",
 			sessionTitle: "Another tab's task",
 			createdAt: 3,
 		});
-		let hidden = false;
-		const shown = (): void => {
-			if (cardCount("AL-7") !== 1) hidden = true;
+		let seen = false;
+		let broken = false;
+		const sample = (): void => {
+			if (cardCount("AL-7") === 1) seen = true;
+			else if (seen) broken = true;
+			if (todoPendingCards().length !== 1) broken = true;
 		};
 		setFrame(frameWith(foreign));
 		refreshState();
-		await waitFor(() => cardCount("AL-7") === 1);
-
-		// The answer names AL-9: AL-7 is not this create's card, so its placeholder holds
-		// the lane again until AL-9 lands.
-		answer(jsonResponse(newCard));
 		await waitFor(() => {
-			shown();
-			return todoPendingCards().length === 1;
+			sample();
+			return seen;
 		});
+		await holdsFor(() => {
+			sample();
+			return true;
+		});
+		expect(broken).toBe(false);
+
+		// The answer names AL-9; the frame still lacks it, so the placeholder holds on.
+		answer(jsonResponse(newCard));
+		await holdsFor(() => {
+			sample();
+			return true;
+		});
+		expect(broken).toBe(false);
+
 		setFrame(frameWith(foreign, newCard));
 		refreshState();
 		await waitFor(() => {
-			shown();
+			if (cardCount("AL-7") !== 1) broken = true;
 			return cardCount("AL-9") === 1 && pendingCards().length === 0;
 		});
-		expect(hidden).toBe(false);
+		expect(broken).toBe(false);
 		expect(cardCount("AL-7")).toBe(1);
 	});
 });
@@ -2885,5 +2899,84 @@ test("New task on the Overview shows a +1 adding chip in the project's Todo cell
 			() => document.querySelectorAll(".pending-count").length === 0,
 		);
 		expect(newTaskOpen()).toBe(false);
+	});
+});
+
+/** The `data-active` flag of one board lane: the phone tier shows only the active lane. */
+const laneActive = (stage: string): string | null | undefined =>
+	document
+		.querySelector(`section.stage[data-stage="${stage}"]`)
+		?.getAttribute("data-active");
+
+test("New task on another stage tab flips the tabs to Todo, where the placeholder stands", async () => {
+	await withCreatePost(async () => {
+		await mountAt("/projects/alpha");
+		// The stage tabs render at every width; CSS shows them only in the phone tier.
+		const inProgress = document.querySelector(
+			'.stage-tabs button[role="tab"][data-tab="in_progress"]',
+		);
+		expect(inProgress).not.toBeNull();
+		await act(async () => {
+			onClickOf(inProgress!)();
+		});
+		expect(laneActive("in_progress")).toBe("true");
+		expect(laneActive("todo")).toBe("false");
+
+		await addTask(newTaskText);
+		expect(laneActive("todo")).toBe("true");
+		expect(laneActive("in_progress")).toBe("false");
+		expect(
+			document
+				.querySelector('.stage-tabs button[role="tab"][data-tab="todo"]')
+				?.getAttribute("aria-selected"),
+		).toBe("true");
+		expectPlaceholder();
+	});
+});
+
+test("a create that fails while the board is not mounted still drops its placeholder", async () => {
+	await withCreatePost(async ({ answer, bodies }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		expectPlaceholder();
+
+		// Another project's board takes the view: Alpha's board and its placeholder unmount.
+		await act(async () => {
+			window.history.pushState(null, "", "/projects/beta");
+			window.dispatchEvent(new window.PopStateEvent("popstate"));
+		});
+		await waitFor(
+			() =>
+				header() === "Beta" &&
+				pendingCards().length === 0 &&
+				cardEl("AL-1") === null,
+		);
+
+		// The POST fails off the board; well past the exit time, nothing is left to drop it.
+		answer(jsonResponse({ error: "boom" }, 500));
+		await holdsFor(
+			() => header() === "Beta" && pendingCards().length === 0,
+			80,
+		);
+		expect(bodies.length).toBe(1);
+
+		// Back on the board, the failed create is gone: no placeholder renders, not even for
+		// an exit. The New task dialog may reopen with the text; only placeholders count here.
+		let leaked = false;
+		await act(async () => {
+			window.history.back();
+		});
+		await waitFor(() => {
+			if (pendingCards().length > 0) leaked = true;
+			return (
+				window.location.pathname === "/projects/alpha" &&
+				document.querySelector('section.stage[data-stage="todo"]') !== null
+			);
+		});
+		await holdsFor(() => {
+			if (pendingCards().length > 0) leaked = true;
+			return true;
+		});
+		expect(leaked).toBe(false);
 	});
 });

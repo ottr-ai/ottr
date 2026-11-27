@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { deriveTitle } from "../title.ts";
 import {
 	type PendingCreate,
 	pairCreates,
@@ -22,10 +23,18 @@ const create = (over: Partial<PendingCreate>): PendingCreate => ({
 	...over,
 });
 
-const task = (id: string, project = "alpha", createdAt = 0) => ({
+// The default title is the one the server gives the default create's text, so a
+// test that only varies ids, projects or ages keeps every card a title match.
+const task = (
+	id: string,
+	project = "alpha",
+	createdAt = 0,
+	title = "Fix the login redirect",
+) => ({
 	id,
 	project,
 	createdAt,
+	title,
 });
 const at = (left: number, top: number) => ({ left, top });
 
@@ -89,6 +98,57 @@ test("pairCreates pairs an unanswered create with the oldest new card of its own
 		new Set(),
 	);
 	expect(pairs).toEqual(new Map([["p1", "AL-9"]]));
+});
+
+test("pairCreates never pairs an unanswered create with a new card titled for another prompt", () => {
+	// Another tab's task lands while this create runs: same project, new since
+	// submit, unclaimed, but not this prompt's card.
+	const p = create({});
+	expect(
+		pairCreates(
+			[p],
+			[task("AL-1"), task("AL-7", "alpha", 3, "Another tab's task")],
+			new Set(),
+		),
+	).toEqual(new Map());
+});
+
+test("pairCreates pairs an unanswered create with its title match even when an unrelated card is older", () => {
+	const p = create({});
+	expect(
+		pairCreates(
+			[p],
+			[
+				task("AL-1"),
+				task("AL-7", "alpha", 3, "Another tab's task"),
+				task("AL-9", "alpha", 10),
+			],
+			new Set(),
+		),
+	).toEqual(new Map([["p1", "AL-9"]]));
+});
+
+test("pairCreates matches the title the server derives from a multi-line or headed prompt", () => {
+	const multiLine = "\n  Ship the lane  \nwith the details below";
+	const headed =
+		"# Goal\nMove the retry button into the drawer\n\n# Acceptance\nIt shows";
+	for (const text of [multiLine, headed]) {
+		// Older decoys titled with the whole prompt and with its raw first line: only the
+		// server's own title for this prompt pairs.
+		const trimmed = text.trim();
+		expect(
+			pairCreates(
+				[create({ text })],
+				[
+					task("AL-1"),
+					task("AL-7", "alpha", 2, trimmed),
+					task("AL-8", "alpha", 3, trimmed.split("\n")[0]),
+					task("AL-9", "alpha", 10, deriveTitle(trimmed)),
+				],
+				new Set(),
+			),
+		).toEqual(new Map([["p1", "AL-9"]]));
+	}
 });
 
 test("pairCreates never pairs a card that was on the board at submit", () => {
