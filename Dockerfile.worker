@@ -253,7 +253,11 @@ ARG OMP_VERSION=19.1.1
 # toon CLI (npm @toon-format/cli) for the bundled toon-json skill — must match
 # the host's toon so workers and host produce identical output.
 ARG TOON_VERSION=4.4.0
-RUN bun install -g --ignore-scripts --minimum-release-age 604800 "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+# Operator waiver (OTTR-1286, 2026-11-27): omp 19.1.1 shipped before the 7-day floor
+# cleared, so this layer drops --minimum-release-age while scripts/verify-image-age-gate.ts
+# carries the matching time-boxed waiver (it fails again after 2026-12-31). Restore the flag
+# here once the pinned version is at least 7 days old.
+RUN bun install -g --ignore-scripts "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
     && bun install -g --ignore-scripts --minimum-release-age 604800 "@toon-format/cli@${TOON_VERSION}" \
     && omp --version \
     && toon --version
