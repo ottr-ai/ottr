@@ -42,30 +42,51 @@ export function placeholderTitle(text: string, max = 140): string {
 }
 
 /**
- * What one project's board renders for the creates in flight.
- * `cards`: the placeholders to draw, a failed one included while its exit plays; a create
- * whose card the state already carries draws none, so the two never show at once.
- * `held`: the project's cards the board holds back. A live frame can carry the new card
- * before the POST answers with its id; while any create runs unanswered, a card new since
- * its submit stays hidden, unless an answered create already claims it.
+ * Pairs each create with the real card that stands for it, keyed by the create's key.
+ * The pairing never hides a real card: it only decides which placeholders still draw.
+ * - An answered create pairs with its own id, once the state carries that card.
+ * - An unanswered create can meet its card first: a live frame can carry the card before
+ *   the POST answers. It then pairs, in submit order, with the oldest card of its project
+ *   that is new since its submit and that no other create or settled create claims. A
+ *   wrong guess (another tab's card) only hides this placeholder early; the POST answer
+ *   corrects it.
+ * `taken`: ids of creates that already settled and dropped; they never pair again.
  */
-export function pendingBoard(
+export function pairCreates(
+	pending: readonly PendingCreate[],
+	tasks: readonly { id: string; project: string; createdAt: number }[],
+	taken: ReadonlySet<string>,
+): Map<string, string> {
+	const ids = new Set(tasks.map((t) => t.id));
+	const pairs = new Map<string, string>();
+	const claimed = new Set(taken);
+	for (const p of pending)
+		if (p.id !== null) {
+			claimed.add(p.id);
+			if (ids.has(p.id)) pairs.set(p.key, p.id);
+		}
+	const oldest = [...tasks].sort((a, b) => a.createdAt - b.createdAt);
+	for (const p of pending) {
+		if (p.id !== null || p.failed) continue;
+		const hit = oldest.find(
+			(t) =>
+				t.project === p.project && !p.before.has(t.id) && !claimed.has(t.id),
+		);
+		if (hit === undefined) continue;
+		claimed.add(hit.id);
+		pairs.set(p.key, hit.id);
+	}
+	return pairs;
+}
+
+/** The placeholders one project draws: its creates with no paired card yet. A failed one
+ * stays while its exit plays. */
+export function projectPlaceholders(
 	pending: readonly PendingCreate[],
 	project: string,
-	tasks: readonly { id: string; project: string }[],
-): { cards: PendingCreate[]; held: Set<string> } {
-	const ids = new Set(tasks.map((t) => t.id));
-	const mine = pending.filter((p) => p.project === project);
-	const cards = mine.filter((p) => p.id === null || !ids.has(p.id));
-	const claimed = new Set(mine.map((p) => p.id).filter((id) => id !== null));
-	const held = new Set<string>();
-	for (const p of mine) {
-		if (p.id !== null || p.failed) continue;
-		for (const t of tasks)
-			if (t.project === project && !p.before.has(t.id) && !claimed.has(t.id))
-				held.add(t.id);
-	}
-	return { cards, held };
+	pairs: ReadonlyMap<string, string>,
+): PendingCreate[] {
+	return pending.filter((p) => p.project === project && !pairs.has(p.key));
 }
 
 /** Keys of the creates whose card the state now carries: they are done and drop. */
@@ -85,17 +106,16 @@ export function settledKeys(
  * the board must not play the fresh-card entrance on it.
  */
 export function placeholderFlights(
-	pending: readonly PendingCreate[],
+	pairs: ReadonlyMap<string, string>,
 	prev: ReadonlyMap<string, { left: number; top: number }>,
 	next: ReadonlyMap<string, { left: number; top: number }>,
 ): Map<string, { dx: number; dy: number }> {
 	const flights = new Map<string, { dx: number; dy: number }>();
-	for (const p of pending) {
-		if (p.id === null) continue;
-		const from = prev.get(p.key);
-		const to = next.get(p.id);
-		if (from === undefined || to === undefined || next.has(p.key)) continue;
-		flights.set(p.id, { dx: from.left - to.left, dy: from.top - to.top });
+	for (const [key, id] of pairs) {
+		const from = prev.get(key);
+		const to = next.get(id);
+		if (from === undefined || to === undefined || next.has(key)) continue;
+		flights.set(id, { dx: from.left - to.left, dy: from.top - to.top });
 	}
 	return flights;
 }

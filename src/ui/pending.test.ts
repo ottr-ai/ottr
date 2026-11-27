@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import {
 	type PendingCreate,
-	pendingBoard,
+	pairCreates,
 	placeholderFlights,
 	placeholderTitle,
+	projectPlaceholders,
 	settledKeys,
 } from "./pending.ts";
 
@@ -21,7 +22,11 @@ const create = (over: Partial<PendingCreate>): PendingCreate => ({
 	...over,
 });
 
-const task = (id: string, project = "alpha") => ({ id, project });
+const task = (id: string, project = "alpha", createdAt = 0) => ({
+	id,
+	project,
+	createdAt,
+});
 const at = (left: number, top: number) => ({ left, top });
 
 // --- placeholderTitle -------------------------------------------------------
@@ -54,101 +59,166 @@ test("placeholderTitle measures the trimmed line, not the padding", () => {
 	expect(placeholderTitle("   abcde   ", 5)).toBe("abcde");
 });
 
-// --- pendingBoard -----------------------------------------------------------
+// --- pairCreates ------------------------------------------------------------
 
-test("pendingBoard draws the placeholder while the POST runs", () => {
+test("pairCreates pairs an answered create only once the state carries its id", () => {
+	const p = create({ id: "AL-9" });
+	expect(pairCreates([p], [task("AL-1")], new Set())).toEqual(new Map());
+	expect(pairCreates([p], [task("AL-1"), task("AL-9")], new Set())).toEqual(
+		new Map([["p1", "AL-9"]]),
+	);
+});
+
+test("pairCreates pairs an answered create with its own id, never with another new card", () => {
+	const p = create({ id: "AL-10" });
+	expect(
+		pairCreates([p], [task("AL-1"), task("AL-9", "alpha", 5)], new Set()),
+	).toEqual(new Map());
+});
+
+test("pairCreates pairs an unanswered create with the oldest new card of its own project", () => {
 	const p = create({});
-	const { cards } = pendingBoard([p], "alpha", [task("AL-1")]);
-	expect(cards).toEqual([p]);
-});
-
-test("pendingBoard still draws an answered create until the state carries its card", () => {
-	const p = create({ id: "AL-9" });
-	expect(pendingBoard([p], "alpha", [task("AL-1")]).cards).toEqual([p]);
-});
-
-test("pendingBoard draws no placeholder once the tasks carry its id", () => {
-	const p = create({ id: "AL-9" });
-	const { cards, held } = pendingBoard([p], "alpha", [
-		task("AL-1"),
-		task("AL-9"),
-	]);
-	expect(cards).toEqual([]);
-	// The real card shows: nothing is held back.
-	expect(held).toEqual(new Set());
-});
-
-test("pendingBoard keeps a failed create in cards while its exit plays", () => {
-	const p = create({ failed: true });
-	const { cards, held } = pendingBoard([p], "alpha", [
-		task("AL-1"),
-		task("AL-7"),
-	]);
-	expect(cards).toEqual([p]);
-	// A failed create holds nothing: a new card from elsewhere shows at once.
-	expect(held).toEqual(new Set());
-});
-
-test("pendingBoard holds a card new since the submit while the create is unanswered", () => {
-	const p = create({ before: new Set(["AL-1"]) });
-	const { held } = pendingBoard([p], "alpha", [task("AL-1"), task("AL-9")]);
-	expect(held).toEqual(new Set(["AL-9"]));
-});
-
-test("pendingBoard releases the held card once the create is answered", () => {
-	const p = create({ id: "AL-9" });
-	expect(pendingBoard([p], "alpha", [task("AL-1"), task("AL-9")]).held).toEqual(
+	const pairs = pairCreates(
+		[p],
+		[
+			task("AL-1"),
+			task("AL-12", "alpha", 30),
+			task("BE-5", "beta", 5),
+			task("AL-9", "alpha", 10),
+		],
 		new Set(),
 	);
-	// Answered with another id: the stray new card is not held either.
-	const q = create({ id: "AL-10" });
-	expect(pendingBoard([q], "alpha", [task("AL-1"), task("AL-9")]).held).toEqual(
-		new Set(),
+	expect(pairs).toEqual(new Map([["p1", "AL-9"]]));
+});
+
+test("pairCreates never pairs a card that was on the board at submit", () => {
+	const p = create({ before: new Set(["AL-1", "AL-9"]) });
+	expect(
+		pairCreates([p], [task("AL-1"), task("AL-9", "alpha", 5)], new Set()),
+	).toEqual(new Map());
+});
+
+test("pairCreates never pairs a card that another create's id claims", () => {
+	// The answered create comes later in submit order: its claim still holds.
+	const running = create({ key: "a" });
+	const answered = create({ key: "b", id: "AL-9" });
+	expect(
+		pairCreates(
+			[running, answered],
+			[task("AL-1"), task("AL-9", "alpha", 5)],
+			new Set(),
+		),
+	).toEqual(new Map([["b", "AL-9"]]));
+	// The running create skips the older card the later answered create claims.
+	expect(
+		pairCreates(
+			[running, create({ key: "b", id: "AL-10" })],
+			[task("AL-1"), task("AL-10", "alpha", 5), task("AL-11", "alpha", 9)],
+			new Set(),
+		),
+	).toEqual(
+		new Map([
+			["b", "AL-10"],
+			["a", "AL-11"],
+		]),
 	);
 });
 
-test("pendingBoard never holds a card that an answered create claims", () => {
-	const answered = create({
-		key: "a",
-		id: "AL-9",
-		before: new Set(["AL-1"]),
-	});
-	const running = create({ key: "b", before: new Set(["AL-1"]) });
-	const { cards, held } = pendingBoard([answered, running], "alpha", [
-		task("AL-1"),
-		task("AL-9"),
-		task("AL-10"),
-	]);
-	// AL-9 belongs to the answered create; AL-10 may be the running one's card.
-	expect(held).toEqual(new Set(["AL-10"]));
-	expect(cards).toEqual([running]);
+test("pairCreates never pairs a card of a settled create", () => {
+	const p = create({});
+	expect(
+		pairCreates(
+			[p],
+			[task("AL-1"), task("AL-9", "alpha", 5)],
+			new Set(["AL-9"]),
+		),
+	).toEqual(new Map());
 });
 
-test("pendingBoard ignores creates of other projects", () => {
-	const beta = create({ project: "beta", before: new Set(["BE-1"]) });
-	const { cards, held } = pendingBoard([beta], "alpha", [
-		task("AL-1"),
-		task("AL-9"),
-	]);
-	expect(cards).toEqual([]);
-	expect(held).toEqual(new Set());
+test("pairCreates never pairs a card of another project", () => {
+	const p = create({});
+	expect(
+		pairCreates([p], [task("AL-1"), task("BE-5", "beta", 5)], new Set()),
+	).toEqual(new Map());
 });
 
-test("pendingBoard holds only the board's own project's new cards", () => {
-	const p = create({ before: new Set(["AL-1"]) });
-	const { held } = pendingBoard([p], "alpha", [
-		task("AL-1"),
-		task("AL-9"),
-		task("BE-5", "beta"),
-	]);
-	expect(held).toEqual(new Set(["AL-9"]));
+test("pairCreates pairs two unanswered creates with two different cards in submit order", () => {
+	const a = create({ key: "a" });
+	const b = create({ key: "b" });
+	expect(
+		pairCreates(
+			[a, b],
+			[task("AL-1"), task("AL-10", "alpha", 20), task("AL-9", "alpha", 10)],
+			new Set(),
+		),
+	).toEqual(
+		new Map([
+			["a", "AL-9"],
+			["b", "AL-10"],
+		]),
+	);
+	// One new card: only the first create pairs.
+	expect(
+		pairCreates([a, b], [task("AL-1"), task("AL-9", "alpha", 10)], new Set()),
+	).toEqual(new Map([["a", "AL-9"]]));
 });
 
-test("pendingBoard draws nothing and holds nothing with no creates", () => {
-	expect(pendingBoard([], "alpha", [task("AL-1")])).toEqual({
-		cards: [],
-		held: new Set(),
-	});
+test("pairCreates never pairs a failed create, and the failed create claims nothing", () => {
+	const failed = create({ key: "f", failed: true });
+	expect(
+		pairCreates([failed], [task("AL-1"), task("AL-9", "alpha", 5)], new Set()),
+	).toEqual(new Map());
+	expect(
+		pairCreates(
+			[failed, create({ key: "r" })],
+			[task("AL-1"), task("AL-9", "alpha", 5)],
+			new Set(),
+		),
+	).toEqual(new Map([["r", "AL-9"]]));
+});
+
+test("pairCreates keeps a settled create's card from the next unanswered create", () => {
+	// Create A answered AL-9, its card landed and A dropped; create B still runs and
+	// its snapshot predates AL-9. AL-9 is A's card, so B keeps its placeholder.
+	const b = create({ key: "b", before: new Set(["AL-1"]) });
+	const taken = new Set(["AL-9"]);
+	expect(
+		pairCreates([b], [task("AL-1"), task("AL-9", "alpha", 5)], taken),
+	).toEqual(new Map());
+	// B's own card can still pair once a frame carries it.
+	expect(
+		pairCreates(
+			[b],
+			[task("AL-1"), task("AL-9", "alpha", 5), task("AL-10", "alpha", 9)],
+			taken,
+		),
+	).toEqual(new Map([["b", "AL-10"]]));
+});
+
+test("pairCreates is empty with no creates", () => {
+	expect(pairCreates([], [task("AL-1"), task("AL-9")], new Set())).toEqual(
+		new Map(),
+	);
+});
+
+// --- projectPlaceholders ----------------------------------------------------
+
+test("projectPlaceholders keeps the project's unpaired creates, failed ones included", () => {
+	const matched = create({ key: "a" });
+	const running = create({ key: "b" });
+	const beta = create({ key: "c", project: "beta" });
+	const failed = create({ key: "d", failed: true });
+	expect(
+		projectPlaceholders(
+			[matched, running, beta, failed],
+			"alpha",
+			new Map([["a", "AL-9"]]),
+		),
+	).toEqual([running, failed]);
+	expect(
+		projectPlaceholders([matched, running, beta, failed], "beta", new Map()),
+	).toEqual([beta]);
+	expect(projectPlaceholders([], "alpha", new Map())).toEqual([]);
 });
 
 // --- settledKeys ------------------------------------------------------------
@@ -172,31 +242,38 @@ test("settledKeys is empty for an empty state", () => {
 
 // --- placeholderFlights -----------------------------------------------------
 
+const paired = new Map([["p1", "AL-9"]]);
+
 test("placeholderFlights gives the offset from the real card back to the placeholder", () => {
-	const p = create({ key: "p1", id: "AL-9" });
 	const flights = placeholderFlights(
-		[p],
+		paired,
 		new Map([["p1", at(100, 400)]]),
 		new Map([["AL-9", at(40, 100)]]),
 	);
 	expect(flights).toEqual(new Map([["AL-9", { dx: 60, dy: 300 }]]));
+	// The sign follows the direction back to the placeholder.
+	expect(
+		placeholderFlights(
+			paired,
+			new Map([["p1", at(40, 100)]]),
+			new Map([["AL-9", at(100, 400)]]),
+		),
+	).toEqual(new Map([["AL-9", { dx: -60, dy: -300 }]]));
 });
 
 test("placeholderFlights lists an in-place swap with a zero offset", () => {
-	const p = create({ key: "p1", id: "AL-9" });
 	const flights = placeholderFlights(
-		[p],
+		paired,
 		new Map([["p1", at(20, 30)]]),
 		new Map([["AL-9", at(20, 30)]]),
 	);
 	expect(flights).toEqual(new Map([["AL-9", { dx: 0, dy: 0 }]]));
 });
 
-test("placeholderFlights skips a create the server has not answered", () => {
-	const p = create({ key: "p1", id: null });
+test("placeholderFlights skips a create with no paired card", () => {
 	expect(
 		placeholderFlights(
-			[p],
+			new Map(),
 			new Map([["p1", at(0, 0)]]),
 			new Map([["AL-9", at(10, 10)]]),
 		),
@@ -204,10 +281,9 @@ test("placeholderFlights skips a create the server has not answered", () => {
 });
 
 test("placeholderFlights skips a create whose placeholder was never measured", () => {
-	const p = create({ key: "p1", id: "AL-9" });
 	expect(
 		placeholderFlights(
-			[p],
+			paired,
 			new Map([["other", at(0, 0)]]),
 			new Map([["AL-9", at(10, 10)]]),
 		),
@@ -215,10 +291,9 @@ test("placeholderFlights skips a create whose placeholder was never measured", (
 });
 
 test("placeholderFlights skips a create whose real card is not rendered yet", () => {
-	const p = create({ key: "p1", id: "AL-9" });
 	expect(
 		placeholderFlights(
-			[p],
+			paired,
 			new Map([["p1", at(0, 0)]]),
 			new Map([["AL-1", at(10, 10)]]),
 		),
@@ -226,10 +301,9 @@ test("placeholderFlights skips a create whose real card is not rendered yet", ()
 });
 
 test("placeholderFlights skips a create whose placeholder is still on screen", () => {
-	const p = create({ key: "p1", id: "AL-9" });
 	expect(
 		placeholderFlights(
-			[p],
+			paired,
 			new Map([["p1", at(0, 0)]]),
 			new Map([
 				["p1", at(0, 0)],
@@ -239,13 +313,12 @@ test("placeholderFlights skips a create whose placeholder is still on screen", (
 	).toEqual(new Map());
 });
 
-test("placeholderFlights flies each landed create from its own placeholder", () => {
+test("placeholderFlights flies each paired card from its own placeholder", () => {
 	const flights = placeholderFlights(
-		[
-			create({ key: "p1", id: "AL-9" }),
-			create({ key: "p2", id: "AL-10" }),
-			create({ key: "p3", id: null }),
-		],
+		new Map([
+			["p1", "AL-9"],
+			["p2", "AL-10"],
+		]),
 		new Map([
 			["p1", at(0, 100)],
 			["p2", at(0, 200)],

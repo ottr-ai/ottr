@@ -204,9 +204,10 @@ import {
 import { fmtNum } from "./numbers.ts";
 import {
 	type PendingCreate,
-	pendingBoard,
+	pairCreates,
 	placeholderFlights,
 	placeholderTitle,
+	projectPlaceholders,
 	type Rect,
 	settledKeys,
 } from "./pending.ts";
@@ -2860,11 +2861,13 @@ type CreateArgs = {
 	from: Rect | null;
 };
 
-/** OTTR-1337: the creates in flight, for the boards' placeholders; `drop` removes one. */
+/** OTTR-1337: the creates in flight, for the boards' placeholders; `drop` removes one.
+ * `taken`: ids of creates that settled and dropped, so pairCreates never pairs them again. */
 export const PendingContext = createContext<{
 	pending: PendingCreate[];
+	taken: ReadonlySet<string>;
 	drop: (key: string) => void;
-}>({ pending: [], drop: () => {} });
+}>({ pending: [], taken: new Set(), drop: () => {} });
 
 const MORPH_EASE = "cubic-bezier(0.2, 0.7, 0.3, 1)"; // --ease; WAAPI options don't resolve var()
 /** A failed send's error line; the draft stays in the dialog and its on-device cache. */
@@ -2875,11 +2878,14 @@ const notAdded = (message: string): string =>
  * switch and back) must not morph them out of the long-gone dialog again. */
 const enteredPlaceholders = new Set<string>();
 
-/** The placeholder of a task the server has not added yet: it morphs out of the New task
- * dialog's rect into the todo lane, and plays a short exit when the POST fails. */
-function PendingCard({ p }: { p: PendingCreate }) {
+/** The motion of a placeholder (the todo lane's card, the Overview's Todo chip): it morphs
+ * out of the New task dialog's rect into its spot, and plays a short exit, then drops, when
+ * the POST fails. */
+function usePendingMotion(
+	ref: React.RefObject<HTMLElement | null>,
+	p: PendingCreate,
+): void {
 	const { drop } = useContext(PendingContext);
-	const ref = useRef<HTMLDivElement>(null);
 	const from = p.from;
 	useLayoutEffect(() => {
 		const el = ref.current;
@@ -2925,10 +2931,9 @@ function PendingCard({ p }: { p: PendingCreate }) {
 			],
 			{ duration: 340, easing: MORPH_EASE },
 		);
-		// The text fades in late, so the stretched start frame never shows warped words.
-		ghost
-			.querySelector<HTMLElement>(".card-open")
-			?.animate(
+		// The content fades in late, so the stretched start frame never shows warped words.
+		for (const c of ghost.children)
+			c.animate(
 				[{ opacity: "0" }, { opacity: "0", offset: 0.5 }, { opacity: "1" }],
 				{
 					duration: 340,
@@ -2945,7 +2950,7 @@ function PendingCard({ p }: { p: PendingCreate }) {
 			ghost.remove();
 			el.style.opacity = "";
 		};
-	}, [from, p.key]);
+	}, [from, p.key, ref]);
 	useEffect(() => {
 		if (!p.failed) return;
 		const el = ref.current;
@@ -2966,7 +2971,13 @@ function PendingCard({ p }: { p: PendingCreate }) {
 		// A timer, never Animation.finished: the drop must happen even where the animation never settles.
 		const t = setTimeout(() => drop(p.key), 170);
 		return () => clearTimeout(t);
-	}, [p.failed, p.key, drop]);
+	}, [p.failed, p.key, drop, ref]);
+}
+
+/** The placeholder of a task the server has not added yet, in the todo lane. */
+function PendingCard({ p }: { p: PendingCreate }) {
+	const ref = useRef<HTMLDivElement>(null);
+	usePendingMotion(ref, p);
 	return (
 		<div
 			ref={ref}
@@ -2985,6 +2996,23 @@ function PendingCard({ p }: { p: PendingCreate }) {
 				<span className="card-title">{placeholderTitle(p.text)}</span>
 			</div>
 		</div>
+	);
+}
+
+/** The Overview's placeholder: a chip after the Todo count of the project the task goes to. */
+function PendingCount({ p }: { p: PendingCreate }) {
+	const ref = useRef<HTMLSpanElement>(null);
+	usePendingMotion(ref, p);
+	return (
+		<span
+			ref={ref}
+			className="pending-count"
+			data-pending-key={p.key}
+			aria-busy="true"
+		>
+			{!p.failed && <span className="spinner" aria-hidden="true" />}
+			<span>{p.failed ? "not added" : "+1 adding"}</span>
+		</span>
 	);
 }
 
@@ -3010,6 +3038,7 @@ export function ComposeDialog({
 	/** One extra control above the prompt card (the follow-up's project picker). */
 	field,
 	restore,
+	waiting,
 	onRestored,
 }: {
 	open: boolean;
@@ -3046,15 +3075,19 @@ export function ComposeDialog({
 	}>;
 	showModel?: boolean;
 	field?: ReactNode;
-	/** A failed optimistic send to put back on the next open: text, model, images and its error line. */
+	/** The oldest failed optimistic send queued for this dialog: text, model, images and its
+	 * error line. It applies on an open whose cached draft is blank; a newer draft wins. */
 	restore?: {
+		key: string;
 		text: string;
 		model: string;
 		files: File[];
 		error: string;
 	} | null;
-	/** The restore is applied; the owner drops it. */
-	onRestored?: () => void;
+	/** How many more failed sends queue behind `restore`. */
+	waiting?: number;
+	/** The restore with this key is applied; the owner drops it from its queue. */
+	onRestored?: (key: string) => void;
 }) {
 	const formRef = useRef<HTMLFormElement>(null);
 	const restoreRef = useRef(restore);
@@ -3102,18 +3135,23 @@ export function ComposeDialog({
 			setModel(saved.model);
 		}
 	}, [open, draftKey]);
-	// A failed optimistic send reopens with what was submitted. Runs after the cache load, so it
-	// wins; read through a ref, so a restore that lands while open waits for the next open.
+	// A failed optimistic send reopens with what was submitted, but only into a blank draft: a
+	// newer draft on this device is never replaced, and the restore stays queued. Read through
+	// a ref, so a restore that lands while open waits for the next open.
 	useEffect(() => {
 		const r = restoreRef.current;
 		if (!open || r === undefined || r === null) return;
+		if ((loadComposeDraft(draftKey)?.text.trim() ?? "") !== "") return;
 		setText(r.text);
 		setModel(r.model);
 		saveComposeDraft(draftKey, { text: r.text, model: r.model });
 		images.addFiles(r.files);
 		setErr(notAdded(r.error));
-		onRestoredRef.current?.();
+		onRestoredRef.current?.(r.key);
 	}, [open, draftKey, images.addFiles]);
+	/** Failed sends still queued for this dialog: they come back one per open into a blank draft. */
+	const queued =
+		(restore === undefined || restore === null ? 0 : 1) + (waiting ?? 0);
 	// Keystrokes and model picks mirror into the cache.
 	const editText = (t: string): void => {
 		setText(t);
@@ -3283,6 +3321,13 @@ export function ComposeDialog({
 							{err}
 						</p>
 					)}
+					{open && queued > 0 && (
+						<p className="hint compose-waiting" role="status">
+							{queued === 1
+								? "1 earlier task was not added. Send or clear this draft, then open New task again to get it back."
+								: `${queued} earlier tasks were not added. Send or clear this draft, then open New task again to get the next one back.`}
+						</p>
+					)}
 				</form>
 			</Modal>
 			{/* Sibling, not child: a nested dialog's close event would propagate to the compose dialog and close both. */}
@@ -3308,6 +3353,7 @@ function NewTaskDialog({
 	act,
 	onCreate,
 	restore,
+	waiting,
 	onRestored,
 }: {
 	project: ProjectView;
@@ -3316,8 +3362,11 @@ function NewTaskDialog({
 	act: Act;
 	/** Starts the optimistic create; the dialog closes at once while the POST runs. */
 	onCreate: (args: CreateArgs) => void;
+	/** The oldest failed create queued for this project; null when none waits. */
 	restore: React.ComponentProps<typeof ComposeDialog>["restore"];
-	onRestored: () => void;
+	/** How many more failed creates of this project queue behind `restore`. */
+	waiting: number;
+	onRestored: (key: string) => void;
 }) {
 	const label = projectLabel(project);
 	return (
@@ -3345,6 +3394,7 @@ function NewTaskDialog({
 				})
 			}
 			restore={restore}
+			waiting={waiting}
 			onRestored={onRestored}
 			send={async (args) => onCreate(args)}
 		/>
@@ -4805,7 +4855,7 @@ export function depHoldContexts(
 
 export function ProjectBoard({
 	project,
-	tasks: boardTasks,
+	tasks,
 	deltas,
 	open,
 	seenAnswers,
@@ -4851,17 +4901,18 @@ export function ProjectBoard({
 	navigate?: (path: string) => void;
 }) {
 	const hosted = useContext(HostedContext);
-	// OTTR-1337: a create in flight draws its placeholder in the todo lane, and a card a live
-	// frame carries before the POST answers stays held back, so the two never show at once.
-	const { pending } = useContext(PendingContext);
-	const { cards: pendingCards, held } = useMemo(
-		() => pendingBoard(pending, project.name, boardTasks),
-		[pending, project.name, boardTasks],
-	);
-	const tasks = useMemo(
+	// OTTR-1337: a create in flight draws its placeholder in the todo lane until a real card
+	// pairs with it; the pairing only drops placeholders and never hides a real card. The
+	// board holds one project's cards, and pairCreates pairs only within a create's project.
+	const { pending, taken } = useContext(PendingContext);
+	const pendingCards = useMemo(
 		() =>
-			held.size === 0 ? boardTasks : boardTasks.filter((t) => !held.has(t.id)),
-		[boardTasks, held],
+			projectPlaceholders(
+				pending,
+				project.name,
+				pairCreates(pending, tasks, taken),
+			),
+		[pending, project.name, tasks, taken],
 	);
 	const [showRelease, setShowRelease] = useState(false);
 	const [showReview, setShowReview] = useState(false);
@@ -5643,6 +5694,12 @@ export function Overview({
 	prov: { data: ProvisioningResponse | null; err: string | null };
 }) {
 	const hosted = useContext(HostedContext);
+	// OTTR-1337: a create in flight shows as a chip in its project's Todo cell until its card lands.
+	const { pending, taken } = useContext(PendingContext);
+	const pairs = useMemo(
+		() => pairCreates(pending, tasks, taken),
+		[pending, tasks, taken],
+	);
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
 	// The provisioning poll lives in App: the Setup tab reads it here, and the skill-gap
@@ -5827,11 +5884,19 @@ export function Overview({
 										// card to Done, however old its stage column still reads.
 										const inStage = own.filter((t) => laneStage(t) === c.key);
 										const running = splitAlarms(inStage).running.length;
+										const adding =
+											c.key === "todo"
+												? projectPlaceholders(pending, p.name, pairs)
+												: [];
 										return (
 											<td
 												key={c.key}
 												data-label={c.label}
-												className={inStage.length === 0 ? "zero" : undefined}
+												className={
+													inStage.length === 0 && adding.length === 0
+														? "zero"
+														: undefined
+												}
 											>
 												<span>
 													{running > 0 && (
@@ -5841,6 +5906,9 @@ export function Overview({
 														</>
 													)}
 													{inStage.length}
+													{adding.map((a) => (
+														<PendingCount key={a.key} p={a} />
+													))}
 												</span>
 											</td>
 										);
@@ -18823,15 +18891,24 @@ export function App() {
 	const pendingRef = useRef(pendingCreates);
 	pendingRef.current = pendingCreates;
 	const pendingSeq = useRef(0);
-	/** A failed create's input, put back into that project's New task dialog on its next open. */
-	const [composeRestore, setComposeRestore] = useState<{
-		project: string;
-		text: string;
-		model: string;
-		files: File[];
-		error: string;
-	} | null>(null);
+	/** Ids of creates that settled and dropped: pairCreates never pairs them with a placeholder
+	 * again. Replaced, never mutated, so the context value changes with it. */
+	const takenRef = useRef<ReadonlySet<string>>(new Set());
+	/** Failed creates, oldest first: each puts its input back into its project's New task
+	 * dialog on an open whose cached draft is blank. A second failure queues, never overwrites. */
+	const [composeRestores, setComposeRestores] = useState<
+		{
+			key: string;
+			project: string;
+			text: string;
+			model: string;
+			files: File[];
+			error: string;
+		}[]
+	>([]);
 	const [draftFor, setDraftFor] = useState<string | null>(null);
+	const draftForRef = useRef(draftFor);
+	draftForRef.current = draftFor;
 	const [notice, setNotice] = useState<string | null>(null);
 	const [offline, setOffline] = useState(false);
 	/** OTTR-964: why the board cannot reach the server, for the offline banner. */
@@ -19117,7 +19194,8 @@ export function App() {
 			draftFor === null &&
 			selectedId === null &&
 			!showAdd &&
-			pendingCreates.length === 0;
+			pendingCreates.length === 0 &&
+			composeRestores.length === 0;
 		const decision = decideReload(
 			seenVersion,
 			state.serverVersion,
@@ -19131,7 +19209,15 @@ export function App() {
 			seenVersion = state.serverVersion;
 			sessionStorage.setItem(SEEN_VERSION_KEY, state.serverVersion);
 		}
-	}, [state, composeFor, draftFor, selectedId, showAdd, pendingCreates]);
+	}, [
+		state,
+		composeFor,
+		draftFor,
+		selectedId,
+		showAdd,
+		pendingCreates,
+		composeRestores,
+	]);
 
 	/** Cards travel: when a task's stage changes, fly the card from its old column to its new one (FLIP). */
 	const cardPos = useRef(new Map<string, CardPos>());
@@ -19148,8 +19234,8 @@ export function App() {
 		// push, the clock tick's siblings); the entrance and flight animations all need one of
 		// the two. A path change remeasures, because another board's DOM sits where the last
 		// scan measured.
-		// Placeholders count too: one appearing, answering or leaving moves cards.
-		const sig = `${boardFlipSig(state.tasks)}|${pendingCreates.map((p) => `${p.key}:${p.id ?? ""}`).join(" ")}`;
+		// Placeholders count too: one appearing, answering, failing or leaving moves cards.
+		const sig = `${boardFlipSig(state.tasks)}|${pendingCreates.map((p) => `${p.key}:${p.id ?? ""}:${p.failed ? 1 : 0}`).join(" ")}`;
 		const path = location.pathname;
 		if (sig === flipKey.current.sig && path === flipKey.current.path) return;
 		flipKey.current = { sig, path };
@@ -19162,7 +19248,11 @@ export function App() {
 		// A fresh follow-up starts where its done parent sits, so it visibly grows out of that card.
 		applyOriginFlight(origin, flights, els, prev, next);
 		// The server's card takes the placeholder's place: no entrance, a flight only when it lands elsewhere.
-		for (const [id, f] of placeholderFlights(pendingRef.current, prev, next)) {
+		for (const [id, f] of placeholderFlights(
+			pairCreates(pendingRef.current, state.tasks, takenRef.current),
+			prev,
+			next,
+		)) {
 			fresh.delete(id);
 			if (f.dx !== 0 || f.dy !== 0) flights.set(id, f);
 		}
@@ -19226,10 +19316,19 @@ export function App() {
 					mark({ id: t.id });
 				},
 				(message) => {
-					// act shows the error toast; the dialog reopens with the input and its error line.
+					// act shows the error toast; the input queues for this project's New task dialog.
 					mark({ failed: true });
-					setComposeRestore({ project, text, model, files, error: message });
-					if (composeForRef.current === null) setComposeFor(project);
+					setComposeRestores((queue) => [
+						...queue,
+						{ key, project, text, model, files, error: message },
+					]);
+					// Open it only over nothing and into a blank draft: a newer draft is never replaced.
+					if (
+						composeForRef.current === null &&
+						draftForRef.current === null &&
+						(loadComposeDraft(`new:${project}`)?.text.trim() ?? "") === ""
+					)
+						setComposeFor(project);
 				},
 			);
 		},
@@ -19238,18 +19337,31 @@ export function App() {
 	const dropPending = useCallback((key: string): void => {
 		setPendingCreates((list) => list.filter((p) => p.key !== key));
 	}, []);
-	// A create whose card the state carries is done: its placeholder drops.
+	const dropRestore = useCallback((key: string): void => {
+		setComposeRestores((queue) => queue.filter((r) => r.key !== key));
+	}, []);
+	// A create whose card the state carries is done: its placeholder drops, and its id joins
+	// `taken`, so no later create pairs with that card.
 	useEffect(() => {
 		if (state === null || pendingCreates.length === 0) return;
 		const done = settledKeys(
 			pendingCreates,
 			new Set(state.tasks.map((t) => t.id)),
 		);
-		if (done.size > 0)
-			setPendingCreates((list) => list.filter((p) => !done.has(p.key)));
+		if (done.size === 0) return;
+		const taken = new Set(takenRef.current);
+		for (const p of pendingCreates)
+			if (done.has(p.key) && p.id !== null) taken.add(p.id);
+		takenRef.current = taken;
+		setPendingCreates((list) => list.filter((p) => !done.has(p.key)));
 	}, [state, pendingCreates]);
+	// takenRef changes only in the settle effect, which also changes pendingCreates.
 	const pendingValue = useMemo(
-		() => ({ pending: pendingCreates, drop: dropPending }),
+		() => ({
+			pending: pendingCreates,
+			taken: takenRef.current,
+			drop: dropPending,
+		}),
 		[pendingCreates, dropPending],
 	);
 
@@ -19940,18 +20052,22 @@ export function App() {
 					</main>
 				</div>
 
-				{projects.map((p) => (
-					<NewTaskDialog
-						key={p.name}
-						project={p}
-						open={composeFor === p.name}
-						onClose={() => setComposeFor(null)}
-						act={act}
-						onCreate={(a) => createTask(p.name, a)}
-						restore={composeRestore?.project === p.name ? composeRestore : null}
-						onRestored={() => setComposeRestore(null)}
-					/>
-				))}
+				{projects.map((p) => {
+					const queued = composeRestores.filter((r) => r.project === p.name);
+					return (
+						<NewTaskDialog
+							key={p.name}
+							project={p}
+							open={composeFor === p.name}
+							onClose={() => setComposeFor(null)}
+							act={act}
+							onCreate={(a) => createTask(p.name, a)}
+							restore={queued[0] ?? null}
+							waiting={Math.max(0, queued.length - 1)}
+							onRestored={dropRestore}
+						/>
+					);
+				})}
 
 				{projects.map((p) => (
 					<BacklogDialog

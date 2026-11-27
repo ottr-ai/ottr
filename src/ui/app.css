@@ -3538,7 +3538,8 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .pending-card .card-title {
 	color: var(--dim);
 }
-.pending-card .spinner {
+.pending-card .spinner,
+.pending-count .spinner {
 	width: 11px;
 	height: 11px;
 	opacity: 0;
@@ -3547,9 +3548,23 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 		wait-show 0s 0.4s forwards;
 }
 @media (prefers-reduced-motion: reduce) {
-	.pending-card .spinner {
+	.pending-card .spinner,
+	.pending-count .spinner {
 		animation: wait-show 0s 0.4s forwards;
 	}
+}
+/* The Overview's placeholder: a small chip after the project's Todo count. Like the card,
+   it is not a control, and it dims by colour. */
+.pending-count {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	margin-left: 8px;
+	font-size: 12px;
+	font-weight: 400;
+	color: var(--dim);
+	pointer-events: none;
+	transform-origin: top left;
 }
 .card:hover {
 	background: var(--card-hover);

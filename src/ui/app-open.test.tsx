@@ -11,7 +11,7 @@ import type {
 	TaskCard,
 	TaskView,
 } from "../types.ts";
-import { clearComposeDraft } from "./notify.ts";
+import { clearComposeDraft, loadComposeDraft } from "./notify.ts";
 import { refreshState } from "./socket.ts";
 import { onChangeOf, onKeyDownOf } from "./testDom.tsx";
 
@@ -294,8 +294,13 @@ beforeAll(() => {
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-/** Mounts App at `path` (a pasted URL) and waits until the board is rendered. */
-async function mountAt(path: string): Promise<void> {
+/** Mounts App at `path` (a pasted URL) and waits until `ready` holds (default: the board
+ * rendered its project header). */
+async function mountAt(
+	path: string,
+	ready: () => boolean = () =>
+		document.querySelector("#project-title") !== null,
+): Promise<void> {
 	window.history.replaceState(null, "", path);
 	container = window.document.createElement("div") as unknown as HTMLDivElement;
 	window.document.body.appendChild(container as unknown as HappyNode);
@@ -303,7 +308,7 @@ async function mountAt(path: string): Promise<void> {
 	await act(async () => {
 		root?.render(<App />);
 	});
-	await waitFor(() => document.querySelector("#project-title") !== null);
+	await waitFor(ready);
 }
 
 async function unmountApp(): Promise<void> {
@@ -2483,30 +2488,36 @@ const cardCount = (id: string): number =>
 	document.querySelectorAll(`.card[data-task-id="${id}"]`).length;
 
 /**
- * Serves the create POST from a deferred answer the test resolves, and passes every
- * other request to the shared mock. setFetch sees only the URL, so this wraps
- * host.fetch to read the method and body. Cleans the frame, the fetch and the
- * on-device New task draft before and after, so test order does not matter.
+ * Serves each create POST from its own deferred answer, in request order: `answer(i, res)`
+ * resolves the i-th POST, before or after it runs. Passes every other request to the
+ * shared mock. setFetch sees only the URL, so this wraps host.fetch to read the method
+ * and body. Cleans the frame, the fetch and the on-device New task draft before and
+ * after, so test order does not matter.
  */
-async function withCreatePost(
+async function withCreatePosts(
 	run: (post: {
-		answer: (res: Response) => void;
+		answer: (index: number, res: Response) => void;
 		bodies: { prompt?: unknown }[];
 	}) => Promise<void>,
 ): Promise<void> {
 	const previousFetch = host.fetch as typeof fetch;
-	const answer = Promise.withResolvers<Response>();
+	const answers: PromiseWithResolvers<Response>[] = [];
+	const answerAt = (i: number): PromiseWithResolvers<Response> => {
+		const d = answers[i] ?? Promise.withResolvers<Response>();
+		answers[i] = d;
+		return d;
+	};
 	const bodies: { prompt?: unknown }[] = [];
 	clearComposeDraft("new:alpha");
 	host.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		if (String(input) === createUrl && init?.method === "POST") {
 			bodies.push(JSON.parse(String(init.body)) as { prompt?: unknown });
-			return answer.promise;
+			return answerAt(bodies.length - 1).promise;
 		}
 		return previousFetch(input, init);
 	}) as typeof fetch;
 	try {
-		await run({ answer: answer.resolve, bodies });
+		await run({ answer: (i, res) => answerAt(i).resolve(res), bodies });
 	} finally {
 		try {
 			await unmountApp();
@@ -2519,15 +2530,33 @@ async function withCreatePost(
 	}
 }
 
-/** Opens New task from the project header, types `text` and submits the form. */
-async function addTask(text: string): Promise<void> {
-	const open = document.querySelector<HTMLButtonElement>(
-		'button[title="New task (N)"]',
+/** withCreatePosts for a test that sends one create: `answer` resolves the first POST. */
+async function withCreatePost(
+	run: (post: {
+		answer: (res: Response) => void;
+		bodies: { prompt?: unknown }[];
+	}) => Promise<void>,
+): Promise<void> {
+	await withCreatePosts(({ answer, bodies }) =>
+		run({ answer: (res) => answer(0, res), bodies }),
 	);
+}
+
+const headerNewTask = 'button[title="New task (N)"]';
+const newTaskBox = (): HTMLTextAreaElement | null =>
+	newTaskDialog()?.querySelector("textarea") ?? null;
+
+/** Opens New task with the button `opener` names and waits for the dialog. */
+async function openNewTask(opener = headerNewTask): Promise<void> {
+	const open = document.querySelector<HTMLButtonElement>(opener);
 	expect(open).not.toBeNull();
 	await click(open!);
 	await waitFor(newTaskOpen);
-	const box = newTaskDialog()?.querySelector("textarea");
+}
+
+/** Types `text` into the open New task dialog, the way a keystroke reaches it. */
+async function typeNewTask(text: string): Promise<void> {
+	const box = newTaskBox();
 	expect(box).not.toBeNull();
 	await act(async () => {
 		onChangeOf(box!)({
@@ -2535,6 +2564,24 @@ async function addTask(text: string): Promise<void> {
 			currentTarget: { value: text },
 		});
 	});
+}
+
+/** Closes the open New task dialog with its X button. */
+async function closeNewTask(): Promise<void> {
+	const close = newTaskDialog()?.querySelector<HTMLButtonElement>(
+		'.dialog-head button[aria-label="Close"]',
+	);
+	expect(close).not.toBeNull();
+	await click(close!);
+	await waitFor(() => !newTaskOpen());
+}
+
+/** Opens New task (from the project header unless `opener` names another button), types
+ * `text` and submits the form. */
+async function addTask(text: string, opener = headerNewTask): Promise<void> {
+	await openNewTask(opener);
+	await typeNewTask(text);
+	const box = newTaskBox();
 	// Enter submits, as the hint says. happy-dom's form element hides React's props
 	// from getOwnPropertyNames, so the textarea's key handler is the reachable path.
 	await act(async () => {
@@ -2546,6 +2593,18 @@ async function addTask(text: string): Promise<void> {
 			preventDefault: () => {},
 		});
 	});
+}
+
+/** Flushes `rounds` rounds of frames and effects; `pred` must hold after every one. */
+async function holdsFor(pred: () => boolean, rounds = 10): Promise<void> {
+	for (let i = 0; i < rounds; i++) {
+		await act(async () => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 5);
+			await promise;
+		});
+		expect(pred()).toBe(true);
+	}
 }
 
 /** The placeholder right after submit: one, in the todo lane, titled by the first line. */
@@ -2590,34 +2649,26 @@ test("a new task closes its dialog at once and a placeholder holds the todo lane
 	});
 });
 
-test("a frame that carries the new card before the POST answers keeps the placeholder, not a duplicate", async () => {
+test("a frame that carries the new card before the POST answers shows the card in place of the placeholder", async () => {
 	await withCreatePost(async ({ answer }) => {
 		await mountAt("/projects/alpha");
 		await addTask(newTaskText);
 		expectPlaceholder();
 
-		// The frame also renames AL-1, so the test can see that it rendered.
-		const revised = "Alpha work, revised";
-		const frame = frameWithNewCard();
-		setFrame({
-			...frame,
-			tasks: frame.tasks.map((t) =>
-				t.id === "AL-1" ? { ...t, title: revised, sessionTitle: revised } : t,
-			),
-		} as unknown as StateResponse);
+		// No real card is held back: the frame's new card of this project stands in for the
+		// placeholder before the POST names its id. Never both, never a duplicate.
+		setFrame(frameWithNewCard());
 		refreshState();
-		await waitFor(() => document.body.textContent?.includes(revised) === true);
-		// The card stays held: only the placeholder shows until the POST names its id.
-		expect(cardCount("AL-9")).toBe(0);
-		expect(pendingCards().length).toBe(1);
-		expect(todoPendingCards().length).toBe(1);
-
-		answer(jsonResponse(newCard));
 		let overlap = false;
-		await waitFor(() => {
+		const once = (): boolean => {
 			if (cardCount("AL-9") > 0 && pendingCards().length > 0) overlap = true;
 			return cardCount("AL-9") === 1 && pendingCards().length === 0;
-		});
+		};
+		await waitFor(once);
+
+		answer(jsonResponse(newCard));
+		refreshState();
+		await holdsFor(once);
 		expect(overlap).toBe(false);
 	});
 });
@@ -2647,5 +2698,192 @@ test("a failed create drops the placeholder and reopens New task with the text a
 		await waitFor(() => appErrorRow() !== null);
 		expect(appErrorRow()?.textContent).toContain("boom");
 		expect(cardCount("AL-9")).toBe(0);
+	});
+});
+
+const frameWith = (...cards: TaskCard[]): StateResponse =>
+	({ ...state, tasks: [...state.tasks, ...cards] }) as unknown as StateResponse;
+/** The New task dialog's line about failed creates still queued for it; null when none. */
+const waitingLine = (): string | null => {
+	const line = newTaskDialog()?.querySelector(".compose-waiting");
+	if (line === null || line === undefined) return null;
+	expect(line.getAttribute("role")).toBe("status");
+	return line.textContent;
+};
+const oneWaiting =
+	"1 earlier task was not added. Send or clear this draft, then open New task again to get it back.";
+
+test("a card from another tab shows at once while a local create runs", async () => {
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask(newTaskText);
+		expectPlaceholder();
+
+		// Another tab adds AL-7 while this tab's POST runs. The placeholder may take it for
+		// its own card, but the card itself always renders.
+		const foreign = card({
+			id: "AL-7",
+			title: "Another tab's task",
+			sessionTitle: "Another tab's task",
+			createdAt: 3,
+		});
+		let hidden = false;
+		const shown = (): void => {
+			if (cardCount("AL-7") !== 1) hidden = true;
+		};
+		setFrame(frameWith(foreign));
+		refreshState();
+		await waitFor(() => cardCount("AL-7") === 1);
+
+		// The answer names AL-9: AL-7 is not this create's card, so its placeholder holds
+		// the lane again until AL-9 lands.
+		answer(jsonResponse(newCard));
+		await waitFor(() => {
+			shown();
+			return todoPendingCards().length === 1;
+		});
+		setFrame(frameWith(foreign, newCard));
+		refreshState();
+		await waitFor(() => {
+			shown();
+			return cardCount("AL-9") === 1 && pendingCards().length === 0;
+		});
+		expect(hidden).toBe(false);
+		expect(cardCount("AL-7")).toBe(1);
+	});
+});
+
+test("two creates each keep their own placeholder until their own card lands", async () => {
+	await withCreatePosts(async ({ answer, bodies }) => {
+		await mountAt("/projects/alpha");
+		await addTask("First concurrent task");
+		await addTask("Second concurrent task");
+		expect(bodies.map((b) => b.prompt)).toEqual([
+			"First concurrent task",
+			"Second concurrent task",
+		]);
+		expect(todoPendingCards().length).toBe(2);
+		const first = card({
+			id: "AL-9",
+			title: "First concurrent task",
+			sessionTitle: "First concurrent task",
+			createdAt: 5,
+		});
+		const second = card({
+			id: "AL-10",
+			title: "Second concurrent task",
+			sessionTitle: "Second concurrent task",
+			createdAt: 6,
+		});
+
+		answer(0, jsonResponse(first));
+		setFrame(frameWith(first));
+		refreshState();
+		const firstLanded = (): boolean =>
+			cardCount("AL-9") === 1 && todoPendingCards().length === 1;
+		await waitFor(firstLanded);
+		expect(todoPendingCards()[0]!.textContent).toContain(
+			"Second concurrent task",
+		);
+		// The first create settles and drops; AL-9 stays its card and never stands in for
+		// the second create, which still runs.
+		await holdsFor(firstLanded);
+		refreshState();
+		await holdsFor(firstLanded);
+
+		answer(1, jsonResponse(second));
+		setFrame(frameWith(first, second));
+		refreshState();
+		await waitFor(
+			() =>
+				cardCount("AL-9") === 1 &&
+				cardCount("AL-10") === 1 &&
+				pendingCards().length === 0,
+		);
+	});
+});
+
+test("two failed creates come back one at a time, and the dialog says how many wait", async () => {
+	await withCreatePosts(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask("First failed task");
+		await addTask("Second failed task");
+		expect(todoPendingCards().length).toBe(2);
+
+		answer(0, jsonResponse({ error: "boom" }, 500));
+		answer(1, jsonResponse({ error: "boom" }, 500));
+		// The first failure reopens New task with its input; the second waits in the queue.
+		await waitFor(
+			() =>
+				pendingCards().length === 0 &&
+				newTaskOpen() &&
+				waitingLine() === oneWaiting,
+		);
+		expect(newTaskBox()?.value).toBe("First failed task");
+		expect(
+			newTaskDialog()?.querySelector('[role="alert"]')?.textContent,
+		).toContain("Not added: boom");
+		await waitFor(() => appErrorRow() !== null);
+
+		// Clear the draft and close: the next open brings the second task back.
+		await typeNewTask("");
+		await closeNewTask();
+		expect(loadComposeDraft("new:alpha")?.text ?? "").toBe("");
+		await openNewTask();
+		await waitFor(() => newTaskBox()?.value === "Second failed task");
+		expect(waitingLine()).toBeNull();
+	});
+});
+
+test("a newer unsent draft wins over a failed create, which waits for the next open", async () => {
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/projects/alpha");
+		await addTask("Failed task");
+		// A new draft, typed and closed while the POST runs: the draft cache keeps it.
+		await openNewTask();
+		await typeNewTask("Unsent newer draft");
+		await closeNewTask();
+		expect(loadComposeDraft("new:alpha")?.text).toBe("Unsent newer draft");
+
+		answer(jsonResponse({ error: "boom" }, 500));
+		await waitFor(() => pendingCards().length === 0 && appErrorRow() !== null);
+		// The dialog does not open over the newer draft, and the draft stays untouched.
+		expect(newTaskOpen()).toBe(false);
+		expect(loadComposeDraft("new:alpha")?.text).toBe("Unsent newer draft");
+
+		await openNewTask();
+		await waitFor(() => waitingLine() === oneWaiting);
+		expect(newTaskBox()?.value).toBe("Unsent newer draft");
+	});
+});
+
+test("New task on the Overview shows a +1 adding chip in the project's Todo cell until the card lands", async () => {
+	const rowButton = 'button[aria-label="New task for Alpha"]';
+	const chips = (): Element[] =>
+		Array.from(
+			document
+				.querySelector(rowButton)
+				?.closest("tr")
+				?.querySelectorAll('td[data-label="Todo"] .pending-count') ?? [],
+		);
+	await withCreatePost(async ({ answer }) => {
+		await mountAt("/", () => document.querySelector(rowButton) !== null);
+		await addTask(newTaskText, rowButton);
+		expect(newTaskOpen()).toBe(false);
+		await waitFor(() => chips().length === 1);
+		const chip = chips()[0]!;
+		expect(chip.textContent).toContain("+1 adding");
+		expect(chip.getAttribute("aria-busy")).toBe("true");
+		expect(chip.getAttribute("data-pending-key")).not.toBeNull();
+		// Only Alpha's row shows a chip.
+		expect(document.querySelectorAll(".pending-count").length).toBe(1);
+
+		setFrame(frameWithNewCard());
+		answer(jsonResponse(newCard));
+		refreshState();
+		await waitFor(
+			() => document.querySelectorAll(".pending-count").length === 0,
+		);
+		expect(newTaskOpen()).toBe(false);
 	});
 });
