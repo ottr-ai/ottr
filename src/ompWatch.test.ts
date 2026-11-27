@@ -120,6 +120,8 @@ function fakeModel() {
 	const replies = new Map<string, string>();
 	const models = new Map<string, string>();
 	const modelsCodes = new Map<string, number>();
+	/** Versions whose transport run rejects (a worker/VM not reachable). */
+	const modelsThrown = new Map<string, string>();
 	const modelsAskedFor: string[] = [];
 	const requests: { model: string; system: string; user: string }[] = [];
 	const spawn: SpawnFn = async (argv, o) => {
@@ -155,6 +157,8 @@ function fakeModel() {
 	): Promise<{ code: number; stdout: string; stderr: string }> => {
 		expect(timeoutMs).toBe(OMP_WATCH_GATES.modelsTimeoutMs);
 		modelsAskedFor.push(version);
+		const thrown = modelsThrown.get(version);
+		if (thrown !== undefined) throw new Error(thrown);
 		const code = modelsCodes.get(version);
 		if (code !== undefined)
 			return { code, stdout: "", stderr: "install failed" };
@@ -173,6 +177,8 @@ function fakeModel() {
 		modelsOut: (version: string, stdout: string) => models.set(version, stdout),
 		modelsExit: (version: string, code: number) =>
 			modelsCodes.set(version, code),
+		modelsThrow: (version: string, message: string) =>
+			modelsThrown.set(version, message),
 		modelsAsked: () => modelsAskedFor,
 	};
 }
@@ -1124,6 +1130,23 @@ describe("createOmpWatcher", () => {
 				l.includes("omp 18.16.0: models list exited with code 1"),
 			),
 		).toBe(true);
+	});
+
+	test("an unreachable transport files no card, logs the warning, and keeps lastError null", async () => {
+		const w = await setup();
+		w.release("18.16.0", 1 * DAY);
+		w.signedIn(["zai"]);
+		w.model.modelsThrow("18.16.0", "no worker reachable");
+		await w.watcher.tick();
+		expect(await w.cards()).toEqual([]);
+		expect(w.scheduled()).toBe(0);
+		expect(
+			w.logs.some((l) =>
+				l.includes("omp 18.16.0: models list not run: no worker reachable"),
+			),
+		).toBe(true);
+		// A transport failure is a warning, never the tick's lastError.
+		expect(w.state().lastError).toBeNull();
 	});
 
 	test("models output over the entry cap files no card and logs a warning", async () => {

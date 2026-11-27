@@ -98,11 +98,14 @@ an acceptable boundary for unapproved code.
 - The user decided on 2026-11-27 (OTTR-1287 security review): the candidate is unapproved
   code, so it never executes on the server host. The probe runs only through
   `deps.probeTransport`, inside the worker or VM isolation the board uses for untrusted
-  code (docs/WORKERS.md). The server wiring passes no transport yet: until the transport
-  lands, no candidate omp executes, the watch records no model sets, and it files normal
-  7-day bump cards only. `modelSet` returns null without one; a wired transport that
-  fails or returns unusable output only loses the fast track (below). `modelsTimeoutMs`
-  bounds one transport run.
+  code (docs/WORKERS.md); the server wiring passes the worker/VM dispatch as the
+  transport. The transport runs
+  `bunx @oh-my-pi/pi-coding-agent@<version> models --json` in a fresh scratch HOME on the
+  worker or guest, with none of the board's identity, credential or configuration env.
+  The scratch dies with the run, and nothing live mounts into it. `modelSet` returns null
+  without a transport; a transport that fails or returns unusable output only loses the
+  fast track (below), and the failure is a warning, never a `lastError`.
+  `modelsTimeoutMs` bounds one transport run.
 - When a review ends with `pass`, the watcher asks the transport for that version's model
   list and stores the set. The transport runs `omp models --json` for that exact version
   on the worker. A failed review never probes: a failed version can never be the target.
@@ -214,7 +217,7 @@ bun (`bun install -g` then `omp --version`). It holds no deploy key and pushes n
 - A passed release younger than 7 days that adds a model id for a signed-in provider files
   one P1 bump card at once (OTTR-1287). A second tick files no second card. With no
   transport wired, the same release files no card: no probe runs, no set is stored, and
-  the aged release later files a normal unrated card (production stance today).
+  the aged release later files a normal unrated card.
 - A passed release whose model set adds nothing for a signed-in provider keeps the 7-day wait.
 - A models list with junk output, or with more entries than the cap, files no card and logs
   a warning.

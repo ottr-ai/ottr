@@ -40,6 +40,7 @@ import {
 	sweepWorker,
 	WORKER_DONE,
 	WorkerConnectError,
+	type WorkerRequest,
 	type WorkerTarget,
 } from "./workers.ts";
 
@@ -103,6 +104,22 @@ writeFileSync(
 	quietScratchPath,
 	`process.stdout.write(process.env.TMPDIR + "\\n");
 setInterval(() => {}, 1000);`,
+);
+
+// Probe stub: one JSON line naming the marker, the paths a probe run saw (cwd, HOME,
+// TMPDIR), and the credential names it must never hold. The tests pick the line by
+// the marker.
+const probeStubPath = join(dir, "probe-omp.js");
+writeFileSync(
+	probeStubPath,
+	`process.stdout.write(JSON.stringify({
+	marker: "probe-ran",
+	pwd: process.cwd(),
+	home: process.env.HOME,
+	tmp: process.env.TMPDIR,
+	token: process.env.OTTR_WORKER_TOKEN,
+	hindsight: Object.keys(process.env).filter((k) => k.startsWith("HINDSIGHT_")),
+}) + "\\n");`,
 );
 
 // Pid-writing sleeper omp: drops its pid, then stays alive until killed. The sweep test
@@ -1417,6 +1434,127 @@ describe("serveWorker", () => {
 			process.off("uncaughtException", onError);
 		}
 	}, 15000);
+
+	test("a probe run runs argv[0] as the full command inside the daemon scratch", async () => {
+		const url = start({ ompPath: process.execPath });
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{
+				id: "probe-1",
+				argv: [process.execPath, probeStubPath],
+				cwd: dir,
+				stdin: "",
+				env: {},
+				probe: true,
+			},
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		const seen = JSON.parse(
+			sink.lines.find((l) => l.includes("probe-ran")) ?? "",
+		) as { pwd: string; home: string; tmp: string };
+		// The probe's argv[0] was the full command, and the daemon's per-run scratch
+		// replaced body.cwd: cwd, HOME and TMPDIR are one `run-` dir under the
+		// daemon's temp root, HOME being the scratch dir itself.
+		expect(seen.pwd.startsWith(join(tmpdir(), "run-probe-1-"))).toBe(true);
+		expect(seen.home.startsWith(join(tmpdir(), "run-probe-1-"))).toBe(true);
+		expect(seen.home).toBe(seen.pwd);
+		expect(seen.tmp).toBe(seen.home);
+	}, 30_000);
+
+	test("probe runs keep the env strips: no worker token, no HINDSIGHT seed", async () => {
+		const savedToken = process.env.OTTR_WORKER_TOKEN;
+		const savedHindsight = process.env.HINDSIGHT_PROBE_URL;
+		process.env.OTTR_WORKER_TOKEN = "worker-secret";
+		process.env.HINDSIGHT_PROBE_URL = "http://hindsight.test";
+		try {
+			const url = start({ ompPath: process.execPath });
+			const sink = fakeSink();
+			const { done } = runWorker(
+				{
+					id: "probe-env",
+					argv: [process.execPath, probeStubPath],
+					cwd: dir,
+					stdin: "",
+					// The request env is the token name's other leak path.
+					env: { OTTR_WORKER_TOKEN: "forwarded" },
+					probe: true,
+				},
+				{ urls: [url] },
+				sink,
+			);
+			await done;
+			const seen = JSON.parse(
+				sink.lines.find((l) => l.includes("probe-ran")) ?? "",
+			) as { token?: string; hindsight: string[] };
+			expect(seen.token).toBeUndefined();
+			expect(seen.hindsight).toEqual([]);
+		} finally {
+			if (savedToken === undefined) delete process.env.OTTR_WORKER_TOKEN;
+			else process.env.OTTR_WORKER_TOKEN = savedToken;
+			if (savedHindsight === undefined) delete process.env.HINDSIGHT_PROBE_URL;
+			else process.env.HINDSIGHT_PROBE_URL = savedHindsight;
+		}
+	}, 30_000);
+
+	test("a probe value that is not the literal true is refused before any spawn", async () => {
+		const server = serveWorker({ port: 0, ompPath: process.execPath });
+		servers.push(server);
+		const url = `http://127.0.0.1:${server.port}`;
+		// JSON round-trip: the wire can carry probe: "yes" even though the request
+		// type forbids it.
+		const body = JSON.parse(
+			JSON.stringify({
+				id: "probe-bad",
+				argv: [process.execPath, probeStubPath],
+				cwd: dir,
+				stdin: "",
+				env: {},
+				probe: "yes",
+			}),
+		) as WorkerRequest;
+		const sink = fakeSink();
+		const { done } = runWorker(body, { urls: [url] }, sink);
+		const outcome = await done.then(
+			() => null,
+			(error: unknown) => error,
+		);
+		expect(outcome).toBeInstanceOf(WorkerConnectError);
+		expect((outcome as Error).message).toContain("responded 400");
+		// Refused at the body check: no run entry ever existed.
+		expect(server.runStarts()).toEqual([]);
+	}, 30_000);
+
+	test("the probe run's scratch dies with the run", async () => {
+		const url = start({ ompPath: process.execPath });
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{
+				id: "probe-scratch",
+				argv: [process.execPath, probeStubPath],
+				cwd: dir,
+				stdin: "",
+				env: {},
+				probe: true,
+			},
+			{ urls: [url] },
+			sink,
+		);
+		await done;
+		const seen = JSON.parse(
+			sink.lines.find((l) => l.includes("probe-ran")) ?? "",
+		) as { home: string };
+		const scratch = seen.home;
+		expect(basename(scratch).startsWith("run-")).toBe(true);
+		// The child's close event lives inside the daemon, so the test has no
+		// promise to await — poll the observable condition like the scratch tests
+		// above; removeScratch also deleted the probe's HOME.
+		const deadline = Date.now() + 10_000;
+		while (existsSync(scratch) && Date.now() < deadline) await Bun.sleep(20);
+		expect(existsSync(scratch)).toBe(false);
+	}, 30_000);
 });
 
 describe("GET /signins", () => {

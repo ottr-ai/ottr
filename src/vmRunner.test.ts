@@ -1299,6 +1299,21 @@ describe("vm-runner health and refusals", () => {
 		});
 		expect(res.status).toBe(401);
 	});
+
+	test("a probe /run with no vm spec is refused and boots no VM", async () => {
+		// OTTR-1334: the omp watch's probe requests ride classic workers only. The
+		// vm spec check refuses the body before any boot, so a probe request can
+		// never execute on a VM host.
+		const r = startRunner();
+		const res = await post(r.url, "/run", {
+			...request(),
+			vm: undefined,
+			probe: true,
+		});
+		expect(res.status).toBe(400);
+		expect(await res.text()).toContain("needs the vm spec");
+		expect(r.recs).toHaveLength(0);
+	});
 });
 
 /* ------------------------------------------------------------------------------------ */

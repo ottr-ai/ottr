@@ -2,10 +2,10 @@
  * The omp watch (docs/specs/omp-watch.md): an hourly tick reads the omp pin in a project's
  * Dockerfile.worker, lists the newer omp releases on npm, has a model review each release's
  * notes, files a fail card that holds the pin, and files a "Bump omp to X" card when a
- * reviewed release is old enough — or, once the candidate probe runs inside the worker/VM
+ * reviewed release is old enough — or, through the candidate probe inside the worker/VM
  * isolation (deps.probeTransport), at once, at P1, when it adds model access for a provider
- * the board is signed in to (OTTR-1287). Until that transport is wired, no candidate omp
- * executes on the server and the watch files normal 7-day bump cards only.
+ * the board is signed in to (OTTR-1287). A wired transport that fails only loses the fast
+ * track: the watch keeps the normal 7-day bump cards.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -485,9 +485,9 @@ export function createOmpWatcher(deps: {
 	 * The candidate probe's transport: runs `omp models --json` for one exact version
 	 * inside the worker/VM isolation the board uses for untrusted code (docs/WORKERS.md),
 	 * and returns its exit code and stdout. The candidate is unapproved code, so it never
-	 * executes on the server host (OTTR-1287 security review): production passes no
-	 * transport yet, the probe stays off, and the watch files normal 7-day bump cards.
-	 * The follow-up card wires the worker/VM transport here. `timeoutMs` bounds the run.
+	 * executes on the server host (OTTR-1287 security review). Production wires the
+	 * worker/VM dispatch; a throw (no worker reachable) or a failed run only loses the
+	 * fast track. `timeoutMs` bounds the run.
 	 */
 	probeTransport?: (
 		version: string,

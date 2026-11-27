@@ -123,6 +123,12 @@ export interface WorkerRequest {
 	/** Set only for a vm-runner dispatch (docs/adr/0009-microvm-workers.md); classic workers
 	 * are never sent one and ignore it. */
 	vm?: VmSpec;
+	/** Set only by the omp watch's candidate probe (docs/specs/omp-watch.md): `argv` is
+	 * then the FULL command (argv[0] names the binary), and the run's cwd, HOME and
+	 * TMPDIR are the daemon's own per-run scratch, which dies with the run. Classic
+	 * workers only: the vm-runner refuses /run without a vm spec, so a probe request
+	 * can never execute on a VM host. */
+	probe?: true;
 }
 
 /**
@@ -786,6 +792,10 @@ export function serveWorker(opts: {
 		// starts and /proc cannot. Best effort, like the scratch prep.
 		touchRunMarker(scratch);
 		env.TMPDIR = scratch;
+		// A probe run lives entirely inside its scratch: its HOME holds none of the
+		// worker's shared home or agent store, and removeScratch deletes everything
+		// (HOME included) when the run closes.
+		if (body.probe === true) env.HOME = scratch;
 		env.OTTR_TMP_ROOT = tmpdir();
 		if (ids !== null) chownSync(scratch, ids.uid, ids.gid);
 		const removeScratch = (): void => {
@@ -803,13 +813,20 @@ export function serveWorker(opts: {
 		};
 		let child: ChildProcess;
 		try {
-			child = spawn(opts.ompPath ?? "omp", body.argv, {
-				cwd: body.cwd,
-				env,
-				stdio: ["pipe", "pipe", "pipe"],
-				windowsHide: true,
-				...(ids ? { uid: ids.uid, gid: ids.gid } : {}),
-			});
+			// A probe run's argv is the full command: argv[0] names the binary, and the
+			// daemon's per-run scratch (cwd, HOME and TMPDIR above) replaces body.cwd.
+			const probe = body.probe === true;
+			child = spawn(
+				probe ? (body.argv[0] ?? "omp") : (opts.ompPath ?? "omp"),
+				probe ? body.argv.slice(1) : body.argv,
+				{
+					cwd: probe ? scratch : body.cwd,
+					env,
+					stdio: ["pipe", "pipe", "pipe"],
+					windowsHide: true,
+					...(ids ? { uid: ids.uid, gid: ids.gid } : {}),
+				},
+			);
 		} catch (err) {
 			release();
 			removeScratch();
@@ -982,7 +999,8 @@ function runIdSegment(id: string): string {
 }
 
 /** A /run request is well-formed when argv is all strings, cwd is an existing absolute
- * directory, and the lists are texts. */
+ * directory, the lists are texts, and probe (when present) is the literal true —
+ * any other value is a malformed request, refused before any spawn. */
 function validRunBody(body: WorkerRequest): boolean {
 	return (
 		typeof body === "object" &&
@@ -996,7 +1014,8 @@ function validRunBody(body: WorkerRequest): boolean {
 		statSync(body.cwd).isDirectory() &&
 		validWorkerEnv(body.env) &&
 		(body.githubReadEnv === undefined || validWorkerEnv(body.githubReadEnv)) &&
-		validLists(body.lists)
+		validLists(body.lists) &&
+		(body.probe === undefined || body.probe === true)
 	);
 }
 

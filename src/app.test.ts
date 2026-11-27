@@ -90,6 +90,7 @@ import {
 import type { OmpStats, OmpStatsAnswer, OmpUsageTotals } from "./ompStats.ts";
 import type { DashboardState, OmpStatsDashboard } from "./ompStatsDashboard.ts";
 import { mirrorFolderName } from "./ompStatsMirror.ts";
+import { OMP_PACKAGE_URL } from "./ompWatch.ts";
 import { summarizeCmd } from "./orphans.ts";
 import {
 	gateCompareText,
@@ -27939,6 +27940,240 @@ describe("worker sign-in warnings", () => {
 			else process.env.PI_CODING_AGENT_DIR = savedAgent;
 			if (savedKey === undefined) delete process.env.ZAI_API_KEY;
 			else process.env.ZAI_API_KEY = savedKey;
+			rmSync(agentTmp, { recursive: true, force: true });
+		}
+	});
+});
+
+/** OTTR-1334: the server wiring of the candidate probe (OTTR-1287 fast track). The tick
+ * reaches the fake worker only through deps.probeTransport, so the recorded POST /run
+ * bodies witness the probe never spawns on the server host. */
+describe("omp watch probe wiring", () => {
+	test("the wired omp watch probes the candidate on a worker and fast-tracks the P1 bump card", async () => {
+		// The stand-in worker: every POST /run body is recorded, and the answer streams
+		// the models JSON line, then the done sentinel (src/workers.ts parseSentinel).
+		const probeRequests: { path: string; probe: unknown; argv: string[] }[] = [];
+		let candidateModels = '{"models":[{"provider":"zai","id":"glm-6.2"}]}';
+		const fakeWorker = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				const url = new URL(req.url);
+				if (req.method !== "POST" || url.pathname !== "/run")
+					return new Response("not found", { status: 404 });
+				const body = (await req.json()) as {
+					probe?: unknown;
+					argv?: unknown;
+				};
+				const argv = Array.isArray(body.argv)
+					? body.argv.map((a) => String(a))
+					: [];
+				probeRequests.push({ path: url.pathname, probe: body.probe, argv });
+				const version = /@(\d+\.\d+\.\d+)$/.exec(argv[1] ?? "")?.[1] ?? "";
+				const models =
+					version === "18.16.0" ? candidateModels : '{"models":[]}';
+				const lines = [
+					models,
+					JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }),
+				];
+				return new Response(`${lines.join("\n")}\n`, {
+					headers: { "content-type": "text/plain" },
+				});
+			},
+		});
+		// A private project board per scenario, like the OTTR-965 slim boards: the pin
+		// line in Dockerfile.worker opts the project in.
+		const ompBoard = async (dirName: string) => {
+			const dir = join(root, dirName);
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "Dockerfile.worker"), "ARG OMP_VERSION=18.15.0\n");
+			const st = await ProjectStore.open(dir);
+			testStores.add(st);
+			await st.setSettings({ ompWatch: true });
+			const entry: Entry = {
+				path: dir,
+				name: dirName,
+				store: st,
+				target: null,
+				gitless: false,
+				github: null,
+				protectedTarget: false,
+				remote: null,
+				dirty: false,
+				mainUnpushed: false,
+				mainBranch: null,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			};
+			return { st, projects: new Map([[dirName, entry]]) };
+		};
+		// One active zai sign-in in the board's agent store: the fast track only counts
+		// providers the board can sign in with (src/login.ts signIns).
+		const agentTmp = mkdtempSync(join(tmpdir(), "ottr-omp-probe"));
+		const db = new Database(join(agentTmp, "agent.db"));
+		db.exec(`CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY,
+			provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL,
+			disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)`);
+		db.exec(`INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES
+			('zai', 'api_key', '{"key":"k"}', NULL, 1, 1)`);
+		db.close();
+		const savedAgent = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentTmp;
+		// npm serves the packument only; every other URL (the worker POST /run) passes
+		// through to the real fetch. The candidate published 1 day ago: only the fast
+		// track files a card this young (the age gate waits 7 days).
+		const DAY = 86_400_000;
+		const packument = () => ({
+			name: "@oh-my-pi/pi-coding-agent",
+			repository: {
+				type: "git",
+				url: "git+https://github.com/can1357/oh-my-pi.git",
+			},
+			time: {
+				created: new Date(Date.now() - 400 * DAY).toISOString(),
+				modified: new Date(Date.now()).toISOString(),
+				"18.15.0": new Date(Date.now() - 60 * DAY).toISOString(),
+				"18.16.0": new Date(Date.now() - 1 * DAY).toISOString(),
+			},
+			versions: { "18.15.0": {}, "18.16.0": {} },
+		});
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (String(input) === OMP_PACKAGE_URL) return Response.json(packument());
+			return realFetch(input, init);
+		}) as typeof fetch;
+		try {
+			// Scenario 1: the candidate adds a signed-in model, the card files at P1.
+			// The pass verdict is seeded, so no review model call ever runs.
+			const p1 = await ompBoard("omp-probe-a");
+			await gstore.set("ompWatch:omp-probe-a", {
+				verdicts: {
+					"18.16.0": {
+						verdict: "pass",
+						reasons: [],
+						cardId: null,
+						at: Date.now(),
+					},
+				},
+				modelSets: {},
+				bumpCard: null,
+				lastError: null,
+			});
+			const workerApp = await createTestApp({
+				gstore,
+				defaultDir: root,
+				projects: p1.projects,
+				...loopStubs(),
+				schedule: () => {},
+				serverVersion: "test",
+				port: 0,
+				publicHosts: [],
+				tmpSpace: () => null,
+				shared: {
+					maxTotalRuns: 3,
+					reviewCheck: true,
+					workCheck: true,
+					idleReviews: true,
+					trendingScan: true,
+					commitIdentity: null,
+					removedPaths: [],
+					envValues: {},
+					envPlain: {},
+					projectPaths: [],
+					projectOrder: [],
+				},
+				serverRef: { current: undefined },
+				workerTarget: {
+					urls: [`http://127.0.0.1:${fakeWorker.port}`],
+					token: "tok",
+				},
+			});
+			await workerApp.ompWatchTick();
+			const bump = (await p1.st.listTasks()).find(
+				(t) => t.title === "Bump omp to 18.16.0",
+			);
+			expect(bump).toBeDefined();
+			expect(bump!.topic).toBe("omp");
+			expect(bump!.priority).toBe("P1");
+			// Both model sets were read on the worker (the pin's baseline, then the
+			// candidate), never spawned on the server: every body carries probe true.
+			const argvs = probeRequests.map((r) => r.argv);
+			expect(argvs).toHaveLength(2);
+			expect(argvs).toContainEqual([
+				"bunx",
+				"@oh-my-pi/pi-coding-agent@18.15.0",
+				"models",
+				"--json",
+			]);
+			expect(argvs).toContainEqual([
+				"bunx",
+				"@oh-my-pi/pi-coding-agent@18.16.0",
+				"models",
+				"--json",
+			]);
+
+			// Scenario 2: the candidate's catalog is identical to the pin's — the
+			// regression mirrors src/ompWatch.test.ts "the same model set keeps the
+			// 7-day wait". No card files for the identical catalog.
+			candidateModels = '{"models":[]}';
+			const p1b = await ompBoard("omp-probe-b");
+			await gstore.set("ompWatch:omp-probe-b", {
+				verdicts: {
+					"18.16.0": {
+						verdict: "pass",
+						reasons: [],
+						cardId: null,
+						at: Date.now(),
+					},
+				},
+				modelSets: {},
+				bumpCard: null,
+				lastError: null,
+			});
+			const workerApp2 = await createTestApp({
+				gstore,
+				defaultDir: root,
+				projects: p1b.projects,
+				...loopStubs(),
+				schedule: () => {},
+				serverVersion: "test",
+				port: 0,
+				publicHosts: [],
+				tmpSpace: () => null,
+				shared: {
+					maxTotalRuns: 3,
+					reviewCheck: true,
+					workCheck: true,
+					idleReviews: true,
+					trendingScan: true,
+					commitIdentity: null,
+					removedPaths: [],
+					envValues: {},
+					envPlain: {},
+					projectPaths: [],
+					projectOrder: [],
+				},
+				serverRef: { current: undefined },
+				workerTarget: {
+					urls: [`http://127.0.0.1:${fakeWorker.port}`],
+					token: "tok",
+				},
+			});
+			await workerApp2.ompWatchTick();
+			expect(
+				(await p1b.st.listTasks()).some((t) =>
+					t.title.startsWith("Bump omp to"),
+				),
+			).toBe(false);
+			// Every probe of both scenarios reached the worker through POST /run.
+			expect(
+				probeRequests.every((r) => r.path === "/run" && r.probe === true),
+			).toBe(true);
+		} finally {
+			fakeWorker.stop(true);
+			globalThis.fetch = realFetch;
+			if (savedAgent === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedAgent;
 			rmSync(agentTmp, { recursive: true, force: true });
 		}
 	});

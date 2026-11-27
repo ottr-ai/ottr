@@ -227,6 +227,7 @@ import {
 	tagsToClear,
 	taskEntryKey,
 } from "./notifications.ts";
+import { createOmpProbeTransport } from "./ompProbeTransport.ts";
 import {
 	buildOmpStatsReport,
 	newSessionUsageCache,
@@ -3888,9 +3889,11 @@ export async function createApp(deps: AppDeps) {
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
 		signIns: activeSignInProviders,
-		// probeTransport stays unwired: the candidate probe must run inside the worker/VM
-		// isolation (OTTR-1287 security review), never on this server host. The watch
-		// files normal 7-day bump cards until the transport lands.
+		// The candidate probe dispatches to the worker containers (OTTR_WORKER_URLS): the
+		// same isolation agent turns get. With no target configured, or a worker
+		// unreachable, the transport throws, the watch logs the warning, and the watch
+		// files normal 7-day bump cards (docs/specs/omp-watch.md).
+		probeTransport: createOmpProbeTransport({ target: deps.workerTarget }),
 	});
 
 	/**
