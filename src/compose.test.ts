@@ -19,7 +19,7 @@ const server = svc("server");
 const postgresTest = svc("postgres-test");
 const alate = svc("alate");
 const postgresTestImage =
-	"docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636";
+	"docker.io/library/postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42";
 const ci = Bun.YAML.parse(
 	readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"),
 ) as { jobs: { check: Service } };

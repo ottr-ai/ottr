@@ -90,11 +90,11 @@ The specification selects PostgreSQL 18 as the minimum and test target major.
 Compose and the CI `check` job use this exact image:
 
 ```text
-docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+docker.io/library/postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
 ```
 
-The digest comes from the [official Docker Hub tag API for `library/postgres:18.4`](https://hub.docker.com/v2/repositories/library/postgres/tags/18.4).
-The tag API records its last push as 2026-08-06.
+The digest comes from the [official Docker Hub tag API for `library/postgres:18.6`](https://hub.docker.com/v2/repositories/library/postgres/tags/18.6).
+The tag API records its last push as 2026-11-06.
 Card F must reuse this exact digest for its optional production service.
 The production service does not exist on card C.
 
