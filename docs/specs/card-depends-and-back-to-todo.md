@@ -14,6 +14,15 @@ the turn history and the lineage. `POST …/backlog` moved cards only between
 
 ## Behavior
 
+### Creation
+
+A create request's `dependsOn` list is written inside the same transaction
+that creates the row: the card is born with its dependencies. A second write
+after the birth transaction would leave a window where the row exists with an
+empty list — its `PREFIX-n` id is predictable — and a concurrent edit could
+close the cycle the birth list closes. `applyTaskCreateExtras` no longer
+writes dependencies.
+
 ### 1. Edit dependsOn — `POST /api/projects/:project/tasks/:id/depends-on`
 
 Body: `{ "dependsOn": string[] }`. The list replaces the card's `dependsOn`
@@ -56,16 +65,24 @@ The existing route gains a second source: a stage `in_progress` card in state
 `needs_you` or `idle` moves back to `todo`/`queued`.
 
 - Before any state write the route refuses 409 when a reply or steer is still
-  queued (`pendingPrompt`), or when the state is `queued`, `preparing`, or
-  `running`.
+  queued (`pendingPrompt`), or when the state is `queued` or `running`. A
+  `preparing` card is refused unless it carries the move's own reservation
+  marker (the reclaim path above).
 - The route reserves the card before it touches git, and the whole move runs
-  under a per-card lock: a transaction writes state `idle` (a needs-you card
-  flips, an idle card bumps its revision), and the guarded row the write
-  returns drives the rest of the move. A reply, restart, or steer that lands
-  during the git work fails its revision/state guard, and the scheduler never
-  picks `idle`, so no run can claim the worktree while the route works on it.
-  A second Back to todo request waits on the per-card lock; its re-read
-  inside the lock meets the moved row and answers 409 without reserving.
+  under a per-card lock. The reservation is state `preparing` under the
+  move's needsReason marker ("Moving back to todo..."): `preparing` is the
+  one run state no dispatcher starts from — `pickRunnable` picks `queued`,
+  the merge slots pick `queued`/`merging`, merge-anyway refuses `preparing`,
+  replies and restarts want `needs_you` — so the reservation holds against
+  every dispatch path, present or future, without per-path guards, and a
+  reply, restart, or steer that lands during the git work fails its
+  revision/state guard. The guarded row the reservation write returns drives
+  the rest of the move. A second Back to todo request waits on the per-card
+  lock; its re-read inside the lock meets the moved row and answers 409
+  without reserving. A crashed move leaves the card in its own preparing
+  reservation; the marker proves the claim is the move's, so a later move
+  reclaims it instead of stranding the card (cancel stays the other way
+  out).
 - Allowed only when the card holds no work: the worktree, if one exists, must
   be clean (`git status` empty) and hold no commits past its base/target
   (`unsavedWork` in `src/worktree.ts`). A husk (unlinked or missing worktree
@@ -137,6 +154,13 @@ The existing route gains a second source: a stage `in_progress` card in state
 
 ## Risks
 
+- The class rule the dependency writers follow (OTTR-1318 send-back 3): every
+  `dependsOn` write is atomic with the fact it encodes — the birth write in
+  the create transaction, the edit route's validate-and-write under
+  `withDepWriteLock`, the settle's prune-and-write under the same lock — and
+  the Back to todo reservation is the one run state (`preparing`) no
+  dispatcher starts from. A new writer or dispatch path that skips these
+  choke points reopens the class.
 - A cross-project cycle can only be detected while both cards' projects are on
   the board; an id the resolver cannot reach counts as satisfied at
   scheduling, so the walk treats it the same way (no cycle through it).

@@ -16,6 +16,8 @@ import {
 	checkModelWarning,
 	checkRoleFor,
 	checkRoutingNote,
+	cyclicDepIds,
+	type DepCard,
 	type DepIndex,
 	type DepProject,
 	demoteUnquoted,
@@ -3345,5 +3347,43 @@ describe("leadBlocker", () => {
 		expect(LEAD_QUESTIONS_PROMPT_PREFIX).toBe(
 			"Needs-validation lead questions from review #",
 		);
+	});
+
+	test("cyclicDepIds flags the id that closes a birth-window cycle", () => {
+		// The created card and the blocker of one project; the created card's list is
+		// the birth write (OTTR-1318): an edit that validated B→[A] against the window
+		// before the list landed must be flagged once A→[B] is on the row.
+		const created: DepCard = {
+			id: "P-2",
+			title: "created",
+			stage: "todo",
+			cancelledAt: null,
+		};
+		const blocker: DepCard = {
+			id: "P-1",
+			title: "blocker",
+			stage: "todo",
+			cancelledAt: null,
+		};
+		const projects: DepProject[] = [
+			{
+				name: "p",
+				prefix: "P",
+				getTask: (id) =>
+					id === created.id ? created : id === blocker.id ? blocker : null,
+			},
+		];
+		// The created card's committed list is the birth write under test.
+		expect(
+			cyclicDepIds(["P-2"], "P-1", "p", projects, (project, id) =>
+				project === "p" && id === created.id ? ["P-1"] : undefined,
+			),
+		).toEqual(["P-2"]);
+		// An id that closes no path back to the card stays out of the drop list.
+		expect(
+			cyclicDepIds(["P-9"], "P-1", "p", projects, (project, id) =>
+				project === "p" && id === created.id ? ["P-1"] : undefined,
+			),
+		).toEqual([]);
 	});
 });

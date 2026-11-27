@@ -12531,6 +12531,13 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}
+	/** OTTR-1318: the needsReason a Back to todo move stamps while it holds the card:
+	 * state `preparing` is the one run state no dispatcher starts from (pickRunnable
+	 * picks `queued`, the merge slots pick `queued`/`merging`, merge-anyway refuses
+	 * `preparing`), so the reservation holds against every dispatch path, present and
+	 * future, without per-path guards. The marker distinguishes the move's own claim
+	 * from a scheduler claim, so a crashed move can be reclaimed. */
+	const BACK_TO_TODO_RESERVE = "Moving back to todo...";
 	/** OTTR-1318: one Back to todo move at a time per card. The lock makes the
 	 * reservation exclusive: a second request that arrives while the first holds the
 	 * card waits here, and its re-read inside the lock meets the moved row and answers
@@ -12574,25 +12581,35 @@ export async function createApp(deps: AppDeps) {
 					{ error: "only a parked in-progress task can move back to todo" },
 					409,
 				);
-			if (live.state !== "needs_you" && live.state !== "idle")
+			// A crashed move leaves the card in its own preparing reservation; the
+			// marker (and the free per-card lock) prove it, so the move reclaims it
+			// instead of stranding the card.
+			const reclaim =
+				live.state === "preparing" && live.needsReason === BACK_TO_TODO_RESERVE;
+			if (live.state !== "needs_you" && live.state !== "idle" && !reclaim)
 				return json(
 					{ error: `a ${live.state} task cannot move back to todo` },
 					409,
 				);
 			if (live.pendingPrompt !== null)
 				return json({ error: "a reply or steer is still queued" }, 409);
-			// Reserve before disposal: needs_you flips to idle (a reply's guard reads state
-			// and revision through withTask), an already-idle card bumps its revision, and
-			// the scheduler skips idle. The worktree stays until the checks below pass, so
-			// a refusal leaves the card parked and retryable. The returned snapshot is the
-			// guarded row the rest of the move writes against.
-			const reserved = await updateSnapshot(e, live, { state: "idle" });
-			// A refused or failed move puts a needs-you card back the way the operator
-			// found it; best-effort, because a writer that landed meanwhile owns the row.
+			// Reserve before disposal: the card flips to `preparing` under the move's
+			// marker (a reply's guard reads state and revision through withTask, and no
+			// dispatcher starts from `preparing`). The worktree stays until the checks
+			// below pass, so a refusal leaves the card parked and retryable. The
+			// returned snapshot is the guarded row the rest of the move writes against.
+			const reserved = await updateSnapshot(e, live, {
+				state: "preparing",
+				needsReason: BACK_TO_TODO_RESERVE,
+			});
+			// A refused or failed move puts the card back the way the operator found
+			// it; best-effort, because a writer that landed meanwhile owns the row.
 			const restore = async (): Promise<void> => {
-				if (live.state !== "needs_you") return;
 				try {
-					await updateSnapshot(e, reserved, { state: "needs_you" });
+					await updateSnapshot(e, reserved, {
+						state: live.state === "preparing" ? "needs_you" : live.state,
+						needsReason: live.state === "preparing" ? null : live.needsReason,
+					});
 				} catch {
 					// the row moved: its writer decides the state
 				}
@@ -13378,7 +13395,15 @@ export async function createApp(deps: AppDeps) {
 		)
 			return json({ error: "reason must be 1-2000 characters" }, 400);
 		if (task.state === "running" || task.state === "preparing")
-			return json({ error: "the work turn is still running" }, 409);
+			return json(
+				{
+					error:
+						task.needsReason === BACK_TO_TODO_RESERVE
+							? "the card is being moved back to todo"
+							: "the work turn is still running",
+				},
+				409,
+			);
 		if (task.stage !== "in_progress")
 			return json({ error: "only a work card can merge anyway" }, 409);
 		if (openWorkBlockers(task.workCheckLog).length === 0)
@@ -15021,7 +15046,6 @@ export async function createApp(deps: AppDeps) {
 			followUpOf: string | null;
 			followUpOfProject: string | null;
 			updateIds: string[];
-			dependsOn: string[];
 		},
 		backlog: unknown,
 	): Promise<void> {
@@ -15031,8 +15055,6 @@ export async function createApp(deps: AppDeps) {
 				followUpOfProject: prep.followUpOfProject,
 				updateIds: prep.updateIds,
 			});
-		if (prep.dependsOn.length > 0)
-			await e.store.updateTask(t.id, { dependsOn: prep.dependsOn });
 		if (backlog === true)
 			await e.store.updateTask(t.id, {
 				stage: "backlog",
@@ -15065,6 +15087,12 @@ export async function createApp(deps: AppDeps) {
 			const t = await e.store.createTask(prep.prompt, prep.model);
 			if (agentCardRequest(req))
 				await e.store.updateTask(t.id, { promptAuthor: "board" });
+			// The card is born with its dependencies: a second write after this
+			// transaction would leave a window where the row exists with an empty list,
+			// and a concurrent edit could close the cycle the birth list closes
+			// (OTTR-1318, the dependency writers' one-writer rule).
+			if (prep.dependsOn.length > 0)
+				await e.store.updateTask(t.id, { dependsOn: prep.dependsOn });
 			return {
 				task: await e.store.updateTask(t.id, { holdUntil: PROMPT_EDIT_HELD }),
 				decoded: result,
