@@ -5900,20 +5900,32 @@ describe("gitEnv", () => {
 	});
 
 	test("gitEnv merges its auth env for a fetch; local subcommands get none of it", () => {
-		const ambientCount = process.env.GIT_CONFIG_COUNT;
-		// git() resolves the resolver and passes it here; gitEnv only merges what it gets.
-		const env = gitEnv(["fetch", "origin"], {
-			GIT_SSH_COMMAND: "ssh -i /resolver-key",
-			GIT_CONFIG_COUNT: "1",
-		});
-		expect(env.GIT_SSH_COMMAND).toBe("ssh -i /resolver-key");
-		expect(env.GIT_CONFIG_COUNT).toBe("1");
-		// An explicit authEnv replaces the resolver output wholesale: no bleed-through.
-		const explicit = gitEnv(["fetch", "origin"], {
-			GIT_SSH_COMMAND: "ssh -i /explicit-key",
-		});
-		expect(explicit.GIT_SSH_COMMAND).toBe("ssh -i /explicit-key");
-		expect(explicit.GIT_CONFIG_COUNT).toBe(ambientCount);
+		const saved = process.env.GIT_CONFIG_COUNT;
+		delete process.env.GIT_CONFIG_COUNT;
+		try {
+			// git() resolves the resolver and passes it here; gitEnv only merges what it gets.
+			const auth = {
+				GIT_SSH_COMMAND: "ssh -i /resolver-key",
+				GIT_CONFIG_COUNT: "1",
+			};
+			const env = gitEnv(["fetch", "origin"], auth);
+			expect(env.GIT_SSH_COMMAND).toBe("ssh -i /resolver-key");
+			expect(env.GIT_CONFIG_COUNT).toBe("1");
+			// An explicit authEnv replaces the resolver output wholesale: no bleed-through.
+			const explicit = gitEnv(["fetch", "origin"], {
+				GIT_SSH_COMMAND: "ssh -i /explicit-key",
+			});
+			expect(explicit.GIT_SSH_COMMAND).toBe("ssh -i /explicit-key");
+			expect(explicit).not.toHaveProperty("GIT_CONFIG_COUNT");
+			for (const args of [["status"], ["commit", "-m", "x"], ["add", "."]]) {
+				const local = gitEnv(args, auth);
+				expect(local.GIT_SSH_COMMAND).toBe("ssh -F /dev/null -o BatchMode=yes");
+				expect(local).not.toHaveProperty("GIT_CONFIG_COUNT");
+			}
+		} finally {
+			if (saved === undefined) delete process.env.GIT_CONFIG_COUNT;
+			else process.env.GIT_CONFIG_COUNT = saved;
+		}
 	});
 
 	test("gitEnv for local subcommands strips every credential name even from the boot env", () => {
