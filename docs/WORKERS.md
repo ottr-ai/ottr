@@ -868,8 +868,14 @@ logs one `turn-uid: off` line at boot. Any identity step that fails fails
 the run, so a run never falls back to a root turn.
 
 Merge agents also use the project uid when the board runs as root. They
-stay on the board host and use the project turn home and shared agent layer.
-The board keeps its own uid for integration and push operations.
+stay on the board host. Each agent receives a fresh, protected configuration
+view from the board's trusted home or layer. Worker turn homes and project
+layer copies never supply merge configuration, plugins, extensions, or skills.
+Writable operational state stays separate from these configuration paths.
+The board keeps its own uid and GitHub push credentials for integration.
+The isolated merge child receives no inherited board GitHub token.
+Provider credentials and OAuth refresh state stay in the private board store.
+The isolated merge child uses the existing board auth broker.
 If identity preparation fails, then the board starts no merge agent.
 See [Merge turn project uid](specs/merge-turn-uid.md).
 
@@ -1609,6 +1615,12 @@ the line stays away when the board home carries a seeded layer
 `board-seed` service, a one-off of the Alate image (see
 [Seed the board config](#seed-the-board-config)). The board decides the memory
 backend at spawn time, so the seeded `config.yml` needs no `memory:` backend line.
+
+Root Linux merge agents use a fresh, protected view of this trusted source.
+The project uid cannot change the view's code-bearing files or directories.
+Per-run writable state does not replace this configuration source.
+The view never copies configuration from a worker home or project layer copy.
+
 The board's own config readers
 (`src/models.ts` model roles, the Settings Hindsight section, the sign-in store in
 `src/login.ts`) resolve the same variable. A worker dispatch strips the variable from the
@@ -1625,11 +1637,13 @@ sign-in in the board's store.
 omp does not resolve every user path from that variable. It reads plugins from
 `$HOME/.omp/plugins` and user skills and context files (`~/.agents`, `~/.claude`, and the
 other tool dirs) from `$HOME`. The board's `$HOME` is the shared home. So the compose file
-also sets `OTTR_BOARD_OMP_HOME=/etc/ottr/home`, and every omp that the board starts for
-itself gets that directory as its `HOME`: merge, release review and release turns, `omp
-models`, `omp usage`, `omp login`, `omp token` (the token refresh), and the fork-analysis gateway (`src/login.ts`
-`boardOmpEnv`). The agent dir above lies in this directory. The entry script creates the
-directory and copies nothing into it, and refuses to start when the variable points into
+also sets `OTTR_BOARD_OMP_HOME=/etc/ottr/home`. Board-side omp processes use
+that home or its pinned layer. Root Linux merge agents use a fresh,
+protected view of that trusted source instead. Other local processes retain
+the board home: release review and release turns, `omp models`, `omp usage`,
+`omp login`, `omp token`, and the fork-analysis gateway (`src/login.ts`
+`boardOmpEnv`). The agent dir above lies in this directory.
+The entry script creates the directory and copies nothing into it. It refuses to start when the variable points into
 the shared home. A worker dispatch removes the variable from the turn env, so a work turn
 keeps the shared home. The board's own reads of the shared home keep
 `/root`: the apt lists, the shared credential store, and the shared `config.yml` (its

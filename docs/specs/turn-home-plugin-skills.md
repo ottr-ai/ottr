@@ -100,8 +100,8 @@ installed (2026-11-10; this shell runs in a worker container, which mounts no
 board-config volume, so the finding is recorded from that check plus the seed
 contract, not read here directly). Every run therefore enumerates its own home:
 Most board-side runs read the board home or its current layer.
-An isolated merge agent reads the shared home or its project layer copy,
-as a worker turn does ([Merge turn project uid](merge-turn-uid.md)).
+An isolated merge agent reads a fresh, protected copy of the board's trusted
+home or layer ([Merge turn project uid](merge-turn-uid.md)).
 VM runs read their own home. Each run reads only its own home's lock.
 
 ### Per-project scoping (alate bundles)

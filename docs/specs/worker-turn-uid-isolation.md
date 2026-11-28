@@ -310,8 +310,9 @@ sits after that section, so a configured turn-home identity keeps winning
 ### Server side
 
 Merge agents stay on the board host. A root board starts each merge agent
-with the same project uid and gid as its work turns. The agent uses the
-project turn home and shared agent layer, not the board's private home.
+with the same project uid and gid as its work turns. The agent reads a
+fresh, protected configuration view from the board's trusted home or layer.
+It never loads configuration from worker turn homes or project layer copies.
 See [Merge turn project uid](merge-turn-uid.md).
 
 The board's Git operations retain the board uid. On a root board, Git

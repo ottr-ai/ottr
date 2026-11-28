@@ -1651,10 +1651,8 @@ export function createRunSink(o: {
 	};
 }
 
-/** D6: no agent run holds Ottr's ssh command, the env-scoped credential helper or the
- * per-host tokens; the server alone runs that git. GH_TOKEN is not in this set: a local run
- * (a merge turn in the server container) keeps it for its push. Worker turns never get it:
- * startRun drops it from the forwarded env, and serveWorker strips it from its own env.
+/** D6: agents never hold Ottr's ssh command, credential helper, or host tokens.
+ * The server retains push authority. Isolated merges also strip GitHub credentials.
  * Exported for the repo-relocating-env strip test (OTTR-1162). */
 export function withoutGitAuth(
 	env: Record<string, string | undefined>,
@@ -1809,6 +1807,8 @@ interface StartOptions {
 	worker?: WorkerTarget | null;
 	/** Merge agents stay local but drop to the project uid on a root Linux board. */
 	localMerge?: LocalMergeIdentity;
+	/** Host grant for isolated local merges; never forwarded to workers or microVMs. */
+	authBroker?: { url: string; token: string } | null;
 	/** Set: run the turn in a fresh microVM on vm-runner (docs/adr/0009-microvm-workers.md);
 	 * wins over `worker`. The run issues the card's VM token at dispatch and revokes it when
 	 * `done` settles. A busy vm-runner settles `workerBusy`, never a lost worker. */
@@ -1840,8 +1840,8 @@ interface StartOptions {
 	secrets?: readonly string[];
 	/** Set: strip the board coordinates from the child env (a retro run). */
 	stripBoard?: boolean;
-	/** The confirmed read-only GitHub token env for worker and microVM turns
-	 * (docs/specs/turn-read-token.md); applied after every strip. A local run ignores it. */
+	/** The confirmed read-only GitHub token env for workers, microVMs, and isolated merges.
+	 * Applied after every strip (docs/specs/turn-read-token.md). */
 	githubReadEnv?: Record<string, string>;
 	/** Set: a local child runs without the board's GitHub token (GH_TOKEN, GITHUB_TOKEN), as a
 	 * worker child always does. A run that reads third-party or worker-written text (the
@@ -1958,8 +1958,16 @@ type RunLayerPin = Pick<
 /** Pin the agent layer once per call, before any spawn: the env carries the resolved layer
  * directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
  * runs resolve the shared home (alate provisions it), the board's own runs the board home. */
-function resolveLayerPin(layerHome: string, sink: RunSink): RunLayerPin {
+function resolveLayerPin(
+	layerHome: string,
+	sink: RunSink,
+	strict = false,
+): RunLayerPin {
 	const pin = pinnedAgentLayer(layerHome);
+	if (strict && !pin.ok && pin.reason !== "none")
+		throw new Error(
+			`merge turn agent layer pin failed (${pin.reason}): ${layerHome}`,
+		);
 	if (!pin.ok && pin.reason !== "none")
 		sink.logMark(
 			`! agent layer pin failed (${pin.reason}); running the flat home\n`,
@@ -2086,8 +2094,23 @@ function lstatQuiet(abs: string): boolean {
  * and git only sees the moves while the park holds. Absent dirs are skipped. Fail-closed:
  * an unexpected rename error throws before the spawn, so a run never starts on a cwd
  * whose park is incomplete. */
-function parkCustomToolDirs(cwd: string, parked: ParkedDir[]): ParkedDir[] {
-	for (const rel of CUSTOM_TOOL_DIRS) {
+function parkCustomToolDirs(
+	cwd: string,
+	parked: ParkedDir[],
+	merge = false,
+	nodeEnv?: string,
+): ParkedDir[] {
+	if (merge && nodeEnv && (nodeEnv.includes("/") || nodeEnv.includes("\\")))
+		throw new Error("merge turn NODE_ENV must not contain a path separator");
+	const sources = merge
+		? new Set([
+				...CUSTOM_TOOL_DIRS,
+				".env",
+				".env.local",
+				`.env.${nodeEnv || "development"}`,
+			])
+		: CUSTOM_TOOL_DIRS;
+	for (const rel of sources) {
 		const from = join(cwd, rel);
 		if (!lstatQuiet(from)) {
 			// Nothing to park here — but heal a crash leftover parked at the stable
@@ -2177,6 +2200,10 @@ function startLocalRun(s: RunStart): RunHandle {
 		delete base.GH_TOKEN;
 		delete base.GITHUB_TOKEN;
 	}
+	if (s.localMerge !== null)
+		for (const key of Object.keys(base))
+			if (/^(GH_|GITHUB_)/.test(key) && key !== "GH_CONFIG_DIR")
+				delete base[key];
 	if (s.localMerge === null && layerEnv !== null) Object.assign(base, layerEnv);
 	Object.assign(base, identityEnv);
 	// OTTR-1211: the per-project cache (every card of the project shares it, two
@@ -2208,7 +2235,12 @@ function startLocalRun(s: RunStart): RunHandle {
 	// unwinding the dirs that did park, so the worktree keeps its committed content.
 	const parked: ParkedDir[] = [];
 	try {
-		parkCustomToolDirs(o.cwd, parked);
+		parkCustomToolDirs(
+			o.cwd,
+			parked,
+			s.localMerge !== null,
+			s.localMerge?.env.NODE_ENV,
+		);
 	} catch (err) {
 		restoreParkedToolDirs(parked, sink);
 		if (s.localMerge === null)
@@ -2227,6 +2259,11 @@ function startLocalRun(s: RunStart): RunHandle {
 	// After every strip: the run's memory binding is the only HINDSIGHT_* env the child
 	// holds (docs/specs/hindsight-bank-binding.md). Null on a mnemopi deployment.
 	if (s.memoryEnv !== null) Object.assign(env, s.memoryEnv.env);
+	if (s.localMerge !== null) Object.assign(env, o.githubReadEnv);
+	if (s.localMerge !== null) {
+		env.OMP_AUTH_BROKER_URL = o.authBroker!.url;
+		env.OMP_AUTH_BROKER_TOKEN = o.authBroker!.token;
+	}
 	let child: ChildProcess;
 	try {
 		child = launch("omp", args, {
@@ -2682,6 +2719,7 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 			onProgress: o.onProgress,
 			secrets: [
 				...(o.secrets ?? []),
+				...(o.authBroker ? [o.authBroker.token] : []),
 				...(vmToken === null ? [] : [vmToken]),
 				...(memory !== null && !("skipped" in memory) ? [memory.token] : []),
 			],
@@ -2698,11 +2736,12 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 			o.localMerge !== undefined && mergeTurnIsolationEnabled();
 		if (isolatedMerge && (o.worker || o.vm))
 			throw new Error("a local merge identity cannot use a worker or microVM");
-		const layerHome =
-			o.worker || o.vm || isolatedMerge
-				? ((isolatedMerge ? o.localMerge?.workerHome : undefined) ?? homedir())
-				: boardOmpHome();
-		layerPin = resolveLayerPin(layerHome, sink);
+		const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
+		layerPin = resolveLayerPin(layerHome, sink, isolatedMerge);
+		if (isolatedMerge && (!o.authBroker?.url || !o.authBroker.token))
+			throw new Error(
+				"an isolated local merge requires an explicit auth broker",
+			);
 		if (isolatedMerge && o.localMerge !== undefined) {
 			const project = o.project ?? o.board?.project;
 			if (!project)

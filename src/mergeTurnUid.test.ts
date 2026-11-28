@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, jest, test } from "bun:test";
 import {
 	type ChildProcess,
@@ -61,8 +62,33 @@ function fixture() {
 	])
 		chmodSync(path, 0o755);
 	mkdirSync(boardHome, { mode: 0o700 });
-	const store = join(workerHome, ".omp", "agent", "agent.db");
-	writeFileSync(store, "shared fixture store", { mode: 0o600 });
+	mkdirSync(join(boardHome, ".omp", "agent"), { recursive: true });
+	const store = join(boardHome, ".omp", "agent", "agent.db");
+	const db = new Database(store, { create: true });
+	db.exec(
+		"PRAGMA journal_mode=WAL; CREATE TABLE merge_fixture(value TEXT); INSERT INTO merge_fixture VALUES ('trusted board store')",
+	);
+	db.exec(
+		"CREATE TABLE auth_credentials(id INTEGER PRIMARY KEY, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT, identity_key TEXT, created_at INTEGER, updated_at INTEGER)",
+	);
+	db.query(
+		"INSERT INTO auth_credentials(provider, credential_type, identity_key, data, created_at, updated_at) VALUES (?, 'oauth', ?, ?, 1, 1)",
+	).run(
+		"fixture-provider",
+		"fixture-account",
+		JSON.stringify({
+			access: "synthetic-access",
+			refresh: "synthetic-refresh",
+			expires: 1,
+			accountId: "fixture-account",
+		}),
+	);
+	writeFileSync(
+		join(boardHome, ".omp", "auth-broker.token"),
+		"synthetic-private-broker-file",
+		{ mode: 0o600 },
+	);
+	chmodSync(store, 0o600);
 	const privateStore = join(boardHome, "agent.db");
 	writeFileSync(privateStore, "private fixture store", { mode: 0o600 });
 	const gitconfig = join(boardHome, "gitconfig");
@@ -87,6 +113,8 @@ function fixture() {
 			"GIT_AUTHOR_EMAIL",
 			"GIT_COMMITTER_NAME",
 			"GIT_COMMITTER_EMAIL",
+			"OMP_AUTH_BROKER_URL",
+			"OMP_AUTH_BROKER_TOKEN",
 		].map((key) => [key, process.env[key]]),
 	);
 	process.env.OTTR_BOARD_OMP_HOME = boardHome;
@@ -95,6 +123,8 @@ function fixture() {
 	const privateTmp = join(root, "board-tmp");
 	mkdirSync(privateTmp, { mode: 0o700 });
 	process.env.TMPDIR = privateTmp;
+	process.env.OMP_AUTH_BROKER_URL = "http://ambient.invalid";
+	process.env.OMP_AUTH_BROKER_TOKEN = "synthetic-ambient-poison";
 	for (const key of [
 		"GIT_AUTHOR_NAME",
 		"GIT_AUTHOR_EMAIL",
@@ -114,6 +144,7 @@ function fixture() {
 		boardHome,
 		privateStore,
 		store,
+		db,
 		homesRoot,
 		options: {
 			cwd,
@@ -124,10 +155,15 @@ function fixture() {
 			extensionPath: null,
 			dataRoot,
 			logPath: join(dataRoot, project, "run.log"),
-			localMerge: { workspaceRoot, homesRoot, workerHome, provisionPaths },
+			localMerge: { workspaceRoot, homesRoot, provisionPaths },
+			authBroker: {
+				url: "http://127.0.0.1:1",
+				token: "synthetic-merge-broker-grant",
+			},
 			env: { ...fixtureGitEnv(), GIT_CONFIG_GLOBAL: gitconfig },
 		},
 		cleanup: () => {
+			db.close();
 			rootView?.mockRestore();
 			for (const [key, value] of previousEnv) {
 				if (value === undefined) delete process.env[key];
@@ -146,15 +182,115 @@ function fakeChild() {
 	}) as unknown as ChildProcess;
 }
 
+identityTest(
+	"sequential preparations exclude provider credentials and pin the explicit broker grant",
+	async () => {
+		const f = fixture();
+		const before = f.db.query("SELECT * FROM auth_credentials").all();
+		const mode = statSync(f.store).mode;
+		try {
+			for (let run = 0; run < 2; run++) {
+				const child = fakeChild();
+				const handle = await startRun({
+					...f.options,
+					env: {
+						...f.options.env,
+						OMP_AUTH_BROKER_URL: "http://project.invalid",
+						OMP_AUTH_BROKER_TOKEN: "synthetic-project-poison",
+					},
+					launcher: (_command, _args, options) => {
+						expect(options.env?.OMP_AUTH_BROKER_URL).toBe(
+							f.options.authBroker.url,
+						);
+						expect(options.env?.OMP_AUTH_BROKER_TOKEN).toBe(
+							f.options.authBroker.token,
+						);
+						const home = String(options.env?.HOME);
+						expect(existsSync(join(home, ".omp", "auth-broker.token"))).toBe(
+							false,
+						);
+						const snapshot = new Database(
+							join(home, ".omp", "agent", "agent.db"),
+						);
+						try {
+							expect(
+								snapshot.query("SELECT * FROM auth_credentials").all(),
+							).toEqual([]);
+							expect(
+								snapshot.query("SELECT value FROM merge_fixture").all(),
+							).toEqual([{ value: "trusted board store" }]);
+							snapshot
+								.query(
+									"INSERT INTO auth_credentials(provider, credential_type, identity_key, data) VALUES (?, 'oauth', ?, ?)",
+								)
+								.run(
+									"fixture-provider",
+									"fixture-account",
+									'{"refresh":"synthetic-child-refresh"}',
+								);
+						} finally {
+							snapshot.close();
+						}
+						return child;
+					},
+				});
+				child.stderr?.emit("data", Buffer.from(f.options.authBroker.token));
+				child.emit("close", 0);
+				await handle.done;
+				expect(f.db.query("SELECT * FROM auth_credentials").all()).toEqual(
+					before,
+				);
+				expect(readFileSync(f.options.logPath, "utf8")).not.toContain(
+					f.options.authBroker.token,
+				);
+				expect(statSync(f.store).mode).toBe(mode);
+			}
+		} finally {
+			f.cleanup();
+		}
+	},
+);
+
+identityTest("a missing explicit broker refuses spawn", async () => {
+	const f = fixture();
+	let launches = 0;
+	const layer = join(f.boardHome, ".alate", "layers", "missing-broker");
+	mkdirSync(join(layer, ".omp", "agent"), { recursive: true });
+	symlinkSync("layers/missing-broker", join(f.boardHome, ".alate", "current"));
+	try {
+		await expect(
+			startRun({
+				...f.options,
+				authBroker: null,
+				launcher: () => {
+					launches++;
+					return fakeChild();
+				},
+			}),
+		).rejects.toThrow("requires an explicit auth broker");
+		expect(launches).toBe(0);
+		expect(existsSync(join(f.homesRoot, project, "home"))).toBe(false);
+		expect(readLayerUse(f.boardHome)).toEqual([]);
+		expect(statSync(f.boardHome).mode & 0o777).toBe(0o700);
+		expect(statSync(f.store).mode & 0o777).toBe(0o600);
+	} finally {
+		f.cleanup();
+	}
+});
+
 describe("local merge project identity", () => {
-	identityTest(
-		"real local child uses the project uid, writable home, scratch, cache and sessions",
-		async () => {
+	identityTest.each([0o022, 0o077])(
+		"real local child uses the project uid, protected config, writable state, scratch, cache and sessions under umask %i",
+		async (umask) => {
 			const f = fixture();
+			const previousUmask = process.umask(umask);
 			let launched: SpawnOptions | undefined;
 			let scratch = "";
 			let runtime = "";
 			try {
+				const skill = join(f.boardHome, ".claude", "skills", "fixture");
+				mkdirSync(skill, { recursive: true });
+				writeFileSync(join(skill, "SKILL.md"), "# Trusted fixture\n");
 				const handle = await startRun({
 					...f.options,
 					commitIdentity: {
@@ -163,9 +299,27 @@ describe("local merge project identity", () => {
 					},
 					launcher: (_command, args, options) => {
 						launched = options;
+						const home = String(options.env?.HOME);
+						for (const path of [
+							"",
+							".omp",
+							".omp/agent",
+							".claude",
+							".claude/skills",
+							".claude/skills/fixture",
+							".config",
+							".config/gh",
+							".config/git",
+						]) {
+							const mode = statSync(join(home, path)).mode;
+							expect(mode & 0o055).toBe(0o055);
+							expect(mode & 0o022).toBe(0);
+						}
+						for (const path of [".gitconfig", ".omp/agent/config.yml"])
+							expect(statSync(join(home, path)).mode & 0o444).toBe(0o444);
 						scratch = String(options.env?.TMPDIR);
 						const overlays = configOverlayPaths(args).filter((path) =>
-							path.startsWith(f.root),
+							path.startsWith(dirname(String(options.env?.HOME))),
 						);
 						expect(overlays.length).toBeGreaterThan(0);
 						runtime = dirname(overlays[0]!);
@@ -177,11 +331,23 @@ describe("local merge project identity", () => {
 								"-c",
 								`
 set -eu
-printf probe > "$HOME/merge-probe"
+	test -r "$HOME/.omp/agent/config.yml"
+	test -r "$HOME/.claude/skills/fixture/SKILL.md"
 printf probe > "$TMPDIR/merge-probe"
 printf probe > "$XDG_CACHE_HOME/merge-probe"
 printf probe > "$MERGE_TEST_SESSIONS/merge-probe"
-test "$(cat "$PI_CODING_AGENT_DIR/agent.db")" = "shared fixture store"
+	"$MERGE_TEST_BUN" -e '
+import { Database } from "bun:sqlite";
+import { existsSync, realpathSync } from "node:fs";
+const path = process.env.PI_CODING_AGENT_DIR + "/agent.db";
+const db = new Database(path);
+if (db.query("SELECT value FROM merge_fixture").get().value !== "trusted board store") throw new Error("trusted snapshot missing");
+db.exec("PRAGMA journal_mode=WAL");
+db.query("INSERT INTO merge_fixture VALUES (?)").run("child write");
+if (!existsSync(realpathSync(path) + "-wal")) throw new Error("state WAL missing");
+if (existsSync(path + "-wal")) throw new Error("WAL crossed config boundary");
+db.close();
+'
 test -w "$OTTR_TMP_ROOT"
 for config in "$@"; do test -r "$config"; done
 printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"uid=%s gid=%s name=%s email=%s"}]}]}\\n' "$(id -u)" "$(id -g)" "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL"
@@ -191,7 +357,11 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 							],
 							{
 								...options,
-								env: { ...options.env, MERGE_TEST_SESSIONS: f.sessionDir },
+								env: {
+									...options.env,
+									MERGE_TEST_SESSIONS: f.sessionDir,
+									MERGE_TEST_BUN: process.execPath,
+								},
 							},
 						);
 					},
@@ -204,7 +374,7 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 				expect(result.finalText).toBe(
 					`uid=${ids.uid} gid=${ids.gid} name=Configured Merge email=configured@example.invalid`,
 				);
-				expect(launched?.env?.HOME).toBe(join(f.homesRoot, project, "home"));
+				expect(launched?.env?.HOME).toBe(join(runtime, "home"));
 				expect(launched?.env?.OTTR_TMP_ROOT).toBe("/tmp");
 				expect(statSync(join(f.cwd, ".git")).uid).toBe(ids.uid);
 				expect(readFileSync(join(f.sessionDir, "merge-probe"), "utf8")).toBe(
@@ -217,6 +387,7 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 				expect(statSync(f.boardHome).mode & 0o777).toBe(0o700);
 				expect(statSync(f.privateStore).mode & 0o777).toBe(0o600);
 			} finally {
+				process.umask(previousUmask);
 				f.cleanup();
 			}
 		},
@@ -309,7 +480,7 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 				f.cleanup();
 			}
 		},
-		30_000,
+		120_000,
 	);
 
 	identityTest(
@@ -347,13 +518,13 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 		"failed cache prep names its root and launches no child",
 		async () => {
 			const f = fixture();
-			const layer = join(f.workerHome, ".alate", "layers", "merge-cache-fault");
+			const layer = join(f.boardHome, ".alate", "layers", "merge-cache-fault");
 			mkdirSync(join(layer, ".omp", "agent"), { recursive: true });
 			writeFileSync(
 				join(layer, ".omp", "agent", "config.yml"),
 				"model: fixture\n",
 			);
-			symlinkSync(layer, join(f.workerHome, ".alate", "current"));
+			symlinkSync(layer, join(f.boardHome, ".alate", "current"));
 			const cache = join(f.homesRoot, project, "cache");
 			mkdirSync(dirname(cache), { recursive: true });
 			writeFileSync(cache, "not a cache directory");
@@ -369,7 +540,7 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 					}),
 				).rejects.toThrow(`merge turn cache preparation failed: ${cache}`);
 				expect(launches).toBe(0);
-				expect(readLayerUse(f.workerHome)).toEqual([]);
+				expect(readLayerUse(f.boardHome)).toEqual([]);
 				expect(
 					existsSync(
 						join(f.homesRoot, project, "layers", "merge-cache-fault.inuse"),
@@ -382,16 +553,16 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 	);
 
 	identityTest(
-		"a pinned merge holds the shared layer and project copy until settle",
+		"a pinned merge holds the private board layer and fresh config until settle",
 		async () => {
 			const f = fixture();
-			const layer = join(f.workerHome, ".alate", "layers", "merge-A");
+			const layer = join(f.boardHome, ".alate", "layers", "merge-A");
 			mkdirSync(join(layer, ".omp", "agent"), { recursive: true });
 			writeFileSync(
 				join(layer, ".omp", "agent", "config.yml"),
 				"model: fixture\n",
 			);
-			symlinkSync(layer, join(f.workerHome, ".alate", "current"));
+			symlinkSync(layer, join(f.boardHome, ".alate", "current"));
 			const child = fakeChild();
 			let launch: SpawnOptions | undefined;
 			try {
@@ -402,20 +573,21 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 						return child;
 					},
 				});
-				const copy = join(f.homesRoot, project, "layers", "merge-A");
-				const copyMarker = `${copy}.inuse`;
+				const copy = String(launch?.env?.HOME);
+				const copyMarker = runMarkerPath(dirname(copy));
 				expect(launch?.uid).toBe(ids.uid);
-				expect(launch?.env?.HOME).toBe(copy);
+				expect(copy).toContain("run-merge-config-");
+				expect(copy).not.toBe(join(f.homesRoot, project, "layers", "merge-A"));
 				expect(launch?.env?.PI_CODING_AGENT_DIR).toBe(
 					join(copy, ".omp", "agent"),
 				);
-				expect(readLayerUse(f.workerHome)).toEqual([
+				expect(readLayerUse(f.boardHome)).toEqual([
 					{ id: "merge-A", since: expect.any(Number) },
 				]);
 				expect(existsSync(copyMarker)).toBe(true);
 				child.emit("close", 0);
 				await handle.done;
-				expect(readLayerUse(f.workerHome)).toEqual([]);
+				expect(readLayerUse(f.boardHome)).toEqual([]);
 				expect(existsSync(copyMarker)).toBe(false);
 			} finally {
 				f.cleanup();
@@ -424,31 +596,22 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 	);
 
 	identityTest(
-		"private board home cannot serve as the shared merge home",
+		"a private board alias remains a trusted configuration source",
 		async () => {
 			const f = fixture();
-			let launches = 0;
+			const alias = join(f.root, "board-alias");
+			symlinkSync(f.boardHome, alias);
+			process.env.OTTR_BOARD_OMP_HOME = alias;
+			const child = fakeChild();
 			try {
-				expect(readFileSync(f.privateStore, "utf8")).toBe(
-					"private fixture store",
-				);
-				const alias = join(f.root, "board-alias");
-				symlinkSync(f.boardHome, alias);
-				for (const workerHome of [f.boardHome, alias]) {
-					await expect(
-						startRun({
-							...f.options,
-							localMerge: { ...f.options.localMerge, workerHome },
-							launcher: () => {
-								launches++;
-								return fakeChild();
-							},
-						}),
-					).rejects.toThrow("shared home distinct from the private board home");
-				}
-				expect(launches).toBe(0);
+				const handle = await startRun({
+					...f.options,
+					launcher: () => child,
+				});
 				expect(statSync(f.boardHome).mode & 0o777).toBe(0o700);
 				expect(statSync(f.privateStore).mode & 0o777).toBe(0o600);
+				child.emit("close", 0);
+				await handle.done;
 			} finally {
 				f.cleanup();
 			}
@@ -499,15 +662,19 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 			const f = fixture();
 			let scratch = "";
 			let runtime = "";
+			for (const name of [".env", ".env.local"])
+				writeFileSync(join(f.cwd, name), "PI_CONFIG_FILES=project-plant.yml\n");
 			try {
 				await expect(
 					startRun({
 						...f.options,
 						launcher: (_command, args, options) => {
+							for (const name of [".env", ".env.local"])
+								expect(existsSync(join(f.cwd, name))).toBe(false);
 							scratch = String(options.env?.TMPDIR);
 							runtime = dirname(
 								configOverlayPaths(args).find((path) =>
-									path.startsWith(f.root),
+									path.startsWith(dirname(String(options.env?.HOME))),
 								)!,
 							);
 							throw new Error("fixture spawn failure");
@@ -519,6 +686,10 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 				expect(existsSync(scratch)).toBe(false);
 				expect(existsSync(runtime)).toBe(false);
 				expect(existsSync(runMarkerPath(scratch))).toBe(false);
+				for (const name of [".env", ".env.local"])
+					expect(readFileSync(join(f.cwd, name), "utf8")).toBe(
+						"PI_CONFIG_FILES=project-plant.yml\n",
+					);
 			} finally {
 				f.cleanup();
 			}
@@ -543,7 +714,9 @@ printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","c
 								"-c",
 								`
 set -eu
-test "$(cat "$PI_CODING_AGENT_DIR/agent.db")" = "shared fixture store"
+	test -r "$PI_CODING_AGENT_DIR/agent.db"
+	if printf plant > "$HOME/plant" 2>/dev/null; then exit 92; fi
+	if printf plant > "$PI_CODING_AGENT_DIR/config.yml" 2>/dev/null; then exit 93; fi
 if cat "$MERGE_PRIVATE_STORE" >/dev/null 2>&1; then exit 91; fi
 printf '{"type":"agent_end","isTerminal":true,"messages":[{"role":"assistant","content":[{"type":"text","text":"private store denied"}]}]}\\n'
 `,

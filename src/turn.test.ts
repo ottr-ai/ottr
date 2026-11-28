@@ -9062,27 +9062,21 @@ describe("package list", () => {
 			};
 			const workspaceRoot = join(root, "workspace");
 			const projectPath = join(workspaceRoot, "ottr");
-			const workerHome = join(root, "shared");
 			const homesRoot = join(root, "turn-homes");
 			const boardHome = join(root, "board");
 			const dataRoot = join(root, "data");
 			mkdirSync(projectPath, { recursive: true });
-			mkdirSync(join(workerHome, ".omp", "agent"), { recursive: true });
+			mkdirSync(boardHome, { mode: 0o700 });
+			mkdirSync(join(boardHome, ".omp", "agent"), { recursive: true });
 			mkdirSync(homesRoot);
 			mkdirSync(dataRoot);
-			mkdirSync(boardHome, { mode: 0o700 });
-			for (const path of [
-				workspaceRoot,
-				workerHome,
-				join(workerHome, ".omp"),
-				homesRoot,
-				dataRoot,
-			])
+			for (const path of [workspaceRoot, homesRoot, dataRoot])
 				chmodSync(path, 0o755);
-			writeFileSync(
-				join(workerHome, ".omp", "agent", "agent.db"),
-				"fixture store",
-			);
+			const auth = new Database(join(boardHome, ".omp", "agent", "agent.db"), {
+				create: true,
+			});
+			auth.exec("CREATE TABLE merge_fixture(value TEXT)");
+			auth.close();
 			const globalConfig = join(boardHome, "gitconfig");
 			writeFileSync(
 				globalConfig,
@@ -9135,9 +9129,12 @@ describe("package list", () => {
 							});
 							const handle = await realStartRun({
 								...options,
+								authBroker: {
+									url: "http://127.0.0.1:1",
+									token: "synthetic-dispatch-broker-grant",
+								},
 								localMerge: {
 									...options.localMerge!,
-									workerHome,
 									homesRoot,
 									provisionPaths,
 								},
@@ -9163,7 +9160,8 @@ describe("package list", () => {
 				expect(launch?.uid).toBe(projectTurnUid(store.name).uid);
 				expect(launch?.gid).toBe(projectTurnUid(store.name).gid);
 				expect(launch?.uid).not.toBe(0);
-				expect(launch?.env?.HOME).toBe(join(homesRoot, store.name, "home"));
+				expect(launch?.env?.HOME).toContain("run-merge-config-");
+				expect(launch?.env?.HOME).not.toBe(join(homesRoot, store.name, "home"));
 				expect(packageHome).toBe(join(homesRoot, store.name, "ottr"));
 			} finally {
 				rootView?.mockRestore();

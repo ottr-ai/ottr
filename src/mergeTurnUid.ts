@@ -1,32 +1,20 @@
 import { execFile } from "node:child_process";
-import {
-	chmodSync,
-	chownSync,
-	mkdirSync,
-	mkdtempSync,
-	realpathSync,
-	rmSync,
-} from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { prepareTurnCache } from "./cachesweep.ts";
 import { errmsg } from "./errmsg.ts";
 import { boardOmpHome } from "./login.ts";
+import { prepareMergeHome, trustedMergeSource } from "./mergeHome.ts";
 import { runMarkerPath, touchRunMarker } from "./tmpsweep.ts";
 import {
-	applyTurnHomeEnv,
 	closeProjectDir,
 	ensureProjectIdentity,
-	ensureTurnStoreAccess,
 	isolationEnabled,
-	newLayerToken,
 	type ProvisionPaths,
 	prepareRunWorkspace,
 	prepareTurnHome,
 	projectTurnUid,
-	releaseLayerCopyUse,
-	resolvePinnedLayer,
 	type TurnIdentity,
 	turnHomesRoot,
 } from "./turnUid.ts";
@@ -36,7 +24,6 @@ export interface LocalMergeIdentity {
 	workspaceRoot: string;
 	/** Test fixtures replace shared roots and account files, never the uid. */
 	homesRoot?: string;
-	workerHome?: string;
 	provisionPaths?: ProvisionPaths;
 }
 
@@ -115,58 +102,41 @@ export async function prepareLocalMerge(
 	sessionDir: string,
 	env: Record<string, string | undefined>,
 ): Promise<PreparedLocalMerge> {
-	const workerHome = request.workerHome ?? homedir();
-	if (realpathSync(workerHome) === realpathSync(boardOmpHome()))
-		throw new Error(
-			"merge turn requires a shared home distinct from the private board home",
-		);
+	const boardHome = boardOmpHome();
+	const sourceHome = env.HOME ?? boardHome;
+	trustedMergeSource(boardHome, sourceHome);
 	const ids = projectTurnUid(project);
 	const homesRoot = request.homesRoot ?? turnHomesRoot();
 	const turnHome = prepareTurnHome(homesRoot, project, ids);
-	let releaseCopy = (): void => {};
 	let runtimeDir: string | null = null;
 	let scratch: string | null = null;
 	let heartbeat: NodeJS.Timeout | undefined;
 	const release = (): void => {
 		clearInterval(heartbeat);
 		try {
-			releaseCopy();
+			if (runtimeDir !== null) {
+				rmSync(runtimeDir, { recursive: true, force: true });
+				rmSync(runMarkerPath(runtimeDir), { force: true });
+			}
 		} finally {
-			try {
-				if (runtimeDir !== null) {
-					rmSync(runtimeDir, { recursive: true, force: true });
-					rmSync(runMarkerPath(runtimeDir), { force: true });
-				}
-			} finally {
-				if (scratch !== null) {
-					rmSync(scratch, { recursive: true, force: true });
-					rmSync(runMarkerPath(scratch), { force: true });
-				}
+			if (scratch !== null) {
+				rmSync(scratch, { recursive: true, force: true });
+				rmSync(runMarkerPath(scratch), { force: true });
 			}
 		}
 	};
 	try {
 		prepareRunWorkspace(cwd, ids, request.workspaceRoot, project);
+		env.GIT_CONFIG_SYSTEM = "/etc/gitconfig";
+		env.XDG_CONFIG_HOME = join(sourceHome, ".config");
+		if (env.GIT_CONFIG_GLOBAL !== undefined)
+			trustedMergeSource(
+				env.GIT_CONFIG_GLOBAL === "/etc/ottr/gitconfig"
+					? "/etc/ottr"
+					: boardHome,
+				env.GIT_CONFIG_GLOBAL,
+			);
 		await captureGitIdentity(cwd, env);
-		const copyToken = newLayerToken();
-		const pinnedLayer = resolvePinnedLayer(workerHome, env.HOME);
-		if (pinnedLayer !== null)
-			releaseCopy = () =>
-				releaseLayerCopyUse(turnHome.layers, basename(pinnedLayer), copyToken);
-		const home = applyTurnHomeEnv(env, {
-			workerHome,
-			turnHome,
-			ids,
-			copyToken,
-			resolveLayer: () => pinnedLayer,
-		});
-		// The board's PI_CODING_AGENT_DIR must never select its private store.
-		env.PI_CODING_AGENT_DIR = join(home.home, ".omp", "agent");
-		ensureTurnStoreAccess(
-			workerHome,
-			join(env.PI_CODING_AGENT_DIR, "agent.db"),
-			ids,
-		);
 		ensureProjectIdentity(project, ids, turnHome, request.provisionPaths);
 		mkdirSync(sessionDir, { recursive: true });
 		closeProjectDir(dirname(sessionDir), ids);
@@ -176,13 +146,23 @@ export async function prepareLocalMerge(
 				`merge turn cache preparation failed: ${join(homesRoot, project, "cache")}`,
 			);
 		Object.assign(env, cache.cacheEnv);
-		scratch = mkdtempSync(join(cache.tmp, "run-merge-"));
-		chownSync(scratch, ids.uid, ids.gid);
+		// Workers mount the turn-home roots. Private board state must stay server-local.
+		scratch = mkdtempSync("/tmp/ottr-merge-state-");
 		env.TMPDIR = scratch;
 		// Linux's host-global temp root stays reachable even with a private board TMPDIR.
 		env.OTTR_TMP_ROOT = "/tmp";
-		runtimeDir = mkdtempSync(join(cache.tmp, "run-merge-config-"));
-		chmodSync(runtimeDir, 0o755);
+		runtimeDir = mkdtempSync("/tmp/ottr-run-merge-config-");
+		chownSync(runtimeDir, process.geteuid?.() ?? 0, ids.gid);
+		chmodSync(runtimeDir, 0o750);
+		prepareMergeHome(
+			boardHome,
+			sourceHome,
+			join(runtimeDir, "home"),
+			join(scratch, "omp-state"),
+			ids,
+			env,
+		);
+		chownSync(scratch, ids.uid, ids.gid);
 		const livePaths = [scratch, runtimeDir];
 		const refresh = (): void => {
 			for (const path of livePaths) touchRunMarker(path);

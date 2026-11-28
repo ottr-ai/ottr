@@ -19,6 +19,13 @@ credential and its refresh token. Before each turn that a worker runs, the board
 puts the provider's short-lived access token into the turn env. The worker store
 keeps no credential that the board manages.
 
+Root Linux merge agents use the board's existing auth broker. The broker keeps
+provider credentials and OAuth refresh state in the private board store.
+The merge agent uses explicit `OMP_AUTH_BROKER_URL` and
+`OMP_AUTH_BROKER_TOKEN` settings. Its per-run database contains no copied
+provider credential rows. See [Merge turn project uid](merge-turn-uid.md).
+
+
 Code flows first: Settings lists every provider that omp's `/login` offers
 (`loginProviders()` in `src/login.ts`). This includes the loopback flows
 `anthropic` and `openai-codex`. These complete from any device through the

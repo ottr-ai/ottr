@@ -49,8 +49,13 @@ import {
 	scrubProcEnviron,
 	takeHostedConfig,
 } from "./hosted.ts";
-import { startLlmGateway } from "./llmGateway.ts";
+import {
+	type LlmGateway,
+	startLlmGateway,
+	startRunWithBroker,
+} from "./llmGateway.ts";
 import { agentDir, boardOmpEnv, boardOmpHome, turnListHome } from "./login.ts";
+import { mergeTurnIsolationEnabled } from "./mergeTurnUid.ts";
 import {
 	createOmpStatsDashboard,
 	parseOmpStatsPort,
@@ -833,22 +838,23 @@ const vmTokens = new VmTokens({
 // dispatch and bound to the run's project and card. Memory only: a run's env
 // dies with the run, and a board restart rotates the boot token too.
 const runTokens = new RunTokens();
-/** The board's provider gateway for VM turns' /llm proxy; null until it started. */
-let llmGateway: { url: string; token: string; stop(): void } | null = null;
-if (vmTarget !== null)
-	startLlmGateway({
-		agentDir: agentDir(),
-		home: boardOmpHome(),
-		log: (l) => console.log(l),
-	})
-		.then((g) => {
-			llmGateway = g;
-			// Its auth-broker and auth-gateway children must not outlive the board.
-			process.on("exit", () => g.stop());
-		})
-		.catch((err) =>
-			logError("the microVM provider gateway did not start", err),
-		);
+/** The board's provider service; local merges await the same readiness as VM access. */
+let llmGateway: LlmGateway | null = null;
+const isolatedMergeHost = mergeTurnIsolationEnabled();
+const llmGatewayReady =
+	vmTarget !== null || isolatedMergeHost
+		? startLlmGateway({
+				agentDir: agentDir(),
+				home: boardOmpHome(),
+				log: (l) => console.log(l),
+			}).then((g) => {
+				llmGateway = g;
+				return g;
+			})
+		: null;
+void llmGatewayReady?.catch((err) =>
+	logError("the board provider gateway did not start", err),
+);
 
 // Boot probe without blocking boot: until it answers, microVM cards wait unclaimed.
 runWork(() => probeVmRunner(vmTarget));
@@ -970,7 +976,13 @@ const loop = createTurnLoop(projects, {
 	syncWorktreeTo,
 	// OTTR-1006: every dispatch carries the board's token store, so a classic run gets a
 	// memory token bound to its own project's bank (docs/specs/hindsight-bank-binding.md).
-	startRun: (o) => startRun({ ...o, memoryTokens: vmTokens }),
+	startRun: (o) =>
+		startRunWithBroker(
+			{ ...o, memoryTokens: vmTokens },
+			startRun,
+			llmGatewayReady,
+			isolatedMergeHost,
+		),
 	// OTTR-454: the restart re-bind asks the workers for their detached runs and kills one on
 	// cancel; with no workerTarget configured the loop never probes.
 	detachedRuns: (url, token) => detachedRunsRequest(url, token),

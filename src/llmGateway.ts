@@ -1,4 +1,7 @@
+import type { RunHandle, startRun } from "./runner.ts";
 import { spawnPiped, stripGitAuthEnv } from "./worktree.ts";
+
+type StartOptions = Parameters<typeof startRun>[0];
 
 /**
  * The board's local credential gateway for microVM turns (OTTR-532). VMs hold no provider
@@ -32,6 +35,7 @@ export type GatewayRun = (
 export interface LlmGateway {
 	url: string;
 	token: string;
+	broker: { url: string; token: string };
 	stop(): void;
 }
 
@@ -50,6 +54,21 @@ export interface LlmGatewayOptions {
 	restartDelayMs?: number;
 	/** Ceiling for both children to answer their health check at start; default 60 s. */
 	readyTimeoutMs?: number;
+}
+
+/** Only an isolated local merge receives the board's private broker connection. */
+export async function startRunWithBroker(
+	o: StartOptions,
+	start: (options: StartOptions) => Promise<RunHandle>,
+	ready: Promise<LlmGateway> | null,
+	isolatedHost: boolean,
+): Promise<RunHandle> {
+	if (!isolatedHost || o.localMerge === undefined || o.worker || o.vm)
+		return start({ ...o, authBroker: undefined });
+	if (ready === null)
+		throw new Error("the merge provider broker is unavailable");
+	const gateway = await ready;
+	return start({ ...o, authBroker: gateway.broker });
 }
 
 const TAIL_LINES = 10;
@@ -174,6 +193,7 @@ export async function startLlmGateway(
 	const live = new Set<GatewayChild>();
 	const timers = new Set<ReturnType<typeof setTimeout>>();
 	const stop = () => {
+		process.off("exit", stop);
 		stopped = true;
 		for (const t of timers) clearTimeout(t);
 		timers.clear();
@@ -222,6 +242,7 @@ export async function startLlmGateway(
 		}
 	};
 
+	process.once("exit", stop);
 	try {
 		supervise(children.broker);
 		await ready(children.broker);
@@ -233,5 +254,10 @@ export async function startLlmGateway(
 		throw err;
 	}
 	o.log(`[llm-gateway] ready at ${gatewayUrl} (broker ${brokerUrl})`);
-	return { url: gatewayUrl, token: gatewayToken, stop };
+	return {
+		url: gatewayUrl,
+		token: gatewayToken,
+		broker: { url: brokerUrl, token: brokerToken },
+		stop,
+	};
 }

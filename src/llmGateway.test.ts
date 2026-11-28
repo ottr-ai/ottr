@@ -195,6 +195,9 @@ describe("startLlmGateway", () => {
 		const g = await started;
 		expect(g.url).toBe("http://127.0.0.1:4102");
 		expect(g.token).toBe("gw-tok");
+		expect(g.broker.url).toBe(`http://${broker.argv[4]}`);
+		expect(g.broker.url === gateway.env.OMP_AUTH_BROKER_URL).toBe(true);
+		expect(g.broker.token === gateway.env.OMP_AUTH_BROKER_TOKEN).toBe(true);
 		expect(logs.some((l) => l.includes("auth-broker exited with code 1"))).toBe(
 			true,
 		);
@@ -213,6 +216,47 @@ describe("startLlmGateway", () => {
 		await Bun.sleep(5);
 		expect(f.spawned).toHaveLength(4);
 	});
+
+	test.each(["broker", "gateway"] as const)(
+		"a board exit before %s readiness stops the service's own children",
+		async (stage) => {
+			const previous = new Set(process.listeners("exit"));
+			const f = fakeOmp();
+			const settled = startLlmGateway({
+				agentDir: "/board/agent",
+				home: "/board/home",
+				log: () => {},
+				spawn: f.spawn,
+				run: f.run,
+				fetch: f.fetch,
+				freePort: f.freePort,
+				readyTimeoutMs: 500,
+			}).then(
+				(gateway) => ({ gateway, error: null }),
+				(error: unknown) => ({ gateway: null, error }),
+			);
+			let child = await f.spawnedChild(1);
+			if (stage === "gateway") {
+				child.up = true;
+				child = await f.spawnedChild(2);
+			}
+			try {
+				const exit = process
+					.listeners("exit")
+					.find((listener) => !previous.has(listener));
+				exit?.(0);
+				expect(child.killed).toBe(true);
+				const result = await settled;
+				expect(result.error).toMatchObject({
+					message: "the LLM gateway was stopped",
+				});
+				expect(f.spawned.every((owned) => owned.killed)).toBe(true);
+			} finally {
+				const result = await settled;
+				result.gateway?.stop();
+			}
+		},
+	);
 
 	test("a broker that never answers fails the start and leaves nothing running", async () => {
 		const f = fakeOmp();

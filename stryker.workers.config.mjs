@@ -13,6 +13,7 @@ export default {
     "src/workers.ts",
     "src/turnUid.ts",
     "src/mergeTurnUid.ts",
+    "src/mergeHome.ts",
     "src/turnPackages.ts",
     "src/turnGithubToken.ts",
     "src/confine.ts",
