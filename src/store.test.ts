@@ -6898,6 +6898,22 @@ Validated by validation run #12 on 2026-11-23: still blocked — no retry contro
 					'Grilled definition of ready'),
 				('crossold1', 'cross-run confirmed lead', 'Needs validation: cross-run result', 'backlog', 'idle', 'work', 920, 1220, 'rev1', NULL, NULL,
 					NULL)`);
+		raw
+			.query(
+				"UPDATE tasks SET state = 'needs_you', needs_reason = ?, asked = ? WHERE id = 'lead1'",
+			)
+			.run(
+				"Wants your answer: 1 question",
+				JSON.stringify([
+					{
+						question: "Which file?",
+						options: [],
+						multi: false,
+						recommended: null,
+						text: true,
+					},
+				]),
+			);
 		raw.close();
 
 		const store = await open(dir);
@@ -6908,6 +6924,9 @@ Validated by validation run #12 on 2026-11-23: still blocked — no retry contro
 		expect(lead.state).toBe("queued");
 		expect(lead.waitsValidation).toBe(true);
 		expect(lead.queuedAt).toBe(500);
+		expect(lead.needsReason).toBeNull();
+		expect(lead.asked).toBeNull();
+		expect(lead.prompt).toBe("Needs validation: suspicious retry loop");
 		// A plain backlog card keeps its stage and reads no marker.
 		const plain = (await store.getTask("plain1"))!;
 		expect(plain.stage).toBe("backlog");

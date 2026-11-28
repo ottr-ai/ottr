@@ -9072,6 +9072,9 @@ button.log-mode[aria-pressed="true"] {
 	order: 1;
 	margin: 18px 0 0;
 }
+.lead-validation-hint {
+	order: 1;
+}
 /* A proposal's decision card carries Cancel task, which can leave the row empty. */
 .drawer-actions:empty {
 	display: none;

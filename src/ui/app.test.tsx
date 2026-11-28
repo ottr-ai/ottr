@@ -5040,6 +5040,48 @@ describe("Waiting lead drawer actions", () => {
 		}
 	});
 
+	test("the review hint and last result follow the actions before Meta", async () => {
+		const { container, close } = await mountLead(leadCard());
+		const win = new Window({ url: "http://localhost/" });
+		try {
+			win.document.head.innerHTML = `<style>${await Bun.file(
+				new URL("./app.css", import.meta.url),
+			).text()}</style>`;
+			win.document.body.innerHTML = container.innerHTML;
+			const body = win.document.querySelector(".drawer-body");
+			if (body === null) throw new Error("the drawer body is missing");
+			const children = [...body.children];
+			const actions = children.find((el) => el.matches(".drawer-actions"));
+			const hint = children.find((el) =>
+				el.textContent?.startsWith("The review "),
+			);
+			const result = children.find((el) =>
+				el.textContent?.startsWith("Last result: "),
+			);
+			const meta = children.find((el) => el.matches(".meta-block"));
+			if (!actions || !hint || !result || !meta) {
+				throw new Error("the lead actions, hints or Meta are missing");
+			}
+			const visualOrder = children.toSorted(
+				(a, b) =>
+					Number(win.getComputedStyle(a).order || 0) -
+					Number(win.getComputedStyle(b).order || 0),
+			);
+			expect(visualOrder.indexOf(hint)).toBeGreaterThan(
+				visualOrder.indexOf(actions),
+			);
+			expect(visualOrder.indexOf(result)).toBeGreaterThan(
+				visualOrder.indexOf(hint),
+			);
+			expect(visualOrder.indexOf(meta)).toBeGreaterThan(
+				visualOrder.indexOf(result),
+			);
+		} finally {
+			win.close();
+			await close();
+		}
+	});
+
 	test("with a validation run open on the board, Validate now names it and stays disabled", async () => {
 		// The gating reads the LIVE board rows (send-back 8): the detail carries
 		// no open-run field, so a stale cached detail cannot hold the button.

@@ -11,7 +11,7 @@ as "waits for validation". Only a confirmed validation result or the operator's
 
 A lead waits when `waitsValidation` is true. The full form:
 
-- stage `todo`, state `queued`, `queuedAt` set, `needsReason` null
+- stage `todo`, state `queued`, `queuedAt` set, `needsReason` null, `asked` null
 - `waitsValidation: true` (store column `waits_validation`, INTEGER/BIGINT NOT NULL DEFAULT 0)
 - `prompt` still starts with "Needs validation", `followUpOf` names the review
 
@@ -212,6 +212,8 @@ waiting lead instead of "queued with no hold found".
 11. One mounted drawer enables Validate now when a run finishes, then disables it when a new run appears.
 12. A legacy lead with quoted answer text still takes the waiting form.
 13. The legacy park route and filing transaction refuse marked leads without a state change.
+14. The review hint and last result appear below the actions and above Meta.
+15. Legacy convergence clears the old grill's `needsReason` and `asked` fields.
 
 
 ## Non-goals

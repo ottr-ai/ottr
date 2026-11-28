@@ -343,7 +343,7 @@ export const projectMigrations: readonly PostgresMigration[] = [
  * form, queued_at stamped from the row's updated_at. The SQLite open and the
  * PostgreSQL step share the statement so both engines converge identically. */
 export const CONVERGE_LEAD_WAIT_SQL =
-	"UPDATE tasks SET stage = 'todo', state = 'queued', waits_validation = 1, queued_at = updated_at WHERE id = ?";
+	"UPDATE tasks SET stage = 'todo', state = 'queued', waits_validation = 1, queued_at = updated_at, needs_reason = NULL, asked = NULL WHERE id = ?";
 
 /** Candidate findings become persisted outcomes only after a non-cancelled run
  * reaches done. Settlement reads candidates separately before this boundary.

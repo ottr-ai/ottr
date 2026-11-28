@@ -14160,7 +14160,7 @@ function DrawerActions(p: {
 			    the newest Validated-by segment of the details shows as a second
 			    short line. Full width under the row, like the re-run lines below. */}
 			{waiting && reviewId !== null && !deploymentLead && (
-				<p className="hint">
+				<p className="hint lead-validation-hint">
 					The review{" "}
 					<a
 						className="reason-card-link"
@@ -14175,7 +14175,7 @@ function DrawerActions(p: {
 				</p>
 			)}
 			{deploymentLead && reviewId !== null && (
-				<p className="hint">
+				<p className="hint lead-validation-hint">
 					The review{" "}
 					<a
 						className="reason-card-link"
@@ -14189,7 +14189,9 @@ function DrawerActions(p: {
 				</p>
 			)}
 			{waiting && lastValidation !== null && (
-				<p className="hint">Last result: {lastValidation}</p>
+				<p className="hint lead-validation-hint">
+					Last result: {lastValidation}
+				</p>
 			)}
 			{waiting && validateError !== null && (
 				<p className="auth-error" role="alert">
