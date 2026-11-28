@@ -867,6 +867,12 @@ domain. A daemon that does not run as root keeps the legacy identity and
 logs one `turn-uid: off` line at boot. Any identity step that fails fails
 the run, so a run never falls back to a root turn.
 
+Merge agents also use the project uid when the board runs as root. They
+stay on the board host and use the project turn home and shared agent layer.
+The board keeps its own uid for integration and push operations.
+If identity preparation fails, then the board starts no merge agent.
+See [Merge turn project uid](specs/merge-turn-uid.md).
+
 The server's own git (merge, release, review) runs as root inside the
 uid-owned worktrees, so the board gitconfig that the entry script seeds
 carries `[safe] directory = *`, added idempotently on every boot. Every git

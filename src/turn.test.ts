@@ -9,9 +9,15 @@ import {
 	test,
 } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type ChildProcess, execSync } from "node:child_process";
+import {
+	type ChildProcess,
+	execFileSync,
+	execSync,
+	type SpawnOptions,
+} from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
+	chmodSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -126,6 +132,7 @@ import {
 	VM_BUSY_RETRY_MS,
 	writeVmFiles,
 } from "./turn.ts";
+import { projectTurnUid } from "./turnUid.ts";
 import type {
 	Outcome,
 	ProposalSummary,
@@ -9031,7 +9038,149 @@ describe("package list", () => {
 		await loop.runTurn(store.name, task.id);
 		expect(asked).toEqual([store.name]);
 		expect(record.runs).toHaveLength(2);
+		expect(record.runs[0]).not.toHaveProperty("localMerge");
+		expect(record.runs[1]).toHaveProperty("localMerge", {
+			workspaceRoot: dirname(store.path),
+		});
 	});
+
+	test.skipIf(
+		process.platform !== "linux" ||
+			(process.getuid?.() !== 0 &&
+				(process.getuid?.() !== projectTurnUid("ottr").uid ||
+					process.getgid?.() !== projectTurnUid("ottr").gid)),
+	)(
+		"merge dispatch reaches real local preparation with a nonzero project uid",
+		async () => {
+			const root = mkdtempSync("/tmp/ottr-merge-dispatch-");
+			chmodSync(root, 0o755);
+			const saved = {
+				data: process.env.OTTR_DATA_DIR,
+				server: process.env.OTTR_SERVER_DATA_DIR,
+				board: process.env.OTTR_BOARD_OMP_HOME,
+				homes: process.env.OTTR_TURN_HOMES,
+			};
+			const workspaceRoot = join(root, "workspace");
+			const projectPath = join(workspaceRoot, "ottr");
+			const workerHome = join(root, "shared");
+			const homesRoot = join(root, "turn-homes");
+			const boardHome = join(root, "board");
+			const dataRoot = join(root, "data");
+			mkdirSync(projectPath, { recursive: true });
+			mkdirSync(join(workerHome, ".omp", "agent"), { recursive: true });
+			mkdirSync(homesRoot);
+			mkdirSync(dataRoot);
+			mkdirSync(boardHome, { mode: 0o700 });
+			for (const path of [
+				workspaceRoot,
+				workerHome,
+				join(workerHome, ".omp"),
+				homesRoot,
+				dataRoot,
+			])
+				chmodSync(path, 0o755);
+			writeFileSync(
+				join(workerHome, ".omp", "agent", "agent.db"),
+				"fixture store",
+			);
+			const globalConfig = join(boardHome, "gitconfig");
+			writeFileSync(
+				globalConfig,
+				"[user]\n name = Merge Fixture\n email = fixture@example.invalid\n",
+			);
+			const provisionPaths = {
+				passwd: join(root, "passwd"),
+				group: join(root, "group"),
+			};
+			writeFileSync(provisionPaths.passwd, "");
+			writeFileSync(provisionPaths.group, "");
+			execFileSync("git", ["init", "-q", projectPath], {
+				env: fixtureGitEnv(),
+			});
+			process.env.OTTR_DATA_DIR = dataRoot;
+			process.env.OTTR_SERVER_DATA_DIR = join(root, "server");
+			process.env.OTTR_BOARD_OMP_HOME = boardHome;
+			process.env.OTTR_TURN_HOMES = homesRoot;
+			const store = await ProjectStore.open(projectPath);
+			const record = baseRecord();
+			let launch: SpawnOptions | undefined;
+			let dispatches = 0;
+			let packageHome: string | undefined;
+			let stopping = false;
+			const rootView =
+				process.getuid?.() === 0
+					? null
+					: jest.spyOn(process, "getuid").mockReturnValue(0);
+			try {
+				const loop = holdFollowUps(
+					new Map([[store.name, fakeProject(store)]]),
+					fakeOps(record, {
+						holdFollowUps: true,
+						stopping: () => stopping,
+						prepareTurn: async (_project, destinationHome) => {
+							packageHome = destinationHome;
+							return { lines: [], pathDir: null };
+						},
+						workerTarget: { urls: ["http://worker.invalid"] },
+						startRun: async (options) => {
+							dispatches++;
+							expect(options.worker).toBeNull();
+							expect(options.vm).toBeNull();
+							expect(options.localMerge).toEqual({ workspaceRoot });
+							mkdirSync(options.cwd, { recursive: true });
+							const child = Object.assign(new EventEmitter(), {
+								stdout: new PassThrough(),
+								stderr: new PassThrough(),
+								stdin: new PassThrough(),
+							});
+							const handle = await realStartRun({
+								...options,
+								localMerge: {
+									...options.localMerge!,
+									workerHome,
+									homesRoot,
+									provisionPaths,
+								},
+								env: { ...fixtureGitEnv(), GIT_CONFIG_GLOBAL: globalConfig },
+								extensionPath: null,
+								auditProvisioned: undefined,
+								rulesAtStart: undefined,
+								launcher: (_command, _args, spawnOptions) => {
+									launch = spawnOptions;
+									return child as unknown as ChildProcess;
+								},
+							});
+							stopping = true;
+							child.emit("close", 0);
+							return handle;
+						},
+					}),
+				);
+				const task = await store.createTask("merge this isolated fixture");
+				await store.updateTask(task.id, { stage: "merging", state: "queued" });
+				await loop.runTurn(store.name, task.id);
+				expect(dispatches).toBe(1);
+				expect(launch?.uid).toBe(projectTurnUid(store.name).uid);
+				expect(launch?.gid).toBe(projectTurnUid(store.name).gid);
+				expect(launch?.uid).not.toBe(0);
+				expect(launch?.env?.HOME).toBe(join(homesRoot, store.name, "home"));
+				expect(packageHome).toBe(join(homesRoot, store.name, "ottr"));
+			} finally {
+				rootView?.mockRestore();
+				await store.close();
+				for (const [name, value] of [
+					["OTTR_DATA_DIR", saved.data],
+					["OTTR_SERVER_DATA_DIR", saved.server],
+					["OTTR_BOARD_OMP_HOME", saved.board],
+					["OTTR_TURN_HOMES", saved.homes],
+				] as const) {
+					if (value === undefined) delete process.env[name];
+					else process.env[name] = value;
+				}
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	test("a merge turn whose session model cannot load reruns with the board's default role", async () => {
 		const { store, record, loop } = await setup({

@@ -15,10 +15,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
 import type { KillExpect } from "./staleTurn.ts";
+import { uidFixtureDir } from "./test/uidFixture.ts";
 import { SWEEP_CLOCK_SKEW_MS, sweepTmpDirs } from "./tmpsweep.ts";
 import {
 	projectTurnUid,
@@ -206,8 +208,10 @@ const sha256 = (bytes: Uint8Array) =>
 	new Bun.CryptoHasher("sha256").update(bytes).digest("hex");
 
 /** A fresh provisioning home for the worker server (cleaned up in afterAll). */
-function freshWorkerHome(): string {
-	const h = mkdtempSync(join(tmpdir(), "ottr-worker-home-"));
+function freshWorkerHome(crossUid = false): string {
+	const h = crossUid
+		? uidFixtureDir("ottr-worker-home-")
+		: mkdtempSync(join(tmpdir(), "ottr-worker-home-"));
 	workerHomes.push(h);
 	return h;
 }
@@ -3034,13 +3038,13 @@ describe("serveWorker turn identity", () => {
 		});
 
 	rootTest(
-		"each project drops to its own uid and home; the layer copy retargets caches",
+		"each project drops to its own uid and home; the layer copy retargets caches [requires uid 0]",
 		async () => {
-			const workerHome = freshWorkerHome();
-			const homesRoot = freshWorkerHome();
+			const workerHome = freshWorkerHome(true);
+			const homesRoot = freshWorkerHome(true);
 			// A real workspace: each project dir holds a git repo, the daemon's
 			// structural git-dir derivation and per-run chown run against it.
-			const ws = freshWorkerHome();
+			const ws = freshWorkerHome(true);
 			// Own passwd/group fixtures: provisioning writes these, never the host's
 			// real files (a leftover ottr-<id> entry carrying another run's temp home
 			// would fail the identity check closed).
@@ -3054,6 +3058,7 @@ describe("serveWorker turn identity", () => {
 				Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
 					stdout: "ignore",
 					stderr: "ignore",
+					env: fixtureGitEnv(),
 				});
 				return repo;
 			};
@@ -3066,7 +3071,14 @@ describe("serveWorker turn identity", () => {
 			const identPath = join(workerHome, "ident-omp.js");
 			writeFileSync(
 				identPath,
-				`#!${process.execPath}\nprocess.stdout.write(JSON.stringify({ uid: process.getuid(), HOME: process.env.HOME, PI: process.env.PI_CODING_AGENT_DIR, SECRET: process.env.DUMMY_SECRET }) + "\\n");`,
+				`#!${process.execPath}
+process.stdout.write(JSON.stringify({ uid: process.getuid(), HOME: process.env.HOME, PI: process.env.PI_CODING_AGENT_DIR, SECRET: process.env.DUMMY_SECRET }) + "\\n");
+if (process.env.HANDSHAKE_URL) {
+	fetch(process.env.HANDSHAKE_URL).then((response) => {
+		if (!response.ok) throw new Error("fixture handshake failed");
+	}).catch((error) => { console.error(error); process.exitCode = 1; });
+}
+`,
 			);
 			chmodSync(identPath, 0o755);
 			chmodSync(workerHome, 0o755);
@@ -3129,6 +3141,19 @@ describe("serveWorker turn identity", () => {
 			mkdirSync(join(homesRoot, "proj-a", "layers"), { recursive: true });
 			const foreignLine = "cafe0102 2026-11-22T00:00:00.000Z\n";
 			writeFileSync(markerA, foreignLine);
+			const ready = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const handshake = Bun.serve({
+				port: 0,
+				hostname: "127.0.0.1",
+				idleTimeout: 0,
+				fetch: async () => {
+					ready.resolve();
+					await release.promise;
+					return new Response("ok");
+				},
+			});
+			servers.push(handshake);
 			const resA = await post(url, {
 				id: "ti-proj-a",
 				argv: ["-p"],
@@ -3139,23 +3164,31 @@ describe("serveWorker turn identity", () => {
 					HOME: layerDir,
 					PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
 					DUMMY_SECRET: "s3cret-proj-a",
+					HANDSHAKE_URL: `http://127.0.0.1:${handshake.port}`,
 				},
 			});
 			expect(resA.status).toBe(200);
-			// Mid-run: the marker holds the foreign line plus the run's own.
-			// No promise signals the daemon's marker write, so this polls the
-			// file (the file's poll helpers above use the same real-time loop).
-			const deadline = Date.now() + 5_000;
-			let mid = "";
-			while (Date.now() < deadline) {
-				mid = readFileSync(markerA, "utf8");
-				if (mid.startsWith(foreignLine) && mid.length > foreignLine.length)
-					break;
-				await Bun.sleep(20);
+			// The child holds its request until the marker assertions finish.
+			// An early child exit fails immediately instead of a marker timeout.
+			const completedA = readLines(resA);
+			let linesA: string[];
+			try {
+				await Promise.race([
+					ready.promise,
+					completedA.then((lines) => {
+						throw new Error(
+							`identity child exited before handshake: ${lines.join("\n")}`,
+						);
+					}),
+				]);
+				const mid = readFileSync(markerA, "utf8");
+				expect(mid.startsWith(foreignLine)).toBe(true);
+				expect(mid.length).toBeGreaterThan(foreignLine.length);
+			} finally {
+				release.resolve();
+				linesA = await completedA;
+				handshake.stop(true);
 			}
-			expect(mid.startsWith(foreignLine)).toBe(true);
-			expect(mid.length).toBeGreaterThan(foreignLine.length);
-			const linesA = await readLines(resA);
 			const dumpedA = JSON.parse(linesA[0]!) as {
 				uid: number;
 				HOME: string;
@@ -3268,9 +3301,9 @@ describe("serveWorker turn identity", () => {
 
 	test("a run provisions the project identity and pins its git identity env", async () => {
 		const ids = turnIdentity("git-env-proj");
-		const workerHome = freshWorkerHome();
-		const homesRoot = freshWorkerHome();
-		const ws = freshWorkerHome();
+		const workerHome = freshWorkerHome(isRoot);
+		const homesRoot = freshWorkerHome(isRoot);
+		const ws = freshWorkerHome(isRoot);
 		const passwd = join(homesRoot, "passwd");
 		const group = join(homesRoot, "group");
 		writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
@@ -3280,6 +3313,7 @@ describe("serveWorker turn identity", () => {
 		Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
 			stdout: "ignore",
 			stderr: "ignore",
+			env: fixtureGitEnv(),
 		});
 		// Identity stub: dumps the env keys the git-identity rewrite must touch.
 		const identPath = join(workerHome, "gitenv-omp.js");
@@ -3350,7 +3384,10 @@ describe("serveWorker turn identity", () => {
 	// The pinned-layer fixture both store tests share: passwd/group snapshots,
 	// one git repo, a pinned layer whose db link targets the flat shared home,
 	// and an omp stub that plays the store access omp does (OTTR-1291).
-	function storeFixture(project: string): {
+	function storeFixture(
+		project: string,
+		crossUid = false,
+	): {
 		workerHome: string;
 		homesRoot: string;
 		ws: string;
@@ -3358,9 +3395,9 @@ describe("serveWorker turn identity", () => {
 		layerDir: string;
 		dbTarget: string;
 	} {
-		const workerHome = freshWorkerHome();
-		const homesRoot = freshWorkerHome();
-		const ws = freshWorkerHome();
+		const workerHome = freshWorkerHome(crossUid);
+		const homesRoot = freshWorkerHome(crossUid);
+		const ws = freshWorkerHome(crossUid);
 		const passwd = join(homesRoot, "passwd");
 		const group = join(homesRoot, "group");
 		writeFileSync(passwd, "root:x:0:0:root:/root:/bin/bash\n");
@@ -3370,6 +3407,7 @@ describe("serveWorker turn identity", () => {
 		Bun.spawnSync(["git", "-C", repo, "init", "-b", "main"], {
 			stdout: "ignore",
 			stderr: "ignore",
+			env: fixtureGitEnv(),
 		});
 		const layerDir = join(workerHome, ".alate", "layers", "l1");
 		mkdirSync(join(layerDir, ".omp", "agent"), { recursive: true });
@@ -3398,7 +3436,7 @@ describe("serveWorker turn identity", () => {
 		const project = "store-restore-proj";
 		const ids = turnIdentity(project);
 		const { workerHome, homesRoot, ws, repo, layerDir, dbTarget } =
-			storeFixture(project);
+			storeFixture(project, isRoot);
 		// Store stub: opens the store through PI_CODING_AGENT_DIR the way omp
 		// does, and prints the result with the uid the turn ran under.
 		const stubPath = join(workerHome, "store-omp.js");

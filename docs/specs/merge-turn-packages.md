@@ -32,9 +32,11 @@ A project declares its Python packages once; both homes install the same set.
 
        <home>/.ottr/pip/<sha256 of the merged list>/
 
-   The worker builds into the shared home when it starts and before each work
-   turn; the server builds into the board home before each server-side turn
-   (merge turn, work turn with no worker, retro and board checks). The build is
+   Workers build into their project provision directory. Server-local turns
+   normally build into the board home. An isolated merge turn builds into
+   its daemon-owned project provision directory instead
+   ([Merge turn project uid](merge-turn-uid.md)). The server reads the
+   trusted lists from the board home for both local paths. The build is
    `python3 -m venv` plus `pip install --no-cache-dir --require-hashes -r`
    against a staged copy of the merged list. The build spawn pins HOME to the
    building home. The base `python3` runs isolated (`-I`,
@@ -54,8 +56,9 @@ A project declares its Python packages once; both homes install the same set.
 6. Dockerfile.worker gains `python3-venv` (platform capability): Debian ships
    no pip without it, and the venv's pip comes from ensurepip.
 
-R5-1 holds: the server reads the list from its own home and builds under it;
-nothing from the shared home is read or run in the server.
+R5-1 holds: the server reads trusted lists from its own home. An isolated
+merge agent uses packages under its project provision directory, not the
+board's private home. The root server never executes a shared-home package.
 
 ## Boundaries and errors
 

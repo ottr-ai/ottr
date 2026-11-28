@@ -1,7 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
-	chmodSync,
 	chownSync,
 	existsSync,
 	mkdirSync,
@@ -15,6 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { uidFixtureDir } from "./test/uidFixture.ts";
 import {
 	formatBytes,
 	runMarkerPath,
@@ -24,6 +24,9 @@ import {
 	touchRunMarker,
 	touchRunMarkers,
 } from "./tmpsweep.ts";
+
+const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+const rootTest = isRoot ? test : test.skip;
 
 describe("sweepTmpDirs", () => {
 	const root = mkdtempSync(join(tmpdir(), "sweeptest-"));
@@ -328,45 +331,52 @@ describe("scratch liveness markers (OTTR-1295)", () => {
 			expect(statSync(m).uid).toBe(process.getuid());
 	});
 
-	test("a turn uid cannot create, touch, or delete the marker", () => {
-		if (!(typeof process.getuid === "function" && process.getuid() === 0))
-			return;
-		// The real layout: root-owned 0711 scratch parent (prepareTurnCache makes
-		// it), daemon-owned marker, uid-owned scratch with a uid-owned temp file.
-		const turnUid = 12345;
-		chmodSync(root, 0o711);
-		const scratch = makeScratch("run-uid-proof");
-		chownSync(scratch, turnUid, turnUid);
-		touchRunMarker(scratch);
-		const m = runMarkerPath(scratch);
-		expect(statSync(m).uid).toBe(0);
-		// Run the three attempts as the turn uid; each reports pass/fail on stdout.
-		const probe = `(async () => {
-			const fs = require("node:fs");
-			const out = [];
-			const attempt = (name, fn) =>
-				out.push(name + ":" + (() => { try { fn(); return "ok"; } catch { return "denied"; } })());
-			attempt("delete-marker", () => fs.unlinkSync(${JSON.stringify(m)}));
-			attempt("create-marker", () =>
-				fs.writeFileSync(${JSON.stringify(join(root, "run-evil.live"))}, "x"));
-			attempt("touch-marker", () => fs.utimesSync(${JSON.stringify(m)}, new Date(), new Date()));
-			attempt("delete-own-temp", () => fs.unlinkSync(${JSON.stringify(join(scratch, "used"))}));
-			console.log(out.join(" "));
-		})()`;
-		const run = spawnSync(process.execPath, ["-e", probe], {
-			uid: turnUid,
-			gid: turnUid,
-			encoding: "utf8",
-			timeout: 30_000,
-		});
-		expect(run.status).toBe(0);
-		expect(run.stdout.trim().split(" ").sort()).toEqual([
-			"create-marker:denied",
-			"delete-marker:denied",
-			"delete-own-temp:ok",
-			"touch-marker:denied",
-		]);
-	});
+	rootTest(
+		"a turn uid cannot create, touch, or delete the marker [requires uid 0]",
+		() => {
+			// The fixture owns this parent outside the caller's private TMPDIR.
+			// The daemon owns the 0711 parent and the marker, not the scratch.
+			const uidRoot = uidFixtureDir("sweepmarker-uid-");
+			try {
+				const turnUid = 12345;
+				const scratch = join(uidRoot, "run-uid-proof");
+				mkdirSync(scratch);
+				writeFileSync(join(scratch, "used"), "x");
+				chownSync(scratch, turnUid, turnUid);
+				touchRunMarker(scratch);
+				const m = runMarkerPath(scratch);
+				expect(statSync(m).uid).toBe(0);
+				// Each attempt reports its result from the same child uid.
+				const probe = `(async () => {
+					const fs = require("node:fs");
+					const out = [];
+					const attempt = (name, fn) =>
+						out.push(name + ":" + (() => { try { fn(); return "ok"; } catch { return "denied"; } })());
+					attempt("delete-marker", () => fs.unlinkSync(${JSON.stringify(m)}));
+					attempt("create-marker", () =>
+						fs.writeFileSync(${JSON.stringify(join(uidRoot, "run-evil.live"))}, "x"));
+					attempt("touch-marker", () => fs.utimesSync(${JSON.stringify(m)}, new Date(), new Date()));
+					attempt("delete-own-temp", () => fs.unlinkSync(${JSON.stringify(join(scratch, "used"))}));
+					console.log(out.join(" "));
+				})()`;
+				const run = spawnSync(process.execPath, ["-e", probe], {
+					uid: turnUid,
+					gid: turnUid,
+					encoding: "utf8",
+					timeout: 30_000,
+				});
+				expect(run.status).toBe(0);
+				expect(run.stdout.trim().split(" ").sort()).toEqual([
+					"create-marker:denied",
+					"delete-marker:denied",
+					"delete-own-temp:ok",
+					"touch-marker:denied",
+				]);
+			} finally {
+				rmSync(uidRoot, { recursive: true, force: true });
+			}
+		},
+	);
 
 	afterAll(() => {
 		for (const p of [root, procRoot])

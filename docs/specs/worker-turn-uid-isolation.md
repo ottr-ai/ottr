@@ -309,14 +309,15 @@ sits after that section, so a configured turn-home identity keeps winning
 
 ### Server side
 
-Server-side turns (merge, release, review) run git as root inside worktrees
-that the workers now own by project uid. Git refuses a repo owned by another
-user ("dubious ownership"). The entry script's board gitconfig
-(`GIT_CONFIG_GLOBAL`, server-only env) gains `[safe] directory = *`,
-idempotently: `git config --file` adds the line on every boot, so existing
-deployments get it on their next recreate. The server already reads
-worker-writable trees; this restores its own git access. Worker turns match
-their repo's owner and need nothing.
+Merge agents stay on the board host. A root board starts each merge agent
+with the same project uid and gid as its work turns. The agent uses the
+project turn home and shared agent layer, not the board's private home.
+See [Merge turn project uid](merge-turn-uid.md).
+
+The board's Git operations retain the board uid. On a root board, Git
+must accept the project-owned checkout. The entry script's board gitconfig
+(`GIT_CONFIG_GLOBAL`, server-only env) therefore keeps `[safe] directory = *`.
+Other local agent kinds retain their current identity.
 
 ## Error cases
 

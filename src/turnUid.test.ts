@@ -23,7 +23,9 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import fc from "fast-check";
+import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { holdLock } from "./layerLeaseLock.ts";
+import { uidFixtureDir } from "./test/uidFixture.ts";
 import {
 	applyTurnGitEnv,
 	applyTurnHomeEnv,
@@ -59,8 +61,10 @@ const dirs: string[] = [];
 afterAll(() => {
 	for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
-function freshDir(prefix: string): string {
-	const d = mkdtempSync(join(tmpdir(), `ottr-turnuid-${prefix}-`));
+function freshDir(prefix: string, crossUid = false): string {
+	const d = crossUid
+		? uidFixtureDir(`ottr-turnuid-${prefix}-`)
+		: mkdtempSync(join(tmpdir(), `ottr-turnuid-${prefix}-`));
 	dirs.push(d);
 	return d;
 }
@@ -1824,7 +1828,7 @@ rootTest("ensureProjectIdentity appends a parseable passwd entry", () => {
 });
 
 rootTest(
-	"a turn's git identity comes from the project config, not inherited env",
+	"a turn's git identity comes from the project config, not inherited env [requires uid 0]",
 	() => {
 		const project = "git-identity-regression";
 		const ids = projectTurnUid(project);
@@ -1832,12 +1836,18 @@ rootTest(
 		// this chain: mkdtemp dirs are root-0700, so the homes root opens up,
 		// and prepareTurnHome gives the uid its own 0700 home (the production
 		// shape its HOME points at).
-		const homesRoot = freshDir("gitid-homes");
+		const homesRoot = freshDir("gitid-homes", true);
 		chmodSync(homesRoot, 0o755);
 		const turnHome = prepareTurnHome(homesRoot, project, ids);
-		const base = freshDir("gitid-repos");
+		const base = freshDir("gitid-repos", true);
 		chmodSync(base, 0o755);
-		const rootEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" };
+		// The caller can pin user.name/email through command-scope Git config.
+		// This fixture checks file precedence, not the caller's config.
+		const rootEnv = fixtureGitEnv();
+		for (const key of Object.keys(rootEnv))
+			if (key.startsWith("GIT_CONFIG")) delete rootEnv[key];
+		rootEnv.GIT_CONFIG_GLOBAL = "/dev/null";
+		rootEnv.GIT_CONFIG_NOSYSTEM = "1";
 		const gitAsRoot = (repo: string, ...argv: string[]): void => {
 			const r = Bun.spawnSync(["git", "-C", repo, ...argv], {
 				stdout: "pipe",

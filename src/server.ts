@@ -66,7 +66,6 @@ import {
 	openPrsView,
 	openPullRequest,
 } from "./prs.ts";
-import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
 	landPostReleaseCommand,
@@ -110,13 +109,7 @@ import { createSupervisor } from "./supervisor.ts";
 import { sweepSeenOps } from "./sweepSeen.ts";
 import { sweepTmpDirsLogged } from "./tmpsweep.ts";
 import { turnEnv } from "./tokens.ts";
-import {
-	buildToolsPath,
-	ensureProjectTools,
-	envValuesByKind,
-	listedEnvNames,
-	readToolsList,
-} from "./tools.ts";
+import { envValuesByKind, listedEnvNames } from "./tools.ts";
 import {
 	appendLog,
 	createTurnLoop,
@@ -125,6 +118,7 @@ import {
 	parseReleaseVersion,
 	type TurnLoop,
 } from "./turn.ts";
+import { prepareTurnPackages } from "./turnPackages.ts";
 import type { CheckRoutingSetting, LatestImage, OpenPrsView } from "./types.ts";
 import { probeVmRunner } from "./vmHealth.ts";
 import { VmTokens } from "./vmTokens.ts";
@@ -1003,33 +997,10 @@ const loop = createTurnLoop(projects, {
 				values: opts?.values,
 			},
 		),
-	// R5-1: a server-local turn reads tools.json and requirements.txt and installs under the
-	// board's server-only home (the board-seed copy), never the shared home a worker turn can
-	// write. The project venv's bin dir joins the tools link dir on the turn PATH, so a merge
-	// turn re-runs the gates against the declared package set with no install step and no
-	// question (docs/specs/merge-turn-packages.md).
-	prepareTurn: async (project) => {
-		const home = turnListHome();
-		const lines = [
-			...(await ensureProjectTools(project, home)),
-			...(await ensureProjectPython(project, home)),
-		];
-		const venvBin = pythonPathDir(project, home);
-		if (venvBin !== "")
-			lines.push("pip: the project venv's bin dir is on this turn's PATH");
-		const pathDir =
-			[
-				buildToolsPath(
-					// Link priority: the project's names first, then the fleet's.
-					[...readToolsList(project, home), ...readToolsList("_all", home)],
-					home,
-				),
-				venvBin,
-			]
-				.filter(Boolean)
-				.join(":") || null;
-		return { lines, pathDir };
-	},
+	// Only the board's trusted home supplies lists. A root merge installs into its
+	// provision home so the project uid never needs access to the private board home.
+	prepareTurn: (project, destinationHome) =>
+		prepareTurnPackages(project, turnListHome(), destinationHome),
 	publishRelease,
 	landPostReleaseCommand,
 	runPostReleaseCommand,

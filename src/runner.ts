@@ -4,6 +4,7 @@ import {
 	spawn,
 } from "node:child_process";
 import {
+	chmodSync,
 	existsSync,
 	lstatSync,
 	mkdtempSync,
@@ -49,6 +50,12 @@ import {
 	memoryBackendFromEnv,
 	memoryTurnEnv,
 } from "./memory.ts";
+import {
+	type LocalMergeIdentity,
+	mergeTurnIsolationEnabled,
+	type PreparedLocalMerge,
+	prepareLocalMerge,
+} from "./mergeTurnUid.ts";
 import { platform } from "./platform/index.ts";
 import { ensurePluginSkillsOverlay } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
@@ -1800,6 +1807,8 @@ interface StartOptions {
 	launcher?: RunLauncher;
 	/** Set: run the turn in a worker container, falling back to a local spawn on connect failure. */
 	worker?: WorkerTarget | null;
+	/** Merge agents stay local but drop to the project uid on a root Linux board. */
+	localMerge?: LocalMergeIdentity;
 	/** Set: run the turn in a fresh microVM on vm-runner (docs/adr/0009-microvm-workers.md);
 	 * wins over `worker`. The run issues the card's VM token at dispatch and revokes it when
 	 * `done` settles. A busy vm-runner settles `workerBusy`, never a lost worker. */
@@ -1898,6 +1907,7 @@ interface RunStart {
 	layerId: string | null;
 	unregisterLayer: () => void;
 	identityEnv: Record<string, string>;
+	localMerge: PreparedLocalMerge | null;
 }
 
 /** The plugin-skills overlay for one run: the enabled plugins of the run's home
@@ -1990,8 +2000,9 @@ function resolveLayerPin(layerHome: string, sink: RunSink): RunLayerPin {
 async function resolveIdentityEnv(
 	o: StartOptions,
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
+	baseEnv?: Record<string, string | undefined>,
 ): Promise<Record<string, string>> {
-	const identBaseEnv = withoutGitAuth({ ...process.env, ...o.env });
+	const identBaseEnv = withoutGitAuth(baseEnv ?? { ...process.env, ...o.env });
 	delete identBaseEnv.OTTR_DATABASE_URL;
 	if (o.vm) {
 		return o.commitIdentity != null
@@ -2159,34 +2170,36 @@ function startLocalRun(s: RunStart): RunHandle {
 	// The provision guard's untracked scan compares against the rules dir as it
 	// stood before omp started (docs/specs/turn-provision-guard.md).
 	const rulesAtStart = o.rulesAtStart ? o.rulesAtStart() : undefined;
-	const base = boardOmpEnv(
-		withoutGitAuth({
-			...process.env,
-			...o.env,
-			...(o.stripGithubToken
-				? { GH_TOKEN: undefined, GITHUB_TOKEN: undefined }
-				: {}),
-		}),
-	);
-	if (layerEnv !== null) Object.assign(base, layerEnv);
+	const base =
+		s.localMerge?.env ??
+		boardOmpEnv(withoutGitAuth({ ...process.env, ...o.env }));
+	if (o.stripGithubToken) {
+		delete base.GH_TOKEN;
+		delete base.GITHUB_TOKEN;
+	}
+	if (s.localMerge === null && layerEnv !== null) Object.assign(base, layerEnv);
 	Object.assign(base, identityEnv);
 	// OTTR-1211: the per-project cache (every card of the project shares it, two
 	// projects never do), on the server's own cache root — a worker-less server runs
 	// its turns here. Same layout and best-effort rule as the worker turn homes.
-	const serverCache = prepareTurnCache(
-		serverTurnCacheRoot(),
-		o.project ?? o.board?.project ?? undefined,
-		null,
-	);
+	const serverCache =
+		s.localMerge === null
+			? prepareTurnCache(
+					serverTurnCacheRoot(),
+					o.project ?? o.board?.project ?? undefined,
+					null,
+				)
+			: null;
 	if (serverCache !== null) Object.assign(base, serverCache.cacheEnv);
 	// OTTR-1211: the run's private scratch: TMPDIR points into a per-run dir, so the
 	// card's temp (pip and bun caches, tool temp) dies with the run instead of aging
 	// out a day later. OTTR_TMP_ROOT names the host temp root for files that must stay
 	// host-global under the redirected TMPDIR — the mutation lock reads it
 	// (scripts/stryker-base.mjs), and this process's own tmpdir() is that root.
-	const scratch = mkdtempSync(join(tmpdir(), "ottr-run-"));
+	const scratch =
+		s.localMerge?.scratch ?? mkdtempSync(join(tmpdir(), "ottr-run-"));
 	base.TMPDIR = scratch;
-	base.OTTR_TMP_ROOT = tmpdir();
+	if (s.localMerge === null) base.OTTR_TMP_ROOT = tmpdir();
 	appendGitPins(base);
 	// OTTR-990: the run cwd is a worker-writable worktree, and omp imports its project
 	// custom tools (`.omp/tools`, plugins, foreign `.claude`/`.codex` tool dirs) into
@@ -2198,6 +2211,8 @@ function startLocalRun(s: RunStart): RunHandle {
 		parkCustomToolDirs(o.cwd, parked);
 	} catch (err) {
 		restoreParkedToolDirs(parked, sink);
+		if (s.localMerge === null)
+			rmSync(scratch, { recursive: true, force: true });
 		throw err;
 	}
 	const env = childEnv({
@@ -2212,12 +2227,21 @@ function startLocalRun(s: RunStart): RunHandle {
 	// After every strip: the run's memory binding is the only HINDSIGHT_* env the child
 	// holds (docs/specs/hindsight-bank-binding.md). Null on a mnemopi deployment.
 	if (s.memoryEnv !== null) Object.assign(env, s.memoryEnv.env);
-	const child = launch("omp", args, {
-		cwd: o.cwd,
-		stdio: ["pipe", "pipe", "pipe"],
-		windowsHide: true,
-		env,
-	});
+	let child: ChildProcess;
+	try {
+		child = launch("omp", args, {
+			cwd: o.cwd,
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+			env,
+			...(s.localMerge === null ? {} : s.localMerge.ids),
+		});
+	} catch (error) {
+		restoreParkedToolDirs(parked, sink);
+		if (s.localMerge === null)
+			rmSync(scratch, { recursive: true, force: true });
+		throw error;
+	}
 
 	let killed = false;
 	// The token dies with the run: any outcome revokes it, so a captured token stops
@@ -2273,9 +2297,11 @@ function startLocalRun(s: RunStart): RunHandle {
 				// holding an entry (a detached dev server's cwd) makes rm fail; the next
 				// aged sweep takes the tree when its holds clear (src/tmpsweep.ts).
 				try {
-					rmSync(scratch, { recursive: true, force: true });
-				} catch {
-					// the aged sweep is the backstop
+					if (s.localMerge !== null) s.localMerge.release();
+					else rmSync(scratch, { recursive: true, force: true });
+				} catch (error) {
+					if (s.localMerge !== null)
+						sink.logMark(`! merge turn cleanup failed: ${errmsg(error)}\n`);
 				}
 				releaseMemory();
 			}
@@ -2646,6 +2672,7 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 	// Until a handle exists, no settlement releases the lease or revokes the token: every
 	// pre-handle error (sink, lease acquisition, setup, dispatch prep) cleans up here.
 	let layerPin: RunLayerPin | null = null;
+	let localMerge: PreparedLocalMerge | null = null;
 	try {
 		const sink = createRunSink({
 			logPath: o.logPath,
@@ -2667,8 +2694,34 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 		// layer directory, so a later atomic switch of `.alate/current` never touches a live
 		// run. Worker runs resolve the shared home (alate provisions it), the board's own runs
 		// the board home.
-		const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
+		const isolatedMerge =
+			o.localMerge !== undefined && mergeTurnIsolationEnabled();
+		if (isolatedMerge && (o.worker || o.vm))
+			throw new Error("a local merge identity cannot use a worker or microVM");
+		const layerHome =
+			o.worker || o.vm || isolatedMerge
+				? ((isolatedMerge ? o.localMerge?.workerHome : undefined) ?? homedir())
+				: boardOmpHome();
 		layerPin = resolveLayerPin(layerHome, sink);
+		if (isolatedMerge && o.localMerge !== undefined) {
+			const project = o.project ?? o.board?.project;
+			if (!project)
+				throw new Error("a local merge identity requires a project");
+			localMerge = await prepareLocalMerge(
+				o.localMerge,
+				project,
+				o.cwd,
+				o.sessionDir,
+				withoutGitAuth({
+					...process.env,
+					...o.env,
+					HOME: layerPin.layerEnv?.HOME ?? layerHome,
+					PI_CODING_AGENT_DIR:
+						layerPin.layerEnv?.PI_CODING_AGENT_DIR ??
+						join(layerHome, ".omp", "agent"),
+				}),
+			);
+		}
 		return await startPinnedRun(
 			o,
 			sink,
@@ -2677,9 +2730,14 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 			layerPin,
 			vmToken,
 			memory,
+			localMerge,
 		);
 	} catch (err) {
-		layerPin?.unregisterLayer();
+		try {
+			localMerge?.release();
+		} finally {
+			layerPin?.unregisterLayer();
+		}
 		if (o.vm && vmToken !== null) o.vm.tokens.revoke(vmToken);
 		if (memory !== null && !("skipped" in memory))
 			o.memoryTokens?.revoke(memory.token);
@@ -2699,21 +2757,48 @@ async function startPinnedRun(
 		| { token: string; env: Record<string, string> }
 		| { skipped: string }
 		| null,
+	localMerge: PreparedLocalMerge | null,
 ): Promise<RunHandle> {
 	if (memory !== null && "skipped" in memory)
 		sink.logMark(`! hindsight memory off for this run: ${memory.skipped}\n`);
-	const memoryConfig = resolveMemoryConfig(o);
-	// The plugin-skills overlay reads the run's pinned home, so a layer run gets its own
-	// layer's plugins (docs/specs/turn-home-plugin-skills.md).
-	const pluginSkillsConfig = pluginSkillsConfigFor(
-		o,
-		layerPin.layerEnv,
-		layerHome,
-	);
+	const memoryConfig =
+		localMerge !== null && o.memoryConfigPath === undefined
+			? ensureMemoryOverlay({
+					...process.env,
+					OTTR_DATA_DIR: localMerge.runtimeDir,
+				})
+			: resolveMemoryConfig(o);
+	// Isolated merges keep their overlays outside the board's private state.
+	const pluginSkillsConfig =
+		localMerge === null
+			? pluginSkillsConfigFor(o, layerPin.layerEnv, layerHome)
+			: ensurePluginSkillsOverlay(
+					{ OTTR_SERVER_DATA_DIR: localMerge.runtimeDir },
+					localMerge.env.HOME ?? layerHome,
+					o.project ?? o.board?.project,
+					{ kind: "board" },
+				);
+	if (localMerge !== null) {
+		if (
+			memoryConfig !== null &&
+			dirname(memoryConfig) === localMerge.runtimeDir
+		)
+			chmodSync(memoryConfig, 0o444);
+		if (pluginSkillsConfig !== null) chmodSync(pluginSkillsConfig, 0o444);
+	}
 	const args = buildOmpArgs({ ...o, memoryConfig, pluginSkillsConfig });
-	// Awaited here (after buildOmpArgs, before RunStart): the probe spawns git and must
-	// not block the caller's tick, but every dispatch path needs the ident env settled.
-	const identityEnv = await resolveIdentityEnv(o, layerPin.layerEnv);
+	const identityEnv = await resolveIdentityEnv(
+		o,
+		localMerge === null
+			? layerPin.layerEnv
+			: {
+					HOME: localMerge.env.HOME ?? layerHome,
+					PI_CODING_AGENT_DIR:
+						localMerge.env.PI_CODING_AGENT_DIR ??
+						join(layerHome, ".omp", "agent"),
+				},
+		localMerge?.env,
+	);
 	const s: RunStart = {
 		o,
 		sink,
@@ -2727,6 +2812,7 @@ async function startPinnedRun(
 		startedAt,
 		...layerPin,
 		identityEnv,
+		localMerge,
 	};
 	if (o.vm && vmToken !== null) return startVmRun(s, o.vm, vmToken);
 	if (!o.worker) return startLocalRun(s);

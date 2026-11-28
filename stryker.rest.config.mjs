@@ -43,6 +43,8 @@ export default {
     // workers area
     "!src/workers.ts",
     "!src/turnUid.ts",
+    "!src/mergeTurnUid.ts",
+    "!src/turnPackages.ts",
     "!src/turnGithubToken.ts",
     "!src/confine.ts",
     "!src/session.ts",

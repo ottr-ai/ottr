@@ -71,6 +71,10 @@ import {
 } from "./inboxSweep.ts";
 import { newSweepState, type SweepState } from "./inboxSweepState.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
+import {
+	mergeTurnIsolationEnabled,
+	mergeTurnProvisionHome,
+} from "./mergeTurnUid.ts";
 import { modelFallbacks, modelList, modelRoles } from "./models.ts";
 import type { GateCheck } from "./promptGate.ts";
 import {
@@ -1180,7 +1184,10 @@ export interface TurnOps {
 		secrets?: string[];
 	}>;
 	/** Tools install lines and the PATH link dir for local runs only (a worker builds its own). */
-	prepareTurn?: (project: string) => Promise<{
+	prepareTurn?: (
+		project: string,
+		destinationHome?: string,
+	) => Promise<{
 		lines: string[];
 		pathDir: string | null;
 	}>;
@@ -6142,7 +6149,7 @@ export function createTurnLoop(
 		// OTTR-532: a microVM project's eligible turn (its cwd is the card worktree) goes to
 		// vm-runner and nowhere else; everything else keeps today's routing.
 		const picked = pickTurnWorker(e, kind, header, idn, loc, task);
-		const prep = await prepareTurnPackages(name, picked.local, log);
+		const prep = await prepareTurnPackages(name, picked.local, kind, log);
 		const execModel = resolveExecModel(
 			store,
 			input.live,
@@ -6247,11 +6254,20 @@ export function createTurnLoop(
 	async function prepareTurnPackages(
 		name: string,
 		local: boolean,
+		kind: TurnKind,
 		log: (line: string) => void | Promise<void>,
 	): Promise<TurnPrep | null> {
 		if (local)
 			for (const line of await ops.ensurePackages(name)) await log(line);
-		const prep = local && ops.prepareTurn ? await ops.prepareTurn(name) : null;
+		const prep =
+			local && ops.prepareTurn
+				? await ops.prepareTurn(
+						name,
+						kind === "merge" && mergeTurnIsolationEnabled()
+							? mergeTurnProvisionHome(name)
+							: undefined,
+					)
+				: null;
 		for (const l of prep?.lines ?? []) await log(l);
 		return prep;
 	}
@@ -6642,6 +6658,9 @@ export function createTurnLoop(
 			model: route.runModel,
 			sessionName: idn.sessionName,
 			worker: route.vmTurn ? null : route.liveWorker,
+			...(kind === "merge" && {
+				localMerge: { workspaceRoot: dirname(e.path) },
+			}),
 			vm:
 				vm === null
 					? null

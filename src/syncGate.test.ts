@@ -28,6 +28,7 @@ import {
 	syncGateFilesError,
 	workspaceRootFor,
 } from "./syncGate.ts";
+import { uidFixtureDir } from "./test/uidFixture.ts";
 import { projectTurnUid } from "./turnUid.ts";
 import type { SyncGateRun } from "./types.ts";
 
@@ -61,8 +62,10 @@ afterAll(() => {
 	for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
-function freshDir(prefix: string): string {
-	const d = mkdtempSync(join(tmpdir(), `ottr-syncgate-${prefix}-`));
+function freshDir(prefix: string, crossUid = false): string {
+	const d = crossUid
+		? uidFixtureDir(`ottr-syncgate-${prefix}-`)
+		: mkdtempSync(join(tmpdir(), `ottr-syncgate-${prefix}-`));
 	dirs.push(d);
 	return d;
 }
@@ -971,9 +974,9 @@ describe("agent-data uid cannot write the alate checkout", () => {
 	});
 
 	rootTest(
-		"a traversable workspace keeps the mode-700 alate dir closed to the agent-data uid",
+		"a traversable workspace keeps the mode-700 alate dir closed to the agent-data uid [requires uid 0]",
 		async () => {
-			const root = freshDir("uid");
+			const root = freshDir("uid", true);
 			// The workspace root mirrors the live layout: traversable, so the
 			// boundary under test is the alate dir's own permissions, never the
 			// parent's.
