@@ -6649,6 +6649,7 @@ function ModelRolesContent({
 	onSetValue,
 	onRemoveRole,
 	onEditChain,
+	onRemoveChain,
 	onAdd,
 	onSubmit,
 }: {
@@ -6677,6 +6678,7 @@ function ModelRolesContent({
 	onSetValue: (name: string, value: string) => void;
 	onRemoveRole: (name: string) => void;
 	onEditChain: (name: string, fn: (chain: string[]) => string[]) => void;
+	onRemoveChain: (name: string) => void;
 	/** Adds the typed new role. */
 	onAdd: () => void;
 	onSubmit: () => void;
@@ -6716,18 +6718,58 @@ function ModelRolesContent({
 						onRemove={onRemoveRole}
 						onEditChain={onEditChain}
 					/>
+					{Object.entries(chains)
+						.filter(([name]) => !rows.some(([role]) => role === name))
+						.map(([name, chain], index) => {
+							const error = ownField(fallbackFields, name);
+							const errorId = `${uid}-unlisted-${index}-err`;
+							return (
+								<fieldset
+									className="role-unlisted-chain"
+									key={name}
+									aria-describedby={error ? errorId : undefined}
+								>
+									<legend className="sr">Fallbacks for {name}</legend>
+									<div className="role-unlisted-values">
+										<h4>{name}</h4>
+										{chain.length === 0 ? (
+											<p className="hint">No fallback models (empty chain).</p>
+										) : (
+											<ol>
+												{chain.map((selector, i) => (
+													<li key={`${i}-${selector}`}>
+														<code>{selector}</code>
+													</li>
+												))}
+											</ol>
+										)}
+										{error && (
+											<p className="auth-error" id={errorId} role="alert">
+												{error}
+											</p>
+										)}
+									</div>
+									<button
+										type="button"
+										className="danger"
+										aria-label={`Remove fallback chain for ${name}`}
+										aria-describedby={error ? errorId : undefined}
+										disabled={locked}
+										onClick={() => onRemoveChain(name)}
+									>
+										Remove
+									</button>
+								</fieldset>
+							);
+						})}
 					{missing.length > 0 && (
 						<div className="role-warn" role="note">
 							<Mark kind="needs" />
 							<b>No second opinion for {missing.join(" and ")}</b>
 							<p>
-								Second-model checks of{" "}
-								{missing
-									.map((v) => (v === "unknown" ? "an unknown" : `a ${v}`))
-									.join(" or ")}{" "}
-								model fall back to the default model, which is often the model
-								they check. Add a role of another vendor above, or set a routing
-								rule below.
+								Second-model checks for models from {missing.join(" or ")} use
+								the default model, which is often the model they check. Add a
+								role of another vendor above, or set a routing rule below.
 							</p>
 						</div>
 					)}
@@ -6836,7 +6878,7 @@ export function ModelRolesSection() {
 	const [loadErr, setLoadErr] = useState<string | null>(null);
 	const [rows, setRows] = useState<Array<[string, string]>>([]);
 	const [fields, setFields] = useState<Record<string, string>>({});
-	// The rows' fallback chains; a role without a chain has no key.
+	// All representable chains, including keys without a role row.
 	const [chains, setChains] = useState<Record<string, string[]>>({});
 	const [fallbackFields, setFallbackFields] = useState<Record<string, string>>(
 		{},
@@ -6869,7 +6911,7 @@ export function ModelRolesSection() {
 		// any edit; `?? null` keeps stale payloads from arming `ro`.
 		setRo(s.ro ?? null);
 		setRows(Object.entries(s.roles));
-		setChains(rowChains(Object.keys(s.roles), s.fallbacks));
+		setChains(rowChains(Object.keys(s.fallbacks), s.fallbacks));
 	}, []);
 	// The failed load's Retry: one manual re-run, plus a read every 30 s while the
 	// error holds, so a slow alate provision needs no page reload. `loadingRef`
@@ -6945,7 +6987,7 @@ export function ModelRolesSection() {
 		state !== null &&
 		(rolesDirty(rows, state.roles) ||
 			fallbacksDirty(
-				rows.map(([name]) => name),
+				[...new Set([...Object.keys(chains), ...Object.keys(state.fallbacks)])],
 				chains,
 				state.fallbacks,
 			));
@@ -6971,17 +7013,25 @@ export function ModelRolesSection() {
 		setChains((c) => withoutKey(c, name));
 		setFallbackFields((f) => withoutKey(f, name));
 	};
+	const removeChain = async (name: string): Promise<void> => {
+		if (locked) return;
+		if (
+			!(await confirmDialog(`Remove the fallback chain for ${name}?`, {
+				ok: "Remove chain",
+				cancel: "Keep chain",
+				danger: true,
+			}))
+		)
+			return;
+		setChains((c) => withoutKey(c, name));
+		setFallbackFields((f) => withoutKey(f, name));
+	};
 	const add = (): void => {
 		const name = newName.trim();
 		const err = addRoleError(name, rows, first);
 		setAddErr(err);
 		if (err === null && first !== undefined) {
 			setRows((rs) => [...rs, [name, first]]);
-			// A new role starts with the chain the file holds for its key.
-			const loaded =
-				state !== null ? ownField(state.fallbacks, name) : undefined;
-			if (loaded !== undefined)
-				setChains((c) => ({ ...c, [name]: [...loaded] }));
 			setNewName("");
 		}
 	};
@@ -7033,10 +7083,7 @@ export function ModelRolesSection() {
 					base: state.base,
 					hash: state.hash,
 					roles: Object.fromEntries(rows),
-					fallbacks: rowChains(
-						rows.map(([name]) => name),
-						chains,
-					),
+					fallbacks: chains,
 				}),
 			});
 			const r = classifyRolesSave(
@@ -7047,7 +7094,7 @@ export function ModelRolesSection() {
 			if (r.kind === "readonly") {
 				setRo({ path: r.path, cause: r.cause });
 				setRows(Object.entries(state.roles));
-				setChains(rowChains(Object.keys(state.roles), state.fallbacks));
+				setChains(rowChains(Object.keys(state.fallbacks), state.fallbacks));
 				setError(null);
 				setFields({});
 				setFallbackFields({});
@@ -7059,7 +7106,7 @@ export function ModelRolesSection() {
 					(old) => old && { ...old, base, hash, roles, fallbacks, seed },
 				);
 				setRows(Object.entries(roles));
-				setChains(rowChains(Object.keys(roles), fallbacks));
+				setChains(rowChains(Object.keys(fallbacks), fallbacks));
 				setSaved({
 					seedAtSave: seed.commit,
 					after: roles,
@@ -7075,7 +7122,7 @@ export function ModelRolesSection() {
 				const { base, hash, roles, fallbacks } = r;
 				setState((old) => old && { ...old, base, hash, roles, fallbacks });
 				setRows(Object.entries(roles));
-				setChains(rowChains(Object.keys(roles), fallbacks));
+				setChains(rowChains(Object.keys(fallbacks), fallbacks));
 				setError(r.error);
 				return false;
 			}
@@ -7124,6 +7171,7 @@ export function ModelRolesSection() {
 				onSetValue={setValue}
 				onRemoveRole={removeRole}
 				onEditChain={editChain}
+				onRemoveChain={(name) => void removeChain(name)}
 				onAdd={add}
 				onSubmit={submit}
 			/>

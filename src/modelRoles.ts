@@ -501,11 +501,10 @@ function render(text: string, lines: Line[], c: Changes): string {
 }
 
 /**
- * The text with `modelRoles` set to `next` and each managed chain set to `fallbacks`: unchanged
- * lines stay byte for byte. Managed chain keys are the file's current roles and the keys of
- * `next`; a managed key without an entry in `fallbacks` loses its chain. A new chain follows the
- * last content line of `fallbackChains`, so blank and comment lines after it stay with the key
- * that follows them. Checked by parsing both texts.
+ * The text with `modelRoles` set to `next` and representable chains set to `fallbacks`.
+ * Unchanged entries keep their bytes. An omitted chain loses its key. Entries that GET
+ * cannot represent stay unchanged. New chains follow the last content line of
+ * `fallbackChains`. The parser checks both texts.
  */
 export function editModelRoles(
 	text: string,
@@ -515,8 +514,28 @@ export function editModelRoles(
 	const s = scan(text);
 	const before = parse(text);
 	const old = (before.modelRoles ?? {}) as Record<string, unknown>;
-	const managed = new Set([...Object.keys(next), ...Object.keys(old)]);
-	const r = scanRetry(s.lines, before, managed);
+	const roleKeys = new Set([...Object.keys(next), ...Object.keys(old)]);
+	const r = scanRetry(s.lines, before, roleKeys);
+	const chains = chainsOf(before).chains;
+	const managed = new Set([
+		...Object.keys(fallbacks),
+		...Object.keys(chains).filter(
+			(k) =>
+				Array.isArray(chains[k]) &&
+				(chains[k] as unknown[]).every(
+					(v) => typeof v === "string" && v !== "",
+				),
+		),
+	]);
+	for (const k of r.keys) {
+		if (roleKeys.has(k.name)) continue;
+		k.value = chains[k.name];
+		if (
+			Object.hasOwn(fallbacks, k.name) &&
+			!Bun.deepEquals(k.value, fallbacks[k.name])
+		)
+			checkManaged(k, s.lines, k.value);
+	}
 	const c: Changes = { replace: new Map(), insert: new Map() };
 	for (const e of s.entries) {
 		const v = Object.hasOwn(next, e.role) ? next[e.role] : undefined;
@@ -698,12 +717,12 @@ function chainError(
 	next: Record<string, unknown>,
 	catalog: ReadonlySet<string>,
 ): string | null {
-	if (!Object.hasOwn(next, role)) return "this role is not in roles";
 	if (!Array.isArray(chain)) return "the fallbacks must be a list";
 	for (const [i, v] of chain.entries()) {
 		const err = selectorError(v, catalog);
 		if (err !== null) return `fallback ${i + 1}: ${err}`;
-		if (v === next[role]) return `fallback ${i + 1}: the role's own value`;
+		if (v === next[role] || v === role)
+			return `fallback ${i + 1}: the role's own value`;
 		const j = chain.indexOf(v);
 		if (j < i) return `fallback ${i + 1}: a duplicate of fallback ${j + 1}`;
 	}
@@ -748,7 +767,20 @@ export function validateRoles(
 	if (!isMap(fallbacks))
 		return { error: "fallbacks must be an object", fields, fallbackFields };
 	for (const [role, chain] of Object.entries(fallbacks)) {
-		const err = chainError(role, chain, next, catalog);
+		const known =
+			Object.hasOwn(next, role) ||
+			Object.hasOwn(current, role) ||
+			(ROLE_NAME.test(role) && Object.hasOwn(currentFallbacks, role)) ||
+			/^[^/\s]+\/\S+$/.test(role);
+		const unchangedNonrole =
+			!Object.hasOwn(next, role) &&
+			!Object.hasOwn(current, role) &&
+			sameChain(fallbacks, currentFallbacks, role);
+		const err = !known
+			? "this key is not a known role or model"
+			: unchangedNonrole
+				? null
+				: chainError(role, chain, next, catalog);
 		if (err !== null) fallbackFields[role] = err;
 	}
 	if (Object.keys(fields).length > 0 || Object.keys(fallbackFields).length > 0)
@@ -760,10 +792,8 @@ export function validateRoles(
 			fallbackFields,
 		};
 	const same =
-		Object.keys(next).length === Object.keys(current).length &&
-		Object.entries(next).every(
-			([r, v]) => current[r] === v && sameChain(fallbacks, currentFallbacks, r),
-		);
+		Bun.deepEquals(next, current) &&
+		Bun.deepEquals(fallbacks, currentFallbacks);
 	return same ? { error: "nothing to save", fields, fallbackFields } : null;
 }
 
@@ -779,7 +809,10 @@ function singleChangeMessage(
 	const chain = Object.hasOwn(nextFallbacks, role)
 		? nextFallbacks[role]
 		: undefined;
-	if (current[role] !== next[role])
+	if (
+		Object.hasOwn(next, role) &&
+		(!Object.hasOwn(current, role) || current[role] !== next[role])
+	)
 		return `chore: set the ${role} model role to ${next[role]}`;
 	if (chain === undefined)
 		return `chore: remove the ${role} model role fallbacks`;
@@ -802,11 +835,20 @@ export function commitMessage(
 	currentFallbacks: Fallbacks,
 	nextFallbacks: Fallbacks,
 ): string {
-	const changed = Object.keys(next).filter(
-		(r) =>
-			current[r] !== next[r] || !sameChain(currentFallbacks, nextFallbacks, r),
-	);
 	const removed = Object.keys(current).filter((r) => !Object.hasOwn(next, r));
+	const changed = [
+		...new Set([
+			...Object.keys(next),
+			...Object.keys(nextFallbacks),
+			...Object.keys(currentFallbacks),
+		]),
+	].filter(
+		(r) =>
+			!removed.includes(r) &&
+			((Object.hasOwn(next, r) &&
+				(!Object.hasOwn(current, r) || current[r] !== next[r])) ||
+				!sameChain(currentFallbacks, nextFallbacks, r)),
+	);
 	let msg: string;
 	const [role] = changed as [string];
 	if (changed.length === 0 && removed.length === 1)

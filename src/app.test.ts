@@ -8221,6 +8221,9 @@ extensions:
 			models: async () => [
 				model("zai/glm-5.3-flash"),
 				model("anthropic/claude-opus-5-5"),
+				model("zai/glm-5.3"),
+				model("openai-codex/gpt-6.1-sol"),
+				model("typesafe/jev-preview"),
 			],
 		});
 		const refMoves = () =>
@@ -8238,6 +8241,10 @@ extensions:
 cycleOrder:
   - smol
 `;
+		const UNLISTED_CHAINS = CHAINS.replace(
+			"    # Exact-model key comment\n    zai/glm-5.3-flash:\n      - anthropic/claude-opus-5-5\n",
+			'    judge: # unlisted role\n      - "typesafe/jev-preview" # keep\n    # Exact-model key comment\n    "openai-codex/gpt-6.1-sol": [zai/glm-5.3:max] # flow\n',
+		);
 		const loadChains = () => {
 			reset();
 			head = snapshot = CHAINS;
@@ -8911,6 +8918,7 @@ cycleOrder:
 						slow: "anthropic/claude-opus-5-5:medium",
 					},
 					fallbacks: {
+						"zai/glm-5.3-flash": ["anthropic/claude-opus-5-5"],
 						default: [
 							"anthropic/claude-opus-5-5:medium",
 							"anthropic/claude-opus-5-5",
@@ -8951,6 +8959,105 @@ cycleOrder:
 					CHAINS.replace(
 						"default: zai/glm-5.3-flash:max",
 						"default: anthropic/claude-opus-5-5",
+					),
+				);
+			});
+
+			test("GET then POST preserves model-key and unlisted judge chains with one changed role", async () => {
+				for (const text of [
+					UNLISTED_CHAINS,
+					UNLISTED_CHAINS.replace("typesafe/jev-preview", "gone/judge").replace(
+						"zai/glm-5.3:max",
+						"gone/model:max",
+					),
+				]) {
+					loadChains();
+					head = snapshot = text;
+					const get = await m.call("/api/model-roles");
+					expect(get.status).toBe(200);
+					const body = (await get.json()) as {
+						base: string;
+						hash: string;
+						roles: Record<string, string>;
+						fallbacks: Record<string, string[]>;
+					};
+					expect(Object.keys(body.fallbacks)).toEqual([
+						"default",
+						"judge",
+						"openai-codex/gpt-6.1-sol",
+					]);
+					const res = await m.call("/api/model-roles", {
+						base: body.base,
+						hash: body.hash,
+						roles: { ...body.roles, slow: "anthropic/claude-opus-5-5:high" },
+						fallbacks: body.fallbacks,
+					});
+					expect(res.status).toBe(200);
+					expect(head).toBe(
+						text.replace(
+							"  slow: anthropic/claude-opus-5-5:medium",
+							"  slow: anthropic/claude-opus-5-5:high",
+						),
+					);
+					expect(await res.json()).toMatchObject({ fallbacks: body.fallbacks });
+				}
+			});
+
+			test("nonrole-chain removal alone saves and removes only the requested chain", async () => {
+				for (const [key, block] of [
+					[
+						"judge",
+						'    judge: # unlisted role\n      - "typesafe/jev-preview" # keep\n',
+					],
+					[
+						"openai-codex/gpt-6.1-sol",
+						'    "openai-codex/gpt-6.1-sol": [zai/glm-5.3:max] # flow\n',
+					],
+				] as const) {
+					loadChains();
+					head = snapshot = UNLISTED_CHAINS;
+					const get = await m.call("/api/model-roles");
+					const body = (await get.json()) as {
+						base: string;
+						hash: string;
+						roles: Record<string, string>;
+						fallbacks: Record<string, string[]>;
+					};
+					const { [key]: _, ...fallbacks } = body.fallbacks;
+					const res = await m.call("/api/model-roles", {
+						base: body.base,
+						hash: body.hash,
+						roles: body.roles,
+						fallbacks,
+					});
+					expect(res.status).toBe(200);
+					expect(head).toBe(UNLISTED_CHAINS.replace(block, ""));
+					expect(await res.json()).toMatchObject({ fallbacks });
+					const commit = ghCalls.find((a) =>
+						a.includes("repos/o/data/git/commits"),
+					);
+					expect(field(commit!, "message")).toBe(
+						`chore: remove the ${key} model role fallbacks`,
+					);
+				}
+			});
+
+			test("omitted fallbacks preserve unlisted chains and remove only a removed role's chain", async () => {
+				loadChains();
+				head = snapshot = UNLISTED_CHAINS;
+				const res = await m.call("/api/model-roles", {
+					base: BASE,
+					hash: sha(UNLISTED_CHAINS),
+					roles: { slow: "anthropic/claude-opus-5-5:medium" },
+				});
+				expect(res.status).toBe(200);
+				expect(head).toBe(
+					UNLISTED_CHAINS.replace(
+						"  default: zai/glm-5.3-flash:max\n",
+						"",
+					).replace(
+						"    default:\n      - anthropic/claude-opus-5-5:high\n",
+						"",
 					),
 				);
 			});

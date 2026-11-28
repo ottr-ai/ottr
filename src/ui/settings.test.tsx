@@ -5771,7 +5771,7 @@ describe("ModelRolesSection model picker", () => {
 			{ plan: "zai/glm-5.3-flash", slow: "openai/gpt-5" },
 			{
 				plan: ["openai/gpt-5:high", "anthropic/claude-opus-5-5"],
-				// A model-selector key: the file keeps it, the rows never show it.
+				// A model-selector key stays read-only and remains in every save.
 				"zai/glm-5.3-flash": ["openai/gpt-5"],
 			},
 		);
@@ -5825,7 +5825,7 @@ describe("ModelRolesSection model picker", () => {
 			expect(ups().map((b) => b.getAttribute("aria-label"))).toEqual([
 				"Move up plan fallback 2",
 			]);
-			// A role without a chain says so; the model-selector key shows nowhere.
+			// A role without a chain says so; the model-key chain stays read-only.
 			expect(slow.querySelector(".fallback-row")).toBeNull();
 			expect(slow.textContent).toContain("No fallback models.");
 			expect(container.querySelectorAll(".fallback-row").length).toBe(2);
@@ -5861,7 +5861,7 @@ describe("ModelRolesSection model picker", () => {
 				"Claude Opus 5.5 (anthropic/claude-opus-5-5)",
 			]);
 
-			// Save sends the rows' chains only, in the edited order.
+			// Save sends every chain, with the role chain in the edited order.
 			await act(async () => {
 				onClickOf(save)({});
 			});
@@ -5873,6 +5873,7 @@ describe("ModelRolesSection model picker", () => {
 					"openai/gpt-5:high",
 					"anthropic/claude-opus-5-5",
 				],
+				"zai/glm-5.3-flash": ["openai/gpt-5"],
 			});
 
 			// The 400's fallback message shows at the group and describes its controls.
@@ -5904,7 +5905,223 @@ describe("ModelRolesSection model picker", () => {
 			});
 			await settle();
 			expect(posts.length).toBe(2);
-			expect(posts[1]!.fallbacks).toEqual({});
+			expect(posts[1]!.fallbacks).toEqual({
+				"zai/glm-5.3-flash": ["openai/gpt-5"],
+			});
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("ModelRolesSection unlisted chains", () => {
+	const chains = {
+		plan: ["openai/gpt-5"],
+		judge: ["legacy/judge:high", "openai/gpt-5"],
+		"openai-codex/gpt-6.1-sol": ["legacy/model"],
+		empty: [],
+	};
+	const saveButton = (container: Element) =>
+		container.querySelector<HTMLButtonElement>(".alate-def-actions button")!;
+	const removeButton = (container: Element) =>
+		container.querySelector<HTMLButtonElement>(
+			'[aria-label="Remove fallback chain for judge"]',
+		)!;
+	const answerConfirmation = async (confirm: boolean): Promise<void> => {
+		const button = document.querySelector<HTMLButtonElement>(
+			confirm
+				? "dialog .dialog-actions button.danger"
+				: "dialog .dialog-actions button:not(.danger)",
+		);
+		if (!button) throw new Error("Chain confirmation did not render");
+		await act(async () => button.click());
+		await settleDialog();
+	};
+	const fixture = (
+		posts: Record<string, unknown>[],
+		answer: () => Response | Promise<Response>,
+		readonly = false,
+	): typeof fetch => {
+		const read = rolesFetch({ plan: "zai/glm-5.3-flash" }, chains);
+		return (async (input: RequestInfo | URL, init?: RequestInit) => {
+			if (String(input).endsWith("/api/model-roles")) {
+				if (init?.method === "POST") {
+					posts.push(JSON.parse(String(init.body)));
+					return answer();
+				}
+				const res = await read(input, init);
+				return Response.json({
+					...(await res.json()),
+					...(readonly ? { ro: { path: "/config", cause: "mount" } } : {}),
+				});
+			}
+			return read(input, init);
+		}) as typeof fetch;
+	};
+	const rejectSave = () =>
+		Response.json(
+			{
+				error: "Check the fallback chain.",
+				fallbackFields: { judge: "Remove the unavailable chain." },
+			},
+			{ status: 400 },
+		);
+
+	test("a model change posts unchanged judge and model-key chains with associated read-only errors", async () => {
+		const posts: Record<string, unknown>[] = [];
+		const { container, unmount } = await mountRoles(fixture(posts, rejectSave));
+		try {
+			const unlisted = [...container.querySelectorAll(".role-unlisted-chain")];
+			expect(unlisted.length).toBe(3);
+			for (const row of unlisted) {
+				expect(row.querySelector("select, input, .model-trigger")).toBeNull();
+			}
+			expect(unlisted[0]!.querySelector("ol")?.textContent).toBe(
+				"legacy/judge:highopenai/gpt-5",
+			);
+			expect(unlisted[2]!.textContent).toContain(
+				"No fallback models (empty chain).",
+			);
+			await act(async () => {
+				onClickOf(container.querySelector("button.model-option")!)({});
+			});
+			await act(async () => saveButton(container).click());
+			await settleDialog();
+			expect(posts[0]!.fallbacks).toEqual(chains);
+			expect(posts[0]!.roles).toEqual({ plan: "anthropic/claude-opus-5-5" });
+			const error = unlisted[0]!.querySelector(".auth-error")!;
+			expect(error.textContent).toBe("Remove the unavailable chain.");
+			expect(unlisted[0]!.getAttribute("aria-describedby")).toBe(error.id);
+			expect(removeButton(container).getAttribute("aria-describedby")).toBe(
+				error.id,
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("confirmed unlisted removal alone enables Save and posts all other keys", async () => {
+		const posts: Record<string, unknown>[] = [];
+		const { container, unmount } = await mountRoles(fixture(posts, rejectSave));
+		try {
+			expect(saveButton(container).disabled).toBe(true);
+			await act(async () => removeButton(container).click());
+			expect(document.querySelector("dialog h2")?.textContent).toContain(
+				"judge",
+			);
+			expect(saveButton(container).disabled).toBe(true);
+			await answerConfirmation(true);
+			expect(removeButton(container)).toBeNull();
+			expect(saveButton(container).disabled).toBe(false);
+			expect(posts).toEqual([]);
+			await act(async () => saveButton(container).click());
+			await settleDialog();
+			expect(posts[0]!.fallbacks).toEqual({
+				plan: chains.plan,
+				"openai-codex/gpt-6.1-sol": chains["openai-codex/gpt-6.1-sol"],
+				empty: [],
+			});
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("cancel confirmation preserves an unlisted chain and leaves Save disabled", async () => {
+		const posts: Record<string, unknown>[] = [];
+		const { container, unmount } = await mountRoles(fixture(posts, rejectSave));
+		try {
+			await act(async () => removeButton(container).click());
+			await answerConfirmation(false);
+			expect(removeButton(container)).not.toBeNull();
+			expect(saveButton(container).disabled).toBe(true);
+			expect(posts).toEqual([]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("save lock and read-only source lock prevent unlisted removal", async () => {
+		for (const readonly of [false, true]) {
+			const posts: Record<string, unknown>[] = [];
+			const { promise: pending, resolve } = Promise.withResolvers<Response>();
+			const { container, unmount } = await mountRoles(
+				fixture(posts, () => pending, readonly),
+			);
+			try {
+				if (!readonly) {
+					await act(async () => {
+						onClickOf(container.querySelector("button.model-option")!)({});
+					});
+					await act(async () => saveButton(container).click());
+				}
+				expect(removeButton(container).disabled).toBe(true);
+				await act(async () => removeButton(container).click());
+				expect(document.querySelector("dialog")).toBeNull();
+				expect(posts.length).toBe(readonly ? 0 : 1);
+				await act(async () => resolve(rejectSave()));
+			} finally {
+				await unmount();
+			}
+		}
+	});
+
+	test("409 reload retains all unlisted entries and posts them on the next save", async () => {
+		const posts: Record<string, unknown>[] = [];
+		const current = { ...chains, judge: ["openai/gpt-5:low"], extra: [] };
+		const { container, unmount } = await mountRoles(
+			fixture(posts, () =>
+				Response.json(
+					{
+						error: "The configuration changed. Review the current values.",
+						base: "new-base",
+						hash: "new-hash",
+						roles: { plan: "zai/glm-5.3-flash" },
+						fallbacks: current,
+					},
+					{ status: 409 },
+				),
+			),
+		);
+		try {
+			await act(async () => {
+				onClickOf(container.querySelector("button.model-option")!)({});
+			});
+			await act(async () => saveButton(container).click());
+			await settleDialog();
+			expect(container.querySelectorAll(".role-unlisted-chain").length).toBe(4);
+			expect(container.textContent).toContain("openai/gpt-5:low");
+			expect(saveButton(container).disabled).toBe(true);
+			await act(async () => {
+				onClickOf(container.querySelector("button.model-option")!)({});
+			});
+			await act(async () => saveButton(container).click());
+			await settleDialog();
+			expect(posts[1]!.fallbacks).toEqual(current);
+			expect(posts[1]!.hash).toBe("new-hash");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a removed chain does not return when a same-name role is added", async () => {
+		const posts: Record<string, unknown>[] = [];
+		const { container, unmount } = await mountRoles(fixture(posts, rejectSave));
+		try {
+			await act(async () => removeButton(container).click());
+			await answerConfirmation(true);
+			const input =
+				container.querySelector<HTMLInputElement>(".role-add input")!;
+			await act(async () => {
+				typeInto(input, "judge");
+				onChangeOf(input)({ target: input });
+			});
+			await act(async () => {
+				container.querySelector("form.role-add")!.dispatchEvent(submitEvent());
+			});
+			await act(async () => saveButton(container).click());
+			await settleDialog();
+			expect(posts[0]!.fallbacks).not.toHaveProperty("judge");
+			expect(posts[0]!.roles).toHaveProperty("judge");
 		} finally {
 			await unmount();
 		}

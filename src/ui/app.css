@@ -10392,6 +10392,34 @@ button.log-mode[aria-pressed="true"] {
 	list-style: none;
 	overflow-wrap: anywhere;
 }
+.role-unlisted-chain {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: start;
+	gap: 8px 14px;
+	margin: 0;
+	min-inline-size: 0;
+	padding-inline: 0;
+	border: 0;
+	padding-block: 14px;
+	border-block-end: 1px solid var(--line-soft);
+}
+.role-unlisted-values {
+	flex: 1 1 240px;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.role-unlisted-values h4,
+.role-unlisted-values p {
+	margin: 0;
+}
+.role-unlisted-values ol {
+	margin-block: 8px 0;
+	padding-inline-start: 24px;
+}
+.role-unlisted-chain > button {
+	margin-inline-start: auto;
+}
 /* A role's fallbacks: tight under the row, so the chain reads as part of its role. The
    "Fallbacks" legend and the empty-chain hint stay for screen readers only; the numbers
    say what the rows are. The entries share one set of columns through the list's subgrid. */

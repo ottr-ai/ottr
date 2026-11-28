@@ -42,7 +42,7 @@ Settings gets a **Model roles** section. The user edits the omp `modelRoles` map
 ```
 
 - `roles` keeps the file order. Only nonempty string values count.
-- `fallbacks` is `retry.fallbackChains` in file order: every key whose value is a list of nonempty strings (also an empty list). omp keys a chain by a role name or by a model selector. The UI shows only the chains of its role rows.
+- `fallbacks` is `retry.fallbackChains` in file order: every key whose value is a list of nonempty strings, including an empty list. Keys name roles or models (`provider/model`). The UI shows chains without role rows as read-only rows with a Remove control.
 - `signIns`: the providers with an active sign-in in the board store (`signIns()`): one sign-in serves the board and the workers (docs/specs/provider-credentials.md). `signIns` is null when the store cannot be read.
 - `base` comes from `GET /api/state` (no re-import, so the read stays fast). When Alate's snapshot is behind the branch head, the first save gets a conflict and then shows the current values.
 - `seed.commit` is the trimmed content of the `seed-commit` file, or null when it is absent. `seed.roles` is the board copy's `modelRoles` (`{}` when the board copy is not seeded), and `seed.fallbacks` is its `retry.fallbackChains` (string lists only, `{}` when absent). All three are null without `seed.needed`.
@@ -51,9 +51,13 @@ Errors (`{ error }`): 400 when the Alate URL or key is not set. 404 when the dat
 
 ### `POST /api/model-roles`
 
-Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles": { "<role>": "<selector>" }, "fallbacks": { "<role>": ["<selector>", "..."] } }`. The object order is the order for new roles.
+Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles": { "<role>": "<selector>" }, "fallbacks": { "<role or model key>": ["<selector>", "..."] } }`. The object order is the order for new roles.
 
-`fallbacks` is optional. It holds the full chain of each role in `roles` that has a chain. A role in `roles` without a `fallbacks` key gets no chain. An empty list stays an explicit empty chain (omp then uses no fallback for that role). Without `fallbacks`, each role in `roles` keeps its current chain. A removed role loses its chain. A `retry.fallbackChains` key that is not a current or a requested role (for example a model selector key) stays byte for byte.
+`fallbacks` is optional. When present, it holds all requested chains, including chains without a role row. An omitted key removes that chain. An empty list stays an explicit empty chain. Without `fallbacks`, every chain stays, except the chain of a removed role. Entries that GET cannot represent stay unchanged.
+
+Assumption for OTTR-1349: an existing fallback role key is a known role, even without an entry in `modelRoles`. A model key has a provider and a model, separated by `/`. Neither part is empty. A key with neither form remains a field error.
+
+Gate assumption for OTTR-1349: an unlisted chain has a read-only row and a Remove control. Removal changes only the draft until Save.
 
 1. Ottr re-imports Alate's snapshot (`POST /api/import`) and reads the file. When the head commit differs from the body `base`, or the file hash differs from the body `hash`, the route returns 409 `{ error, base, hash, roles, fallbacks }` with the current values, and commits nothing. A commit on main that leaves `config.yml` alone is a conflict too. This check runs before validation, so a stale form gets the current values also when they already hold the requested ones.
 2. The save checks the write target before anything else: when the Settings → Alate data-repository pin is set, Alate's source must name that repository (`owner/name`; a path source is a mismatch), or the route answers 409 `{ error }` without values and writes nothing. A pinned branch must equal the write branch (the branch Alate names, or GitHub's default branch when it names none); that check runs in the write step, before its first write call, so a mismatch also writes nothing.
@@ -62,8 +66,9 @@ Body: `{ "base": "<base from the read>", "hash": "<hash from the read>", "roles"
    - A new role name must match `^[A-Za-z][A-Za-z0-9_-]{0,63}$`. A name that the file already holds stays editable.
    - `roles` must hold at least one role.
    - Each value must be `<catalog selector>` or `<catalog selector>:<level>`. This applies to every value, also to an unchanged value. The catalog is `omp models --json` (the `/api/models` list). The level is one of `THINKING_LEVELS` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`). A value with a known model and an unknown suffix gets "unknown thinking level".
-   - `fallbacks` must be an object. Each key must be a role in `roles`. Each value must be a list. Each entry follows the value rule above, and the message names the entry ("fallback 2: unknown model x/y").
-   - A chain must not hold one selector twice, and must not hold the role's own value.
+   - `fallbacks` must be an object. Each key must name a current role, a requested role, an existing fallback role, or a model (`provider/model`). Each value must be a list. Each edited entry follows the model value rule above.
+   - An unchanged chain without a role row stays valid even when its model leaves the catalog. The save preserves its bytes.
+   - An edited chain must not hold one selector twice or hold its own role value or model key.
    - A save that changes no role and no chain gives 400 `nothing to save`.
 5. Ottr writes the new text (see "Text edit") as a GitHub commit with the loaded `base` as its parent (see "Data path"). Before the first write call, the save reads the write branch's head from GitHub and requires it to equal `base` — a loaded commit that is only a descendant of the head would still fast-forward, moving the branch onto Alate's chosen history. A mismatch answers 409 `{ error, base, hash, roles, fallbacks }` with the re-imported current values and writes nothing. The write branch must also equal a pinned branch: the branch Alate names, or GitHub's default branch when it names none. That mismatch answers 409 and writes nothing.
 6. When GitHub refuses the fast-forward (a move between the head read and the ref update), Ottr re-imports, reads the file again, and returns 409 `{ error, base, hash, roles, fallbacks }`. Ottr never retries the write by itself. When the refresh fails, the route returns the refresh error. Other GitHub errors (no write access, no token, gh missing) return 502 with GitHub's message.
@@ -74,12 +79,12 @@ The commit message is a Conventional Commit of at most 500 characters:
 
 - One role added or changed: `chore: set the <role> model role to <value>`.
 - One role removed: `chore: remove the <role> model role`.
-- Only the chain of one role changed: `chore: set the <role> model role fallbacks to <a>, <b>`, `chore: set the <role> model role fallbacks to none` for an empty list, or `chore: remove the <role> model role fallbacks` when the chain goes.
-- Other cases: `chore: update the <role>, <role> model roles`, with each role that has a changed value or chain. A long list ends in `…` before the 500-character cap.
+- Only one chain changed: `chore: set the <key> model role fallbacks to <a>, <b>`, `chore: set the <key> model role fallbacks to none`, or `chore: remove the <key> model role fallbacks`.
+- Other cases: `chore: update the <key>, <key> model roles`, with each changed role or chain key. A long list ends in `…` before the 500-character cap.
 
 ## Text edit
 
-The edit changes only the `modelRoles` block. Every other byte stays: other keys, comments, order, blank lines, line ends, and the final newline. A file without a final newline keeps its open end, also when the edit removes its last line.
+For role edits, the text edit changes only the `modelRoles` block. Fallback edits follow the rules below. Every untouched byte stays, including comments, order, blank lines, line ends, and the final newline. A file without a final newline keeps its open end.
 
 - The block starts at a column-0 line `modelRoles:` (a trailing comment is allowed). It ends before the next column-0 line that is not blank and not a comment.
 - Each entry is one line `<indent><role>: <value>` with an optional trailing ` # comment`. The value is a plain scalar or a single-quoted or double-quoted string. All entries share one indent.
@@ -87,25 +92,26 @@ The edit changes only the `modelRoles` block. Every other byte stays: other keys
 - A new value is written plain when it matches `^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$` and holds a `/`. Else it is written as a JSON string (a valid YAML double-quoted string).
 - When the file has no `modelRoles` key, the edit appends a block at the end.
 - Any other layout (a flow map, a multi-line value, an anchor, a nested key) gives the 422 error. Ottr then edits nothing.
-- A check after the edit parses both texts. The new `modelRoles` must equal the requested map, and every other key must equal its old value. A failed check is an error, and nothing is committed.
+- The parser checks both texts. `modelRoles` must equal the requested map. Unchanged keys must keep their old values. A failed check stops the commit.
 
 ### Fallback chains
 
-The edit changes only the managed keys of `retry.fallbackChains`: the current roles and the requested roles. Every other byte stays, also the other keys of `retry` and the unmanaged chain keys with their comments.
+The edit changes the current and requested roles and the chains that GET represents. Every untouched entry stays byte for byte. This includes model keys, unlisted role keys, comments, quotes, order, line ends, and other `retry` keys.
 
 - `retry` is a column-0 block `retry:` (a trailing comment is allowed). `fallbackChains:` is one line at the indent of the first child of `retry`, with an optional trailing comment. Its block holds the lines with a deeper indent, and blank and comment lines.
-- Each chain key is one line at one shared indent. A managed key holds `<key>:` with block list items `- <value>` on the next lines (at a deeper indent or at the key's indent), or `<key>: []`. Each item is one plain or quoted scalar with an optional trailing comment. An unmanaged key can have any layout.
+- Each chain key is one line at one shared indent. An editable chain holds block list items or `<key>: []`. An unchanged chain without a role row can use any layout. Removal accepts that layout too.
 - A changed chain replaces the item lines of its key. An unchanged chain keeps its lines exactly. A chain that goes loses its key line and its item lines. A new chain follows the last line of the block, with the key indent and the item indent of the block (or two more spaces). An empty list is written `<key>: []`.
 - Without `fallbackChains`, the edit adds it at the end of the `retry` block. Without `retry`, the edit appends a `retry:` block at the end of the file. A chain block that loses its last key keeps its `fallbackChains:` line (YAML null, which omp reads as no chains).
 - Item values follow the value rule above (plain or a JSON string).
-- Any other layout of `retry` or of a managed key (a flow map, a flow list with entries, a multi-line value, an anchor, two `fallbackChains` keys) gives the 422 error, also on the read.
-- The check after the edit also requires: each managed key holds exactly the requested chain (no key when no chain is requested), every unmanaged chain key and every other `retry` key equals its old value.
+- An unsupported `retry` layout or editable role-chain layout gives 422, also on GET. An untouched chain without a role row keeps its layout.
+- The check after the edit requires each requested chain to match. Entries that GET cannot represent and other `retry` keys keep their old values.
 
 ## UI
 
 - The General Settings page shows **Model roles** after **Provider sign-in**.
 - One row for each role: the role name, a model `<select>` with the `/api/models` catalog, and a thinking `<select>` (Default, then each level). A current value that is not in the catalog shows as an extra option "<value> (not in the catalog)".
 - Under each row, the role's **Fallbacks** in chain order. Each fallback has the same model and thinking pickers, a **Move up** button (not on the first one) and a remove button. **Add fallback** appends the first catalog model. A new role starts with the chain that the file holds for that key, or with none. A `fallbackFields` message shows at the row's fallback list.
+- Chains without a role row show their key and ordered values as read-only text. Remove asks for confirmation. Save persists the removal. The draft and request retain every other chain. Read-only sources disable Remove.
 - A remove button for each row. An add form with a role name, then the new row takes the first catalog model.
 - **Save** is off while nothing changed or a save runs. A 400 shows each `fields` message at its row (`aria-describedby`, `aria-invalid`). A 409 with `roles` loads the current values and shows the conflict message. Other errors show in an alert. A 400 with exactly the read-only error locks the editor: `cause: "mount"` (the folder sits on a read-only mount) shows the mount hint, the answer without `cause` (a plain folder, not a git repo) keeps the git hint. For a folder source (`base` null), the section's help text says Save writes through Alate's editor, not with the board's GitHub token.
 - A row warns when its provider (the selector text before `/`) has no active sign-in on the board: "No active sign-in for <provider> on the board". A store with `active: null` gives no warning.
@@ -124,7 +130,10 @@ The edit changes only the managed keys of `retry.fallbackChains`: the current ro
 
 - A test: a save changes only the `modelRoles` values and keeps every other byte of `config.yml`.
 - A test: a fallback save changes only the managed chain lines and keeps every other byte, also the unmanaged chain keys and their comments.
-- A test: an unknown fallback model, a duplicate, and a fallback for a role that is not in `roles` are refused, and no write reaches GitHub.
+- A route test: GET then POST with unchanged model-key and unlisted-role chains and one changed role returns 200. Only that role line changes.
+- A route test: an unknown fallback model, a duplicate, and a key with neither role nor model form return 400 with field errors.
+- Route and UI tests: an unlisted chain removal alone enables Save and removes only that chain. Omitted `fallbacks` preserves unlisted chains.
+- Property tests: role edits preserve untouched chains byte for byte across quotes, comments, line ends, and absent final newlines.
 - A test: an unknown model or level is refused, and no write reaches GitHub (`gh api` git trees, commits, or refs).
 - A test: a moved data repo gives a 409 conflict with the current roles and no write: a commit on main that leaves `config.yml` alone, a changed `config.yml`, and a move between the re-import and the ref update (GitHub refuses the fast-forward, no second write).
 - A test: with a pinned data repository, a save whose Alate source names another repository, or a path source, is refused with 409 and no GitHub write; a matching source writes.
@@ -145,3 +154,4 @@ The edit changes only the managed keys of `retry.fallbackChains`: the current ro
 - A pin or blob check on the GET route: `GET /api/model-roles` only reads and never writes, so a stale or unpinned display needs no fail-closed answer.
 - Provider API keys in the env do not clear the sign-in warning.
 - A seed state from git history: the board has no clone of the data repo. The seed step compares the roles and the recorded `seed.commit`, not the commit graph.
+- Changes to turn fallback resolution, new npm dependencies, and wording changes in `src/prompts.ts`.

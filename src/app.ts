@@ -16685,13 +16685,15 @@ export async function createApp(deps: AppDeps) {
 		const catalog = new Set(
 			(await (deps.models ?? modelList)()).map((m) => m.selector),
 		);
-		// Without `fallbacks`, each requested role keeps its current chain.
+		// Without `fallbacks`, keep all chains except those of removed current roles.
 		const fb: Record<string, unknown> =
 			fallbacks === undefined
 				? Object.fromEntries(
-						Object.keys(roles as Record<string, unknown>)
-							.filter((k) => Object.hasOwn(currentFallbacks, k))
-							.map((k) => [k, currentFallbacks[k]]),
+						Object.entries(currentFallbacks).filter(
+							([k]) =>
+								!Object.hasOwn(current, k) ||
+								Object.hasOwn(roles as Record<string, unknown>, k),
+						),
 					)
 				: (fallbacks as Record<string, unknown>);
 		const bad = validateRoles(

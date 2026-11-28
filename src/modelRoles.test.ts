@@ -219,7 +219,7 @@ cycleOrder:
 		const out = editModelRoles(
 			shape,
 			{ plan: "zai/glm-5.3" },
-			{ plan: ["zai/glm-5.3:max"] },
+			{ ...readFallbacks(shape), plan: ["zai/glm-5.3:max"] },
 		);
 		expect(out).toBe(
 			`${shape.replace("      - openai-codex/gpt-6.1-sol\n", "      - zai/glm-5.3:max\n")}modelRoles:\n  plan: zai/glm-5.3\n`,
@@ -344,9 +344,16 @@ retry:
 			"x/y": ["a/b", "c/d"],
 			default: ["a/b"],
 		});
-		expect(editModelRoles(text, { default: "x/y" }, { default: ["e/f"] })).toBe(
-			text.replace("      - a/b\n", "      - e/f\n"),
-		);
+		expect(
+			editModelRoles(
+				text,
+				{ default: "x/y" },
+				{
+					...readFallbacks(text),
+					default: ["e/f"],
+				},
+			),
+		).toBe(text.replace("      - a/b\n", "      - e/f\n"));
 	});
 
 	const M = "modelRoles:\n  default: x/y\n";
@@ -411,7 +418,7 @@ retry:
 				{ requiredKeys: [] },
 			),
 			(req) => {
-				const want = req as Fallbacks;
+				const want: Fallbacks = { [SELECTOR_KEY]: FB[SELECTOR_KEY]!, ...req };
 				const out = editModelRoles(REAL, ROLES, want);
 				const got = readFallbacks(out);
 				for (const role of Object.keys(ROLES)) {
@@ -426,6 +433,78 @@ retry:
 			},
 		);
 		fc.assert(prop, { seed: 42, numRuns: 150 });
+	});
+
+	test("nonrole chain edits and removals affect only their own lines", () => {
+		const out = editModelRoles(REAL, ROLES, {
+			...FB,
+			[SELECTOR_KEY]: ["typesafe/jev-preview"],
+			"new/model": ["zai/glm-5.3"],
+		});
+		expect(out).toBe(
+			REAL.replace(
+				"      - zai/glm-5.3:max\n",
+				"      - typesafe/jev-preview\n",
+			).replace(
+				"  # after the chains\n",
+				'    "new/model":\n      - zai/glm-5.3\n  # after the chains\n',
+			),
+		);
+		const flow = REAL.replace(
+			"    openai-codex/gpt-6.1-sol:\n      - zai/glm-5.3:max\n",
+			'    "openai-codex/gpt-6.1-sol": ["gone/model:max"] # keep\n',
+		);
+		const { [SELECTOR_KEY]: _, ...rest } = readFallbacks(flow);
+		expect(editModelRoles(flow, ROLES, rest)).toBe(
+			flow.replace(
+				'    "openai-codex/gpt-6.1-sol": ["gone/model:max"] # keep\n',
+				"",
+			),
+		);
+	});
+
+	test("role edits preserve nonrole YAML bytes across quotes, comments and line ends", () => {
+		fc.assert(
+			fc.property(
+				fc.constantFrom("plain", "single", "double"),
+				fc.boolean(),
+				fc.boolean(),
+				fc.boolean(),
+				(quote, flow, crlf, finalNewline) => {
+					const scalar = (s: string) =>
+						quote === "single"
+							? `'${s}'`
+							: quote === "double"
+								? JSON.stringify(s)
+								: s;
+					let text = REAL.replace("  judge: zai/glm-5.3\n", "")
+						.replace(
+							"    judge:\n      - typesafe/jev-preview\n",
+							`    ${scalar("judge")}: # keep judge\n      - ${scalar("gone/judge:max")} # keep item\n`,
+						)
+						.replace(
+							"    openai-codex/gpt-6.1-sol:\n      - zai/glm-5.3:max\n",
+							flow
+								? `    ${scalar(SELECTOR_KEY)}: [${scalar("gone/model:max")}] # keep flow\n`
+								: `    ${scalar(SELECTOR_KEY)}: # keep model\n      - ${scalar("gone/model:max")} # keep item\n`,
+						);
+					if (!finalNewline) text = text.slice(0, -1);
+					if (crlf) text = text.replaceAll("\n", "\r\n");
+					const out = editModelRoles(
+						text,
+						{ ...readRoles(text), default: "zai/glm-5.3" },
+						readFallbacks(text),
+					);
+					expect(out).toBe(
+						text.replace(
+							"  default: zai/glm-5.3-flash:max",
+							"  default: zai/glm-5.3",
+						),
+					);
+				},
+			),
+			{ seed: 1349, numRuns: 150 },
+		);
 	});
 });
 
@@ -541,13 +620,13 @@ describe("validateRoles", () => {
 			});
 		});
 
-		test("a key that is not a role in roles is refused, also __proto__", () => {
+		test("an unknown bare key is refused, also __proto__", () => {
 			expect(check({ plan: [] })?.fallbackFields).toEqual({
-				plan: "this role is not in roles",
+				plan: "this key is not a known role or model",
 			});
 			expect(
 				check(JSON.parse('{"__proto__":[]}'))?.fallbackFields,
-			).toHaveProperty("__proto__", "this role is not in roles");
+			).toHaveProperty("__proto__", "this key is not a known role or model");
 		});
 
 		test("a value that is not an object is refused", () => {
@@ -566,6 +645,182 @@ describe("validateRoles", () => {
 			expect(save({ default: [] }, {})).toBeNull();
 			expect(save({}, { default: [] })).toBeNull();
 			expect(save({ default: chain }, { default: [] })).toBeNull();
+		});
+
+		test("known unlisted roles and model keys accept edited lists", () => {
+			expect(
+				validateRoles(
+					ok,
+					ok,
+					catalog,
+					{ judge: ["anthropic/claude-opus-5-5"] },
+					{ judge: [] },
+				),
+			).toBeNull();
+			expect(check({ "new/model": ["anthropic/claude-opus-5-5"] })).toBeNull();
+			expect(
+				validateRoles(
+					ok,
+					{ ...ok, judge: "anthropic/claude-opus-5-5" },
+					catalog,
+					{ judge: [] },
+					{},
+				),
+			).toBeNull();
+		});
+
+		test("unchanged nonrole chains allow stale selectors but role chains do not", () => {
+			const chains = { judge: ["gone/model"], "gone/key": ["gone/fallback"] };
+			expect(
+				validateRoles(
+					{ ...ok, slow: "anthropic/claude-opus-5-5" },
+					ok,
+					catalog,
+					chains,
+					chains,
+				),
+			).toBeNull();
+			expect(validateRoles(ok, ok, catalog, chains, chains)?.error).toBe(
+				"nothing to save",
+			);
+			expect(
+				validateRoles(
+					ok,
+					ok,
+					catalog,
+					{ default: ["gone/model"] },
+					{ default: ["gone/model"] },
+				)?.fallbackFields,
+			).toEqual({ default: "fallback 1: unknown model gone/model" });
+			expect(
+				validateRoles(ok, ok, catalog, { judge: ["gone/edited"] }, chains)
+					?.fallbackFields,
+			).toEqual({ judge: "fallback 1: unknown model gone/edited" });
+		});
+
+		test("model keys retain list, selector, duplicate and self checks", () => {
+			for (const [key, chain, message] of [
+				["/model", [], "this key is not a known role or model"],
+				["provider/", [], "this key is not a known role or model"],
+				["provider /model", [], "this key is not a known role or model"],
+				["new/model", "x/y", "the fallbacks must be a list"],
+				["new/model", ["gone/model"], "fallback 1: unknown model gone/model"],
+				[
+					"new/model",
+					["anthropic/claude-opus-5-5:turbo"],
+					`fallback 1: ${level}`,
+				],
+				[
+					"new/model",
+					["anthropic/claude-opus-5-5", "anthropic/claude-opus-5-5"],
+					"fallback 2: a duplicate of fallback 1",
+				],
+				[
+					"anthropic/claude-opus-5-5",
+					["anthropic/claude-opus-5-5"],
+					"fallback 1: the role's own value",
+				],
+			] as const) {
+				expect(check({ [key]: chain })?.fallbackFields).toEqual({
+					[key]: message,
+				});
+			}
+		});
+
+		test("fallback key validation agrees with known names and a split-based model oracle", () => {
+			const old = { ...ok, current_role: "anthropic/claude-opus-5-5" };
+			const next = { ...ok, "requested-role": "anthropic/claude-opus-5-5" };
+			const existing = { judge: ["gone/judge"] };
+			const known = ["default", "current_role", "requested-role", "judge"];
+			const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+			const key = fc.oneof(
+				fc.string({ maxLength: 80 }),
+				fc
+					.tuple(fc.string({ maxLength: 8 }), fc.string({ maxLength: 12 }))
+					.map(([provider, model]) => `${provider}/${model}`),
+				fc.constantFrom(...known),
+			);
+			fc.assert(
+				fc.property(key, (name) => {
+					const [provider, ...model] = name.split("/");
+					const modelKey =
+						provider !== "" &&
+						model.join("/") !== "" &&
+						[...name].every((char) => char.trim() !== "");
+					const roleKey =
+						name.length > 0 &&
+						name.length <= 64 &&
+						letters.includes(name.charAt(0)) &&
+						[...name].every((char) => `${letters}0123456789_-`.includes(char));
+					const valid = known.includes(name) || modelKey;
+					const validExisting = valid || roleKey;
+					for (const [currentFallbacks, allowed] of [
+						[existing, valid],
+						[{ ...existing, [name]: [] }, validExisting],
+					] as const) {
+						const result = validateRoles(
+							next,
+							old,
+							catalog,
+							{ ...existing, [name]: [] },
+							currentFallbacks,
+						);
+						if (allowed) expect(result).toBeNull();
+						else
+							expect(result?.fallbackFields).toEqual({
+								[name]: "this key is not a known role or model",
+							});
+					}
+					if (
+						validExisting &&
+						!Object.hasOwn(old, name) &&
+						!Object.hasOwn(next, name)
+					) {
+						const unchanged = { ...existing, [name]: ["gone/model"] };
+						expect(
+							validateRoles(next, old, catalog, unchanged, unchanged),
+						).toBeNull();
+					}
+				}),
+				{
+					seed: 1349,
+					numRuns: 150,
+					examples: [
+						["judge"],
+						["provider/model"],
+						["default"],
+						["current_role"],
+						["requested-role"],
+						["/model"],
+						["provider/"],
+						["provider /model"],
+						["provider/model/submodel"],
+						["__proto__"],
+						["provider/model\n"],
+						["provider/model\r"],
+						["provider/model\u2028"],
+						["provider/model\u2029"],
+						["judge\n"],
+						["judge\r"],
+						["judge\u2028"],
+						["judge\u2029"],
+					],
+				},
+			);
+		});
+
+		test("nonrole-only changes and removals count as saves", () => {
+			const chains = { judge: ["anthropic/claude-opus-5-5"], "old/model": [] };
+			expect(validateRoles(ok, ok, catalog, {}, chains)).toBeNull();
+			expect(
+				validateRoles(ok, ok, catalog, { ...chains, "new/model": [] }, chains),
+			).toBeNull();
+			expect(
+				validateRoles(ok, ok, catalog, { ...chains, judge: [] }, chains),
+			).toBeNull();
+			expect(validateRoles(ok, ok, catalog, { ...chains }, chains)?.error).toBe(
+				"nothing to save",
+			);
 		});
 	});
 });
@@ -606,6 +861,47 @@ describe("commitMessage", () => {
 		).toBe("chore: update the default, slow model roles");
 		expect(commitMessage(cur, { default: "a/b" }, { slow: ["e/f"] }, {})).toBe(
 			"chore: remove the slow model role",
+		);
+	});
+	test("nonrole-only changes name their keys without hiding role removals", () => {
+		expect(commitMessage(cur, cur, {}, { "new/model": ["e/f"] })).toBe(
+			"chore: set the new/model model role fallbacks to e/f",
+		);
+		expect(commitMessage(cur, cur, { judge: ["e/f"] }, {})).toBe(
+			"chore: remove the judge model role fallbacks",
+		);
+		expect(
+			commitMessage(cur, cur, { "old/model": ["e/f"] }, { "old/model": [] }),
+		).toBe("chore: set the old/model model role fallbacks to none");
+		expect(
+			commitMessage(cur, { default: "a/b" }, { slow: ["e/f"], judge: [] }, {}),
+		).toBe("chore: update the judge, slow model roles");
+	});
+	test("a constructor chain removal uses only own role values", () => {
+		const text = REAL.replace(
+			"  # after the chains\n",
+			"    constructor: []\n  # after the chains\n",
+		);
+		const current = readRoles(text);
+		const next = JSON.parse(JSON.stringify(current)) as Record<string, string>;
+		const before = readFallbacks(text);
+		const { constructor: _, ...after } = before;
+		expect(commitMessage(current, next, before, after)).toBe(
+			"chore: remove the constructor model role fallbacks",
+		);
+	});
+	test("an unchanged constructor chain does not enter a role change message", () => {
+		const text = REAL.replace(
+			"  # after the chains\n",
+			"    constructor: []\n  # after the chains\n",
+		);
+		const current = readRoles(text);
+		const next = JSON.parse(
+			JSON.stringify({ ...current, default: "zai/glm-5.3" }),
+		) as Record<string, string>;
+		const fallbacks = readFallbacks(text);
+		expect(commitMessage(current, next, fallbacks, fallbacks)).toBe(
+			"chore: set the default model role to zai/glm-5.3",
 		);
 	});
 	test("a long list ends in … within 500 characters", () => {
