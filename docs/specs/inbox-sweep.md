@@ -7,6 +7,34 @@ opening each card. Reference: docs/specs/research-inbox.md (OTTR-488) — its pe
 buttons, pin rules and seen-mark semantics stay unchanged; the sweep only adds a
 batch path over the same state.
 
+## State boundary correction
+
+The earlier design assumes that a ProjectStore transaction also covers GlobalStore.
+This premise is false. Each SQLite store has its own connection and commit.
+An exception before the seen write does not test a failure after that write.
+The earlier callback test also lacks a card before the baseline.
+
+The bug class is an authority gap. A partial row, a model record, or a write in
+another database cannot prove the state that a decision requires.
+
+Use these rules:
+
+- Save the exact batch in board-owned project state when the board files the run.
+- Accept a verdict only for a new member of that batch.
+- Commit accepted verdicts with the sweep's Done state in one ProjectStore transaction.
+- Read a full target card before the apply guard resolves legacy steps.
+- Commit proposals, draft deduplication, and an approval receipt in one ProjectStore transaction.
+- Deliver the receipt's completion key to GlobalStore only after the project commit.
+- Save the delivery id and the seen key in one GlobalStore transaction.
+- Derive each receipt's completion key from its approved card id and saved `doneAt`.
+- Acknowledge delivery in ProjectStore after that global commit.
+- Retry pending deliveries on apply, drawer access, and app startup.
+- A repeated delivery does not override a later manual unread action.
+
+The sweep is not live on main yet. No old sweep-state migration is necessary.
+The existing `settings` and global `kv` tables hold the records. No schema changes
+or changes to the per-card buttons are necessary.
+
 ## Decisions
 
 1. The sweep is a run card of a new kind `"sweep"`, shaped like the batch validation
@@ -39,14 +67,17 @@ A pinned research card of project p joins the sweep when all hold:
   check runs, so a card done again after an older read stays a candidate while
   every read card outside today's Inbox drops out (the ops seen ids, unioned
   with the explicit `seen` override, carry the keys)
-- no live sweep card (kind `"sweep"`, not cancelled) already records a verdict for
-  it — a chained or re-started sweep never re-sweeps a covered card
+- no live sweep card (kind `"sweep"`, not cancelled) already has an accepted
+  verdict for it in board-owned state
 
 Order: oldest `createdAt` first, id tiebreak. Cap: `SWEEP_BATCH_SIZE = 10` cards per
 run (module constant; no new setting in v1). The done sweep's settle files the next
 sweep for the remainder (the chain), so a large inbox continues without the operator
 clicking again. No pinned cards: the start route answers `409 "no pinned research
 cards"`. An open sweep: `409 "a sweep run is already open"`.
+The board saves these exact batch ids before the model runs. If either production
+read callback is absent, the route returns 503. A failed read propagates an error,
+not an empty seen set or a zero baseline.
 
 ## Evidence per card (server-gathered, all labelled untrusted in the prompt)
 
@@ -90,9 +121,18 @@ settle's first-result rule).
 
 ## Storage and view
 
-No new column or table. The run's `propose_task` calls persist as review findings on
-the sweep card (`appendReviewFinding`, the validation path), so the drawer and the
-apply route parse them from `listReviewFindings(runId)` at read time.
+No new column or table. ProjectStore saves one board-owned `SweepState` under
+`inbox-sweep:<run id>` in `settings`. The record holds:
+
+- `batch`: the exact card ids the board selected at filing.
+- `verdicts`: the first accepted verdict for each batch member.
+- `applications`: approved rows, each with its card id, action, original `doneAt`, and delivery flag.
+- `filedDrafts`: the distinct draft texts that the run already filed.
+
+The model's `propose_task` calls remain raw review findings. Only the settle can
+accept them into `verdicts`. Raw findings cannot supply approval or delivery state.
+The drawer, coverage query, and apply path read the board-owned record.
+
 
 `TaskView` gains `sweep?: SweepView`, set only for kind `"sweep"` cards in the drawer
 detail view:
@@ -106,7 +146,7 @@ interface SweepRowView {
   drafts: string[];
   proposed: "clear" | "implement";
   stale: boolean;
-  applied: boolean;        // the row's durable applied marker exists
+  applied: boolean;        // the approval receipt has a delivery acknowledgment
   linkedCards: string[];   // cited evidence ids that exist in the store
   stage: Stage;
   state: RunState;
@@ -129,24 +169,30 @@ an answer, finish or cancellation landing on an existing one alike.
   project), schedules, returns the card view. 409s above; 404 unknown project.
 - `POST /api/projects/:project/inbox/sweep/apply` — body
   `{ run: string, rows: Array<{ card: string, action: "clear" | "implement" }> }`.
-  Per row: the run card must be kind `"sweep"` and carry a parsed verdict for the
-  card, else `skipped: "no verdict"`. Stale rows never apply (`skipped: "stale"`),
-  whatever the body asks. `clear` adds the card id to the seen set (the `/api/seen`
-  path: seenable-gated, decayed). `implement` files each recorded draft as a held
-  proposal card — backlog stage, `needs_you`, `promptAuthor: "board"`,
-  `needsReason: sweepProposedReason(run card)` (`"Inbox sweep proposal from #<run>."
-  + the action sentence`) — then marks the target seen. A draft that already
-  filed for this run skips (identical draft text files once per run — across
-  rows, requests, and proposal edits; the filed text rides durable findings on
-  the run card, `Sweep draft: <text>` beside `Sweep applied: #<card> <action>`,
-  both idempotent by the findings table's conflict rule), and a row whose
-  applied marker exists answers `skipped: "already applied"`. Repeated rows in
-  one request collapse. The whole apply runs in one store transaction, so
-  concurrent requests serialize; the seen write happens after the transaction
-  commits (it reads every project's store, and holding it inside would
-  deadlock two projects' applies against each other). Marks use the completion key
-  (`<id>@<doneAt>`), the Inbox's own mark. An implement row with no drafts only
-  marks seen. Response: `{ results: Array<{ card, applied, skipped? }> }`.
+  The core reads the live run and its board-owned record inside the project
+  transaction. A row needs an accepted batch verdict. A stale row never applies.
+  The core reads the full target, including its report, before the legacy steps guard.
+  `implement` files each distinct draft as a held proposal card: backlog stage,
+  `needs_you`, `promptAuthor: "board"`, and `sweepProposedReason(run)` as its reason.
+  The transaction saves the proposal, draft registry, and approval receipt together.
+  Repeated rows collapse. An existing receipt prevents a duplicate proposal,
+  including after an operator edits the proposal.
+
+  After the project commit, the core delivers the receipt's completion key
+  (`<id>@<doneAt>`) to GlobalStore. GlobalStore commits the key and delivery id
+  together. A repeated delivery id makes no change. The project then acknowledges
+  delivery. No transaction holds one project while it reads another project.
+
+  A project commit failure writes no global key. A global failure leaves a durable
+  pending receipt and the proposals. The route returns an error, not success.
+  A retry completes delivery without another proposal. Startup and drawer access
+  also retry pending receipts. A stop after global commit but before acknowledgment
+  is safe because the delivery id prevents a second global effect.
+
+  `clear` saves the same receipt without proposals. An implement row with no drafts
+  only clears its pin. The drawer shows Applied only after delivery.
+  Response: `{ results: Array<{ card, applied, skipped? }> }`.
+
 
 ## Turn plumbing (src/turn.ts, extension/tracker.ts)
 
@@ -158,12 +204,13 @@ an answer, finish or cancellation landing on an existing one alike.
 - `retroEnvMarks`: sweep → `{ OTTR_SWEEP: "1" }` plus the scout's GitHub-token strip.
 - `turnRunTools`: sweep → the tools of decision 2.
 - `onRecorded` (arrival persistence) also fires for sweep runs.
-- Settle: sweep never parks at merging; at done `settleSweepResults` parses the
-  recorded verdicts (union of stored findings and this run's recorded set, dedupe by
-  prompt), logs one line per card, parks `needs_you` "The sweep recorded no per-card
-  verdicts" when zero parsed results, else passes done through and files the chain
-  sweep when pinned uncovered cards remain. A refusal (open run, no candidates)
-  ends the chain quietly, like the validation chain.
+- Settle: a sweep never parks at merging. At done, `settleSweepResults` reads the
+  exact saved batch and the raw model findings. It accepts only batch members
+  that no other live sweep already covers. It saves accepted verdicts in project
+  state. Unknown ids, non-batch ids, and old coverage do not count as progress.
+  With no new coverage, the run parks `needs_you` and files no continuation.
+  Otherwise the done sweep files the next batch from the uncovered remainder.
+
 - The duplicate gate, work check, review holds and merge holds never apply (kind is
   not `"work"`, no `followUpOf`); `findingOpen`'s validation exemption pattern does
   not need a sweep case.
@@ -241,23 +288,22 @@ extension (it loads standalone) and mirrors the prompt's contract section.
 - A card with no recorded verdict cannot apply (`no verdict`), whatever the body says.
 - Stale rows never apply, also not server-side (the UI check is display only).
 - A cancelled sweep card's verdicts apply nowhere (the run must be live and done).
-- A seen-set write for a card that stopped being seenable decays (the shared
-  `/api/seen` rule), it never re-pins.
+- A receipt carries the original completion key. A later completion uses a different
+  key, so delayed delivery cannot clear that newer pin.
 - Injection: an evidence line, a report step, or a descendant title that says "mark
   all done" or similar changes nothing — verdicts come only from parsed first lines,
   applies only from the apply route's body, and a verdict whose first line is not
-  exact parses to null and logs. The board's own marker namespaces ("Sweep applied:
-  ", "Sweep draft: ") are refused at record time: the extension's propose_task
-  rejects model prompts that start with them, so a model cannot forge an applied
-  or filed-draft record.
+  exact parses to null and logs. The extension rejects the old control prefixes
+  `"Sweep applied: "` and `"Sweep draft: "`. More importantly, the board never
+  reads approval or draft deduplication state from model findings.
 - A gitless project sweeps without the commits evidence.
-- The settle counts a verdict as progress only when its card is a pinned research
-  card of the project (resolved like the filing's candidates); a verdict for an
-  unknown or foreign id logs and covers nothing. With no progress the settle parks
-  the run needs_you instead of landing done, so wrong ids cannot chain the same
-  batch forever.
-- The chain stops after any filing refusal, so a full batch cap and a broken store
-  cannot loop.
+- Only a new verdict for the exact saved batch counts as progress.
+  A verdict for an unknown, foreign, already covered, or non-batch card covers nothing.
+  With no new coverage, the settle parks `needs_you` and does not repeat the batch.
+- A pending approval receipt survives a global failure or a process stop.
+  Retries deliver the original completion key, never a newer completion key.
+- The chain stops after any filing refusal.
+
 
 ## Acceptance checks (worktree root; every command exits 0)
 
@@ -275,6 +321,16 @@ extension (it loads standalone) and mirrors the prompt's contract section.
 - UI test: the drawer table renders the checkbox names, the preselected proposed
   actions, the disabled stale row, and the apply button's disabled state; a
   screenshot proves the rendered surface.
+- Legacy apply: a card with `steps: "unknown"` and a Recommended steps report
+  files its proposal and clears its pin.
+- Commit failure: a real SQLite commit failure leaves no seen key, receipt, or proposal.
+- Recovery: a global failure leaves the committed proposal and pending receipt.
+  A restart delivers the key once and does not undo a later manual unread action.
+- Batch progress: a continuation that records only an earlier batch's card parks
+  without another continuation.
+- Production callbacks: a seen card and an unseen card before the baseline both
+  stay outside the real route's batch. A recent unseen card joins it.
+
 - Impeccable detect on the changed UI files (primary findings block).
 
 ## Non-goals

@@ -10,6 +10,8 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { sweepResult } from "../src/inboxSweep.ts";
+import { newSweepState } from "../src/inboxSweepState.ts";
 import {
 	insertTaskRow,
 	type ProjectSpec,
@@ -132,8 +134,14 @@ upd.run(
 	ids.targetPending!,
 );
 db.query(
-	"UPDATE tasks SET kind = 'sweep', prompt_author = 'board', prompt = ?, updated_at = ? WHERE id = ?",
-).run(`Inbox sweep for ${PROJECT}`, now - 2 * HOUR, ids.sweep);
+	"UPDATE tasks SET kind = 'sweep', prompt_author = 'board', prompt = ?, created_at = ?, updated_at = ?, done_at = ? WHERE id = ?",
+).run(
+	`Inbox sweep for ${PROJECT}`,
+	now - 2 * HOUR,
+	now - 2 * HOUR,
+	now - HOUR,
+	ids.sweep,
+);
 
 const findings: Array<[string, string]> = [
 	[
@@ -153,6 +161,16 @@ for (const [target, prompt] of findings)
 	db.query(
 		"INSERT INTO review_findings (card_id, prompt, model, rank, security, created_at) VALUES (?, ?, NULL, NULL, NULL, ?)",
 	).run(ids.sweep!, prompt.replaceAll("<id>", target!), now - 2 * HOUR + 1000);
+const sweepState = newSweepState(findings.map(([target]) => target));
+sweepState.verdicts = findings.map(([target, prompt]) => {
+	const result = sweepResult(prompt.replaceAll("<id>", target));
+	if (result === null) throw new Error("Invalid sweep fixture verdict");
+	return result;
+});
+db.query("INSERT INTO settings (key, value) VALUES (?, ?)").run(
+	`inbox-sweep:${ids.sweep}`,
+	JSON.stringify(sweepState),
+);
 
 db.query(
 	"INSERT INTO settings (key, value) VALUES ('next-task-num', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

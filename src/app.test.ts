@@ -38,6 +38,7 @@ import { dirname, join, resolve } from "node:path";
 import type { BunRequest, Server } from "bun";
 import {
 	type App,
+	applyInboxSweepRows,
 	behindMain,
 	boardWarnings,
 	type CompletionDigest,
@@ -76,7 +77,8 @@ import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
-import { SWEEP_DRAFT_SEP } from "./inboxSweep.ts";
+import { SWEEP_DRAFT_SEP, sweepResult } from "./inboxSweep.ts";
+import { newSweepState } from "./inboxSweepState.ts";
 import { acquireLayerUse } from "./layers.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
 import type { MemoryHealth } from "./memory.ts";
@@ -13990,7 +13992,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 	const pinnedResearch = async (
 		prompt: string,
 		report: string,
-		steps: "yes" | "no" = "yes",
+		steps: "yes" | "no" | "unknown" = "yes",
 	) => {
 		const t = await store3.createTask(prompt);
 		await store3.updateTask(t.id, {
@@ -14004,7 +14006,7 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		return (await store3.getTask(t.id))!;
 	};
 
-	/** A done sweep run card with one recorded verdict per given prompt. */
+	/** A done sweep fixture with board-accepted batch verdicts. */
 	const doneSweep = async (findings: { cardId: string; record: string }[]) => {
 		const run = await store3.createTask(
 			`Inbox sweep route run ${findings.length}`,
@@ -14016,13 +14018,25 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 			state: "idle",
 			promptAuthor: "board",
 		});
-		for (const f of findings)
+		const state = newSweepState(findings.map((f) => f.cardId));
+		for (const f of findings) {
+			const prompt = f.record.replace("<CARD>", f.cardId);
 			await store3.appendReviewFinding(run.id, {
-				prompt: f.record.replace("<CARD>", f.cardId),
+				prompt,
 				model: null,
 				rank: null,
 				security: null,
 			});
+			const verdict = sweepResult(prompt);
+			if (verdict !== null) state.verdicts.push(verdict);
+		}
+		await store3.setInboxSweep(run.id, state);
+		// Force later test edits past the millisecond that stamps the sweep.
+		while (Date.now() <= run.createdAt) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setImmediate(resolve);
+			await promise;
+		}
 		return run;
 	};
 
@@ -14067,6 +14081,91 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		} finally {
 			sweepInboxImpl = null;
 		}
+	});
+
+	test("app startup delivers a committed approval after a global outage", async () => {
+		const target = await pinnedResearch(
+			"recover this approval",
+			"# R\n## Recommended steps\n- Add the test",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> none\nThe test is absent.\n${SWEEP_DRAFT_SEP}\nAdd the recovery test`,
+			},
+		]);
+		await expect(
+			applyInboxSweepRows({
+				store: store3,
+				run,
+				rows: [{ card: target.id, action: "implement" }],
+				markSeen: async () => {
+					throw new Error("global write unavailable");
+				},
+				log: async () => {},
+			}),
+		).rejects.toThrow("global write unavailable");
+		const key = doneReadKey({ id: target.id, doneAt: target.doneAt! });
+		expect(await app.seenIds()).not.toContain(key);
+		const restarted = await createTestApp({
+			gstore,
+			secretBox: testBox(gstore),
+			defaultDir: root,
+			projects: new Map([["p3", p3Entry]]),
+			...loopStubs(),
+			schedule: () => {},
+			serverVersion: "test",
+			port: 0,
+			publicHosts: [],
+			shared,
+			serverRef: { current: undefined },
+		});
+		try {
+			expect(await restarted.seenIds()).toContain(key);
+			const res = await get(`/api/projects/p3/tasks/${run.id}`);
+			const view = (await res.json()) as {
+				sweep: { rows: { applied: boolean }[] };
+			};
+			expect(view.sweep.rows.map((row) => row.applied)).toEqual([true]);
+			expect(
+				(await store3.listTasks())
+					.filter((t) => t.followUpOf === run.id)
+					.map((t) => t.prompt),
+			).toEqual(["Add the recovery test"]);
+		} finally {
+			await closeTestApp(restarted);
+		}
+	});
+
+	test("a legacy report resolves before the apply guard and files its proposal", async () => {
+		const target = await pinnedResearch(
+			"legacy steps card",
+			"# Research\n## Recommended steps\n- Add the retry test",
+			"unknown",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> none\nThe test is absent.\n${SWEEP_DRAFT_SEP}\nAdd the legacy retry test`,
+			},
+		]);
+		const res = await post("/api/projects/p3/inbox/sweep/apply", {
+			run: run.id,
+			rows: [{ card: target.id, action: "implement" }],
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			results: [{ card: target.id, applied: true }],
+		});
+		const proposals = (await store3.listTasks()).filter(
+			(t) => t.followUpOf === run.id,
+		);
+		expect(proposals.map((t) => t.prompt)).toEqual([
+			"Add the legacy retry test",
+		]);
+		expect(await app.seenIds()).toContain(
+			doneReadKey({ id: target.id, doneAt: target.doneAt! }),
+		);
 	});
 
 	test("the apply route clears, implements and marks seen", async () => {

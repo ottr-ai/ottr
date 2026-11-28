@@ -134,7 +134,8 @@ import type {
 	WorkCheckRun,
 } from "./types.ts";
 import { applyInboxSweepRows } from "./app.ts";
-import { SWEEP_DRAFT_SEP } from "./inboxSweep.ts";
+import { SWEEP_DRAFT_SEP, sweepResult } from "./inboxSweep.ts";
+import { newSweepState, writeSweepSeen } from "./inboxSweepState.ts";
 import { doneReadKey } from "./types.ts";
 import { resetVmState, vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
@@ -32356,6 +32357,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			// The fixtures' cards all land after the baseline, so only the seen
 			// marks decide candidacy (the app wires the real stamp).
 			seenSince: async () => 0,
+			seenIds: async () => [],
 			startRun: async (o: StartOpts) => {
 				record.runs.push(o);
 				await o.onSession?.("sess");
@@ -32510,6 +32512,15 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		).toEqual({ error: "no pinned research cards", status: 409 });
 	});
 
+	test("failed read state cannot file a sweep from empty fallback data", async () => {
+		const { store, projects, loop } = await sweepCase(baseRecord(), {
+			seenIds: async () => { throw new Error("read state unavailable"); },
+		});
+		await pinnedCard(store, "only", "# R\n## Recommended steps\n- x");
+		await expect(loop.filePendingSweepRun(entryOf(projects, store))).rejects.toThrow("read state unavailable");
+		expect((await store.listTasks()).filter(t => t.kind === "sweep")).toEqual([]);
+	});
+
 	test("an open sweep answers 409 and no pinned cards answers 409", async () => {
 		const record = baseRecord();
 		const { store, projects, loop } = await sweepCase(record);
@@ -32571,6 +32582,55 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			expect(run2.prompt).not.toContain(`id="#${card.id}"`);
 	});
 
+	test("an interrupted settle retries before verdict acceptance and Done commit together", async () => {
+		let fail = true;
+		const { store, projects, loop, batches } = await sweepCase(baseRecord(), {
+			targetCommits: async () => {
+				if (fail) {
+					fail = false;
+					throw new Error("settle commit interrupted");
+				}
+				return 0;
+			},
+		});
+		const entry = entryOf(projects, store);
+		entry.gitless = true;
+		const target = await pinnedCard(store, "retry settle", "# R\n## Recommended steps\n- a");
+		const filed = await loop.filePendingSweepRun(entry);
+		if (!("id" in filed)) throw new Error("no sweep filed");
+		batches.push([mkFinding(`Sweep: #${target.id} done\nThe child implements the step.`)]);
+		await loop.runTurn(store.name, filed.id);
+		expect((await settled(store, filed.id)).needsReason).toContain("settle commit interrupted");
+		expect((await store.getInboxSweep(filed.id))?.verdicts).toEqual([]);
+		const paused = await store.getTask(filed.id);
+		if (paused === null) throw new Error("no sweep card");
+		await store.updateTask(filed.id, replyPatch(paused, "Retry"));
+		await loop.runTurn(store.name, filed.id);
+		expect((await settled(store, filed.id)).stage).toBe("done");
+		expect((await store.getInboxSweep(filed.id))?.verdicts.map(v => v.cardId)).toEqual([target.id]);
+	});
+
+	test("a continuation cannot count an earlier batch's verdict as new coverage", async () => {
+		const { store, projects, loop, batches } = await sweepCase(baseRecord());
+		const a = await pinnedCard(store, "covered a", "# R\n## Recommended steps\n- a");
+		const b = await pinnedCard(store, "pending b", "# R\n## Recommended steps\n- b");
+		const first = await loop.filePendingSweepRun(entryOf(projects, store));
+		if (!("id" in first)) throw new Error("no sweep filed");
+		batches.push([mkFinding(`Sweep: #${a.id} done\nA is complete.`)]);
+		await loop.runTurn(store.name, first.id);
+		expect((await settled(store, first.id)).stage).toBe("done");
+		const next = (await store.listTasks()).find(t => t.kind === "sweep" && t.id !== first.id);
+		if (!next) throw new Error("no continuation filed");
+		expect(next.prompt).toContain(`id="#${b.id}"`);
+		expect(next.prompt).not.toContain(`id="#${a.id}"`);
+		batches.push([mkFinding(`Sweep: #${a.id} done\nA is still complete.`)]);
+		await loop.runTurn(store.name, next.id);
+		const stopped = await settled(store, next.id);
+		expect(stopped.stage).toBe("in_progress");
+		expect(stopped.state).toBe("needs_you");
+		expect((await store.listTasks()).filter(t => t.kind === "sweep")).toHaveLength(2);
+	});
+
 	test("the acceptance sequence: settle records the three verdicts and the preselected rows apply", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, batches } = await sweepCase(record);
@@ -32629,9 +32689,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 					{ card: b.id, action: "implement" },
 					{ card: c.id, action: "clear" },
 				],
-				markSeen: async (keys) => {
-					await gstore.set("seen_answers", keys);
-				},
+				markSeen: (keys, id) => writeSweepSeen(gstore, keys, id),
 				log: async () => {},
 			});
 			expect(applied.results).toEqual([
@@ -32672,7 +32730,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		}
 	});
 
-	test("a failed seen write rolls the apply back", async () => {
+	test("a failed seen write leaves a pending receipt that retry delivers once", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, batches } = await sweepCase(record);
 		const a = await pinnedCard(store, "a", "# R\n## Recommended steps\n- a");
@@ -32686,9 +32744,8 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		]);
 		await loop.runTurn(store.name, filed.id);
 		const run = (await store.getTask(filed.id))!;
-		// The seen store is down: the whole apply rolls back — no marker, no
-		// proposal — so a retry re-applies instead of finding Applied rows on a
-		// card that is still pinned.
+		// The project commit precedes delivery. A global failure retains the
+		// proposal and pending receipt so the retry can complete safely.
 		await expect(
 			applyInboxSweepRows({
 				store,
@@ -32700,14 +32757,14 @@ describe("inbox sweep run (OTTR-1259)", () => {
 				log: async () => {},
 			}),
 		).rejects.toThrow("the seen store is down");
-		const markers = (await store.listReviewFindings(filed.id)).filter((f) =>
-			f.prompt.startsWith("Sweep applied: "),
-		);
-		expect(markers).toHaveLength(0);
+		if (a.doneAt === null) throw new Error("the fixture has no completion stamp");
+		expect((await store.getInboxSweep(filed.id))?.applications).toEqual([{
+			card: a.id, action: "implement",
+			doneAt: a.doneAt, delivered: false,
+		}]);
 		expect(
 			(await store.listTasks()).filter((t) => t.followUpOf === filed.id),
-		).toHaveLength(0);
-		// The retry with a working seen write applies.
+		).toHaveLength(1);
 		const seenKeys: string[] = [];
 		const retry = await applyInboxSweepRows({
 			store,
@@ -32718,10 +32775,12 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			},
 			log: async () => {},
 		});
-		expect(retry.results).toEqual([{ card: a.id, applied: true }]);
+		expect(retry.results).toEqual([{ card: a.id, applied: false, skipped: "already applied" }]);
 		expect(seenKeys).toEqual([
 			doneReadKey({ id: a.id, doneAt: a.doneAt! }),
 		]);
+		expect((await store.getInboxSweep(filed.id))?.applications[0]?.delivered).toBe(true);
+		expect((await store.listTasks()).filter(t => t.followUpOf === filed.id)).toHaveLength(1);
 	});
 
 	test("a cancellation that lands before the apply is honored", async () => {
@@ -32768,7 +32827,7 @@ describe("inbox sweep run (OTTR-1259)", () => {
 		expect(done.stage).toBe("in_progress");
 		expect(done.state).toBe("needs_you");
 		expect(done.needsReason).toBe(
-			"None of the sweep's verdicts name a pinned card of this project",
+			"The sweep recorded no new verdicts for its batch",
 		);
 		expect(
 			(await store.listTasks()).filter((t) => t.kind === "sweep"),
@@ -32788,6 +32847,9 @@ describe("inbox sweep run (OTTR-1259)", () => {
 			promptAuthor: "board",
 		});
 		await store.appendReviewFinding(done.id, mkFinding(`Sweep: #${a.id} info\nno steps`));
+		const state = newSweepState([a.id]);
+		state.verdicts = [sweepResult(`Sweep: #${a.id} info\nno steps`)!];
+		await store.setInboxSweep(done.id, state);
 		const filed = await loop.filePendingSweepRun(entryOf(projects, store));
 		expect("id" in filed).toBe(true);
 		if (!("id" in filed)) throw new Error("no sweep filed");

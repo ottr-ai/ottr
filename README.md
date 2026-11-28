@@ -94,6 +94,12 @@ Open <http://127.0.0.1:4747>.
 
 [How a task moves](docs/how-it-works.md#how-a-task-moves) covers the full column list, research cards, backlog drafts, the second-model check, and the review and release workflows.
 
+The Done lane's Inbox keeps research reports that need a decision.
+Use **Sweep inbox** to review proposed actions in one batch.
+**Apply selected** clears approved reports and files editable proposal cards for open steps.
+No action applies before your click.
+See the [inbox sweep specification](docs/specs/inbox-sweep.md).
+
 Use **Search settings** to find a setting by label, key, or description on the current settings page.
 For example, `firecracker` finds the microVM setting.
 

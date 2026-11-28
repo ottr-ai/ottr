@@ -20,6 +20,7 @@ import {
 	sweepRowStale,
 	sweepSteps,
 } from "./inboxSweep.ts";
+import { newSweepState } from "./inboxSweepState.ts";
 import type { ListedTask } from "./types.ts";
 
 /** A minimal list-row fixture; the pure helpers read only the fields they name. */
@@ -168,8 +169,8 @@ describe("sweepResult", () => {
 
 describe("sweepSteps", () => {
 	test("stored values pass through, legacy unknown resolves against the report", () => {
-		expect(sweepSteps({ steps: "yes" })).toBe("yes");
-		expect(sweepSteps({ steps: "no" })).toBe("no");
+		expect(sweepSteps({ steps: "yes", report: null })).toBe("yes");
+		expect(sweepSteps({ steps: "no", report: null })).toBe("no");
 		expect(
 			sweepSteps({ steps: "unknown", report: "## Recommended steps\n- a" }),
 		).toBe("yes");
@@ -422,18 +423,21 @@ describe("sweepRowStale", () => {
 });
 
 describe("sweepCoveredCards", () => {
-	test("live sweeps cover their recorded cards; cancelled ones cover nothing", async () => {
+	test("live sweeps cover accepted batch verdicts; cancelled ones cover nothing", async () => {
 		const tasks = [
 			row({ id: "run1", kind: "sweep" }),
 			row({ id: "run2", kind: "sweep", cancelledAt: 5_000 }),
 			row({ id: "work", kind: "work" }),
 		];
+		const state = newSweepState(["a", "b"]);
+		state.verdicts = [
+			sweepResult("Sweep: #a done\nx")!,
+			sweepResult("Sweep: #b none")!,
+		];
+		const cancelled = newSweepState(["c"]);
+		cancelled.verdicts = [sweepResult("Sweep: #c done")!];
 		const covered = await sweepCoveredCards(tasks, async (id) =>
-			id === "run1"
-				? [{ prompt: "Sweep: #a done\nx" }, { prompt: "Sweep: #b none" }]
-				: id === "run2"
-					? [{ prompt: "Sweep: #c done" }]
-					: [{ prompt: "Sweep: #z done" }],
+			id === "run1" ? state : id === "run2" ? cancelled : null,
 		);
 		expect([...covered].sort()).toEqual(["a", "b"]);
 	});

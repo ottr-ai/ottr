@@ -1,12 +1,8 @@
-// OTTR-1259 production wiring proof: the sweep filing must read the board's
-// seen keys through the ops server.ts wires into createTurnLoop. The test boots
-// the real server on a planted fixture root, marks one of two pinned research
-// cards seen, starts the sweep through the route, and asserts the filed run's
-// prompt covers the unseen card and not the seen one. With the wiring missing,
-// the filing reads an empty seen set and the prompt covers both cards.
+// The real server must exclude both a read completion and an unseen completion
+// before the saved baseline. The recent unseen completion is the only candidate.
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { seedDemo } from "../scripts/demo-data.ts";
@@ -23,17 +19,13 @@ const HOUR = 60 * MIN;
 describe("server sweep seen wiring (OTTR-1259)", () => {
 	const root = mkdtempSync(join(tmpdir(), "ottr-sweep-wiring-"));
 	const stateDir = join(root, "state");
-	const children: Array<{ kill: () => void }> = [];
 	// The planted card ids, captured at plant time (the state route omits the
 	// titles the test matches on).
 	const plantedIds: Record<string, string> = {};
 
-	afterAll(async () => {
-		for (const child of children) child.kill();
-		children.length = 0;
-	});
+	afterAll(() => rmSync(root, { recursive: true }));
 
-	test("the route-filed sweep covers the unseen card, not the seen one", async () => {
+	test("the route excludes seen and pre-baseline cards through both production callbacks", async () => {
 		await seedDemo(root, false, stateDir);
 		const now = Date.now();
 		const seenKeys: string[] = [];
@@ -45,6 +37,7 @@ describe("server sweep seen wiring (OTTR-1259)", () => {
 				for (const [title, steps, isSeen] of [
 					["Seen rate limit card", "# R\n## Recommended steps\n- a", true],
 					["Unseen retry card", "# R\n## Recommended steps\n- b", false],
+					["Old unseen card", "# R\n## Recommended steps\n- c", false],
 				] as const) {
 					const t = await store.createTask(title);
 					await store.updateTask(t.id, {
@@ -63,6 +56,19 @@ describe("server sweep seen wiring (OTTR-1259)", () => {
 			} finally {
 				await store.close();
 			}
+			// The old card has no read key. Only seenSince can exclude it.
+			const pdb = new Database(join(root, "lumen", ".tasks", "tasks.db"));
+			pdb
+				.query(
+					"UPDATE tasks SET created_at = ?, done_at = ?, updated_at = ? WHERE id = ?",
+				)
+				.run(
+					now - 72 * HOUR,
+					now - 48 * HOUR,
+					now - 48 * HOUR,
+					plantedIds["Old unseen card"]!,
+				);
+			pdb.close();
 			// The seen marks and the baseline: a direct write into the global
 			// store the board opens below.
 			const gdb = new Database(join(stateDir, ".tasks", "tracker.db"));
@@ -99,7 +105,6 @@ describe("server sweep seen wiring (OTTR-1259)", () => {
 			stdout: "ignore",
 			stderr: "pipe",
 		});
-		children.push(board);
 		try {
 			let ready = false;
 			for (let waited = 0; waited < 30_000; waited += 250) {
@@ -136,16 +141,17 @@ describe("server sweep seen wiring (OTTR-1259)", () => {
 			expect(res.status).toBe(200);
 			// The route answers the filed card's view, prompt included.
 			const view = (await res.json()) as { id: string; prompt: string };
-			// The wiring: the filing read the board's seen keys, so the seen
-			// card is not a candidate and the unseen one is.
-			// The wiring: the filing read the board's seen keys, so the seen
-			// card is not a candidate and the unseen one is.
+			// Either lost callback admits one excluded card into the real batch.
 			expect(view.prompt).toContain(`id="#${plantedIds["Unseen retry card"]}"`);
 			expect(view.prompt).not.toContain(
 				`id="#${plantedIds["Seen rate limit card"]}"`,
 			);
+			expect(view.prompt).not.toContain(
+				`id="#${plantedIds["Old unseen card"]}"`,
+			);
 		} finally {
 			board.kill();
+			await board.exited;
 		}
 	}, 120_000);
 });

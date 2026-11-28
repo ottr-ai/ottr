@@ -5,6 +5,7 @@
 // evidence and titles are untrusted data: nothing here parses instructions from
 // them into behavior, and a verdict whose first line is not exact reads as null.
 
+import type { SweepState } from "./inboxSweepState.ts";
 import type { ListedTask, ResearchSteps, Task } from "./types.ts";
 import { doneReadKey, recommendsSteps } from "./types.ts";
 
@@ -65,9 +66,7 @@ export function sweepResult(prompt: string): SweepRecord | null {
 /** OTTR-488 steps resolution for the sweep's candidate filter: the stored value,
  * except legacy 'unknown' rows resolve against the stored report (the app.ts
  * viewSteps rule; a copy because the turn loop cannot import app.ts). */
-export function sweepSteps(
-	t: Pick<Task, "steps"> & { report?: string | null },
-): ResearchSteps {
+export function sweepSteps(t: Pick<Task, "steps" | "report">): ResearchSteps {
 	return t.steps !== "unknown"
 		? t.steps
 		: t.report != null && recommendsSteps(t.report)
@@ -237,20 +236,16 @@ export function sweepRowStale(
 	return descendants.some((d) => d.updatedAt > stamp);
 }
 
-/** The card ids every live sweep card (kind "sweep", not cancelled) already
- * records a verdict for — a chained or re-started sweep never re-sweeps a
- * covered card, and a cancelled sweep's verdicts cover nothing. */
+/** Only board-accepted batch verdicts cover a card. Raw model findings do not. */
 export async function sweepCoveredCards(
 	tasks: ReadonlyArray<Pick<ListedTask, "id" | "kind" | "cancelledAt">>,
-	findingsOf: (cardId: string) => Promise<ReadonlyArray<{ prompt: string }>>,
+	stateOf: (cardId: string) => Promise<SweepState | null>,
 ): Promise<Set<string>> {
 	const covered = new Set<string>();
 	for (const t of tasks) {
 		if (t.kind !== "sweep" || t.cancelledAt !== null) continue;
-		for (const f of await findingsOf(t.id)) {
-			const r = sweepResult(f.prompt);
-			if (r !== null) covered.add(r.cardId);
-		}
+		for (const verdict of (await stateOf(t.id))?.verdicts ?? [])
+			covered.add(verdict.cardId);
 	}
 	return covered;
 }

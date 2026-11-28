@@ -17,6 +17,7 @@ import {
 	StoreLockedError,
 	vacuumInto,
 } from "./dblock.ts";
+import { parseSweepState, type SweepState } from "./inboxSweepState.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import { databaseConfig } from "./postgresConfig.ts";
@@ -3249,7 +3250,7 @@ export class ProjectStore {
 			const out = structuredClone(DEFAULT_SETTINGS);
 			for (const row of await this.db
 				.query<{ key: string; value: string }, []>(
-					"SELECT key, value FROM settings",
+					"SELECT key, value FROM settings WHERE key NOT LIKE 'inbox-sweep:%'",
 				)
 				.all()) {
 				try {
@@ -3279,6 +3280,42 @@ export class ProjectStore {
 			}
 			return await this.getSettings();
 		});
+	}
+
+	/** Board-only sweep state, outside the settings that clients can edit. */
+	async getInboxSweep(id: string): Promise<SweepState | null> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<{ value: string }, [string]>(
+					"SELECT value FROM settings WHERE key = ?",
+				)
+				.get(`inbox-sweep:${id}`);
+			return row === null ? null : parseSweepState(row.value);
+		});
+	}
+
+	async setInboxSweep(id: string, state: SweepState): Promise<void> {
+		await this.queue.run(() =>
+			this.db.run(
+				"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				[`inbox-sweep:${id}`, JSON.stringify(state)],
+			),
+		);
+	}
+
+	async listInboxSweeps(): Promise<Array<{ id: string; state: SweepState }>> {
+		return this.queue.run(async () =>
+			(
+				await this.db
+					.query<{ key: string; value: string }, []>(
+						"SELECT key, value FROM settings WHERE key LIKE 'inbox-sweep:%'",
+					)
+					.all()
+			).map((row) => ({
+				id: row.key.slice("inbox-sweep:".length),
+				state: parseSweepState(row.value),
+			})),
+		);
 	}
 
 	/** The card the Check the board button filed last (POST /api/projects/:project/board-check).

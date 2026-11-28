@@ -63,13 +63,13 @@ import {
 	reportIdTokens,
 	reportPathTokens,
 	SWEEP_BATCH_SIZE,
-	type SweepRecord,
 	stepsEvidence,
 	sweepCandidateRows,
 	sweepCoveredCards,
 	sweepResult,
 	sweepSteps,
 } from "./inboxSweep.ts";
+import { newSweepState, type SweepState } from "./inboxSweepState.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
 import { modelFallbacks, modelList, modelRoles } from "./models.ts";
 import type { GateCheck } from "./promptGate.ts";
@@ -1933,6 +1933,8 @@ type TurnSettle = {
 	report: string | null | undefined;
 	steps: "yes" | "no" | undefined;
 	commits: number | null | undefined;
+	/** Commit accepted verdicts with the terminal card state, never before it. */
+	sweepState?: SweepState;
 	mergeHead: string | null | undefined;
 	keptFiles: string[] | undefined;
 	holdReason: string | null;
@@ -7148,6 +7150,8 @@ export function createTurnLoop(
 			if (await finishTurnRow(st, planned)) return true;
 			await planTurnChecks(st, planned);
 			await writeSettledCard(st, planned);
+			if (planned.stage === "done" && st.sweepState !== undefined)
+				await st.store.setInboxSweep(st.id, st.sweepState);
 			return false;
 		});
 		await st.store.captureTurnData(st.dispatch.turn.id);
@@ -10142,74 +10146,71 @@ export function createTurnLoop(
 		return next;
 	}
 
-	/** A sweep card classified done (OTTR-1259): parse the run's per-card verdicts —
-	 * the card's stored findings unioned with this run's recorded set, dedupe by
-	 * prompt, stored first (the review check's union rule) — and log one line per
-	 * card, first result per card id winning (the validation settle's rule). The
-	 * settle writes no target card: verdicts are records on the sweep card, the
-	 * drawer and the apply route parse them from the stored findings, and the chain
-	 * trigger below files the remainder. Zero parsed results park the card
-	 * needs_you; otherwise the done Next passes through unchanged. */
+	/** Accept only new verdicts for the exact board-owned batch. Model findings
+	 * cannot extend that batch or repeat an earlier sweep's coverage. */
 	async function settleSweepResults(st: TurnSettle, next: Next): Promise<Next> {
-		const stored = await st.store.listReviewFindings(st.id);
-		const seen = new Set(stored.map((f) => f.prompt));
-		const all = [...stored];
-		for (const finding of st.result.recorded) {
-			if (seen.has(finding.prompt)) continue;
-			seen.add(finding.prompt);
-			all.push(finding);
-		}
-		const results = all
-			.map((finding) => sweepResult(finding.prompt))
-			.filter((r) => r !== null);
-		if (results.length === 0)
-			return {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: "The sweep recorded no per-card verdicts",
-			};
-		const first = new Map<string, SweepRecord>();
-		for (const result of results)
-			if (!first.has(result.cardId)) first.set(result.cardId, result);
-		// Membership: a verdict names progress only when its card is a pinned
-		// research card of this project. A verdict for an unknown or foreign id
-		// covers nothing, so counting it as progress would let wrong ids chain
-		// the same batch forever.
-		const tasks = await st.store.listTasks();
-		// Pinned research cards, resolved like the filing's candidates: the list
-		// rows lack the report column, so the resolution reads the full card.
-		const pinned = new Set<string>();
-		for (const t of tasks) {
-			if (!t.research || t.stage !== "done" || t.cancelledAt !== null) continue;
-			const full = await st.store.getTask(t.id);
-			if (full !== null && sweepSteps(full) !== "unknown") pinned.add(t.id);
-		}
-		let progress = 0;
-		for (const [cardId, result] of first) {
-			if (!pinned.has(cardId)) {
-				await st.log(
-					`- sweep verdict for #${cardId}: not a pinned card of this project; not counted as progress`,
-				);
-				continue;
-			}
-			progress += 1;
-			await st.log(
-				`- sweep verdict for #${cardId}: ${result.verdict}${result.drafts.length > 0 ? ` (${result.drafts.length} draft(s))` : ""}`,
+		return st.store.transaction(async () => {
+			const state = await st.store.getInboxSweep(st.id);
+			if (state === null)
+				return {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: "The sweep has no saved batch",
+				};
+			const stored = await st.store.listReviewFindings(st.id);
+			const results = [...stored, ...st.result.recorded]
+				.map((f) => sweepResult(f.prompt))
+				.filter((r) => r !== null);
+			if (results.length === 0)
+				return {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: "The sweep recorded no per-card verdicts",
+				};
+			const tasks = await st.store.listTasks();
+			const covered = await sweepCoveredCards(
+				tasks.filter((t) => t.id !== st.id),
+				(id) => st.store.getInboxSweep(id),
 			);
-		}
-		// Progress gate: with no verdict naming a pinned card the run made no
-		// progress, so landing done would chain the same batch forever.
-		if (progress === 0)
-			return {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason:
-					"None of the sweep's verdicts name a pinned card of this project",
-			};
-		await st.log(
-			`- sweep results: ${progress} card(s) recorded, the table and the apply route read them from this card`,
-		);
-		return next;
+			const accepted = new Set(state.verdicts.map((v) => v.cardId));
+			let progress = 0;
+			for (const result of results) {
+				const id = result.cardId;
+				if (accepted.has(id)) continue;
+				if (!state.batch.includes(id) || covered.has(id)) {
+					await st.log(
+						`- sweep verdict for #${id}: not new coverage for this batch; ignored`,
+					);
+					continue;
+				}
+				const target = await st.store.getTask(id);
+				if (
+					target === null ||
+					!target.research ||
+					target.stage !== "done" ||
+					target.cancelledAt !== null ||
+					sweepSteps(target) === "unknown"
+				)
+					continue;
+				accepted.add(id);
+				state.verdicts.push(result);
+				progress += 1;
+				await st.log(
+					`- sweep verdict for #${id}: ${result.verdict}${result.drafts.length > 0 ? ` (${result.drafts.length} draft(s))` : ""}`,
+				);
+			}
+			if (progress === 0)
+				return {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: "The sweep recorded no new verdicts for its batch",
+				};
+			st.sweepState = state;
+			await st.log(
+				`- sweep results: ${progress} card(s) recorded, the table and the apply route read them from this card`,
+			);
+			return next;
+		});
 	}
 
 	/** OTTR-1129 validate-again: clears validatedAt on the review's sandbox leads whose
@@ -10506,6 +10507,12 @@ export function createTurnLoop(
 		e: TurnProject,
 		seen?: ReadonlySet<string>,
 	): Promise<{ id: string } | { error: string; status: number }> {
+		if (ops.seenIds === undefined || ops.seenSince === undefined)
+			return { error: "sweep read state is not wired", status: 503 };
+		// Missing or failed state is not an empty Inbox read set.
+		// Read the other database before the project transaction.
+		const seenSet = new Set([...(await ops.seenIds()), ...(seen ?? [])]);
+		const since = await ops.seenSince();
 		return await e.store.transaction(async () => {
 			const tasks = await e.store.listTasks();
 			// One open sweep per project: the manual route's 409 and the chain's
@@ -10518,13 +10525,8 @@ export function createTurnLoop(
 			)
 				return { error: "a sweep run is already open", status: 409 };
 			const covered = await sweepCoveredCards(tasks, (id) =>
-				e.store.listReviewFindings(id),
+				e.store.getInboxSweep(id),
 			);
-			const seenSet = new Set([
-				...((await ops.seenIds?.().catch(() => [])) ?? []),
-				...(seen ?? []),
-			]);
-			const since = await ops.seenSince?.().catch(() => 0);
 			// The list rows lack the wide report column, so the steps resolution
 			// (and every evidence read below) reads the full card, like the seen
 			// set's own resolution does.
@@ -10535,12 +10537,7 @@ export function createTurnLoop(
 				const full = await e.store.getTask(row.id);
 				if (full !== null && sweepSteps(full) !== "unknown") fulls.push(full);
 			}
-			const candidates = sweepCandidateRows(
-				fulls,
-				seenSet,
-				since ?? 0,
-				covered,
-			);
+			const candidates = sweepCandidateRows(fulls, seenSet, since, covered);
 			if (candidates.length === 0)
 				return { error: "no pinned research cards", status: 409 };
 			const batch = candidates.slice(0, SWEEP_BATCH_SIZE);
@@ -10606,6 +10603,10 @@ export function createTurnLoop(
 				promptAuthor: "board",
 				details: `Inbox sweep of ${batch.length} pinned research card(s).`,
 			});
+			await e.store.setInboxSweep(
+				run.id,
+				newSweepState(batch.map((card) => card.id)),
+			);
 			return { id: run.id };
 		});
 	}
