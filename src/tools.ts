@@ -710,6 +710,9 @@ function writeLinksDir(
 		throw new Error(
 			`tools: link dir does not match the tool set (${bad} differs); remove ${dir} to rebuild`,
 		);
+	// mkdtemp builds the dir 0700, but the project uid has no rights on this root-owned dir
+	// and the provisioning spec keeps it world-readable: every call, a reused dir too, sets 0755.
+	chmodSync(dir, 0o755);
 	return dir;
 }
 

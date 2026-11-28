@@ -2088,27 +2088,36 @@ function lstatQuiet(abs: string): boolean {
 	}
 }
 
+/**
+ * Every dotenv file Bun can load from the run cwd. Bun picks the mode from BUN_ENV, then
+ * NODE_ENV (production or test, else development), and a planted file of any mode re-adds
+ * an override that the merge env drops (GIT_CONFIG_GLOBAL, PI_PACKAGE_DIR, OMP_PROFILE).
+ * A merge parks all of them, so the park never depends on the mode.
+ */
+const BUN_DOTENV_FILES = [
+	".env",
+	".env.local",
+	".env.development",
+	".env.development.local",
+	".env.production",
+	".env.production.local",
+	".env.test",
+	".env.test.local",
+] as const;
+
 /** Parks every custom-tool source dir in the run cwd out of omp's sight, appending each
  * pair to the caller-owned `parked` (so a throw still leaves every parked dir restorable)
- * and returning it. Renames stay inside the parent dir, so the worktree keeps its content
- * and git only sees the moves while the park holds. Absent dirs are skipped. Fail-closed:
- * an unexpected rename error throws before the spawn, so a run never starts on a cwd
- * whose park is incomplete. */
+ * and returning it. A merge run parks the dotenv files too. Renames stay inside the parent
+ * dir, so the worktree keeps its content and git only sees the moves while the park holds.
+ * Absent dirs are skipped. Fail-closed: an unexpected rename error throws before the
+ * spawn, so a run never starts on a cwd whose park is incomplete. */
 function parkCustomToolDirs(
 	cwd: string,
 	parked: ParkedDir[],
 	merge = false,
-	nodeEnv?: string,
 ): ParkedDir[] {
-	if (merge && nodeEnv && (nodeEnv.includes("/") || nodeEnv.includes("\\")))
-		throw new Error("merge turn NODE_ENV must not contain a path separator");
 	const sources = merge
-		? new Set([
-				...CUSTOM_TOOL_DIRS,
-				".env",
-				".env.local",
-				`.env.${nodeEnv || "development"}`,
-			])
+		? [...CUSTOM_TOOL_DIRS, ...BUN_DOTENV_FILES]
 		: CUSTOM_TOOL_DIRS;
 	for (const rel of sources) {
 		const from = join(cwd, rel);
@@ -2235,12 +2244,7 @@ function startLocalRun(s: RunStart): RunHandle {
 	// unwinding the dirs that did park, so the worktree keeps its committed content.
 	const parked: ParkedDir[] = [];
 	try {
-		parkCustomToolDirs(
-			o.cwd,
-			parked,
-			s.localMerge !== null,
-			s.localMerge?.env.NODE_ENV,
-		);
+		parkCustomToolDirs(o.cwd, parked, s.localMerge !== null);
 	} catch (err) {
 		restoreParkedToolDirs(parked, sink);
 		if (s.localMerge === null)

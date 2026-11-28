@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -689,6 +690,28 @@ describe("buildToolsPath", () => {
 				n.startsWith("path-"),
 			),
 		).toHaveLength(2);
+	});
+
+	test("the link dir stays traversable for other uids, a reused 0700 dir included", () => {
+		const h = mkdtempSync(join(home, "mode-"));
+		const bytes = new TextEncoder().encode("tool\n");
+		const sha = sha256(bytes);
+		mkdirSync(join(h, ".ottr", "tools", sha), { recursive: true });
+		writeFileSync(join(h, ".ottr", "tools", sha, "mode-tool"), bytes);
+		provision(
+			"moder",
+			[{ name: "mode-tool", url: "https://x/m", sha256: sha, unpack: "none" }],
+			[],
+			h,
+		);
+		const entries = readToolsList("moder", h);
+		const dir = buildToolsPath(entries, h);
+		// The project uid owns nothing here: read and search must be open to everyone.
+		expect(statSync(dir).mode & 0o555).toBe(0o555);
+		// A dir that an older build left at 0700 is repaired on the next turn.
+		chmodSync(dir, 0o700);
+		expect(buildToolsPath(entries, h)).toBe(dir);
+		expect(statSync(dir).mode & 0o555).toBe(0o555);
 	});
 
 	test("a name missing from the tools store throws", () => {

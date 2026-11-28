@@ -30,7 +30,7 @@ Startup failure and board exit stop the service's own daemons, even before readi
 
 The isolated merge child receives no inherited board GitHub token. The server retains push credentials. An explicitly granted read-only GitHub token can reach the child through the existing turn-read-token path.
 
-The protected view excludes dotenv files. Provider env and the board auth broker supply model access. Home and configuration override variables cannot redirect discovery into worker-writable paths. An isolated merge parks its worktree `.env` before omp starts and restores it when the run ends.
+The protected view excludes dotenv files. Provider env and the board auth broker supply model access. Home and configuration override variables cannot redirect discovery into worker-writable paths. An isolated merge parks every dotenv file that Bun can load from its worktree before omp starts: `.env`, `.env.local`, and the development, production, and test files with their `.local` variants. Bun chooses a mode from BUN_ENV or NODE_ENV, so the park does not depend on either variable. The run restores the files when it ends.
 
 Root-only tests use their own uid and traversable fixture parents. Tests that require an unprivileged caller state that requirement with an explicit skip under root. No test removes a uid-isolation assertion to accept root access.
 
@@ -62,6 +62,8 @@ Git environment tests do not assume that the caller lacks `GIT_CONFIG_COUNT`. Re
 - Start two merge runs in sequence. The second run does not reuse mutable state from the first run as configuration.
 - Keep the configuration view and its code-bearing directories read-only for the project uid. Keep required operational state writable.
 - Assert that inherited GitHub credentials do not reach the merge child, including through explicit env objects. Preserve the approved read-only token path.
+- Plant every Bun dotenv name in the merge worktree. In every mode, the real child loads none of them, and the run restores all of them.
+- The merge agent's PATH link directory stays readable and searchable for the project uid. This includes a directory that an older build created with mode `0700`.
 
 ## Non-goals
 
@@ -69,3 +71,7 @@ Git environment tests do not assume that the caller lacks `GIT_CONFIG_COUNT`. Re
 - No new dependency, schema, prompt wording, or visible UI.
 - No weaker filesystem or uid-isolation checks.
 - No change to other local agent kinds or the general omp run-directory design.
+
+## Known limits
+
+- A worktree `bunfig.toml` still loads in the merge agent and its gates. The agent runs the branch's own gates, and they need that file. The park limits configuration discovery. It does not limit the worktree code that the gates run.

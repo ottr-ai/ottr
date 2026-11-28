@@ -126,6 +126,16 @@ function checkedGit(cwd: string, home: string, args: string[]) {
 	return child.stdout.trim();
 }
 
+// Every dotenv name Bun can load from a cwd: BUN_ENV or NODE_ENV picks one mode.
+const dotenvNames = [
+	".env",
+	".env.local",
+	...["development", "production", "test"].flatMap((mode) => [
+		`.env.${mode}`,
+		`.env.${mode}.local`,
+	]),
+];
+
 function fixture(pinned: boolean): Fixture {
 	// Assumptions: only root Linux merges isolate, and all readers use the prepared env.
 	// /tmp keeps every ancestor accessible even with a private host TMPDIR.
@@ -162,14 +172,17 @@ function fixture(pinned: boolean): Fixture {
 	};
 	const marker = `plant-${crypto.randomUUID()}`;
 	const trustedMarker = `trusted-${crypto.randomUUID()}`;
-	const dotenvPaths = [".env", ".env.local", ".env.ottr-merge-security"].map(
-		(name) => join(cwd, name),
-	);
+	const dotenvPaths = dotenvNames.map((name) => join(cwd, name));
+	// A loaded file would add back each override below, and GIT_CONFIG_GLOBAL then
+	// reaches the planted credential helper.
 	const dotenvContent = [
 		"# Synthetic merge fixture",
 		...githubKeys.map((key) => `${key}=synthetic-${crypto.randomUUID()}`),
 		`XDG_CONFIG_HOME=${join(projectHome, ".config")}`,
 		`GH_CONFIG_DIR=${join(projectHome, ".config", "gh")}`,
+		`GIT_CONFIG_GLOBAL=${join(projectHome, ".gitconfig")}`,
+		`PI_PACKAGE_DIR=${join(projectHome, ".omp")}`,
+		"OMP_PROFILE=planted",
 		"",
 	].join("\n");
 	// The host Bun can live below a private root home. Give the dropped probe a real executable.
@@ -460,7 +473,6 @@ if (process.argv[2]) await plant(process.argv[2]);
 			env: {
 				GIT_CONFIG_NOSYSTEM: "1",
 				GIT_TERMINAL_PROMPT: "0",
-				NODE_ENV: "ottr-merge-security",
 			},
 		},
 		async cleanup() {
@@ -618,6 +630,7 @@ const report = {
  credentialsAbsent, brokerGranted, brokerTokenFileAbsent,
  helperAbsent: helper.code === 1, aliasAbsent: alias.code === 1, pagerAbsent: pager.code === 1,
 	dotenvAbsent: input.dotenvNames.every(name => !existsSync(join(process.cwd(), name))),
+	dotenvEnvAbsent: ["GIT_CONFIG_GLOBAL", "PI_PACKAGE_DIR", "OMP_PROFILE"].every(key => process.env[key] === undefined),
 	homeDotenvAbsent: !existsSync(join(home, ".env")),
  credentialFailed: credential.code !== 0,
  identity: author.text.startsWith("Trusted Merge <trusted@example.invalid>"),
@@ -652,6 +665,7 @@ interface ProbeReport {
 	credentialFailed: boolean;
 	identity: boolean;
 	dotenvAbsent: boolean;
+	dotenvEnvAbsent: boolean;
 	homeDotenvAbsent: boolean;
 }
 
@@ -662,6 +676,7 @@ async function mergeProbe(
 		explicitTokens?: boolean;
 		approved?: string;
 		denials?: boolean;
+		env?: Record<string, string | undefined>;
 	} = {},
 ) {
 	let launched: SpawnOptions | undefined;
@@ -686,6 +701,7 @@ async function mergeProbe(
 						OMP_AUTH_BROKER_TOKEN: crypto.randomUUID(),
 					}
 				: {}),
+			...extra.env,
 		},
 		githubReadEnv:
 			extra.approved === undefined
@@ -751,6 +767,7 @@ async function mergeProbe(
 	expect(report.home).not.toBe(f.projectLayer);
 	expect(report.home).not.toBe(f.sharedHome);
 	expect(report.dotenvAbsent).toBe(true);
+	expect(report.dotenvEnvAbsent).toBe(true);
 	expect(report.homeDotenvAbsent).toBe(true);
 	expectDotenvRestored(f);
 	expect(report.planted).toBe(false);
@@ -940,6 +957,42 @@ process.exit(43);`,
 			}
 		},
 		30_000,
+	);
+
+	identityTest(
+		"no Bun dotenv name reaches the child in any mode",
+		async () => {
+			const f = fixture(false);
+			// BUN_ENV outranks NODE_ENV, and an unknown value loads the development files.
+			const modes: Record<string, string | undefined>[] = [
+				{ NODE_ENV: undefined, BUN_ENV: undefined },
+				{ NODE_ENV: "production", BUN_ENV: undefined },
+				{ NODE_ENV: "test", BUN_ENV: undefined },
+				{ NODE_ENV: "staging", BUN_ENV: undefined },
+				{ NODE_ENV: undefined, BUN_ENV: "production" },
+				{ NODE_ENV: undefined, BUN_ENV: "test" },
+			];
+			try {
+				// Control: with the files in place, Bun loads the planted override.
+				const control = spawnSync(
+					f.bun,
+					["-e", "console.log(process.env.OMP_PROFILE ?? 'unset')"],
+					{
+						cwd: f.options.cwd,
+						env: { PATH: process.env.PATH, HOME: f.root },
+						encoding: "utf8",
+					},
+				);
+				expect(control.stdout.trim()).toBe("planted");
+				for (const [index, env] of modes.entries())
+					await mergeProbe(f, 10 + index, { env });
+				expect(f.requests).toEqual([]);
+				expect(readFileSync(f.trace, "utf8")).toBe("");
+			} finally {
+				await f.cleanup();
+			}
+		},
+		60_000,
 	);
 
 	rootTest(
