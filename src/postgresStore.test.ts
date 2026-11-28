@@ -27,6 +27,7 @@ import { ProjectStore } from ${JSON.stringify(new URL("./store.ts", import.meta.
 import { GlobalStore } from ${JSON.stringify(new URL("./globalStore.ts", import.meta.url).href)};
 import { getPostgresDatabase, closePostgresBackend } from ${JSON.stringify(new URL("./postgresDriver.ts", import.meta.url).href)};
 import { applyPostgresMigrations, projectMigrationCount, projectMigrations, projectSchemaName, reseedPostgresIdentities } from ${JSON.stringify(new URL("./postgresSchema.ts", import.meta.url).href)};
+import { deploymentQuestionRecovery } from ${JSON.stringify(new URL("./test/deploymentQuestions.ts", import.meta.url).href)};
 `;
 
 // These exact scenarios run in fresh processes for both backend selections.
@@ -36,6 +37,7 @@ const global = await GlobalStore.open(root);
 let store = await ProjectStore.init(project);
 const db = store.db;
 try {
+  await deploymentQuestionRecovery(join(root, 'deployment-question-recovery'));
   await global.set('unicode', { text: "O'Brien λ\n", flag: false, empty: null });
   assert.deepEqual(await global.get('unicode'), { text: "O'Brien λ\n", flag: false, empty: null });
   await Promise.all(Array.from({ length: 8 }, () => global.update('counter', value => (value ?? 0) + 1)));

@@ -5434,6 +5434,8 @@ describe("Waiting lead drawer actions", () => {
 	/** Mounts the drawer for the lead; the detail route serves the same card
 	 * back loaded (OTTR-965), everything else 404s. */
 	const mountLead = async (card: TaskCard, boardTasks: TaskCard[] = []) => {
+		const opened: string[] = [];
+		const onOpenTask = (id: string) => opened.push(id);
 		const { restore } = stubFetch(async (url) => {
 			const u = String(url);
 			if (u.endsWith(`/api/projects/proj/tasks/${card.id}`)) {
@@ -5445,14 +5447,27 @@ describe("Waiting lead drawer actions", () => {
 			return new Response("{}", { status: 404 });
 		});
 		const { container, root, unmount } = await mount(
-			<Drawer {...base} task={card} tasks={boardTasks} />,
+			<Drawer
+				{...base}
+				task={card}
+				tasks={boardTasks}
+				onOpenTask={onOpenTask}
+			/>,
 		);
 		await act(async () => {});
 		return {
 			container,
+			opened,
 			updateTasks: async (tasks: TaskCard[]) => {
 				await act(async () => {
-					root.render(<Drawer {...base} task={card} tasks={tasks} />);
+					root.render(
+						<Drawer
+							{...base}
+							task={card}
+							tasks={tasks}
+							onOpenTask={onOpenTask}
+						/>,
+					);
 				});
 			},
 			close: async () => {
@@ -5648,7 +5663,7 @@ describe("Waiting lead drawer actions", () => {
 				"Validate now starts it at once.",
 			);
 			expect(container.textContent).not.toContain(
-				"asks this lead's deployment question",
+				"Answer the deployment question",
 			);
 		} finally {
 			await close();
@@ -5664,6 +5679,7 @@ describe("Waiting lead drawer actions", () => {
 				validatedAt: 1_764_000_000_000,
 				details:
 					"Unverified lead from review.\nValidated by validation run #14 on 2026-11-22: deployment — Which proxy terminates TLS?",
+				deploymentQuestionId: "Q-8",
 			}),
 		);
 		try {
@@ -5673,9 +5689,11 @@ describe("Waiting lead drawer actions", () => {
 				),
 			].map((b) => b.textContent?.trim());
 			expect(names).toEqual(["Cancel task"]);
-			expect(container.textContent).toContain(
-				"asks this lead's deployment question; your answer decides the lead.",
-			);
+			expect(
+				container
+					.querySelector<HTMLAnchorElement>(".lead-validation-hint a")
+					?.getAttribute("href"),
+			).toBe("/projects/proj/tasks/Q-8");
 			expect(container.textContent).not.toContain("Validate now");
 			// The last-result line reads the deployment outcome.
 			expect(container.textContent).toContain(
@@ -5695,6 +5713,7 @@ describe("Waiting lead drawer actions", () => {
 			leadCard({
 				details: "Grilled definition of ready",
 				appliedValidationOutcome: "deployment",
+				deploymentQuestionId: "Q-9",
 			}),
 		);
 		try {
@@ -5704,10 +5723,13 @@ describe("Waiting lead drawer actions", () => {
 				),
 			].map((b) => b.textContent?.trim());
 			expect(names).toEqual(["Cancel task"]);
-			expect(container.textContent).toContain(
-				"asks this lead's deployment question; your answer decides the lead.",
-			);
+			expect(
+				container
+					.querySelector<HTMLAnchorElement>(".lead-validation-hint a")
+					?.getAttribute("href"),
+			).toBe("/projects/proj/tasks/Q-9");
 			expect(container.textContent).not.toContain("Validate now");
+			expect(container.textContent).toContain("Last result: deployment");
 		} finally {
 			await close();
 		}
@@ -5741,10 +5763,11 @@ describe("Waiting lead drawer actions", () => {
 		// A deployment-fact lead never enters a batch, so there is no run to
 		// start: the drawer keeps Cancel and the hint names the question card
 		// that decides the lead.
-		const { container, close } = await mountLead(
+		const { container, opened, close } = await mountLead(
 			leadCard({
 				prompt:
 					"Needs validation: proxy header\nBlocker: deployment fact: Which proxy terminates TLS?",
+				deploymentQuestionId: "Q-10",
 			}),
 		);
 		try {
@@ -5755,11 +5778,18 @@ describe("Waiting lead drawer actions", () => {
 			].map((b) => b.textContent?.trim());
 			expect(names).toEqual(["Cancel task"]);
 			const link = container.querySelector<HTMLAnchorElement>(
-				'a[href="/projects/proj/tasks/R-7"]',
+				".lead-validation-hint a",
 			);
-			expect(link?.textContent).toBe("#R-7");
-			expect(container.textContent).toContain(
-				"asks this lead's deployment question; your answer decides the lead.",
+			expect(link?.textContent).toBe("Answer the deployment question");
+			expect(link?.getAttribute("href")).toBe("/projects/proj/tasks/Q-10");
+			if (!link) throw new Error("the deployment question link is missing");
+			await act(async () => link.click());
+			expect(opened).toEqual(["Q-10"]);
+			expect(container.textContent).not.toContain("Ask again");
+			expect(container.querySelector("form.steer-form")).toBeNull();
+			expect(container.textContent).not.toContain("Edit task");
+			expect(container.textContent).not.toContain(
+				"Not ready — park in backlog",
 			);
 			expect(container.textContent).not.toContain("Validate now");
 			expect(container.textContent).not.toContain(
@@ -5769,6 +5799,44 @@ describe("Waiting lead drawer actions", () => {
 			await close();
 		}
 	});
+
+	for (const deploymentQuestionId of [undefined, null]) {
+		test(`a deployment lead without question ${deploymentQuestionId} states the limit`, async () => {
+			const { container, opened, close } = await mountLead(
+				leadCard({
+					prompt:
+						"Needs validation: proxy header\nBlocker: deployment fact: Which proxy terminates TLS?",
+					deploymentQuestionId,
+				}),
+			);
+			try {
+				expect(container.textContent).toContain(
+					"The deployment question is unavailable. This lead still waits for a decision.",
+				);
+				expect(container.querySelector(".lead-validation-hint a")).toBeNull();
+				expect(container.textContent).not.toContain(
+					"Answer the deployment question",
+				);
+				expect(container.textContent).not.toContain("Ask again");
+				expect(container.textContent).not.toContain("Validate now");
+				expect(
+					[...container.querySelectorAll(".drawer-actions button")].map(
+						(button) => button.textContent?.trim(),
+					),
+				).toEqual(["Cancel task"]);
+				expect(opened).toEqual([]);
+				const hints = [...container.querySelectorAll(".lead-validation-hint")];
+				expect(hints[0]?.textContent).toContain(
+					"The deployment question is unavailable.",
+				);
+				expect(hints[1]?.textContent).toBe(
+					"Last result: still blocked — 2026-11-20",
+				);
+			} finally {
+				await close();
+			}
+		});
+	}
 });
 
 describe("Drawer file-section loading placeholders", () => {

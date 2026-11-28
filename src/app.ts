@@ -7320,6 +7320,14 @@ export async function createApp(deps: AppDeps) {
 				? ((await e.store.appliedValidationOutcomes(t.followUpOf)).get(t.id)
 						?.outcome ?? null)
 				: null;
+		const deploymentQuestionId =
+			t.waitsValidation === true &&
+			t.followUpOf !== null &&
+			t.followUpOfProject === null &&
+			t.cancelledAt === null &&
+			t.stage !== "done"
+				? await e.store.leadQuestionCardId(t.id, t.followUpOf)
+				: null;
 		return {
 			...task,
 			steps: viewSteps(t),
@@ -7327,7 +7335,9 @@ export async function createApp(deps: AppDeps) {
 				({ prompt: _prompt, ...turn }) => turn,
 			),
 			sessionTitle: await e.store.frozenTitle(t),
-			...(t.waitsValidation === true ? { appliedValidationOutcome } : {}),
+			...(t.waitsValidation === true
+				? { appliedValidationOutcome, deploymentQuestionId }
+				: {}),
 			...(proposal?.verdict === "filed" ? { trendingRepo: proposal.repo } : {}),
 			...(pr !== null && e.github !== null
 				? {
@@ -14578,8 +14588,10 @@ export async function createApp(deps: AppDeps) {
 						lead === undefined ||
 						lead.cancelledAt !== null ||
 						lead.stage === "done"
-					)
+					) {
+						if (lead !== undefined) answered.add(lead.id);
 						continue;
+					}
 					const live = await e.store.getTask(lead.id);
 					if (live === null) continue;
 					// A note behind the pick (OTTR-1281) keeps the label match; the full
@@ -14633,7 +14645,6 @@ export async function createApp(deps: AppDeps) {
 						continue;
 					}
 					await appendDetails(lead.id, m.answer);
-					answered.add(lead.id);
 				}
 				if (free !== "")
 					for (const q of asked) {
@@ -14644,14 +14655,24 @@ export async function createApp(deps: AppDeps) {
 							lead.stage === "done"
 						)
 							continue;
-						if (answered.has(lead.id)) continue;
+						if (
+							answered.has(lead.id) ||
+							matches.some((m) => m.question === q.question)
+						)
+							continue;
 						await appendDetails(lead.id, free);
 					}
-				// A complete reply lands the card Done; a partial reply keeps it at
-				// needs_you with only the unanswered questions (OTTR-1130).
-				const left = asked.filter(
-					(q) => !matches.some((m) => m.question === q.question),
-				);
+				// Keep uncertain and unanswered questions in their original order.
+				// Remove resolved questions and questions whose leads no longer exist.
+				const left = asked.filter((q) => {
+					const lead = leadOf(q.question, tasks);
+					return (
+						lead !== undefined &&
+						lead.cancelledAt === null &&
+						lead.stage !== "done" &&
+						!answered.has(lead.id)
+					);
+				});
 				if (left.length === 0)
 					await e.store.updateTask(task.id, {
 						stage: "done",

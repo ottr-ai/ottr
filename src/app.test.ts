@@ -2714,8 +2714,7 @@ describe("task routes", () => {
 		expect(two.needsReason).toBe(
 			`Cancelled by the user's answer to the review's question: ${LEAD_NOT_APPLY_OPTION}`,
 		);
-		// Not sure leaves the lead open: the answer only records. The question
-		// itself is answered, so the card lands Done with the lead still open.
+		// Not sure records a note and keeps the deployment question open.
 		const three = (await store.getTask(lead3.id))!;
 		expect(three.stage).toBe("todo");
 		expect(three.state).toBe("queued");
@@ -2724,9 +2723,12 @@ describe("task routes", () => {
 		expect(three.details).toBe(
 			`\n\nThe user answered the review's question: ${LEAD_UNSURE_OPTION}`,
 		);
-		const done = (await store.getTask(ask.id))!;
-		expect(done.stage).toBe("done");
-		expect(done.state).toBe("idle");
+		const waiting = (await store.getTask(ask.id))!;
+		expect(waiting.stage).toBe("backlog");
+		expect(waiting.state).toBe("needs_you");
+		expect(waiting.asked?.map((q) => q.question)).toEqual([
+			`Q three? (card #${lead3.id})`,
+		]);
 		// A free-text answer to the same question records and leaves the lead open.
 		const free = await seedLeadAskOne();
 		const res2 = await post(`/api/projects/p1/tasks/${free.ask.id}/reply`, {
@@ -2741,6 +2743,42 @@ describe("task routes", () => {
 		expect(freeLead.details).toBe(
 			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
+		expect((await store.getTask(free.ask.id))!.state).toBe("needs_you");
+		expect((await store.getTask(free.ask.id))!.asked).toHaveLength(1);
+	});
+
+	test("mixed and partial deployment replies retain only unresolved questions in order (OTTR-1350)", async () => {
+		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
+		const questions = (await store.getTask(ask.id))!.asked!;
+		const first = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: [
+				askAnswerLine(questions[0]!.question, LEAD_UNSURE_OPTION),
+				askAnswerLine(questions[1]!.question, LEAD_APPLIES_OPTION),
+			].join("\n"),
+		});
+		expect(first.status).toBe(200);
+		expect((await store.getTask(ask.id))!.asked).toEqual([
+			questions[0]!,
+			questions[2]!,
+		]);
+		const resolvedPrompt = (await store.getTask(lead2.id))!.prompt;
+		const second = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(questions[2]!.question, "The owner must check"),
+		});
+		expect(second.status).toBe(200);
+		expect((await store.getTask(ask.id))!.asked).toEqual([
+			questions[0]!,
+			questions[2]!,
+		]);
+		const third = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(questions[0]!.question, LEAD_NOT_APPLY_OPTION),
+		});
+		expect(third.status).toBe(200);
+		expect((await store.getTask(ask.id))!.asked).toEqual([questions[2]!]);
+		expect((await store.getTask(lead1.id))!.cancelledAt).not.toBeNull();
+		expect((await store.getTask(lead3.id))!.waitsValidation).toBe(true);
+		expect((await store.getTask(lead2.id))!.prompt).toBe(resolvedPrompt);
+		expect((await store.getTask(lead2.id))!.details).toBeNull();
 	});
 
 	test("a lead-question pick with a note still queues the applies lead and carries the note (OTTR-1281)", async () => {
@@ -2766,7 +2804,7 @@ describe("task routes", () => {
 		expect(two.needsReason).toContain("fixed in v2");
 	});
 
-	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
+	test("a lead-question free-text answer records a note and keeps both questions open", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: askAnswerLine(
@@ -2788,16 +2826,17 @@ describe("task routes", () => {
 		expect(two.state).toBe("queued");
 		expect(two.cancelledAt).toBeNull();
 		expect(two.details).toBeNull();
-		// A partial reply keeps the card at needs_you with only the unanswered question.
+		// Uncertain and unanswered questions both stay open.
 		const card = (await store.getTask(ask.id))!;
 		expect(card.state).toBe("needs_you");
 		expect(card.stage).toBe("backlog");
 		expect(card.doneAt).toBeNull();
 		expect(card.asked).toEqual([
+			expect.objectContaining({ question: `Q one? (card #${lead1.id})` }),
 			expect.objectContaining({ question: `Q two? (card #${lead2.id})` }),
 		]);
 		expect(card.needsReason).toBe(
-			`Waiting for answers to 1 of 2 questions: Q1 "Q two? (card #${lead2.id})"`,
+			`Waiting for answers to 2 of 2 questions: Q1 "Q one? (card #${lead1.id})", Q2 "Q two? (card #${lead2.id})"`,
 		);
 	});
 
@@ -2876,7 +2915,7 @@ describe("task routes", () => {
 		expect(one.details).toBe(
 			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
-		expect((await store.getTask(ask.id))?.stage).toBe("done");
+		expect((await store.getTask(ask.id))?.state).toBe("needs_you");
 	});
 
 	test("the drawer's Approve text records on the lead instead of vanishing", async () => {
@@ -2891,7 +2930,11 @@ describe("task routes", () => {
 		expect(one.details).toBe(
 			"\n\nThe user answered the review's question: Approve",
 		);
-		expect((await store.getTask(ask.id))?.stage).toBe("done");
+		const waiting = (await store.getTask(ask.id))!;
+		expect(waiting.stage).toBe("backlog");
+		expect(waiting.state).toBe("needs_you");
+		expect(waiting.asked).toHaveLength(1);
+		expect(one.waitsValidation).toBe(true);
 	});
 
 	test("a multi-question reply matching no question is refused and changes nothing", async () => {
@@ -14046,6 +14089,100 @@ describe("waiting lead validate route and guards (OTTR-1252)", () => {
 		});
 		return { review, lead, ask };
 	};
+
+	for (const uncertain of [LEAD_UNSURE_OPTION, "I need the deployment owner"])
+		for (const definitive of [LEAD_APPLIES_OPTION, LEAD_NOT_APPLY_OPTION])
+			test(`${uncertain} keeps the real question available for ${definitive} (OTTR-1350)`, async () => {
+				const { lead, ask } = await seedWaitingLeadAsk();
+				await store.updateTask(lead.id, {
+					prompt:
+						"Needs validation: proxy header\nBlocker: deployment fact: Which proxy terminates TLS?",
+				});
+				const question = `Q one? (card #${lead.id})`;
+				const reply = (answer: string) =>
+					post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+						text: askAnswerLine(question, answer),
+					});
+				expect((await reply(uncertain)).status).toBe(200);
+				const waiting = (await store.getTask(lead.id))!;
+				expect(waiting.waitsValidation).toBe(true);
+				expect(waiting.cancelledAt).toBeNull();
+				expect(waiting.details).toContain(uncertain);
+				const open = (await store.getTask(ask.id))!;
+				expect(open.state).toBe("needs_you");
+				expect(open.asked?.map((q) => q.question)).toEqual([question]);
+				const runnable = async () =>
+					pickRunnable(
+						[(await store.getTask(lead.id))!, (await store.getTask(ask.id))!],
+						{ maxParallel: 1, hasRules: true },
+					).map((t) => t.id);
+				expect(await runnable()).not.toContain(lead.id);
+				const detail = await get(`/api/projects/p1/tasks/${lead.id}`);
+				expect(detail.status).toBe(200);
+				expect((await detail.json()).deploymentQuestionId).toBe(ask.id);
+				expect((await reply(definitive)).status).toBe(200);
+				const resolved = (await store.getTask(lead.id))!;
+				expect((await store.getTask(ask.id))!.stage).toBe("done");
+				if (definitive === LEAD_APPLIES_OPTION) {
+					expect(resolved.waitsValidation).toBe(false);
+					expect(resolved.cancelledAt).toBeNull();
+					expect(await runnable()).toContain(lead.id);
+				} else {
+					expect(resolved.cancelledAt).not.toBeNull();
+					expect(await runnable()).not.toContain(lead.id);
+				}
+				const replay = await reply(definitive);
+				expect(replay.status).toBe(409);
+			});
+
+	test("the real lead detail links only an open question in its review (OTTR-1350)", async () => {
+		const { review, lead, ask } = await seedWaitingLeadAsk();
+		const detailId = async () => {
+			const response = await get(`/api/projects/p1/tasks/${lead.id}`);
+			expect(response.status).toBe(200);
+			return (await response.json()).deploymentQuestionId;
+		};
+		expect(await detailId()).toBe(ask.id);
+		const other = await store.createTask("another review", null, "review");
+		await store.updateTask(ask.id, { followUpOf: other.id });
+		expect(await detailId()).toBeNull();
+		await store.updateTask(ask.id, {
+			followUpOf: review.id,
+			cancelledAt: Date.now(),
+		});
+		expect(await detailId()).toBeNull();
+		await store.updateTask(ask.id, {
+			cancelledAt: null,
+			stage: "done",
+			state: "idle",
+		});
+		expect(await detailId()).toBeNull();
+		await store.updateTask(ask.id, {
+			stage: "backlog",
+			state: "needs_you",
+			asked: [
+				{
+					...(await store.getTask(ask.id))!.asked![0]!,
+					question: `Other? (card #${lead.id}-extra)`,
+				},
+			],
+		});
+		expect(await detailId()).toBeNull();
+		await store.updateTask(ask.id, {
+			asked: [
+				{
+					...(await store.getTask(ask.id))!.asked![0]!,
+					question: `Q one? (card #${lead.id})`,
+				},
+			],
+		});
+		expect(await detailId()).toBe(ask.id);
+		await store.updateTask(lead.id, { followUpOfProject: "p2" });
+		expect(await detailId()).toBeNull();
+		await store.updateTask(lead.id, { followUpOfProject: null });
+		await store.updateTask(ask.id, { prompt: "An unrelated question card" });
+		expect(await detailId()).toBeNull();
+	});
 
 	test("the applies answer clears the marker and queues the waiting lead", async () => {
 		const { lead, ask } = await seedWaitingLeadAsk();

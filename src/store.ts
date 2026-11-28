@@ -47,7 +47,15 @@ import {
 } from "./prompts.ts";
 import { sumUsageIn, type UsageSum } from "./retro.ts";
 import {
+	isLead,
 	isReview,
+	LEAD_APPLIES_OPTION,
+	LEAD_NOT_APPLY_OPTION,
+	LEAD_QUESTIONS_PROMPT_PREFIX,
+	LEAD_UNSURE_OPTION,
+	type LeadValidationOutcome,
+	leadBlocker,
+	leadValidationOutcome,
 	legacyLeadWaits,
 	queueOrder,
 	validationOutcomes,
@@ -3050,12 +3058,179 @@ export class ProjectStore {
 	}
 
 	private async finishOpen(): Promise<ProjectStore> {
+		await this.restoreDeploymentQuestions();
 		// Transcript backfills start only after either backend finishes its migrations.
 		this.backfill = this.backfillTranscriptData().catch(() => {
 			/* backfill is best-effort; the next open retries */
 		});
 		await this.backfill;
 		return this;
+	}
+
+	/** Restore decision paths before either backend admits callers. */
+	private async restoreDeploymentQuestions(): Promise<void> {
+		await this.transaction(async () => {
+			const byReview = new Map<string, ListedTask[]>();
+			for (const row of await this.listTasks()) {
+				if (
+					row.followUpOf === null ||
+					row.followUpOfProject !== null ||
+					row.cancelledAt !== null
+				)
+					continue;
+				const group = byReview.get(row.followUpOf);
+				if (group === undefined) byReview.set(row.followUpOf, [row]);
+				else group.push(row);
+			}
+			for (const [reviewId, rows] of byReview)
+				await this.restoreReviewDeploymentQuestions(reviewId, rows);
+		});
+	}
+
+	private async restoreReviewDeploymentQuestions(
+		reviewId: string,
+		rows: ListedTask[],
+	): Promise<void> {
+		const leads = rows.filter(
+			(row) =>
+				isLead(row) &&
+				(row.stage === "backlog" ||
+					(row.stage === "todo" && row.waitsValidation)),
+		);
+		if (leads.length === 0) return;
+		const outcomes = await this.appliedValidationOutcomes(reviewId);
+		const pending = new Map<string, AskQuestion>();
+		for (const lead of leads) {
+			const question = await this.deploymentQuestionForLead(
+				lead,
+				outcomes.get(lead.id),
+			);
+			if (question !== null) pending.set(lead.id, question);
+		}
+		if (pending.size === 0) return;
+		await this.restoreDeploymentQuestionCard(
+			reviewId,
+			rows.filter((row) => row.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)),
+			pending,
+		);
+	}
+
+	private async deploymentQuestionForLead(
+		lead: ListedTask,
+		result: LeadValidationOutcome | undefined,
+	): Promise<AskQuestion | null> {
+		if (lead.prompt.includes("\nThe user answered the review's question"))
+			return null;
+		const details =
+			result === undefined
+				? ((await this.getTask(lead.id))?.details ?? null)
+				: null;
+		const outcome = result?.outcome ?? leadValidationOutcome(details);
+		if (outcome === "confirmed" || outcome === "refuted") return null;
+		// A wait marker remains authoritative when only the old result text is lost.
+		if (
+			!lead.waitsValidation &&
+			!legacyLeadWaits(
+				lead.prompt,
+				lead.validatedAt,
+				details,
+				result?.outcome ?? null,
+			)
+		)
+			return null;
+		const blocker = leadBlocker(lead.prompt);
+		if (blocker.kind !== "deployment" && outcome !== "deployment") return null;
+		if (!lead.waitsValidation || lead.stage === "backlog")
+			await this.updateTask(lead.id, {
+				stage: "todo",
+				state: "queued",
+				waitsValidation: true,
+				queuedAt: lead.updatedAt,
+				needsReason: null,
+				asked: null,
+			});
+		const text =
+			(blocker.kind === "deployment" ? blocker.question : null) ||
+			result?.evidence ||
+			`Does the risk in "${lead.title ?? lead.id}" apply to this deployment?`;
+		return {
+			question: `${text} (card #${lead.id})`,
+			options: [
+				{ label: LEAD_APPLIES_OPTION },
+				{ label: LEAD_NOT_APPLY_OPTION },
+				{ label: LEAD_UNSURE_OPTION },
+			],
+			multi: false,
+			recommended: null,
+			text: false,
+		};
+	}
+
+	private async restoreDeploymentQuestionCard(
+		reviewId: string,
+		cards: ListedTask[],
+		pending: Map<string, AskQuestion>,
+	): Promise<void> {
+		const open = cards.find(
+			(card) => card.stage !== "done" && card.state === "needs_you",
+		);
+		const target =
+			open ??
+			cards.find((card) => card.stage === "done") ??
+			(await this.createTask(
+				`${LEAD_QUESTIONS_PROMPT_PREFIX}${reviewId}: reply with one answer per question, and the board applies each answer to its lead card.`,
+			));
+		const asked = [...(target.asked ?? [])];
+		const originals = cards.flatMap((card) => card.asked ?? []);
+		for (const [id, question] of pending) {
+			const suffix = `(card #${id})`;
+			if (asked.some((q) => q.question.endsWith(suffix))) continue;
+			asked.push(
+				originals.find((q) => q.question.endsWith(suffix)) ?? question,
+			);
+		}
+		if (open !== undefined && asked.length === (open.asked ?? []).length)
+			return;
+		await this.updateTask(target.id, {
+			followUpOf: reviewId,
+			promptAuthor: "board",
+			stage: "backlog",
+			state: "needs_you",
+			queuedAt: null,
+			asked,
+			needsReason: `Wants your answer: ${asked.length} question${asked.length === 1 ? "" : "s"} about the review's needs-validation leads`,
+		});
+	}
+
+	/** Find the live decision card within this project and review. */
+	async leadQuestionCardId(
+		leadId: string,
+		reviewId: string,
+	): Promise<string | null> {
+		return this.queue.run(async () => {
+			const tasks = await this.listTasks();
+			const lead = tasks.find((row) => row.id === leadId);
+			if (
+				lead === undefined ||
+				lead.followUpOf !== reviewId ||
+				lead.followUpOfProject !== null
+			)
+				return null;
+			for (const row of tasks) {
+				if (
+					row.followUpOf !== reviewId ||
+					row.followUpOfProject !== null ||
+					row.cancelledAt !== null ||
+					row.stage === "done" ||
+					row.state !== "needs_you" ||
+					!row.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)
+				)
+					continue;
+				if (row.asked?.some((q) => q.question.endsWith(`(card #${leadId})`)))
+					return row.id;
+			}
+			return null;
+		});
 	}
 
 	async logPath(taskId: string): Promise<string> {

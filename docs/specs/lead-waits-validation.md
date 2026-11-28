@@ -152,6 +152,48 @@ No schema change or validation prompt change is necessary.
 - `taskView` adds optional `appliedValidationOutcome` from the serialized store lookup.
   A cancelled or unfinished run cannot supply this value.
 
+## Uncertain deployment answers (OTTR-1350)
+
+The operator selected this flow on 2026-11-28: keep the question open.
+An uncertain answer includes "Not sure" and free text.
+The reply records the answer in the lead's details but keeps its question in `asked`.
+The question card stays at `needs_you` until each live lead receives a definitive answer.
+A mixed reply removes only resolved questions and keeps the remaining questions in order.
+The existing reply route accepts a later "Applies" or "Does not apply" answer.
+"Applies" clears `waitsValidation` and queues work.
+"Does not apply" cancels the lead.
+Uncertain answers never clear the marker or queue a work turn.
+
+The lead detail response adds optional `deploymentQuestionId: string | null`.
+It identifies an open question card in the same project and review whose `asked` includes that lead.
+The drawer links directly to that question with "Answer the deployment question".
+It does not offer Ask again or link to the review as the decision action.
+If no question exists, the drawer states that the question is unavailable.
+
+Assumptions: the lead retains its review link and its blocker or applied deployment result.
+Both backends run recovery in the shared `ProjectStore.finishOpen` path after schema initialization.
+Recovery preserves the marker and restores questions for unresolved deployment leads.
+It reuses an existing open question card, or restores the review's closed question card.
+If no question card exists, it creates one with the existing deployment-answer options.
+Recovery uses the blocker question or applied result evidence.
+If old data loses that text, the question names the lead's risk from its title.
+Recovery does not reopen questions for confirmed, refuted, cancelled, done, or applies-answered leads.
+It does not change ordinary review cards, sandbox leads, or validation prompts.
+Recovery runs in a transaction and remains idempotent after a second store open.
+This change needs no schema column or new migration.
+
+Acceptance:
+
+- Real reply-route regressions cover "Not sure" and free text.
+- After each uncertain reply, `pickRunnable` never returns the lead.
+- A later reply to the same card releases the marker on Applies or cancels on Does not apply.
+- A mixed reply retains only unresolved deployment questions.
+- SQLite and PostgreSQL store-open tests restore closed legacy questions and cover repeated open.
+- The detail response identifies the restored question through the real store reader.
+- The drawer link opens that question card and describes this reachable action.
+- UI proof includes a screenshot of the lead and its open question.
+- `bun run check` and `bun test` both exit 0.
+
 ## UI (src/ui/app.tsx)
 
 For a waiting lead the drawer renders:
@@ -162,10 +204,10 @@ For a waiting lead the drawer renders:
 - a deployment decision (blocker line `deployment fact`, or a recorded
   deployment outcome overruling a sandbox blocker line): only "Cancel task".
   No run can take the lead, so there is no Validate now button;
-- one hint line under the actions linking the review card: a sandbox lead
+- one hint line under the actions: a sandbox lead links to its review and
   reads "The review #<id> starts this lead's validation run by itself.
-  Validate now starts it at once."; a deployment-fact lead reads "The review
-  #<id> asks this lead's deployment question; your answer decides the lead.";
+  Validate now starts it at once."; a deployment lead links to its open question
+  with "Answer the deployment question";
   plus the last validation result and date when `validatedAt` exists.
   An applied finding supplies the result when the details lack a result segment;
 - no Move-to-backlog/park button, no Merge anyway, no prompt edit, no reply or

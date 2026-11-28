@@ -14137,6 +14137,7 @@ function DrawerActions(p: {
 	/** OTTR-1252: true when the waiting lead's blocker line names a deployment
 	 * fact — that lead takes no validation run, so it gets no Validate now. */
 	deploymentLead: boolean;
+	deploymentQuestionId: TaskView["deploymentQuestionId"];
 	/** OTTR-1252: the waiting lead's newest validation result, one short line;
 	 * null when the card carries none. */
 	lastValidation: string | null;
@@ -14178,6 +14179,7 @@ function DrawerActions(p: {
 		backToTodoError,
 		openValidationRun,
 		deploymentLead,
+		deploymentQuestionId,
 		lastValidation,
 		onOpenTask,
 	} = p;
@@ -14416,13 +14418,7 @@ function DrawerActions(p: {
 					Validation run filed.
 				</p>
 			)}
-			{/* OTTR-1252: a waiting lead carries one hint line under the actions row.
-			    A sandbox lead names the review's own batch run, which Validate now
-			    starts at once. A deployment-fact lead names the question flow that
-			    actually decides it — the review's question card, which the user's
-			    applies or does-not-apply reply settles. With a result on the card,
-			    the newest Validated-by segment of the details shows as a second
-			    short line. Full width under the row, like the re-run lines below. */}
+			{/* Waiting lead hints stay under the actions, before the last result. */}
 			{waiting && reviewId !== null && !deploymentLead && (
 				<p className="hint lead-validation-hint">
 					The review{" "}
@@ -14438,18 +14434,21 @@ function DrawerActions(p: {
 					once.
 				</p>
 			)}
-			{deploymentLead && reviewId !== null && (
+			{waiting && deploymentLead && (
 				<p className="hint lead-validation-hint">
-					The review{" "}
-					<a
-						className="reason-card-link"
-						href={taskPath(task.followUpOfProject ?? task.project, reviewId)}
-						title={`Review #${reviewId}`}
-						onClick={(e) => navClick(e, () => onOpenTask(reviewId))}
-					>
-						#{reviewId}
-					</a>{" "}
-					asks this lead's deployment question; your answer decides the lead.
+					{deploymentQuestionId ? (
+						<a
+							className="reason-card-link"
+							href={taskPath(task.project, deploymentQuestionId)}
+							onClick={(e) =>
+								navClick(e, () => onOpenTask(deploymentQuestionId))
+							}
+						>
+							Answer the deployment question
+						</a>
+					) : (
+						"The deployment question is unavailable. This lead still waits for a decision."
+					)}
 				</p>
 			)}
 			{waiting && lastValidation !== null && (
@@ -16547,6 +16546,7 @@ export function Drawer({
 						backToTodoError={backToTodoError}
 						openValidationRun={openValidationRunId}
 						deploymentLead={deploymentLead}
+						deploymentQuestionId={detail?.deploymentQuestionId}
 						lastValidation={lastValidation}
 						onOpenTask={onOpenTask}
 					/>

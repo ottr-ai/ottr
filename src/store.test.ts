@@ -41,6 +41,7 @@ import {
 	tasksDirFor,
 } from "./store.ts";
 import { prConflictReason } from "./supervisor.ts";
+import { deploymentQuestionRecovery } from "./test/deploymentQuestions.ts";
 import { leadOutcomeCases } from "./test/leadOutcomeCases.ts";
 import { type StoreChildHandle, spawnStoreChild } from "./test/storeChild.ts";
 import {
@@ -59,6 +60,10 @@ const open = async (dbPath: string) => {
 	opened.push(store);
 	return store;
 };
+
+test("store open restores unresolved deployment decision paths", async () => {
+	await deploymentQuestionRecovery(join(root, "deployment-question-recovery"));
+});
 afterEach(async () => {
 	for (const store of opened.splice(0)) await store.close(); // double close is a no-op
 });
@@ -3578,23 +3583,7 @@ describe("preparing migration", () => {
 		const dir = join(root, "followup-pr-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
-		db.exec(`CREATE TABLE tasks (
-			id TEXT PRIMARY KEY,
-			title TEXT,
-			prompt TEXT,
-			stage TEXT NOT NULL,
-			state TEXT NOT NULL,
-			needs_reason TEXT,
-			pending_prompt TEXT,
-			branch TEXT,
-			base TEXT,
-			worktree TEXT,
-			session_id TEXT,
-			summary TEXT,
-			details TEXT,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL
-		)`);
+		db.exec(OLD_TASKS_DDL);
 		db.exec(
 			"INSERT INTO tasks (id, stage, state, created_at, updated_at) VALUES ('seed1', 'merging', 'idle', 1, 1)",
 		);

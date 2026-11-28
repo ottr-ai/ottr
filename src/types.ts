@@ -1338,6 +1338,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 		| "blocked"
 		| "deployment"
 		| null;
+	/** The open deployment question in the same project and review, or null. */
+	deploymentQuestionId?: string | null;
 	/** Set only for kind "sweep" (OTTR-1259): the run's per-card verdict rows and the
 	 * pinned cards the run does not cover (the chain's remainder). */
 	sweep?: SweepView;
