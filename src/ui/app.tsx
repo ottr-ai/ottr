@@ -11969,7 +11969,7 @@ function SweepEvidence(p: {
 		for (const m of text.matchAll(idRe)) {
 			if (m.index > at) segs.push(text.slice(at, m.index));
 			const id = m[0];
-			segs.push(p.linkedCards.has(id) ? cardLink(id, `${key}-${id}`) : id);
+			segs.push(p.linkedCards.has(id) ? cardLink(id, `${key}-${m.index}`) : id);
 			at = m.index + id.length;
 		}
 		segs.push(text.slice(at));
@@ -12009,36 +12009,14 @@ function DrawerSweep(p: {
 }) {
 	const { task, act, setDetail } = p;
 	const sweep = task.sweep;
-	// Checked rows, keyed by the target card id. Stale rows never join: their
-	// checkbox is disabled, so an apply cannot carry them either. Applied rows
-	// (the run's durable applied marker, which the server ships on every row)
-	// render as done and drop out of every reset, so a reload never re-selects
-	// work that filed.
-	const [checked, setChecked] = useState<ReadonlySet<string>>(
-		() =>
-			new Set(
-				(sweep?.rows ?? [])
-					.filter((r) => !r.stale && !r.applied)
-					.map((r) => r.card),
-			),
+	// Keep operator choices across detail refreshes. Server flags decide eligibility.
+	const [unchecked, setUnchecked] = useState<ReadonlySet<string>>(
+		() => new Set(),
 	);
-	const applied = useRef(new Set<string>());
 	const [error, setError] = useState<string | null>(null);
-	// An apply refetches the detail (and the state refresh re-renders the drawer):
-	// the fresh rows reset the checks to their defaults minus the applied ones —
-	// the server's applied flags first, this session's own applies second — like
-	// PrReviewSection's draft reset. Render-phase guard on the rows identity.
-	const lastRows = useRef(sweep?.rows);
-	if (sweep !== undefined && sweep.rows !== lastRows.current) {
-		lastRows.current = sweep.rows;
-		setChecked(
-			new Set(
-				sweep.rows
-					.filter((r) => !r.stale && !r.applied && !applied.current.has(r.card))
-					.map((r) => r.card),
-			),
-		);
-	}
+	const selected = (sweep?.rows ?? []).filter(
+		(row) => !row.stale && !row.applied && !unchecked.has(row.card),
+	);
 	const applyUrl = `/api/projects/${encodeURIComponent(task.project)}/inbox/sweep/apply`;
 	return (
 		<>
@@ -12058,16 +12036,18 @@ function DrawerSweep(p: {
 										<input
 											type="checkbox"
 											name={`sweep-row-${row.card}`}
-											aria-label={`${sweepVerdictLabel(row)}: ${row.title}`}
+											aria-label={`${sweepVerdictLabel(row)}: ${row.title}${row.applied ? "; Applied" : ""}${row.stale ? "; Stale" : ""}`}
 											checked={
-												!row.stale && !row.applied && checked.has(row.card)
+												!row.stale && !row.applied && !unchecked.has(row.card)
 											}
 											disabled={row.stale || row.applied}
 											onChange={() => {
-												const next = new Set(checked);
-												if (next.has(row.card)) next.delete(row.card);
-												else next.add(row.card);
-												setChecked(next);
+												setUnchecked((current) => {
+													const next = new Set(current);
+													if (next.has(row.card)) next.delete(row.card);
+													else next.add(row.card);
+													return next;
+												});
 											}}
 										/>
 										<span className="sweep-verdict" data-verdict={row.verdict}>
@@ -12091,7 +12071,7 @@ function DrawerSweep(p: {
 											onOpenTask={p.onOpenTask}
 										/>
 									</pre>
-									{row.drafts.length > 0 && !row.applied && (
+									{row.drafts.length > 0 && !row.applied && !row.stale && (
 										<p className="sweep-drafts">
 											{row.drafts.length} draft
 											{row.drafts.length === 1 ? "" : "s"} to file on apply.
@@ -12115,24 +12095,44 @@ function DrawerSweep(p: {
 						<div className="reply-actions">
 							<BusyButton
 								className="primary"
-								disabled={checked.size === 0}
+								disabled={selected.length === 0}
 								run={() =>
 									act(async () => {
 										setError(null);
-										// Each checked row applies its own proposed action; stale
-										// rows cannot join (their checkbox is disabled) and the
-										// server refuses them too.
-										const rows = sweep.rows
-											.filter((r) => !r.stale && checked.has(r.card))
-											.map((r) => ({ card: r.card, action: r.proposed }));
+										const rows = selected.map((row) => ({
+											card: row.card,
+											action: row.proposed,
+										}));
 										const appliedRows = await post<{
-											results: { card: string; skipped?: string }[];
+											results: {
+												card: string;
+												applied: boolean;
+												skipped?: string;
+											}[];
 										}>(applyUrl, { run: task.id, rows });
-										// Rows the server answers "already applied" (their drafts
-										// filed on an earlier apply) join the applied set with the
-										// rows this apply carried, so no reset re-selects them.
-										for (const r of appliedRows.results)
-											applied.current.add(r.card);
+										setUnchecked(
+											(current) =>
+												new Set([
+													...current,
+													...appliedRows.results
+														.filter(
+															(row) =>
+																row.applied ||
+																row.skipped === "already applied",
+														)
+														.map((row) => row.card),
+												]),
+										);
+										setError(
+											appliedRows.results
+												.filter(
+													(row) =>
+														row.skipped !== undefined &&
+														row.skipped !== "already applied",
+												)
+												.map((row) => `${row.card}: ${row.skipped}`)
+												.join("\n") || null,
+										);
 										// The applied rows changed seen marks and filed drafts:
 										// refetch this card's detail, act refreshes the board state.
 										setDetail(
@@ -12140,9 +12140,6 @@ function DrawerSweep(p: {
 												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`,
 											),
 										);
-										// Nothing stays checked after an apply: the applied rows
-										// leave the defaults, so a second click cannot re-send work.
-										setChecked(new Set());
 									}, setError)
 								}
 							>
@@ -16407,6 +16404,7 @@ export function Drawer({
 						setDetail={setDetail}
 					/>
 					<DrawerSweep
+						key={task.id}
 						task={task}
 						act={act}
 						setDetail={setDetail}

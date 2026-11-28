@@ -21,6 +21,7 @@ import {
 	sweepSteps,
 } from "./inboxSweep.ts";
 import { newSweepState } from "./inboxSweepState.ts";
+import fc from "./test/properties.ts";
 import type { ListedTask } from "./types.ts";
 
 /** A minimal list-row fixture; the pure helpers read only the fields they name. */
@@ -126,6 +127,35 @@ describe("sweepResult", () => {
 		]);
 	});
 
+	test("empty draft blocks invalidate a verdict instead of filing blank proposals", () => {
+		for (const block of ["", " \t", `Fix the retry\n${SWEEP_DRAFT_SEP}\n`])
+			expect(
+				sweepResult(`Sweep: #a none\nStep open\n${SWEEP_DRAFT_SEP}\n${block}`),
+			).toBeNull();
+	});
+
+	test("verdicts preserve evidence and drafts across LF and CRLF lines", () => {
+		fc.assert(
+			fc.property(
+				fc.constantFrom("done", "partial", "none", "info"),
+				fc.stringMatching(/^[a-z0-9 ]{0,40}$/),
+				fc.array(fc.stringMatching(/^[a-z][a-z0-9 ]{0,40}$/), { maxLength: 4 }),
+				fc.constantFrom("\n", "\r\n"),
+				(verdict, evidence, drafts, newline) => {
+					const lines = [`Sweep: #P-1 ${verdict}`, evidence];
+					for (const draft of drafts) lines.push(SWEEP_DRAFT_SEP, draft);
+					expect(sweepResult(lines.join(newline))).toEqual({
+						cardId: "P-1",
+						verdict,
+						evidence: evidence.trim(),
+						drafts: drafts.map((draft) => draft.trim()),
+					});
+				},
+			),
+			{ examples: [["done", "", [], "\r\n"]] },
+		);
+	});
+
 	test("a separator embedded inside a line is evidence, never a draft", () => {
 		const r = sweepResult(
 			`Sweep: #a none\nsee --- card draft --- inline and nothing else`,
@@ -221,6 +251,54 @@ describe("reportPathTokens", () => {
 		expect(
 			reportPathTokens("see https://x.dev/a/b and README.md and --flag"),
 		).toEqual([]);
+	});
+
+	test("sentence periods and a leading dot do not hide related file evidence", async () => {
+		const tokens = reportPathTokens(
+			"Edit src/turn.ts. Then edit ./src/ui/app.tsx. See src/turn.ts:12.",
+		);
+		expect(tokens).toEqual(["src/turn.ts", "src/ui/app.tsx"]);
+		const related = await relatedByTokens(
+			[row({ id: "P-2", prompt: "Implement the guard in src/turn.ts" })],
+			tokens,
+			[],
+			"P-1",
+			async () => null,
+		);
+		expect(related.map((card) => card.id)).toEqual(["P-2"]);
+	});
+
+	test("parent path segments never enter the git pathspec", () => {
+		expect(
+			reportPathTokens("src/../../etc/passwd ../private/data src/../data a/b"),
+		).toEqual(["a/b"]);
+	});
+
+	test("normalized path evidence matches the named repository paths", () => {
+		const segment = fc.stringMatching(/^[a-z][a-z0-9_-]{0,10}$/);
+		const path = fc
+			.array(segment, { minLength: 2, maxLength: 5 })
+			.map((parts) => `${parts.join("/")}.ts`);
+		fc.assert(
+			fc.property(
+				fc.array(fc.record({ path, dot: fc.boolean(), period: fc.boolean() }), {
+					minLength: 1,
+					maxLength: 20,
+				}),
+				(entries) => {
+					const report = entries
+						.map(
+							(entry) =>
+								`${entry.dot ? "./" : ""}${entry.path}${entry.period ? "." : ""}`,
+						)
+						.join(" ");
+					expect(reportPathTokens(report)).toEqual([
+						...new Set(entries.map((entry) => entry.path)),
+					]);
+				},
+			),
+			{ examples: [[[{ path: "a/a.ts", dot: false, period: true }]]] },
+		);
 	});
 
 	test("capped at 20 tokens", () => {

@@ -14224,13 +14224,55 @@ describe("inbox sweep routes (OTTR-1259)", () => {
 		expect(proposals).toHaveLength(1);
 		const proposal = proposals[0]!;
 		expect(proposal.prompt).toBe(draft);
-		expect(proposal.stage).toBe("backlog");
+		expect(proposal.stage).toBe("todo");
 		expect(proposal.state).toBe("needs_you");
 		expect(proposal.queuedAt).toBeNull();
 		expect(proposal.promptAuthor).toBe("board");
 		expect(proposal.needsReason).toBe(
 			`Inbox sweep proposal from #${run.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
+	});
+
+	test("an approved sweep draft stays editable and Accept queues implementation", async () => {
+		const target = await pinnedResearch(
+			"editable sweep proposal",
+			"# Report\n## Recommended steps\n- Add the retry test",
+		);
+		const run = await doneSweep([
+			{
+				cardId: target.id,
+				record: `Sweep: #<CARD> none\nThe retry test is absent.\n${SWEEP_DRAFT_SEP}\nAdd the retry test`,
+			},
+		]);
+		expect(
+			(
+				await post("/api/projects/p3/inbox/sweep/apply", {
+					run: run.id,
+					rows: [{ card: target.id, action: "implement" }],
+				})
+			).status,
+		).toBe(200);
+		const proposals = (await store3.listTasks()).filter(
+			(card) => card.followUpOf === run.id,
+		);
+		expect(proposals).toHaveLength(1);
+		const proposal = proposals[0]!;
+		expect(proposal.state).toBe("needs_you");
+		expect(proposal.queuedAt).toBeNull();
+		const prompt = "Add a retry test for the queue instead";
+		expect(
+			(await post(`/api/projects/p3/tasks/${proposal.id}/edit`, { prompt }))
+				.status,
+		).toBe(200);
+		expect((await store3.getTask(proposal.id))?.prompt).toBe(prompt);
+		expect(
+			(await post(`/api/projects/p3/tasks/${proposal.id}/reply`, { text: "." }))
+				.status,
+		).toBe(200);
+		const accepted = (await store3.getTask(proposal.id))!;
+		expect(accepted.stage).toBe("todo");
+		expect(accepted.state).toBe("queued");
+		expect(accepted.prompt).toBe(prompt);
 	});
 
 	test("a repeated apply files no duplicate proposals", async () => {

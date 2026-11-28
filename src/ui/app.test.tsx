@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { type Node as HappyNode, Window } from "happy-dom";
 import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -1678,6 +1678,15 @@ describe("Inbox sweep (OTTR-1259)", () => {
 		expect(stale.disabled).toBe(true);
 		expect(stale.checked).toBe(false);
 		expect(html).toContain(">Stale</span>");
+		expect(html).toContain(
+			'aria-label="Nothing done: Research the stale plan; Stale"',
+		);
+		expect(
+			parseMarkup(html)
+				.querySelector('input[name="sweep-row-r3"]')
+				?.closest("li")
+				?.querySelector(".sweep-drafts"),
+		).toBeNull();
 		// The fresh rows stay enabled.
 		expect(rowInput(html, "r1").disabled).toBe(false);
 	});
@@ -1747,6 +1756,9 @@ describe("Inbox sweep (OTTR-1259)", () => {
 		const applied = rowInput(html, "r1");
 		expect(applied.disabled).toBe(true);
 		expect(applied.checked).toBe(false);
+		expect(html).toContain(
+			'aria-label="All steps done: Fix the login bug; Applied"',
+		);
 		// The other rows stay preselected, but the applied one never joins them.
 		expect(rowInput(html, "r2").checked).toBe(true);
 		// Apply stays enabled while a non-applied row is checked.
@@ -1810,25 +1822,30 @@ describe("Inbox sweep (OTTR-1259)", () => {
 		throw new Error("no Apply selected button");
 	};
 
+	const applyBase = {
+		...drawerBase,
+		act: async (fn: () => Promise<unknown>) => {
+			await fn();
+			return true;
+		},
+	} as unknown as Parameters<typeof Drawer>[0];
+
 	test("Apply selected POSTs the checked rows to the project's apply route", async () => {
 		// The fixture carries the sweep view through the same short cast the
 		// static tests use; the detail fetch answers it back with the sweep.
 		const card = sweepCard(sweepView(sweepRows()));
-		// A real act: the fixture's no-op act never runs the apply callback.
-		const applyBase = {
-			...drawerBase,
-			act: async (fn: () => Promise<unknown>) => {
-				await fn();
-				return true;
-			},
-		} as unknown as Parameters<typeof Drawer>[0];
 		await withDrawerRoute(
 			applyBase,
 			card,
 			"/inbox/sweep/apply",
 			{
 				status: 200,
-				body: { results: [{ card: "r1" }, { card: "r2" }] },
+				body: {
+					results: [
+						{ card: "r1", applied: true },
+						{ card: "r2", applied: true },
+					],
+				},
 			},
 			async ({ posts, container }) => {
 				await act(async () => {
@@ -1855,6 +1872,116 @@ describe("Inbox sweep (OTTR-1259)", () => {
 				).not.toBeNull();
 			},
 		);
+	});
+
+	test("unchecked rows stay unchecked after a detail refresh and an apply", async () => {
+		const card = sweepCard(sweepView(sweepRows()));
+		await withDrawerRoute(
+			applyBase,
+			card,
+			"/inbox/sweep/apply",
+			{ status: 200, body: { results: [{ card: "r1", applied: true }] } },
+			async ({ posts, container, root }) => {
+				const unchecked = container.querySelector<HTMLInputElement>(
+					'input[name="sweep-row-r2"]',
+				);
+				if (unchecked === null) throw new Error("no second sweep row");
+				await act(async () => onChangeOf(unchecked)());
+				expect(unchecked.checked).toBe(false);
+				await act(async () => {
+					root.render(
+						<Drawer
+							{...applyBase}
+							task={{ ...card, updatedAt: card.updatedAt + 1 }}
+						/>,
+					);
+				});
+				await act(async () => {});
+				expect(unchecked.checked).toBe(false);
+				await act(async () => onClickOf(mountedApplyButton(container))({}));
+				await act(async () => {});
+				expect(posts.at(-1)?.body).toEqual({
+					run: card.id,
+					rows: [{ card: "r1", action: "clear" }],
+				});
+				expect(unchecked.checked).toBe(false);
+				expect(
+					mountedApplyButton(container).getAttribute("disabled"),
+				).not.toBeNull();
+			},
+		);
+	});
+
+	test("refused rows remain selectable and show the server's refusal", async () => {
+		const card = sweepCard(sweepView(sweepRows()));
+		await withDrawerRoute(
+			applyBase,
+			card,
+			"/inbox/sweep/apply",
+			{
+				status: 200,
+				body: {
+					results: [
+						{ card: "r1", applied: false, skipped: "stale" },
+						{ card: "r2", applied: false, skipped: "no verdict" },
+					],
+				},
+			},
+			async ({ container }) => {
+				await act(async () => onClickOf(mountedApplyButton(container))({}));
+				await act(async () => {});
+				expect(
+					container.querySelector<HTMLInputElement>(
+						'input[name="sweep-row-r2"]',
+					)?.checked,
+				).toBe(true);
+				expect(
+					container.querySelector('[role="alert"]')?.textContent,
+				).toContain("r1: stale");
+				expect(
+					container.querySelector('[role="alert"]')?.textContent,
+				).toContain("r2: no verdict");
+				expect(
+					mountedApplyButton(container).getAttribute("disabled"),
+				).toBeNull();
+			},
+		);
+	});
+
+	test("repeated evidence links retain their text without duplicate React keys", async () => {
+		const card = sweepCard(
+			sweepView([
+				{
+					...sweepRows()[0]!,
+					evidence: "Done in OTTR-12; OTTR-12 also closed step 2.",
+					linkedCards: ["OTTR-12"],
+				},
+			]),
+		);
+		const errors = spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await withDrawerRoute(
+				applyBase,
+				card,
+				"/inbox/sweep/apply",
+				{ status: 200, body: { results: [] } },
+				async ({ container }) => {
+					expect(container.querySelector(".sweep-evidence")?.textContent).toBe(
+						"Done in OTTR-12; OTTR-12 also closed step 2.",
+					);
+					expect(container.querySelectorAll(".sweep-evidence a")).toHaveLength(
+						2,
+					);
+					expect(
+						errors.mock.calls.filter(([format]) =>
+							String(format).includes("same key"),
+						),
+					).toEqual([]);
+				},
+			);
+		} finally {
+			errors.mockRestore();
+		}
 	});
 });
 

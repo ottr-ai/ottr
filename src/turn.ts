@@ -7045,7 +7045,10 @@ export function createTurnLoop(
 		// OTTR-1259: the sweep's read-only toolset — the extension's OTTR_SWEEP mode
 		// registers propose_task (prompt-only verdict records).
 		if (idn.sweep)
-			return { tools: "read,grep,glob,report_outcome,propose_task" };
+			return {
+				tools: "read,grep,glob,report_outcome,propose_task",
+				config: join(dirname(ops.extensionPath), "retro.yml"),
+			};
 		return {};
 	}
 

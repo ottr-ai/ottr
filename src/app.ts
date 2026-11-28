@@ -2286,7 +2286,6 @@ export async function applyInboxSweepRows(o: {
 					await store.updateTask(proposal.id, {
 						followUpOf: run.id,
 						promptAuthor: "board",
-						stage: "backlog",
 						state: "needs_you",
 						queuedAt: null,
 						needsReason: sweepProposedReason(run),

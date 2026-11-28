@@ -47,6 +47,8 @@ or changes to the per-card buttons are necessary.
    tools are `read,grep,glob,report_outcome,propose_task`. `OTTR_SWEEP=1` makes the
    extension register a sweep-mode `propose_task` (prompt-only parameter, no
    sandbox_run).
+   The trusted read-only overlay disables autolearn, so the runtime cannot add
+   persistent memory or skill write tools.
 3. Nothing applies without the operator's click. The sweep settle writes no target
    card: verdicts are records on the sweep card, the table reads them, and the apply
    route runs the drawer actions per approved row.
@@ -97,6 +99,9 @@ not an empty seen set or a zero baseline.
   branches are invisible to this log — the descendants evidence covers in-flight
   work.
 
+Path tokens omit a leading `./` and trailing sentence periods. Tokens with a
+`..` path segment do not enter the evidence search or the git request.
+
 ## Verdicts and the recorded shape
 
 One `propose_task` call per card. The recorded prompt's first line is exactly:
@@ -118,6 +123,9 @@ are the draft's self-contained card prompt. Reader: `sweepResult(prompt)` in
 src/inboxSweep.ts returns `{ cardId, verdict, evidence, drafts }` or null for any
 other shape; never throws; the first result per card id wins (like the validation
 settle's first-result rule).
+
+The reader accepts LF and CRLF line endings. An empty draft block invalidates
+the verdict, so the board cannot file a blank proposal.
 
 ## Storage and view
 
@@ -172,7 +180,7 @@ an answer, finish or cancellation landing on an existing one alike.
   The core reads the live run and its board-owned record inside the project
   transaction. A row needs an accepted batch verdict. A stale row never applies.
   The core reads the full target, including its report, before the legacy steps guard.
-  `implement` files each distinct draft as a held proposal card: backlog stage,
+  `implement` files each distinct draft as a held proposal card: todo stage,
   `needs_you`, `promptAuthor: "board"`, and `sweepProposedReason(run)` as its reason.
   The transaction saves the proposal, draft registry, and approval receipt together.
   Repeated rows collapse. An existing receipt prevents a duplicate proposal,
@@ -239,6 +247,9 @@ extension (it loads standalone) and mirrors the prompt's contract section.
   cards continue in the next sweep run."). The evidence renders the cited ids as
   links: a board card id opens its card when the board lists it, and a commit hash
   links to the project's GitHub commit when the project has one.
+  An unchecked row stays unchecked after a detail refresh or an apply.
+  Refused rows retain their selection and show the refusal reason.
+  Checkbox names include the `Stale` and `Applied` states.
 - No change to research card pins, the drawer's per-card buttons, or the seen-mark
   rules (research-inbox.md decisions stay).
 

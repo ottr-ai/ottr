@@ -35,7 +35,7 @@ export type SweepRecord = {
  * case-sensitively, and a `Sweep:` line inside evidence or a draft never wins.
  * Null: any other shape — no recorded verdict. Never throws. */
 export function sweepResult(prompt: string): SweepRecord | null {
-	const lines = prompt.split("\n");
+	const lines = prompt.split(/\r?\n/);
 	const match = /^Sweep: #(\S+) (done|partial|none|info)$/.exec(lines[0] ?? "");
 	if (match === null) return null;
 	const cardId = match[1];
@@ -55,11 +55,13 @@ export function sweepResult(prompt: string): SweepRecord | null {
 		else open.push(line);
 	}
 	if (open !== null) blocks.push(open);
+	const drafts = blocks.map((block) => block.join("\n").trim());
+	if (drafts.some((draft) => draft === "")) return null;
 	return {
 		cardId,
 		verdict: verdict as SweepRecord["verdict"],
 		evidence: head.join("\n").trim(),
-		drafts: blocks.map((b) => b.join("\n").trim()),
+		drafts,
 	};
 }
 
@@ -95,13 +97,15 @@ export function stepsEvidence(report: string): string {
 /** The repo-relative path-looking strings a report names, capped at 20: word
  * characters with at least one inner `/`, no scheme (a URL's path is another
  * card's concern), no `-` or `:` lead, so a token is always a safe git pathspec.
- * Duplicates collapse, order keeps the report's. */
+ * Duplicates collapse after removal of `./` and sentence periods. Parent path
+ * segments never enter the git pathspec. Order keeps the report's. */
 export function reportPathTokens(report: string): string[] {
 	const found: string[] = [];
 	for (const m of report.matchAll(
-		/(?<![\w./:@-])[A-Za-z0-9_][\w.-]*\/[\w.-]+(?:\/[\w.-]+)*(?![\w.-]*:\/\/)/g,
+		/(?<![\w./:@-])(?:\.\/)?[A-Za-z0-9_][\w.-]*\/[\w.-]+(?:\/[\w.-]+)*(?![\w.-]*:\/\/)/g,
 	)) {
-		const token = m[0];
+		const token = m[0].replace(/^\.\//, "").replace(/\.+$/, "");
+		if (token.endsWith("/") || token.split("/").includes("..")) continue;
 		if (!found.includes(token)) found.push(token);
 		if (found.length === 20) break;
 	}
